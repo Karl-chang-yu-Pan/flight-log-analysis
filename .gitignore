@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+
+outputs/
+logs/
+missions/
+*.ulg
+
+# Local reference checkouts used by the analysis tools.
+ref/

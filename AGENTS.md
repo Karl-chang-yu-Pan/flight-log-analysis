@@ -1,0 +1,10 @@
+- Preserve existing behavior unless the user explicitly asks to change it.
+- Keep generated reports and schemas stable unless the user asks to change them.
+- Prefer small, testable modules over putting all logic in runner.py.
+- Add or update tests when implementing new features.
+- After code changes, run pytest.
+- Keep changes focused on the requested scope.
+- Prefer simple, runnable code over abstract architecture.
+- Explain the changes when editing files.
+- AGENTS.md is for Codex build/edit instructions; runtime flight-log agent behavior belongs in code prompts or agent instructions.
+- When installing python packages, search for virtual environment and install in it.
