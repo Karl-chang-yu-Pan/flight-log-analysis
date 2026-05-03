@@ -40,6 +40,14 @@ class PlotRef(BaseModel):
     purpose: str
 
 
+class PlotOverlay(BaseModel):
+    start_s: float
+    end_s: Optional[float] = None
+    label: Optional[str] = None
+    color: Optional[str] = None
+    alpha: Optional[float] = None
+
+
 class CodeRef(BaseModel):
     file: str
     function: Optional[str] = None
@@ -194,7 +202,7 @@ def generate_signal_plot(
     purpose: str,
     plot_type: str = "timeseries",
     bins: int = 50,
-    overlays: Optional[list[dict]] = None,
+    overlays: Optional[list[PlotOverlay]] = None,
 ) -> dict:
     """
     Generate a hypothesis-specific plot.
@@ -209,7 +217,7 @@ def generate_signal_plot(
         purpose,
         plot_type=plot_type,
         bins=bins,
-        overlays=overlays,
+        overlays=[overlay.model_dump(exclude_none=True) for overlay in overlays] if overlays else None,
     )
 
 

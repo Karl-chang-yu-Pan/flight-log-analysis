@@ -2,6 +2,7 @@ import importlib.util
 import asyncio
 import json
 import math
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -28,6 +29,12 @@ def load_runner(tmp_path: Path):
 
         def model_dump_json(self, indent=None):
             return "{}"
+
+        def model_dump(self, exclude_none=False):
+            data = self.__dict__.copy()
+            if exclude_none:
+                data = {key: value for key, value in data.items() if value is not None}
+            return data
 
     pydantic_stub.BaseModel = BaseModel
 
@@ -530,6 +537,18 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
         "suggestions_requested": False,
     }
     assert output_dir.is_dir()
+
+
+def test_runner_imports_with_real_sdk_function_tool_schema():
+    result = subprocess.run(
+        [sys.executable, "-c", "import runner; print(runner.flight_log_agent.name)"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "PX4 Flight Log Analyst V1" in result.stdout
 
 
 def test_infer_control_surface_maps_ca_servo_types_to_pwm_outputs(tmp_path, monkeypatch):
@@ -1301,7 +1320,7 @@ def test_generate_signal_plot_delegates_to_plot_module(tmp_path):
             purpose="Compare mission progress with navigation state.",
             plot_type="xy",
             bins=30,
-            overlays=[{"start_s": 4.5, "end_s": 5.5, "label": "window"}],
+            overlays=[runner.PlotOverlay(start_s=4.5, end_s=5.5, label="window")],
         )
 
     plot_impl.assert_called_once_with(
