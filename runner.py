@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List
 
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, RunContextWrapper, WebSearchTool
+
+from px4_source import checkout_px4_source_revision, read_source_file, search_source
+from mission_parser import parse_mission_file as parse_mission_file_impl
+from ulog_control_surface import infer_control_surface as infer_control_surface_impl
+from ulog_inventory import parse_ulog_inventory as parse_ulog_inventory_impl
+from ulog_metrics import compute_log_metrics as compute_log_metrics_impl
+from ulog_plots import generate_signal_plot as generate_signal_plot_impl
+from ulog_timeline import build_basic_timeline as build_basic_timeline_impl
 
 
 # ============================================================
@@ -68,63 +75,43 @@ class FlightLogReport(BaseModel):
 
 def parse_ulog_inventory(log_path: Path) -> dict:
     """
-    TODO:
-    Implement with pyulog.
-
-    Should extract:
+    Extract:
     - firmware version / git hash
     - parameters
     - available uORB topics
     - warnings/errors
     - duration
     """
-    return {
-        "firmware_version": "TODO_FROM_LOG",
-        "git_hash": None,
-        "duration_s": None,
-        "important_parameters": {},
-        "available_topics": [],
-        "warnings": [],
-        "missing_topics": [],
-    }
+    return parse_ulog_inventory_impl(log_path)
 
 
 def build_basic_timeline(log_path: Path) -> list[dict]:
     """
-    TODO:
     Build from vehicle_status, vehicle_type, nav_state,
     arming_state, vtol_vehicle_status, mission_result.
     """
-    return []
+    return build_basic_timeline_impl(log_path)
+
+
+def infer_control_surface(log_path: Path, source_path: Optional[Path]) -> dict:
+    """
+    Infer actuator/control-surface assumptions from logged PX4 parameters.
+    """
+    return infer_control_surface_impl(log_path, source_path)
 
 
 def infer_control_mapping(log_path: Path, source_path: Optional[Path]) -> dict:
     """
-    TODO:
-    Infer from CA_* params, PWM_MAIN_FUNCx / AUX_FUNCx,
-    actuator_motors, actuator_servos, airframe config.
+    Backward-compatible name for control-surface inference.
     """
-    return {
-        "vehicle_type": "unknown",
-        "assumed_actuator_mapping": {},
-        "evidence": [],
-        "confidence": "low",
-        "warning": "Mapping is not confirmed yet.",
-    }
+    return infer_control_surface(log_path, source_path)
 
 
 def parse_mission_file(mission_path: Optional[Path]) -> Optional[dict]:
     """
-    TODO:
     Parse .plan or mission file if provided.
     """
-    if mission_path is None:
-        return None
-
-    return {
-        "mission_file": str(mission_path),
-        "items": [],
-    }
+    return parse_mission_file_impl(mission_path)
 
 
 # ============================================================
@@ -145,30 +132,43 @@ def search_px4_source(
     if source_path is None:
         return [{"error": "No PX4 source path provided."}]
 
-    cmd = [
-        "rg",
-        "-n",
-        "--context", "3",
-        query,
-        str(source_path),
-    ]
+    return search_source(source_path, query, max_results=max_results)
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except Exception as e:
-        return [{"error": str(e)}]
 
-    lines = result.stdout.splitlines()[:max_results * 8]
+@function_tool
+def checkout_px4_source(
+    ctx: RunContextWrapper[FlightLogContext],
+    revision: str,
+) -> dict:
+    """
+    Checkout local PX4 source code to a git hash, tag, or branch.
 
-    return [{
-        "query": query,
-        "matches": lines,
-    }]
+    Refuses to checkout if the PX4 tree has local changes.
+    """
+    source_path = ctx.context.source_path
+
+    if source_path is None:
+        return {"error": "No PX4 source path provided."}
+
+    return checkout_px4_source_revision(source_path, revision)
+
+
+@function_tool
+def read_px4_source_file(
+    ctx: RunContextWrapper[FlightLogContext],
+    relative_path: str,
+    start_line: int = 1,
+    end_line: Optional[int] = None,
+) -> dict:
+    """
+    Read a line range from a file inside the local PX4 source tree.
+    """
+    source_path = ctx.context.source_path
+
+    if source_path is None:
+        return {"error": "No PX4 source path provided."}
+
+    return read_source_file(source_path, relative_path, start_line, end_line)
 
 
 @function_tool
@@ -180,17 +180,8 @@ def compute_log_metrics(
 ) -> dict:
     """
     Compute numeric metrics for selected signals.
-
-    TODO:
-    Implement actual signal extraction from pyulog/pandas cache.
     """
-    return {
-        "window_s": [start_s, end_s],
-        "signals": signals,
-        "metrics": {
-            "TODO": "replace with real metrics",
-        },
-    }
+    return compute_log_metrics_impl(ctx.context.log_path, start_s, end_s, signals)
 
 
 @function_tool
@@ -201,28 +192,25 @@ def generate_signal_plot(
     end_s: float,
     signals: list[str],
     purpose: str,
+    plot_type: str = "timeseries",
+    bins: int = 50,
+    overlays: Optional[list[dict]] = None,
 ) -> dict:
     """
     Generate a hypothesis-specific plot.
-
-    TODO:
-    Implement actual matplotlib plotting.
     """
-    plots_dir = ctx.context.output_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    safe_title = title.lower().replace(" ", "_").replace("/", "_")
-    plot_path = plots_dir / f"{safe_title}.png"
-
-    # TODO: actual plotting code here
-
-    return {
-        "title": title,
-        "path": str(plot_path),
-        "purpose": purpose,
-        "window_s": [start_s, end_s],
-        "signals": signals,
-    }
+    return generate_signal_plot_impl(
+        ctx.context.log_path,
+        ctx.context.output_dir,
+        title,
+        start_s,
+        end_s,
+        signals,
+        purpose,
+        plot_type=plot_type,
+        bins=bins,
+        overlays=overlays,
+    )
 
 
 # ============================================================
@@ -247,17 +235,19 @@ Workflow:
 2. Show detected vehicle/control-surface assumptions at the top.
 3. Use web search only for culprit discovery:
    PX4 docs, forum posts, GitHub issues, parameter concepts, known mechanisms.
-4. Use local PX4 source search for exact code behavior.
-5. Select relevant analysis windows.
-6. Generate ranked hypotheses.
-7. For each hypothesis, include:
+4. If a relevant PX4 git hash, tag, or branch is known, checkout the local
+   PX4 source tree before source-code investigation.
+5. Use local PX4 source search for exact code behavior.
+6. Select relevant analysis windows.
+7. Generate ranked hypotheses.
+8. For each hypothesis, include:
    - mechanism
    - evidence from log
    - contradicting evidence
    - relevant plot
    - relevant code path
    - confidence
-8. Do not provide parameter tuning, code-change, or flight-test suggestions
+9. Do not provide parameter tuning, code-change, or flight-test suggestions
    unless the user explicitly asks for suggestions or fixes.
 
 Always separate:
@@ -281,6 +271,8 @@ For mission acceptance:
     tools=[
         WebSearchTool(),
         search_px4_source,
+        checkout_px4_source,
+        read_px4_source_file,
         compute_log_metrics,
         generate_signal_plot,
     ],
@@ -309,7 +301,7 @@ async def analyze_flight_log_v1(
     # Deterministic pre-pass
     inventory = parse_ulog_inventory(log_path)
     timeline = build_basic_timeline(log_path)
-    assumptions = infer_control_mapping(log_path, source_path_obj)
+    assumptions = infer_control_surface(log_path, source_path_obj)
     mission = parse_mission_file(mission_path_obj)
 
     ctx = FlightLogContext(
