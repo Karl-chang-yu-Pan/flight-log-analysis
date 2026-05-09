@@ -6,6 +6,7 @@ __pycache__/
 outputs/
 logs/
 missions/
+uploads/
 *.ulg
 
 # Local reference checkouts used by the analysis tools.
