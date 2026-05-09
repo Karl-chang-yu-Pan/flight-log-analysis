@@ -557,13 +557,15 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
     mission_path = tmp_path / "mission.plan"
     source_path = tmp_path / "PX4-Autopilot"
     output_dir = tmp_path / "outputs"
+    dev_log_root = tmp_path / "dev_logs"
     captured = {}
 
-    async def fake_run(agent, input, context, max_turns):
+    async def fake_run(agent, input, context, max_turns, hooks=None):
         captured["agent"] = agent
         captured["input"] = json.loads(input)
         captured["context"] = context
         captured["max_turns"] = max_turns
+        captured["hooks"] = hooks
         return SimpleNamespace(final_output={"final_summary": "answered"})
 
     runner.Runner.run = fake_run
@@ -591,6 +593,7 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
                 mission_path=str(mission_path),
                 source_path=str(source_path),
                 output_dir=str(output_dir),
+                dev_log_root=str(dev_log_root),
                 user_question="Why did it loiter before the waypoint?",
             )
         )
@@ -603,6 +606,7 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
     assert result == {"final_summary": "answered"}
     assert captured["agent"] is runner.flight_log_agent
     assert captured["max_turns"] == 20
+    assert captured["hooks"] is not None
     assert captured["context"] == runner.FlightLogContext(
         log_path=log_path,
         mission_path=mission_path,
@@ -619,12 +623,20 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
         "suggestions_requested": False,
     }
     assert output_dir.is_dir()
+    run_dirs = list(dev_log_root.iterdir())
+    assert len(run_dirs) == 1
+    assert (run_dirs[0] / "run_events.jsonl").is_file()
+    assert (run_dirs[0] / "usage.json").is_file()
+    assert json.loads((run_dirs[0] / "metadata.json").read_text())["report_path"] == str(
+        output_dir / "report.json"
+    )
 
 
 def test_analyze_flight_log_v1_generates_plots_from_hypothesis_specs(tmp_path):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"
     output_dir = tmp_path / "outputs"
+    dev_log_root = tmp_path / "dev_logs"
     expected_plot_path = output_dir / "plots" / "altitude_drop.png"
 
     report = runner.FlightLogReport(
@@ -667,7 +679,7 @@ def test_analyze_flight_log_v1_generates_plots_from_hypothesis_specs(tmp_path):
         final_summary="summary",
     )
 
-    async def fake_run(agent, input, context, max_turns):
+    async def fake_run(agent, input, context, max_turns, hooks=None):
         return SimpleNamespace(final_output=report)
 
     runner.Runner.run = fake_run
@@ -716,6 +728,7 @@ def test_analyze_flight_log_v1_generates_plots_from_hypothesis_specs(tmp_path):
             runner.analyze_flight_log_v1(
                 log_path=str(log_path),
                 output_dir=str(output_dir),
+                dev_log_root=str(dev_log_root),
                 user_question="Why did altitude drop after transition?",
             )
         )
@@ -746,6 +759,11 @@ def test_analyze_flight_log_v1_generates_plots_from_hypothesis_specs(tmp_path):
     assert result.ranked_hypotheses[0].plots[0].warnings == []
     assert result.unconfirmed == []
     assert json.loads((output_dir / "report.json").read_text())["ranked_hypotheses"][0]["plots"][0]["path"] == str(expected_plot_path)
+    event_lines = (next(dev_log_root.iterdir()) / "run_events.jsonl").read_text().splitlines()
+    assert any(
+        json.loads(line)["event"] == "postprocess_plot.finished"
+        for line in event_lines
+    )
 
 
 def test_generate_report_plots_warns_when_hypothesis_has_no_plot_spec(tmp_path):

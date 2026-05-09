@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, List
@@ -16,6 +17,12 @@ from ulog_inventory import parse_ulog_inventory as parse_ulog_inventory_impl
 from ulog_metrics import compute_log_metrics as compute_log_metrics_impl
 from ulog_plots import generate_signal_plot as generate_signal_plot_impl
 from ulog_timeline import build_basic_timeline as build_basic_timeline_impl
+from run_audit_log import (
+    AgentRunAuditHooks,
+    DEFAULT_DEV_LOG_ROOT,
+    DeveloperAuditLogger,
+    log_run_items,
+)
 
 
 # ============================================================
@@ -334,6 +341,7 @@ async def analyze_flight_log_v1(
     mission_path: Optional[str] = None,
     source_path: Optional[str] = None,
     output_dir: str = "outputs/run_001",
+    dev_log_root: str = str(DEFAULT_DEV_LOG_ROOT),
 ) -> FlightLogReport:
 
     log_path = Path(log_path)
@@ -341,13 +349,66 @@ async def analyze_flight_log_v1(
     source_path_obj = Path(source_path) if source_path else None
     output_dir_obj = Path(output_dir)
     output_dir_obj.mkdir(parents=True, exist_ok=True)
+    audit_logger = DeveloperAuditLogger(Path(dev_log_root))
     report_path = output_dir_obj / "report.json"
+    audit_logger.save_metadata(
+        {
+            "log_path": str(log_path),
+            "mission_path": str(mission_path_obj) if mission_path_obj else None,
+            "source_path": str(source_path_obj) if source_path_obj else None,
+            "output_dir": str(output_dir_obj),
+            "report_path": str(report_path),
+        }
+    )
+    audit_logger.log_event(
+        "run.started",
+        input={
+            "log_path": log_path,
+            "user_question": user_question,
+            "mission_path": mission_path_obj,
+            "source_path": source_path_obj,
+            "output_dir": output_dir_obj,
+        },
+    )
 
-    # Deterministic pre-pass
-    inventory = parse_ulog_inventory(log_path)
-    timeline = build_basic_timeline(log_path)
-    assumptions = infer_control_surface(log_path, source_path_obj)
-    mission = parse_mission_file(mission_path_obj)
+    try:
+        # Deterministic pre-pass
+        inventory = _audit_sync_call(
+            audit_logger,
+            "prepass",
+            "parse_ulog_inventory",
+            parse_ulog_inventory,
+            {"log_path": log_path},
+            log_path,
+        )
+        timeline = _audit_sync_call(
+            audit_logger,
+            "prepass",
+            "build_basic_timeline",
+            build_basic_timeline,
+            {"log_path": log_path},
+            log_path,
+        )
+        assumptions = _audit_sync_call(
+            audit_logger,
+            "prepass",
+            "infer_control_surface",
+            infer_control_surface,
+            {"log_path": log_path, "source_path": source_path_obj},
+            log_path,
+            source_path_obj,
+        )
+        mission = _audit_sync_call(
+            audit_logger,
+            "prepass",
+            "parse_mission_file",
+            parse_mission_file,
+            {"mission_path": mission_path_obj},
+            mission_path_obj,
+        )
+    except Exception as exc:
+        audit_logger.log_event("run.failed", error=repr(exc))
+        raise
 
     ctx = FlightLogContext(
         log_path=log_path,
@@ -370,16 +431,29 @@ async def analyze_flight_log_v1(
         ),
     }
 
-    result = await Runner.run(
-        flight_log_agent,
-        input=json.dumps(agent_input, indent=2),
-        context=ctx,
-        max_turns=20,
-    )
+    try:
+        result = await Runner.run(
+            flight_log_agent,
+            input=json.dumps(agent_input, indent=2),
+            context=ctx,
+            max_turns=20,
+            hooks=AgentRunAuditHooks(audit_logger),
+        )
+        log_run_items(audit_logger, getattr(result, "new_items", []) or [])
+        usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
+        audit_logger.save_usage(usage)
 
-    report = generate_report_plots(result.final_output, ctx)
-    save_report(report, report_path)
-    return report
+        report = generate_report_plots(result.final_output, ctx, audit_logger=audit_logger)
+        save_report(report, report_path)
+        audit_logger.log_event(
+            "run.finished",
+            output={"report_path": report_path, "dev_log_dir": audit_logger.run_dir},
+            usage=usage,
+        )
+        return report
+    except Exception as exc:
+        audit_logger.log_event("run.failed", error=repr(exc))
+        raise
 
 
 def save_report(report: FlightLogReport, path: Path) -> None:
@@ -395,6 +469,7 @@ def save_report(report: FlightLogReport, path: Path) -> None:
 def generate_report_plots(
     report: FlightLogReport,
     ctx: FlightLogContext,
+    audit_logger: Optional[DeveloperAuditLogger] = None,
 ) -> FlightLogReport:
     """
     Materialize plot requests embedded in the structured report.
@@ -416,7 +491,16 @@ def generate_report_plots(
             if spec is None:
                 continue
 
-            result = generate_signal_plot_impl(
+            result = _audit_sync_call(
+                audit_logger,
+                "postprocess_plot",
+                "generate_signal_plot",
+                generate_signal_plot_impl,
+                {
+                    "log_path": ctx.log_path,
+                    "output_dir": ctx.output_dir,
+                    **spec,
+                },
                 ctx.log_path,
                 ctx.output_dir,
                 spec["title"],
@@ -442,6 +526,40 @@ def generate_report_plots(
             )
 
     return report
+
+
+def _audit_sync_call(
+    audit_logger: Optional[DeveloperAuditLogger],
+    event_prefix: str,
+    name: str,
+    func: Any,
+    input_payload: dict,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    if audit_logger is None:
+        return func(*args, **kwargs)
+
+    started_at = time.perf_counter()
+    audit_logger.log_event(f"{event_prefix}.started", name=name, input=input_payload)
+    try:
+        result = func(*args, **kwargs)
+    except Exception as exc:
+        audit_logger.log_event(
+            f"{event_prefix}.failed",
+            name=name,
+            error=repr(exc),
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+        )
+        raise
+
+    audit_logger.log_event(
+        f"{event_prefix}.finished",
+        name=name,
+        output=result,
+        duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+    )
+    return result
 
 
 def _plot_generation_spec(plot: Any) -> Optional[dict]:
