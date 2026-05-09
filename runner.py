@@ -4,7 +4,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Optional, List
 
 from pydantic import BaseModel
 from agents import Agent, Runner, function_tool, RunContextWrapper, WebSearchTool
@@ -34,18 +34,30 @@ class FlightLogContext:
 # 2. Structured report output
 # ============================================================
 
-class PlotRef(BaseModel):
-    title: str
-    path: str
-    purpose: str
-
-
 class PlotOverlay(BaseModel):
     start_s: float
     end_s: Optional[float] = None
     label: Optional[str] = None
     color: Optional[str] = None
     alpha: Optional[float] = None
+    kind: Optional[str] = None
+    source: Optional[str] = None
+    ymin: Optional[float] = None
+    ymax: Optional[float] = None
+
+
+class PlotRef(BaseModel):
+    title: str
+    path: str
+    purpose: str
+    start_s: Optional[float] = None
+    end_s: Optional[float] = None
+    signals: Optional[List[str]] = None
+    plot_type: str = "timeseries"
+    bins: int = 50
+    overlays: Optional[List[PlotOverlay]] = None
+    missing_signals: Optional[List[str]] = None
+    warnings: Optional[List[str]] = None
 
 
 class CodeRef(BaseModel):
@@ -241,22 +253,46 @@ You receive:
 Workflow:
 1. Start from the provided log inventory and timeline.
 2. Show detected vehicle/control-surface assumptions at the top.
-3. Use web search only for culprit discovery:
+3. Use log_inventory.topic_fields when choosing plot signals. Prefer exact
+   logged fields from topic_fields. The runner prepares Flight Review-style
+   derived vehicle_attitude roll/pitch/yaw fields from quaternions before
+   plotting.
+4. Use web search only for culprit discovery:
    PX4 docs, forum posts, GitHub issues, parameter concepts, known mechanisms.
-4. If a relevant PX4 git hash, tag, or branch is known, checkout the local
+5. If a relevant PX4 git hash, tag, or branch is known, checkout the local
    PX4 source tree before source-code investigation.
-5. Use local PX4 source search for exact code behavior.
-6. Select relevant analysis windows.
-7. Generate ranked hypotheses.
-8. For each hypothesis, include:
+6. Use local PX4 source search for exact code behavior.
+7. Select relevant analysis windows.
+8. Generate ranked hypotheses.
+9. For each hypothesis, include:
    - mechanism
    - evidence from log
    - contradicting evidence
-   - relevant plot
+   - at least one relevant plot request in plots
    - relevant code path
    - confidence
-9. Do not provide parameter tuning, code-change, or flight-test suggestions
+10. Do not provide parameter tuning, code-change, or flight-test suggestions
    unless the user explicitly asks for suggestions or fixes.
+
+Plot requirements:
+- For every hypothesis, include at least one plots entry with signals and a
+  time window directly related to that hypothesis. Treat plots entries as
+  structured generation requests: fill title, purpose, start_s, end_s, signals,
+  plot_type, bins, and overlays. Set path to an empty string; the runner will
+  generate the PNG after your final report and fill in the actual path,
+  missing_signals, and warnings.
+- Decide which overlays are useful for each hypothesis plot. Relevant overlays
+  can include mode changes, mission item changes, VTOL state changes,
+  parameter-change evidence if available, user/control input changes, failsafe
+  changes, or command/state transitions.
+- Derive overlay times from the provided flight_timeline or from
+  compute_log_metrics transitions on discrete signals. Use vertical markers for
+  point changes and shaded spans for state intervals.
+- Keep overlays selective: include context that explains or challenges the
+  hypothesis, and avoid unrelated clutter.
+- In the plot purpose, state why the chosen signals and overlays are relevant.
+- If a plot cannot be generated because the required signals are missing, state
+  the attempted signals, window, and missing-signal reason in the hypothesis.
 
 Always separate:
 - observed from log
@@ -305,6 +341,7 @@ async def analyze_flight_log_v1(
     source_path_obj = Path(source_path) if source_path else None
     output_dir_obj = Path(output_dir)
     output_dir_obj.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir_obj / "report.json"
 
     # Deterministic pre-pass
     inventory = parse_ulog_inventory(log_path)
@@ -340,7 +377,138 @@ async def analyze_flight_log_v1(
         max_turns=20,
     )
 
-    return result.final_output
+    report = generate_report_plots(result.final_output, ctx)
+    save_report(report, report_path)
+    return report
+
+
+def save_report(report: FlightLogReport, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if hasattr(report, "model_dump_json"):
+        report_json = report.model_dump_json(indent=2)
+    else:
+        report_json = json.dumps(report, indent=2)
+
+    path.write_text(report_json, encoding="utf-8")
+
+
+def generate_report_plots(
+    report: FlightLogReport,
+    ctx: FlightLogContext,
+) -> FlightLogReport:
+    """
+    Materialize plot requests embedded in the structured report.
+
+    The model chooses hypothesis-specific plot specs; the runner writes the
+    files so plot artifacts do not depend on whether the model remembered to
+    call a tool during the run.
+    """
+    hypotheses = getattr(report, "ranked_hypotheses", None)
+    if not hypotheses:
+        return report
+
+    for hypothesis in hypotheses:
+        plots = getattr(hypothesis, "plots", None) or []
+        generated_count = 0
+
+        for plot in plots:
+            spec = _plot_generation_spec(plot)
+            if spec is None:
+                continue
+
+            result = generate_signal_plot_impl(
+                ctx.log_path,
+                ctx.output_dir,
+                spec["title"],
+                spec["start_s"],
+                spec["end_s"],
+                spec["signals"],
+                spec["purpose"],
+                plot_type=spec["plot_type"],
+                bins=spec["bins"],
+                overlays=spec["overlays"],
+            )
+            _apply_plot_result(plot, result)
+            generated_count += 1
+
+        if generated_count == 0 and not _has_existing_plot_file(plots):
+            title = getattr(hypothesis, "title", "untitled hypothesis")
+            _append_unconfirmed(
+                report,
+                (
+                    f"Plot generation was not attempted for hypothesis "
+                    f"'{title}' because no complete plot spec was returned."
+                ),
+            )
+
+    return report
+
+
+def _plot_generation_spec(plot: Any) -> Optional[dict]:
+    start_s = getattr(plot, "start_s", None)
+    end_s = getattr(plot, "end_s", None)
+    signals = getattr(plot, "signals", None) or []
+
+    if start_s is None or end_s is None or not signals:
+        return None
+
+    return {
+        "title": getattr(plot, "title", "Flight Log Plot"),
+        "purpose": getattr(plot, "purpose", ""),
+        "start_s": float(start_s),
+        "end_s": float(end_s),
+        "signals": list(signals),
+        "plot_type": getattr(plot, "plot_type", "timeseries") or "timeseries",
+        "bins": int(getattr(plot, "bins", 50) or 50),
+        "overlays": [_model_to_dict(overlay) for overlay in (getattr(plot, "overlays", None) or [])],
+    }
+
+
+def _apply_plot_result(plot: Any, result: dict) -> None:
+    for key in (
+        "title",
+        "path",
+        "purpose",
+        "signals",
+        "plot_type",
+        "overlays",
+        "missing_signals",
+        "warnings",
+    ):
+        if key in result:
+            setattr(plot, key, result[key])
+
+
+def _has_existing_plot_file(plots: list[Any]) -> bool:
+    for plot in plots:
+        path = getattr(plot, "path", "")
+        if path and Path(path).is_file():
+            return True
+
+    return False
+
+
+def _append_unconfirmed(report: Any, message: str) -> None:
+    unconfirmed = getattr(report, "unconfirmed", None)
+    if unconfirmed is None:
+        return
+
+    if message not in unconfirmed:
+        unconfirmed.append(message)
+
+
+def _model_to_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return {key: item for key, item in value.items() if item is not None}
+
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+
+    return {
+        key: getattr(value, key)
+        for key in ("start_s", "end_s", "label", "color", "alpha", "kind", "source", "ymin", "ymax")
+        if getattr(value, key, None) is not None
+    }
 
 
 # ============================================================

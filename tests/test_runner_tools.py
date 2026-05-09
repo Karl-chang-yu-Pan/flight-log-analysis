@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 import ulog_inventory
 import ulog_timeline
 import ulog_control_surface
@@ -28,13 +30,30 @@ def load_runner(tmp_path: Path):
                 setattr(self, key, value)
 
         def model_dump_json(self, indent=None):
-            return "{}"
+            return json.dumps(self.model_dump(), indent=indent)
 
         def model_dump(self, exclude_none=False):
-            data = self.__dict__.copy()
+            data = {
+                key: self._dump_value(value, exclude_none)
+                for key, value in self.__dict__.items()
+            }
             if exclude_none:
                 data = {key: value for key, value in data.items() if value is not None}
             return data
+
+        @classmethod
+        def _dump_value(cls, value, exclude_none=False):
+            if isinstance(value, BaseModel):
+                return value.model_dump(exclude_none=exclude_none)
+            if isinstance(value, list):
+                return [cls._dump_value(item, exclude_none) for item in value]
+            if isinstance(value, dict):
+                return {
+                    key: cls._dump_value(item, exclude_none)
+                    for key, item in value.items()
+                    if not exclude_none or item is not None
+                }
+            return value
 
     pydantic_stub.BaseModel = BaseModel
 
@@ -119,9 +138,9 @@ def test_parse_ulog_inventory_extracts_inventory_from_pyulog(tmp_path, monkeypat
             self.start_timestamp = 1_000_000
             self.last_timestamp = 6_500_000
             self.data_list = [
-                SimpleNamespace(name="vehicle_status", data={}),
-                SimpleNamespace(name="mission_result", data={}),
-                SimpleNamespace(name="sensor_combined", data={}),
+                SimpleNamespace(name="vehicle_status", data={"timestamp": [1], "nav_state": [3]}),
+                SimpleNamespace(name="mission_result", data={"timestamp": [1], "seq_current": [1]}),
+                SimpleNamespace(name="sensor_combined", data={"timestamp": [1], "gyro_rad[0]": [0.1]}),
             ]
             self.logged_messages = [
                 SimpleNamespace(log_level_str="INFO", message="armed"),
@@ -146,6 +165,11 @@ def test_parse_ulog_inventory_extracts_inventory_from_pyulog(tmp_path, monkeypat
             "sensor_combined",
             "vehicle_status",
         ],
+        "topic_fields": {
+            "mission_result": ["seq_current", "timestamp"],
+            "sensor_combined": ["gyro_rad[0]", "timestamp"],
+            "vehicle_status": ["nav_state", "timestamp"],
+        },
         "warnings": [
             "error: mission failure",
             "dropout: 42 ms",
@@ -169,6 +193,64 @@ def test_parse_ulog_inventory_reports_parse_failure(tmp_path, monkeypatch):
     assert result["important_parameters"] == {}
     assert result["missing_topics"] == ulog_inventory.EXPECTED_TIMELINE_TOPICS
     assert result["warnings"] == ["failed to parse ULog: bad log"]
+
+
+def test_parse_ulog_inventory_includes_derived_attitude_plot_fields(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.msg_info_dict = {}
+            self.initial_parameters = {}
+            self.start_timestamp = 1_000_000
+            self.last_timestamp = 2_000_000
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_attitude",
+                    data={
+                        "timestamp": [1_000_000],
+                        "q[0]": [1.0],
+                        "q[1]": [0.0],
+                        "q[2]": [0.0],
+                        "q[3]": [0.0],
+                    },
+                ),
+                SimpleNamespace(
+                    name="vehicle_attitude_setpoint",
+                    data={
+                        "timestamp": [1_000_000],
+                        "q_d[0]": [1.0],
+                        "q_d[1]": [0.0],
+                        "q_d[2]": [0.0],
+                        "q_d[3]": [0.0],
+                    },
+                ),
+            ]
+            self.logged_messages = []
+            self.dropouts = []
+
+    monkeypatch.setattr(ulog_inventory, "ULog", FakeULog)
+
+    result = ulog_inventory.parse_ulog_inventory(tmp_path / "flight.ulg")
+
+    assert result["topic_fields"]["vehicle_attitude"] == [
+        "pitch",
+        "q[0]",
+        "q[1]",
+        "q[2]",
+        "q[3]",
+        "roll",
+        "timestamp",
+        "yaw",
+    ]
+    assert result["topic_fields"]["vehicle_attitude_setpoint"] == [
+        "pitch_d",
+        "q_d[0]",
+        "q_d[1]",
+        "q_d[2]",
+        "q_d[3]",
+        "roll_d",
+        "timestamp",
+        "yaw_d",
+    ]
 
 
 def test_build_basic_timeline_returns_state_change_events(tmp_path, monkeypatch):
@@ -537,6 +619,194 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
         "suggestions_requested": False,
     }
     assert output_dir.is_dir()
+
+
+def test_analyze_flight_log_v1_generates_plots_from_hypothesis_specs(tmp_path):
+    runner = load_runner(tmp_path)
+    log_path = tmp_path / "flight.ulg"
+    output_dir = tmp_path / "outputs"
+    expected_plot_path = output_dir / "plots" / "altitude_drop.png"
+
+    report = runner.FlightLogReport(
+        assumption_header="assumptions",
+        log_inventory_summary="inventory",
+        timeline_summary="timeline",
+        relevant_windows=["10-20s"],
+        ranked_hypotheses=[
+            runner.Hypothesis(
+                title="Altitude drop after transition",
+                mechanism="Pitch demand changed during transition.",
+                evidence=["local z changed"],
+                contradicting_evidence=[],
+                confidence="medium",
+                plots=[
+                    runner.PlotRef(
+                        title="Altitude Drop",
+                        path="",
+                        purpose="Compare altitude estimate and setpoint during transition.",
+                        start_s=10.0,
+                        end_s=20.0,
+                        signals=[
+                            "vehicle_local_position.z",
+                            "vehicle_local_position_setpoint.z",
+                        ],
+                        overlays=[
+                            runner.PlotOverlay(
+                                start_s=12.5,
+                                label="transition",
+                                color="#d55e00",
+                            )
+                        ],
+                    )
+                ],
+                code_references=[],
+            )
+        ],
+        confirmed=[],
+        unconfirmed=[],
+        final_summary="summary",
+    )
+
+    async def fake_run(agent, input, context, max_turns):
+        return SimpleNamespace(final_output=report)
+
+    runner.Runner.run = fake_run
+
+    with patch.object(
+        runner,
+        "parse_ulog_inventory",
+        return_value={"available_topics": ["vehicle_local_position"]},
+    ), patch.object(
+        runner,
+        "build_basic_timeline",
+        return_value=[],
+    ), patch.object(
+        runner,
+        "infer_control_surface",
+        return_value={},
+    ), patch.object(
+        runner,
+        "parse_mission_file",
+        return_value=None,
+    ), patch.object(
+        runner,
+        "generate_signal_plot_impl",
+        return_value={
+            "title": "Altitude Drop",
+            "path": str(expected_plot_path),
+            "purpose": "Compare altitude estimate and setpoint during transition.",
+            "window_s": [10.0, 20.0],
+            "signals": [
+                "vehicle_local_position.z",
+                "vehicle_local_position_setpoint.z",
+            ],
+            "plot_type": "timeseries",
+            "overlays": [
+                {
+                    "start_s": 12.5,
+                    "label": "transition",
+                    "color": "#d55e00",
+                }
+            ],
+            "missing_signals": [],
+            "warnings": [],
+        },
+    ) as plot_impl:
+        result = asyncio.run(
+            runner.analyze_flight_log_v1(
+                log_path=str(log_path),
+                output_dir=str(output_dir),
+                user_question="Why did altitude drop after transition?",
+            )
+        )
+
+    plot_impl.assert_called_once_with(
+        log_path,
+        output_dir,
+        "Altitude Drop",
+        10.0,
+        20.0,
+        [
+            "vehicle_local_position.z",
+            "vehicle_local_position_setpoint.z",
+        ],
+        "Compare altitude estimate and setpoint during transition.",
+        plot_type="timeseries",
+        bins=50,
+        overlays=[
+            {
+                "start_s": 12.5,
+                "label": "transition",
+                "color": "#d55e00",
+            }
+        ],
+    )
+    assert result.ranked_hypotheses[0].plots[0].path == str(expected_plot_path)
+    assert result.ranked_hypotheses[0].plots[0].missing_signals == []
+    assert result.ranked_hypotheses[0].plots[0].warnings == []
+    assert result.unconfirmed == []
+    assert json.loads((output_dir / "report.json").read_text())["ranked_hypotheses"][0]["plots"][0]["path"] == str(expected_plot_path)
+
+
+def test_generate_report_plots_warns_when_hypothesis_has_no_plot_spec(tmp_path):
+    runner = load_runner(tmp_path)
+    report = runner.FlightLogReport(
+        assumption_header="assumptions",
+        log_inventory_summary="inventory",
+        timeline_summary="timeline",
+        relevant_windows=[],
+        ranked_hypotheses=[
+            runner.Hypothesis(
+                title="Unplotted hypothesis",
+                mechanism="No complete plot spec was returned.",
+                evidence=[],
+                contradicting_evidence=[],
+                confidence="low",
+                plots=[
+                    runner.PlotRef(
+                        title="Incomplete Plot",
+                        path="",
+                        purpose="Missing start/end/signals.",
+                    )
+                ],
+                code_references=[],
+            )
+        ],
+        confirmed=[],
+        unconfirmed=[],
+        final_summary="summary",
+    )
+    ctx = runner.FlightLogContext(
+        log_path=tmp_path / "flight.ulg",
+        mission_path=None,
+        source_path=None,
+        output_dir=tmp_path / "outputs",
+    )
+
+    with patch.object(runner, "generate_signal_plot_impl") as plot_impl:
+        result = runner.generate_report_plots(report, ctx)
+
+    plot_impl.assert_not_called()
+    assert result.unconfirmed == [
+        (
+            "Plot generation was not attempted for hypothesis "
+            "'Unplotted hypothesis' because no complete plot spec was returned."
+        )
+    ]
+
+
+def test_flight_log_agent_instructions_require_hypothesis_plots_and_selected_overlays(tmp_path):
+    runner = load_runner(tmp_path)
+
+    instructions = runner.flight_log_agent.kwargs["instructions"]
+
+    assert "For every hypothesis, include at least one plots entry" in instructions
+    assert "Set path to an empty string" in instructions
+    assert "generate the PNG after your final report" in instructions
+    assert "Decide which overlays are useful for each hypothesis plot" in instructions
+    assert "flight_timeline" in instructions
+    assert "compute_log_metrics transitions" in instructions
+    assert "avoid unrelated clutter" in instructions
 
 
 def test_runner_imports_with_real_sdk_function_tool_schema():
@@ -1145,6 +1415,86 @@ def test_resolve_signal_converts_flight_review_angle_units_to_degrees():
     assert result["values"] == [0.0, 90.0]
 
 
+def test_prepare_ulog_for_plotting_adds_flight_review_attitude_fields():
+    pitch_rad = math.radians(60.0)
+    ulog = SimpleNamespace(
+        data_list=[
+            SimpleNamespace(
+                name="vehicle_attitude",
+                data={
+                    "timestamp": [1_000_000, 2_000_000],
+                    "q[0]": np.array([1.0, math.cos(pitch_rad / 2.0)]),
+                    "q[1]": np.array([0.0, 0.0]),
+                    "q[2]": np.array([0.0, math.sin(pitch_rad / 2.0)]),
+                    "q[3]": np.array([0.0, 0.0]),
+                },
+            )
+        ],
+        get_dataset=lambda topic: next(
+            dataset
+            for dataset in ulog.data_list
+            if dataset.name == topic
+        ),
+    )
+
+    ulog_plots.prepare_ulog_for_plotting(ulog)
+    result = ulog_plots.resolve_signal(
+        ulog,
+        "vehicle_attitude.pitch",
+        start_s=1.0,
+        end_s=2.0,
+    )
+
+    assert result["axis_label"] == "[deg]"
+    assert result["unit"] == "deg"
+    assert result["values"][0] == 0.0
+    assert math.isclose(result["values"][1], 60.0)
+
+
+def test_resolve_signal_accepts_common_px4_plot_aliases():
+    ulog = SimpleNamespace(
+        data_list=[
+            SimpleNamespace(
+                name="airspeed",
+                data={
+                    "timestamp": [1_000_000, 2_000_000],
+                    "true_airspeed_m_s": [11.0, 12.5],
+                },
+            ),
+            SimpleNamespace(
+                name="tecs_status",
+                data={
+                    "timestamp": [1_000_000, 2_000_000],
+                    "altitude_sp": [100.0, 101.0],
+                },
+            ),
+        ],
+        get_dataset=lambda topic: next(
+            dataset
+            for dataset in ulog.data_list
+            if dataset.name == topic
+        ),
+    )
+
+    airspeed = ulog_plots.resolve_signal(
+        ulog,
+        "airspeed.true_airspeed",
+        start_s=1.0,
+        end_s=2.0,
+    )
+    altitude_sp = ulog_plots.resolve_signal(
+        ulog,
+        "tecs_status.hgt_setpoint",
+        start_s=1.0,
+        end_s=2.0,
+    )
+
+    assert airspeed["field"] == "true_airspeed_m_s"
+    assert airspeed["values"] == [11.0, 12.5]
+    assert altitude_sp["field"] == "altitude_sp"
+    assert altitude_sp["values"] == [100.0, 101.0]
+
+
 def test_align_signals_interpolates_y_values_to_x_timestamps():
     x_signal = {
         "signal": "vehicle_local_position.x",
@@ -1294,6 +1644,127 @@ def test_generate_signal_plot_writes_hist2d_png_with_fake_pyplot(tmp_path, monke
     assert fake_pyplot.axes.xlabel == "vehicle_local_position.x [m]"
     assert fake_pyplot.axes.ylabel == "vehicle_local_position.y [m]"
     assert fake_pyplot.axes.spans == [(1.25, 2.25, "#56b4e9", 0.12, "analysis window")]
+
+
+def test_generate_signal_plot_adds_flight_review_style_mode_backgrounds(tmp_path, monkeypatch):
+    log_path = tmp_path / "flight.ulg"
+    output_dir = tmp_path / "outputs"
+
+    class FakeULog:
+        def __init__(self, path):
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_local_position",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "x": [0.0, 1.0, 2.0],
+                    },
+                ),
+                SimpleNamespace(
+                    name="vehicle_status",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "nav_state": [3, 3, 4],
+                    },
+                ),
+                SimpleNamespace(
+                    name="vtol_vehicle_status",
+                    data={
+                        "timestamp": [1_000_000, 2_500_000, 3_000_000],
+                        "vehicle_vtol_state": [3, 1, 4],
+                    },
+                ),
+            ]
+
+        def get_dataset(self, topic):
+            return next(dataset for dataset in self.data_list if dataset.name == topic)
+
+    class FakeAxes:
+        transAxes = object()
+
+        def __init__(self):
+            self.spans = []
+
+        def plot(self, *args, **kwargs):
+            pass
+
+        def set_xlabel(self, value):
+            pass
+
+        def set_ylabel(self, value):
+            pass
+
+        def set_title(self, value):
+            pass
+
+        def grid(self, *args, **kwargs):
+            pass
+
+        def legend(self):
+            pass
+
+        def axvspan(self, start_s, end_s, **kwargs):
+            self.spans.append((start_s, end_s, kwargs))
+
+        def get_legend_handles_labels(self):
+            return [], []
+
+    class FakeFigure:
+        def tight_layout(self):
+            pass
+
+        def savefig(self, path):
+            Path(path).write_bytes(b"fake-png")
+
+    class FakePyplot:
+        def __init__(self):
+            self.axes = FakeAxes()
+
+        def subplots(self, figsize):
+            return FakeFigure(), self.axes
+
+        def close(self, fig):
+            pass
+
+    fake_pyplot = FakePyplot()
+    monkeypatch.setattr(ulog_plots, "ULog", FakeULog)
+    monkeypatch.setattr(ulog_plots, "_load_pyplot", lambda: fake_pyplot)
+
+    result = ulog_plots.generate_signal_plot(
+        log_path,
+        output_dir,
+        title="Mode Backgrounds",
+        start_s=1.0,
+        end_s=3.0,
+        signals=["vehicle_local_position.x"],
+        purpose="Check automatic background context.",
+    )
+
+    background_overlays = [
+        overlay
+        for overlay in result["overlays"]
+        if overlay.get("kind") in {"mode_background", "vtol_background"}
+    ]
+    assert [
+        (overlay["source"], overlay["start_s"], overlay["end_s"], overlay["label"])
+        for overlay in background_overlays
+    ] == [
+        ("vehicle_status.nav_state", 1.0, 3.0, "Mission"),
+        ("vtol_vehicle_status.vehicle_vtol_state", 1.0, 2.5, "Multicopter"),
+        ("vtol_vehicle_status.vehicle_vtol_state", 2.5, 3.0, "Transition"),
+    ]
+    assert fake_pyplot.axes.spans[0] == (
+        1.0,
+        3.0,
+        {
+            "color": "#6600cc",
+            "alpha": 0.08,
+            "label": "_Mission",
+            "ymin": 0.0,
+            "ymax": 1.0,
+        },
+    )
+    assert fake_pyplot.axes.spans[1][2]["ymax"] == 0.14
 
 
 def test_generate_signal_plot_delegates_to_plot_module(tmp_path):

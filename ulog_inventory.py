@@ -29,6 +29,41 @@ IMPORTANT_PARAMETER_PREFIXES = (
     "SENS_",
 )
 
+TOPIC_FIELD_INVENTORY_TOPICS = {
+    "actuator_controls_0",
+    "actuator_controls_1",
+    "actuator_motors",
+    "actuator_outputs",
+    "actuator_servos",
+    "airspeed",
+    "airspeed_validated",
+    "battery_status",
+    "estimator_status",
+    "failsafe_flags",
+    "manual_control_setpoint",
+    "manual_control_switches",
+    "mission_result",
+    "position_setpoint_triplet",
+    "rate_ctrl_status",
+    "rc_channels",
+    "sensor_baro",
+    "sensor_combined",
+    "tecs_status",
+    "vehicle_air_data",
+    "vehicle_angular_velocity",
+    "vehicle_attitude",
+    "vehicle_attitude_setpoint",
+    "vehicle_global_position",
+    "vehicle_gps_position",
+    "vehicle_local_position",
+    "vehicle_local_position_setpoint",
+    "vehicle_rates_setpoint",
+    "vehicle_status",
+    "vehicle_thrust_setpoint",
+    "vehicle_torque_setpoint",
+    "vtol_vehicle_status",
+}
+
 
 def parse_ulog_inventory(log_path: Path) -> dict:
     inventory = _empty_inventory()
@@ -50,6 +85,7 @@ def parse_ulog_inventory(log_path: Path) -> dict:
     inventory["duration_s"] = _extract_duration_s(ulog)
     inventory["important_parameters"] = _extract_important_parameters(ulog)
     inventory["available_topics"] = available_topics
+    inventory["topic_fields"] = _extract_topic_fields(ulog)
     inventory["warnings"] = _extract_logged_warnings(ulog)
     inventory["missing_topics"] = [
         topic for topic in EXPECTED_TIMELINE_TOPICS if topic not in available_topics
@@ -65,6 +101,7 @@ def _empty_inventory() -> dict:
         "duration_s": None,
         "important_parameters": {},
         "available_topics": [],
+        "topic_fields": {},
         "warnings": [],
         "missing_topics": [],
     }
@@ -89,6 +126,37 @@ def _extract_topic_names(ulog: Any) -> list[str]:
             topics.add(str(name))
 
     return sorted(topics)
+
+
+def _extract_topic_fields(ulog: Any) -> dict[str, list[str]]:
+    fields_by_topic: dict[str, set[str]] = {}
+
+    for data in getattr(ulog, "data_list", []) or []:
+        name = getattr(data, "name", None)
+        if not name or str(name) not in TOPIC_FIELD_INVENTORY_TOPICS:
+            continue
+
+        fields = fields_by_topic.setdefault(str(name), set())
+        fields.update(str(field) for field in (getattr(data, "data", {}) or {}).keys())
+
+    _add_derived_attitude_fields(fields_by_topic)
+
+    return {
+        topic: sorted(fields)
+        for topic, fields in sorted(fields_by_topic.items())
+    }
+
+
+def _add_derived_attitude_fields(fields_by_topic: dict[str, set[str]]) -> None:
+    attitude_fields = fields_by_topic.get("vehicle_attitude")
+    if attitude_fields and all(f"q[{index}]" in attitude_fields for index in range(4)):
+        attitude_fields.update({"roll", "pitch", "yaw"})
+
+    attitude_setpoint_fields = fields_by_topic.get("vehicle_attitude_setpoint")
+    if attitude_setpoint_fields and all(
+        f"q_d[{index}]" in attitude_setpoint_fields for index in range(4)
+    ):
+        attitude_setpoint_fields.update({"roll_d", "pitch_d", "yaw_d"})
 
 
 def _extract_duration_s(ulog: Any) -> Optional[float]:

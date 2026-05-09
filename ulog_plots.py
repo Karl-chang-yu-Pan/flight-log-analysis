@@ -7,9 +7,47 @@ from pathlib import Path
 from typing import Any, Optional
 
 from pyulog import ULog
+from pyulog.px4 import PX4ULog
 
 
 DEFAULT_HISTOGRAM_BINS = 50
+
+FLIGHT_MODE_STYLES = {
+    0: ("Manual", "#cc0000"),
+    1: ("Altitude", "#eecc00"),
+    2: ("Position", "#00cc33"),
+    3: ("Mission", "#6600cc"),
+    4: ("Loiter", "#6600cc"),
+    5: ("Return", "#6600cc"),
+    6: ("Position Slow", "#00cc33"),
+    8: ("Altitude Cruise", "#eecc00"),
+    10: ("Acro", "#66cc00"),
+    12: ("Descend", "#6600cc"),
+    13: ("Terminate", "#6600cc"),
+    14: ("Offboard", "#00cccc"),
+    15: ("Stabilized", "#0033cc"),
+    17: ("Takeoff", "#6600cc"),
+    18: ("Land", "#6600cc"),
+    19: ("Follow Target", "#6600cc"),
+    20: ("Precision Land", "#6600cc"),
+    21: ("Orbit", "#6600cc"),
+    22: ("VTOL Takeoff", "#6600cc"),
+}
+
+VTOL_MODE_STYLES = {
+    1: ("Transition", "#cc0000"),
+    2: ("Fixed-Wing", "#eecc00"),
+    3: ("Multicopter", "#0033cc"),
+    4: ("Fixed-Wing", "#eecc00"),
+}
+
+SIGNAL_ALIASES = {
+    ("airspeed", "true_airspeed"): "true_airspeed_m_s",
+    ("airspeed_validated", "true_airspeed"): "true_airspeed_m_s",
+    ("tecs_status", "airspeed_sp"): "true_airspeed_sp",
+    ("tecs_status", "hgt_setpoint"): "altitude_sp",
+    ("tecs_status", "height_setpoint"): "altitude_sp",
+}
 
 
 def generate_signal_plot(
@@ -51,6 +89,13 @@ def generate_signal_plot(
         result["missing_signals"] = list(signals)
         result["warnings"].append(f"failed to parse ULog: {exc}")
         return result
+    prepare_ulog_for_plotting(ulog)
+
+    rendered_overlays = [
+        *_flight_review_style_background_overlays(ulog, start_s, end_s),
+        *(overlays or []),
+    ]
+    result["overlays"] = rendered_overlays
 
     resolved_signals = []
     for signal in signals:
@@ -68,7 +113,7 @@ def generate_signal_plot(
             resolved_signals,
             plot_type,
             bins,
-            overlays or [],
+            rendered_overlays,
         )
     except Exception as exc:
         result["warnings"].append(f"failed to render plot: {exc}")
@@ -103,7 +148,11 @@ def resolve_signal(ulog: Any, signal: str, start_s: float, end_s: float) -> dict
 
     values = data.get(field_name)
     if values is None:
-        return {"warning": f"missing field for signal '{signal}': {field_name}"}
+        alias = _resolve_field_alias(data, topic_name, field_name)
+        if alias is None:
+            return {"warning": f"missing field for signal '{signal}': {field_name}"}
+        field_name = alias
+        values = data.get(field_name)
 
     times = []
     windowed_values = []
@@ -127,6 +176,30 @@ def resolve_signal(ulog: Any, signal: str, start_s: float, end_s: float) -> dict
         "time_s": times,
         "values": windowed_values,
     }
+
+
+def prepare_ulog_for_plotting(ulog: Any) -> Any:
+    """
+    Apply the same kind of PX4/Flight Review preparation expected by plot specs.
+
+    Flight Review derives roll/pitch/yaw from quaternion fields before plotting.
+    It also carries a few compatibility renames for older logs. Keep the
+    preparation local to plotting so raw inventory and metric parsing stay
+    untouched.
+    """
+    _apply_flight_review_field_compatibility(ulog)
+    px4_ulog = PX4ULog(ulog)
+
+    for message, suffix in (
+        ("vehicle_attitude", ""),
+        ("vehicle_vision_attitude", ""),
+        ("vehicle_attitude_groundtruth", ""),
+        ("vehicle_attitude_setpoint", "_d"),
+    ):
+        if _topic_has_quaternion(ulog, message, suffix):
+            px4_ulog.add_roll_pitch_yaw([f"{message}:_d" if suffix else message])
+
+    return ulog
 
 
 def align_signals(
@@ -277,12 +350,15 @@ def _render_overlays(ax: Any, overlays: list[dict], warnings: list[str]) -> None
         label = overlay.get("label")
         color = overlay.get("color", "#d55e00")
         alpha = float(overlay.get("alpha", 0.12))
+        is_background = overlay.get("kind") in {"mode_background", "vtol_background"}
+        if is_background and label:
+            label = f"_{label}"
 
         if end_s == start_s:
             if hasattr(ax, "axvline"):
                 ax.axvline(start_s, color=color, alpha=max(alpha, 0.45), linestyle="--", label=label)
         elif hasattr(ax, "axvspan"):
-            ax.axvspan(start_s, end_s, color=color, alpha=alpha, label=label)
+            _axvspan(ax, start_s, end_s, color, alpha, label, overlay, warnings)
 
 
 def _parse_signal(signal: str) -> Optional[tuple[str, str]]:
@@ -302,6 +378,199 @@ def _find_dataset(ulog: Any, topic_name: str) -> Any:
             return dataset
 
     return None
+
+
+def _apply_flight_review_field_compatibility(ulog: Any) -> None:
+    for topic in getattr(ulog, "data_list", []) or []:
+        name = getattr(topic, "name", None)
+        data = getattr(topic, "data", {}) or {}
+
+        if name == "system_power":
+            _rename_field(data, "voltage5V_v", "voltage5v_v")
+            _rename_field(data, "voltage3V3_v", "sensors3v3[0]")
+            _rename_field(data, "voltage3v3_v", "sensors3v3[0]")
+        elif name == "tecs_status":
+            _rename_field(data, "airspeed_sp", "true_airspeed_sp")
+
+
+def _rename_field(data: dict, old_name: str, new_name: str) -> None:
+    if old_name in data and new_name not in data:
+        data[new_name] = data.pop(old_name)
+
+
+def _topic_has_quaternion(ulog: Any, topic_name: str, suffix: str) -> bool:
+    for dataset in getattr(ulog, "data_list", []) or []:
+        if getattr(dataset, "name", None) != topic_name:
+            continue
+
+        data = getattr(dataset, "data", {}) or {}
+        return all(f"q{suffix}[{index}]" in data for index in range(4))
+
+    return False
+
+
+def _resolve_field_alias(data: dict, topic_name: str, field_name: str) -> Optional[str]:
+    alias = SIGNAL_ALIASES.get((topic_name, field_name))
+    if alias and alias in data:
+        return alias
+
+    return None
+
+
+def _flight_review_style_background_overlays(
+    ulog: Any,
+    start_s: float,
+    end_s: float,
+) -> list[dict]:
+    overlays = []
+    vehicle_status = _find_dataset(ulog, "vehicle_status")
+    if vehicle_status is not None:
+        overlays.extend(
+            _state_background_overlays(
+                vehicle_status,
+                "nav_state",
+                start_s,
+                end_s,
+                FLIGHT_MODE_STYLES,
+                kind="mode_background",
+                source="vehicle_status.nav_state",
+                alpha=0.08,
+                ymin=0.0,
+                ymax=1.0,
+            )
+        )
+
+    vtol_status = _find_dataset(ulog, "vtol_vehicle_status")
+    if vtol_status is not None:
+        overlays.extend(
+            _state_background_overlays(
+                vtol_status,
+                "vehicle_vtol_state",
+                start_s,
+                end_s,
+                VTOL_MODE_STYLES,
+                kind="vtol_background",
+                source="vtol_vehicle_status.vehicle_vtol_state",
+                alpha=0.14,
+                ymin=0.0,
+                ymax=0.14,
+            )
+        )
+
+    return overlays
+
+
+def _state_background_overlays(
+    dataset: Any,
+    field_name: str,
+    start_s: float,
+    end_s: float,
+    styles: dict[int, tuple[str, str]],
+    kind: str,
+    source: str,
+    alpha: float,
+    ymin: float,
+    ymax: float,
+) -> list[dict]:
+    data = getattr(dataset, "data", {}) or {}
+    timestamps = data.get("timestamp")
+    values = data.get(field_name)
+    if timestamps is None or values is None:
+        return []
+
+    intervals = _state_intervals(timestamps, values, start_s, end_s)
+    overlays = []
+    for interval_start, interval_end, value in intervals:
+        try:
+            style = styles[int(value)]
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        label, color = style
+        overlays.append(
+            {
+                "kind": kind,
+                "source": source,
+                "start_s": interval_start,
+                "end_s": interval_end,
+                "label": label,
+                "color": color,
+                "alpha": alpha,
+                "ymin": ymin,
+                "ymax": ymax,
+            }
+        )
+
+    return overlays
+
+
+def _state_intervals(
+    timestamps: Any,
+    values: Any,
+    start_s: float,
+    end_s: float,
+) -> list[tuple[float, float, Any]]:
+    current_value = None
+    current_start = start_s
+    intervals = []
+
+    for timestamp, value in zip(timestamps, values):
+        time_s = _timestamp_to_seconds(timestamp)
+        if time_s < start_s:
+            current_value = _json_safe_value(value)
+            continue
+
+        if time_s > end_s:
+            break
+
+        value = _json_safe_value(value)
+        if current_value is None:
+            current_value = value
+            current_start = max(start_s, time_s)
+            continue
+
+        if value != current_value:
+            if time_s > current_start:
+                intervals.append((current_start, time_s, current_value))
+            current_value = value
+            current_start = time_s
+
+    if current_value is not None and end_s > current_start:
+        intervals.append((current_start, end_s, current_value))
+
+    return intervals
+
+
+def _axvspan(
+    ax: Any,
+    start_s: float,
+    end_s: float,
+    color: str,
+    alpha: float,
+    label: Optional[str],
+    overlay: dict,
+    warnings: list[str],
+) -> None:
+    kwargs = {
+        "color": color,
+        "alpha": alpha,
+        "label": label,
+    }
+
+    if "ymin" in overlay:
+        kwargs["ymin"] = float(overlay["ymin"])
+    if "ymax" in overlay:
+        kwargs["ymax"] = float(overlay["ymax"])
+
+    try:
+        ax.axvspan(start_s, end_s, **kwargs)
+    except TypeError:
+        kwargs.pop("ymin", None)
+        kwargs.pop("ymax", None)
+        try:
+            ax.axvspan(start_s, end_s, **kwargs)
+        except TypeError as exc:
+            warnings.append(f"failed to render overlay {overlay}: {exc}")
 
 
 def _nearest_value(times: list[float], values: list[float], target_time: float) -> Optional[float]:
