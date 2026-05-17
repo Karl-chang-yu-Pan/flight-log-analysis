@@ -129,6 +129,22 @@
         </section>
 
         <section class="canvas-section">
+          <div class="section-title-row">
+            <h2>Agent Analysis</h2>
+            <span id="analysisStatus" class="status-text">Idle</span>
+          </div>
+          <div class="analysis-controls">
+            <label>
+              Question
+              <textarea id="analysisQuestion" rows="3" placeholder="Why did the aircraft drop altitude right after transition?"></textarea>
+            </label>
+            <button id="analysisButton" type="button" disabled>Run Analysis</button>
+          </div>
+          <div id="analysisProgress" class="progress-list"></div>
+          <div id="analysisReport" class="analysis-report"></div>
+        </section>
+
+        <section class="canvas-section">
           <h2>Changed Parameters</h2>
           <div class="table-shell main-table">
             <table class="dense-table">

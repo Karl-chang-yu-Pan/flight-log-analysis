@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from agents import RunHooks
+
 
 DEFAULT_DEV_LOG_ROOT = Path(".dev_logs") / "flight_agent_runs"
 
@@ -63,7 +65,7 @@ class DeveloperAuditLogger:
         return json.dumps(safe_payload, indent=indent, sort_keys=True)
 
 
-class AgentRunAuditHooks:
+class AgentRunAuditHooks(RunHooks):
     def __init__(self, audit_logger: DeveloperAuditLogger) -> None:
         self.audit_logger = audit_logger
         self._tool_starts: dict[str, float] = {}

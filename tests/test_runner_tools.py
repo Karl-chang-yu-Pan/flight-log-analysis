@@ -15,6 +15,7 @@ import ulog_inventory
 import ulog_timeline
 import ulog_control_surface
 import ulog_metrics
+import ulog_hypothesis_verifier
 import px4_source
 import mission_parser
 import ulog_plots
@@ -66,6 +67,9 @@ def load_runner(tmp_path: Path):
     class Runner:
         pass
 
+    class RunHooks:
+        pass
+
     class WebSearchTool:
         pass
 
@@ -79,6 +83,7 @@ def load_runner(tmp_path: Path):
 
     agents_stub.Agent = Agent
     agents_stub.Runner = Runner
+    agents_stub.RunHooks = RunHooks
     agents_stub.WebSearchTool = WebSearchTool
     agents_stub.RunContextWrapper = RunContextWrapper
     agents_stub.function_tool = function_tool
@@ -594,6 +599,7 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
                 source_path=str(source_path),
                 output_dir=str(output_dir),
                 dev_log_root=str(dev_log_root),
+                dev_run_id="web_run_001",
                 user_question="Why did it loiter before the waypoint?",
             )
         )
@@ -623,11 +629,11 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
         "suggestions_requested": False,
     }
     assert output_dir.is_dir()
-    run_dirs = list(dev_log_root.iterdir())
-    assert len(run_dirs) == 1
-    assert (run_dirs[0] / "run_events.jsonl").is_file()
-    assert (run_dirs[0] / "usage.json").is_file()
-    assert json.loads((run_dirs[0] / "metadata.json").read_text())["report_path"] == str(
+    run_dir = dev_log_root / "web_run_001"
+    assert run_dir.is_dir()
+    assert (run_dir / "run_events.jsonl").is_file()
+    assert (run_dir / "usage.json").is_file()
+    assert json.loads((run_dir / "metadata.json").read_text())["report_path"] == str(
         output_dir / "report.json"
     )
 
@@ -818,6 +824,10 @@ def test_flight_log_agent_instructions_require_hypothesis_plots_and_selected_ove
 
     instructions = runner.flight_log_agent.kwargs["instructions"]
 
+    assert "Call verify_hypothesis_against_log for every hypothesis" in instructions
+    assert "known PX4 mechanism" in instructions
+    assert "expected logged signature" in instructions
+    assert "Use the verifier result as the log-evidence basis" in instructions
     assert "For every hypothesis, include at least one plots entry" in instructions
     assert "Set path to an empty string" in instructions
     assert "generate the PNG after your final report" in instructions
@@ -1365,6 +1375,196 @@ def test_compute_log_metrics_reports_missing_signals(tmp_path, monkeypatch):
             "missing topic for signal 'vehicle_local_position.z': vehicle_local_position",
         ],
     }
+
+
+def test_verify_hypothesis_against_log_supports_threshold_transition_and_divergence(tmp_path, monkeypatch):
+    log_path = tmp_path / "flight.ulg"
+
+    class FakeULog:
+        def __init__(self, path):
+            self.data_list = [
+                SimpleNamespace(
+                    name="vtol_vehicle_status",
+                    data={
+                        "timestamp": [10_000_000, 12_000_000, 14_000_000],
+                        "vehicle_vtol_state": [1, 1, 4],
+                    },
+                ),
+                SimpleNamespace(
+                    name="vehicle_air_data",
+                    data={
+                        "timestamp": [12_000_000, 13_000_000, 14_000_000, 15_000_000],
+                        "baro_alt_meter": [100.0, 98.0, 94.0, 90.0],
+                    },
+                ),
+                SimpleNamespace(
+                    name="tecs_status",
+                    data={
+                        "timestamp": [12_000_000, 13_000_000, 14_000_000, 15_000_000],
+                        "altitude_sp": [100.0, 100.0, 100.0, 100.0],
+                        "throttle_sp": [0.9, 0.95, 0.92, 0.91],
+                    },
+                ),
+            ]
+
+    monkeypatch.setattr(ulog_hypothesis_verifier, "ULog", FakeULog)
+
+    result = ulog_hypothesis_verifier.verify_hypothesis_against_log(
+        log_path,
+        mechanism="FW takeover had insufficient altitude tracking after transition.",
+        expected_signature={
+            "transition": "vtol_vehicle_status.vehicle_vtol_state changes 1->4",
+            "altitude": "actual altitude drops below TECS altitude setpoint",
+        },
+        candidate_windows=[
+            {"name": "transition", "start_s": 10.0, "end_s": 14.5},
+            {"name": "post_transition", "start_s": 12.0, "end_s": 15.0},
+        ],
+        required_signals=[
+            "vtol_vehicle_status.vehicle_vtol_state",
+            "vehicle_air_data.baro_alt_meter",
+            "tecs_status.altitude_sp",
+            "tecs_status.throttle_sp",
+        ],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "transition_occurs",
+                "signal": "vtol_vehicle_status.vehicle_vtol_state",
+                "window": "transition",
+                "from": 1,
+                "to": 4,
+                "supports": "Transition to fixed-wing occurred in the selected window.",
+            },
+            {
+                "type": "diverges_from_setpoint",
+                "actual": "vehicle_air_data.baro_alt_meter",
+                "setpoint": "tecs_status.altitude_sp",
+                "window": "post_transition",
+                "direction": "below",
+                "min_error": 6.0,
+                "supports": "Altitude fell materially below the TECS altitude setpoint.",
+            },
+            {
+                "type": "threshold",
+                "signal": "tecs_status.throttle_sp",
+                "window": "post_transition",
+                "metric": "mean",
+                "op": ">=",
+                "value": 0.8,
+                "supports": "TECS commanded high throttle during the altitude loss.",
+            },
+        ],
+    )
+
+    assert result["required_signals"]["missing"] == []
+    assert result["confidence"] == "high"
+    assert result["confidence_score"] == 1.0
+    assert result["evidence"] == [
+        "Transition to fixed-wing occurred in the selected window.",
+        "Altitude fell materially below the TECS altitude setpoint.",
+        "TECS commanded high throttle during the altitude loss.",
+    ]
+    assert result["contradicting_evidence"] == []
+    assert result["unresolved"] == []
+    assert result["numeric_checks"][1]["value"]["max_relevant_error"] == 10.0
+
+
+def test_verify_hypothesis_against_log_reports_contradictions_and_missing_signals(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.data_list = [
+                SimpleNamespace(
+                    name="tecs_status",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "throttle_sp": [0.2, 0.3],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_hypothesis_verifier, "ULog", FakeULog)
+
+    result = ulog_hypothesis_verifier.verify_hypothesis_against_log(
+        tmp_path / "flight.ulg",
+        mechanism="TECS commanded maximum throttle.",
+        expected_signature={},
+        candidate_windows=[{"name": "event", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=["tecs_status.throttle_sp", "vehicle_air_data.baro_alt_meter"],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "threshold",
+                "signal": "tecs_status.throttle_sp",
+                "window": "event",
+                "metric": "mean",
+                "op": ">=",
+                "value": 0.8,
+                "contradicts": "Throttle was not high enough to support the mechanism.",
+            }
+        ],
+    )
+
+    assert result["required_signals"]["present"] == ["tecs_status.throttle_sp"]
+    assert result["required_signals"]["missing"] == ["vehicle_air_data.baro_alt_meter"]
+    assert result["contradicting_evidence"] == [
+        "Throttle was not high enough to support the mechanism.",
+    ]
+    assert result["unresolved"] == [
+        "required signal is missing: vehicle_air_data.baro_alt_meter",
+    ]
+    assert result["confidence"] == "low"
+
+
+def test_runner_verify_hypothesis_against_log_delegates_to_verifier_module(tmp_path):
+    runner = load_runner(tmp_path)
+    ctx = make_ctx(runner, tmp_path)
+
+    with patch.object(
+        runner,
+        "verify_hypothesis_against_log_impl",
+        return_value={"confidence": "medium"},
+    ) as verify_impl:
+        result = runner.verify_hypothesis_against_log(
+            ctx,
+            mechanism="mechanism",
+            expected_signature=[
+                runner.VerifierSignatureItem(name="signature", description="expected behavior")
+            ],
+            candidate_windows=[
+                runner.VerifierWindow(name="event", start_s=1.0, end_s=2.0)
+            ],
+            required_signals=["vehicle_status.nav_state"],
+            exclusion_checks=[],
+            numeric_checks=[
+                runner.VerifierCheck(
+                    type="transition_occurs",
+                    signal="vehicle_status.nav_state",
+                    window="event",
+                    from_value=3,
+                    to_value=4,
+                )
+            ],
+        )
+
+    verify_impl.assert_called_once_with(
+        ctx.context.log_path,
+        "mechanism",
+        [{"name": "signature", "description": "expected behavior"}],
+        [{"name": "event", "start_s": 1.0, "end_s": 2.0}],
+        ["vehicle_status.nav_state"],
+        [],
+        [
+            {
+                "type": "transition_occurs",
+                "window": "event",
+                "signal": "vehicle_status.nav_state",
+                "from": 3,
+                "to": 4,
+            }
+        ],
+    )
+    assert result == {"confidence": "medium"}
 
 
 def test_resolve_signal_extracts_windowed_numeric_values():

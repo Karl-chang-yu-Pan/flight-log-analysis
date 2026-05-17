@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
+ENV_FILE="${REPO_ROOT}/.env"
 
 HOST="127.0.0.1"
 PORT="8000"
@@ -51,6 +52,13 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Virtual environment Python not found: ${PYTHON_BIN}" >&2
   echo "Create .venv before starting the web UI." >&2
   exit 1
+fi
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "${ENV_FILE}"
+  set +a
 fi
 
 CMD=("${PYTHON_BIN}" "${REPO_ROOT}/web_app.py" --host "${HOST}" --port "${PORT}")

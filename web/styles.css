@@ -332,6 +332,13 @@ h2 {
   cursor: pointer;
 }
 
+.input-bar button:disabled,
+.analysis-controls button:disabled {
+  border-color: var(--line-strong);
+  background: var(--line-strong);
+  cursor: not-allowed;
+}
+
 .advanced-inputs {
   grid-column: 1 / -1;
   border: 1px solid var(--line);
@@ -376,6 +383,165 @@ h2 {
   display: grid;
   gap: 10px;
   color: var(--muted);
+}
+
+.analysis-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+
+.analysis-controls label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.analysis-controls textarea {
+  width: 100%;
+  min-height: 76px;
+  resize: vertical;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 8px 9px;
+  font: inherit;
+}
+
+.analysis-controls button {
+  min-height: 36px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #ffffff;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.progress-list {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.progress-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.progress-item strong {
+  font-weight: 650;
+}
+
+.progress-item span {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: nowrap;
+}
+
+.progress-item.active {
+  border-left-color: var(--accent);
+  background: var(--accent-weak);
+}
+
+.progress-item.done {
+  border-left-color: var(--accent);
+}
+
+.progress-item.failed {
+  border-left-color: var(--danger);
+  background: #fff2f2;
+}
+
+.analysis-report {
+  display: grid;
+  gap: 12px;
+}
+
+.report-block,
+.hypothesis-card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 12px;
+}
+
+.report-block h3,
+.hypothesis-card h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.report-block p,
+.hypothesis-card p,
+.plot-card figcaption span {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.hypothesis-list {
+  display: grid;
+  gap: 12px;
+}
+
+.report-list {
+  margin-top: 10px;
+}
+
+.report-list h4 {
+  margin: 0 0 5px;
+  font-size: 12px;
+}
+
+.report-list ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.plot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.plot-card {
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+}
+
+.plot-card img {
+  display: block;
+  width: 100%;
+  background: #ffffff;
+}
+
+.plot-card figcaption {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  font-size: 12px;
+}
+
+.plot-warning {
+  color: var(--warn);
 }
 
 .summary-kpis {
@@ -441,6 +607,10 @@ h2 {
   }
 
   .input-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .analysis-controls {
     grid-template-columns: 1fr;
   }
 

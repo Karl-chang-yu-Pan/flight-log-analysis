@@ -1,31 +1,40 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import cgi
 import json
 import mimetypes
 import subprocess
+import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import urlopen
 
 from pyulog import ULog
 from preparse_view import build_preparse_payload
+from run_audit_log import DEFAULT_DEV_LOG_ROOT, make_json_safe
 
 
 ROOT_DIR = Path(__file__).resolve().parent
 WEB_DIR = ROOT_DIR / "web"
 UPLOAD_ROOT = ROOT_DIR / "uploads"
+OUTPUT_ROOT = ROOT_DIR / "outputs"
+WEB_DEV_LOG_ROOT = ROOT_DIR / DEFAULT_DEV_LOG_ROOT
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 UPLOAD_FIELDS = {
     "log_file": ".ulg",
     "mission_file": None,
     "parameters_xml_file": ".xml",
 }
+
+ANALYSIS_RUNS: dict[str, dict[str, Any]] = {}
+ANALYSIS_RUNS_LOCK = threading.Lock()
 
 
 class FlightLogWebHandler(BaseHTTPRequestHandler):
@@ -36,6 +45,14 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             self._serve_file(WEB_DIR / "index.html")
+            return
+
+        if path.startswith("/api/analyze-runs/"):
+            self._handle_analysis_status(path.removeprefix("/api/analyze-runs/"))
+            return
+
+        if path == "/artifacts":
+            self._handle_artifact(parsed.query)
             return
 
         requested = (WEB_DIR / unquote(path.lstrip("/"))).resolve()
@@ -55,6 +72,10 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/upload-preparse":
             self._handle_upload_preparse()
+            return
+
+        if parsed.path == "/api/analyze-runs":
+            self._handle_start_analysis()
             return
 
         self._send_json({"error": "not found"}, status=404)
@@ -129,6 +150,43 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
         }
         self._send_json(result)
 
+    def _handle_start_analysis(self) -> None:
+        try:
+            payload = self._read_json_body()
+            run = start_analysis_run(payload)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        self._send_json(analysis_run_snapshot(run["run_id"]))
+
+    def _handle_analysis_status(self, run_id: str) -> None:
+        run_id = run_id.strip("/")
+        if not run_id:
+            self._send_json({"error": "run_id is required"}, status=400)
+            return
+
+        snapshot = analysis_run_snapshot(run_id)
+        if snapshot is None:
+            self._send_json({"error": "analysis run not found"}, status=404)
+            return
+
+        self._send_json(snapshot)
+
+    def _handle_artifact(self, query: str) -> None:
+        path_values = parse_qs(query).get("path") or []
+        if not path_values:
+            self._send_json({"error": "path is required"}, status=400)
+            return
+
+        try:
+            artifact_path = resolve_artifact_path(path_values[0])
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        self._serve_file(artifact_path)
+
     def _read_multipart_form(self) -> cgi.FieldStorage:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
@@ -201,6 +259,229 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
 def _optional_payload_path(payload: dict[str, Any], key: str) -> str | None:
     value = str(payload.get(key) or "").strip()
     return value or None
+
+
+def start_analysis_run(payload: dict[str, Any]) -> dict[str, Any]:
+    log_path = str(payload.get("log_path") or "").strip()
+    if not log_path:
+        raise ValueError("log_path is required")
+
+    user_question = str(payload.get("user_question") or "").strip()
+    if not user_question:
+        raise ValueError("user_question is required")
+
+    run_id = uuid.uuid4().hex
+    output_dir = OUTPUT_ROOT / f"web_{run_id}"
+    run = {
+        "run_id": run_id,
+        "status": "queued",
+        "created_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "error": None,
+        "traceback": None,
+        "log_path": log_path,
+        "mission_path": _optional_payload_path(payload, "mission_path"),
+        "source_path": _optional_payload_path(payload, "source_path"),
+        "output_dir": str(output_dir),
+        "report_path": str(output_dir / "report.json"),
+        "dev_log_dir": str(WEB_DEV_LOG_ROOT / run_id),
+        "report": None,
+    }
+
+    with ANALYSIS_RUNS_LOCK:
+        ANALYSIS_RUNS[run_id] = run
+
+    thread = threading.Thread(
+        target=_run_analysis_job,
+        args=(run_id, user_question),
+        name=f"flight-log-analysis-{run_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return run
+
+
+def analysis_run_snapshot(run_id: str) -> dict[str, Any] | None:
+    with ANALYSIS_RUNS_LOCK:
+        run = ANALYSIS_RUNS.get(run_id)
+        if run is None:
+            return None
+        snapshot = {
+            key: value
+            for key, value in run.items()
+            if key != "traceback"
+        }
+
+    events = read_analysis_events(run_id)
+    snapshot["events"] = events
+    snapshot["progress"] = build_analysis_progress(snapshot["status"], events)
+    return snapshot
+
+
+def read_analysis_events(run_id: str) -> list[dict[str, Any]]:
+    events_path = WEB_DEV_LOG_ROOT / run_id / "run_events.jsonl"
+    if not events_path.is_file():
+        return []
+
+    events = []
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def build_analysis_progress(status: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    messages = [analysis_event_message(event) for event in events]
+    messages = [message for message in messages if message is not None]
+    phase = messages[-1]["message"] if messages else status_label(status)
+    return {
+        "phase": phase,
+        "messages": messages[-80:],
+    }
+
+
+def analysis_event_message(event: dict[str, Any]) -> dict[str, Any] | None:
+    event_name = event.get("event")
+    name = event.get("name")
+    tool_name = event.get("tool_name")
+    message = None
+
+    if event_name == "run.started":
+        message = "Started analysis run"
+    elif event_name == "run.finished":
+        message = "Analysis complete"
+    elif event_name == "run.failed":
+        message = "Analysis failed"
+    elif event_name == "prepass.started":
+        message = {
+            "parse_ulog_inventory": "Parsing log inventory",
+            "build_basic_timeline": "Building flight timeline",
+            "infer_control_surface": "Inferring control-surface assumptions",
+            "parse_mission_file": "Parsing mission file",
+        }.get(str(name), f"Running pre-pass: {name}")
+    elif event_name == "prepass.finished":
+        message = {
+            "parse_ulog_inventory": "Parsed log inventory",
+            "build_basic_timeline": "Built flight timeline",
+            "infer_control_surface": "Inferred control-surface assumptions",
+            "parse_mission_file": "Parsed mission file",
+        }.get(str(name), f"Finished pre-pass: {name}")
+    elif event_name == "llm.started":
+        message = "Analyzing with agent"
+    elif event_name == "llm.finished":
+        message = "Agent reasoning step complete"
+    elif event_name == "tool.started":
+        message = tool_progress_message(str(tool_name), started=True)
+    elif event_name == "tool.finished":
+        message = tool_progress_message(str(tool_name), started=False)
+    elif event_name == "postprocess_plot.started":
+        message = "Generating report plots"
+    elif event_name == "postprocess_plot.finished":
+        message = "Generated report plots"
+    elif event_name == "hosted_tool.item":
+        message = "Using web search"
+
+    if message is None:
+        return None
+
+    return {
+        "ts": event.get("ts"),
+        "event": event_name,
+        "message": message,
+    }
+
+
+def tool_progress_message(tool_name: str, *, started: bool) -> str:
+    action = "Finished" if not started else None
+    if tool_name == "compute_log_metrics":
+        return "Computing log metrics" if started else "Computed log metrics"
+    if tool_name == "generate_signal_plot":
+        return "Generating plot" if started else "Generated plot"
+    if tool_name == "verify_hypothesis_against_log":
+        return "Verifying hypothesis against log" if started else "Verified hypothesis against log"
+    if tool_name == "search_px4_source":
+        return "Searching PX4 source" if started else "Searched PX4 source"
+    if tool_name == "checkout_px4_source":
+        return "Checking out PX4 source revision" if started else "Checked out PX4 source revision"
+    if tool_name == "read_px4_source_file":
+        return "Reading PX4 source file" if started else "Read PX4 source file"
+    return f"{action or 'Running'} tool: {tool_name}"
+
+
+def status_label(status: str) -> str:
+    return {
+        "queued": "Queued",
+        "running": "Running",
+        "completed": "Complete",
+        "failed": "Failed",
+    }.get(status, status)
+
+
+def resolve_artifact_path(path_value: str) -> Path:
+    raw_path = Path(path_value)
+    requested = raw_path.resolve() if raw_path.is_absolute() else (ROOT_DIR / raw_path).resolve()
+    allowed_roots = (OUTPUT_ROOT.resolve(),)
+
+    if not any(_is_relative_to(requested, root) for root in allowed_roots):
+        raise ValueError("artifact path is not allowed")
+
+    if not requested.is_file():
+        raise ValueError("artifact does not exist")
+
+    return requested
+
+
+def _run_analysis_job(run_id: str, user_question: str) -> None:
+    _update_analysis_run(run_id, status="running", started_at=time.time())
+    try:
+        from runner import analyze_flight_log_v1
+
+        with ANALYSIS_RUNS_LOCK:
+            run = dict(ANALYSIS_RUNS[run_id])
+
+        report = asyncio.run(
+            analyze_flight_log_v1(
+                log_path=run["log_path"],
+                user_question=user_question,
+                mission_path=run["mission_path"],
+                source_path=run["source_path"],
+                output_dir=run["output_dir"],
+                dev_log_root=str(WEB_DEV_LOG_ROOT),
+                dev_run_id=run_id,
+            )
+        )
+        _update_analysis_run(
+            run_id,
+            status="completed",
+            finished_at=time.time(),
+            report=make_json_safe(report),
+        )
+    except Exception as exc:
+        _update_analysis_run(
+            run_id,
+            status="failed",
+            finished_at=time.time(),
+            error=repr(exc),
+            traceback=traceback.format_exc(),
+        )
+
+
+def _update_analysis_run(run_id: str, **fields: Any) -> None:
+    with ANALYSIS_RUNS_LOCK:
+        if run_id in ANALYSIS_RUNS:
+            ANALYSIS_RUNS[run_id].update(fields)
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+
+    return True
 
 
 def save_upload_form(form: cgi.FieldStorage, upload_root: Path = UPLOAD_ROOT) -> dict[str, Path]:

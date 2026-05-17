@@ -15,6 +15,7 @@ from mission_parser import parse_mission_file as parse_mission_file_impl
 from ulog_control_surface import infer_control_surface as infer_control_surface_impl
 from ulog_inventory import parse_ulog_inventory as parse_ulog_inventory_impl
 from ulog_metrics import compute_log_metrics as compute_log_metrics_impl
+from ulog_hypothesis_verifier import verify_hypothesis_against_log as verify_hypothesis_against_log_impl
 from ulog_plots import generate_signal_plot as generate_signal_plot_impl
 from ulog_timeline import build_basic_timeline as build_basic_timeline_impl
 from run_audit_log import (
@@ -72,6 +73,41 @@ class CodeRef(BaseModel):
     function: Optional[str] = None
     snippet: Optional[str] = None
     explanation: str
+
+
+class VerifierSignatureItem(BaseModel):
+    name: str
+    description: str
+    signal: Optional[str] = None
+
+
+class VerifierWindow(BaseModel):
+    name: str
+    start_s: float
+    end_s: float
+
+
+class VerifierCheck(BaseModel):
+    type: str
+    window: Optional[str] = None
+    signal: Optional[str] = None
+    actual: Optional[str] = None
+    setpoint: Optional[str] = None
+    first: Optional[str] = None
+    second: Optional[str] = None
+    metric: Optional[str] = None
+    op: Optional[str] = None
+    value: Optional[float] = None
+    from_value: Optional[float] = None
+    to_value: Optional[float] = None
+    mode: Optional[str] = None
+    max_error: Optional[float] = None
+    min_error: Optional[float] = None
+    direction: Optional[str] = None
+    min_delta: Optional[float] = None
+    supports: Optional[str] = None
+    contradicts: Optional[str] = None
+    description: Optional[str] = None
 
 
 class Hypothesis(BaseModel):
@@ -240,6 +276,30 @@ def generate_signal_plot(
     )
 
 
+@function_tool
+def verify_hypothesis_against_log(
+    ctx: RunContextWrapper[FlightLogContext],
+    mechanism: str,
+    expected_signature: list[VerifierSignatureItem],
+    candidate_windows: list[VerifierWindow],
+    required_signals: list[str],
+    exclusion_checks: list[VerifierCheck],
+    numeric_checks: list[VerifierCheck],
+) -> dict:
+    """
+    Verify a hypothesis against logged signals using deterministic checks.
+    """
+    return verify_hypothesis_against_log_impl(
+        ctx.context.log_path,
+        mechanism,
+        [_model_to_dict(item) for item in expected_signature],
+        [_model_to_dict(window) for window in candidate_windows],
+        required_signals,
+        [_verifier_check_to_dict(check) for check in exclusion_checks],
+        [_verifier_check_to_dict(check) for check in numeric_checks],
+    )
+
+
 # ============================================================
 # 5. Single V1 agent
 # ============================================================
@@ -271,14 +331,27 @@ Workflow:
 6. Use local PX4 source search for exact code behavior.
 7. Select relevant analysis windows.
 8. Generate ranked hypotheses.
-9. For each hypothesis, include:
+9. For every hypothesis, define:
+   - known PX4 mechanism
+   - expected logged signature
+   - candidate windows
+   - required signals
+   - exclusion checks for plausible alternate sources
+   - numeric checks that can support or contradict the hypothesis
+10. Call verify_hypothesis_against_log for every hypothesis before assigning
+   confidence. Use the verifier result as the log-evidence basis for
+   confidence, and only downgrade or qualify that confidence when source-code,
+   mission, parameter, or control-surface assumptions are weaker than the log
+   evidence. Do not request raw arrays, full dataframes, or long source
+   excerpts unless the verifier marks the hypothesis as unresolved.
+11. For each hypothesis, include:
    - mechanism
-   - evidence from log
-   - contradicting evidence
+   - evidence from log, including verifier evidence
+   - contradicting evidence, including verifier contradictions
    - at least one relevant plot request in plots
    - relevant code path
    - confidence
-10. Do not provide parameter tuning, code-change, or flight-test suggestions
+12. Do not provide parameter tuning, code-change, or flight-test suggestions
    unless the user explicitly asks for suggestions or fixes.
 
 Plot requirements:
@@ -326,6 +399,7 @@ For mission acceptance:
         read_px4_source_file,
         compute_log_metrics,
         generate_signal_plot,
+        verify_hypothesis_against_log,
     ],
     output_type=FlightLogReport,
 )
@@ -342,6 +416,7 @@ async def analyze_flight_log_v1(
     source_path: Optional[str] = None,
     output_dir: str = "outputs/run_001",
     dev_log_root: str = str(DEFAULT_DEV_LOG_ROOT),
+    dev_run_id: Optional[str] = None,
 ) -> FlightLogReport:
 
     log_path = Path(log_path)
@@ -349,7 +424,7 @@ async def analyze_flight_log_v1(
     source_path_obj = Path(source_path) if source_path else None
     output_dir_obj = Path(output_dir)
     output_dir_obj.mkdir(parents=True, exist_ok=True)
-    audit_logger = DeveloperAuditLogger(Path(dev_log_root))
+    audit_logger = DeveloperAuditLogger(Path(dev_log_root), run_id=dev_run_id)
     report_path = output_dir_obj / "report.json"
     audit_logger.save_metadata(
         {
@@ -627,6 +702,15 @@ def _model_to_dict(value: Any) -> dict:
         for key in ("start_s", "end_s", "label", "color", "alpha", "kind", "source", "ymin", "ymax")
         if getattr(value, key, None) is not None
     }
+
+
+def _verifier_check_to_dict(value: Any) -> dict:
+    check = _model_to_dict(value)
+    if "from_value" in check:
+        check["from"] = check.pop("from_value")
+    if "to_value" in check:
+        check["to"] = check.pop("to_value")
+    return check
 
 
 # ============================================================

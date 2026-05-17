@@ -1,5 +1,7 @@
 const state = {
   payload: null,
+  analysisRunId: null,
+  analysisPollTimer: null,
   sidebarCollapsed: false,
 };
 
@@ -24,6 +26,11 @@ const els = {
   topicRows: document.getElementById("topicRows"),
   topicCount: document.getElementById("topicCount"),
   mainSummary: document.getElementById("mainSummary"),
+  analysisQuestion: document.getElementById("analysisQuestion"),
+  analysisButton: document.getElementById("analysisButton"),
+  analysisStatus: document.getElementById("analysisStatus"),
+  analysisProgress: document.getElementById("analysisProgress"),
+  analysisReport: document.getElementById("analysisReport"),
   changedParameterRows: document.getElementById("changedParameterRows"),
   timelineRows: document.getElementById("timelineRows"),
 };
@@ -37,6 +44,7 @@ els.parameterSearch.addEventListener("input", renderParameters);
 els.parameterStatus.addEventListener("change", renderParameters);
 els.hideRcCal.addEventListener("change", renderParameters);
 els.topicSearch.addEventListener("input", renderTopics);
+els.analysisButton.addEventListener("click", startAnalysis);
 
 els.sidebarToggle.addEventListener("click", () => {
   state.sidebarCollapsed = !state.sidebarCollapsed;
@@ -59,6 +67,7 @@ async function preparseLog() {
       ? await uploadAndPreparse(formData)
       : await preparseLocalPath(formData);
     state.payload = result;
+    resetAnalysis();
     renderAll();
     setStatus("Loaded");
   } catch (error) {
@@ -66,6 +75,186 @@ async function preparseLog() {
     els.mainSummary.innerHTML = `<p class="message-item">${escapeHtml(error.message)}</p>`;
   } finally {
     hideUploadProgressSoon();
+  }
+}
+
+async function startAnalysis() {
+  if (!state.payload) {
+    setAnalysisStatus("Load a log first");
+    return;
+  }
+
+  const inputs = state.payload.inputs || {};
+  const question = els.analysisQuestion.value.trim()
+    || "Analyze this flight log and identify the most likely root causes.";
+  const payload = {
+    log_path: inputs.log_path,
+    mission_path: inputs.mission_path,
+    source_path: inputs.source_path,
+    user_question: question,
+  };
+
+  if (!payload.log_path) {
+    setAnalysisStatus("Missing log path");
+    return;
+  }
+
+  clearAnalysisPoll();
+  els.analysisButton.disabled = true;
+  els.analysisReport.innerHTML = "";
+  els.analysisProgress.innerHTML = `<div class="progress-item active">Starting analysis...</div>`;
+  setAnalysisStatus("Starting");
+
+  try {
+    const response = await fetch("/api/analyze-runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    state.analysisRunId = result.run_id;
+    renderAnalysisRun(result);
+    state.analysisPollTimer = window.setInterval(pollAnalysisRun, 1000);
+  } catch (error) {
+    setAnalysisStatus("Failed");
+    els.analysisProgress.innerHTML = `<div class="progress-item failed">${escapeHtml(error.message)}</div>`;
+    els.analysisButton.disabled = false;
+  }
+}
+
+async function pollAnalysisRun() {
+  if (!state.analysisRunId) return;
+
+  try {
+    const response = await fetch(`/api/analyze-runs/${encodeURIComponent(state.analysisRunId)}`);
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    renderAnalysisRun(result);
+    if (result.status === "completed" || result.status === "failed") {
+      clearAnalysisPoll();
+      els.analysisButton.disabled = !state.payload;
+    }
+  } catch (error) {
+    clearAnalysisPoll();
+    setAnalysisStatus("Failed");
+    els.analysisProgress.innerHTML += `<div class="progress-item failed">${escapeHtml(error.message)}</div>`;
+    els.analysisButton.disabled = !state.payload;
+  }
+}
+
+function renderAnalysisRun(run) {
+  setAnalysisStatus(statusText(run.status, run.progress?.phase));
+  const messages = run.progress?.messages || [];
+  els.analysisProgress.innerHTML = messages.length
+    ? messages.map((message, index) => renderProgressItem(message, index === messages.length - 1, run.status)).join("")
+    : `<div class="progress-item active">${escapeHtml(statusText(run.status, ""))}</div>`;
+
+  if (run.status === "failed") {
+    els.analysisReport.innerHTML = `<p class="message-item">${escapeHtml(run.error || "Analysis failed.")}</p>`;
+  } else if (run.report) {
+    renderAnalysisReport(run.report);
+  }
+}
+
+function renderProgressItem(item, isLatest, status) {
+  const classes = ["progress-item"];
+  if (isLatest && status !== "completed") classes.push(status === "failed" ? "failed" : "active");
+  if (item.event === "run.finished") classes.push("done");
+  const time = item.ts ? `<span>${escapeHtml(formatEventTime(item.ts))}</span>` : "";
+  return `
+    <div class="${classes.join(" ")}">
+      <strong>${escapeHtml(item.message)}</strong>
+      ${time}
+    </div>
+  `;
+}
+
+function renderAnalysisReport(report) {
+  const hypotheses = report.ranked_hypotheses || [];
+  els.analysisReport.innerHTML = `
+    <div class="report-block">
+      <h3>Summary</h3>
+      <p>${escapeHtml(report.final_summary || "")}</p>
+    </div>
+    <div class="report-block">
+      <h3>Assumptions</h3>
+      <p>${escapeHtml(report.assumption_header || "")}</p>
+    </div>
+    <div class="report-block">
+      <h3>Timeline</h3>
+      <p>${escapeHtml(report.timeline_summary || "")}</p>
+    </div>
+    ${renderStringList("Confirmed", report.confirmed || [])}
+    ${renderStringList("Unconfirmed", report.unconfirmed || [])}
+    <div class="hypothesis-list">
+      ${hypotheses.map(renderHypothesis).join("")}
+    </div>
+  `;
+}
+
+function renderHypothesis(hypothesis, index) {
+  return `
+    <article class="hypothesis-card">
+      <div class="section-title-row">
+        <h3>${escapeHtml(`${index + 1}. ${hypothesis.title || "Hypothesis"}`)}</h3>
+        <span class="status-badge">${escapeHtml(hypothesis.confidence || "unknown")}</span>
+      </div>
+      <p>${escapeHtml(hypothesis.mechanism || "")}</p>
+      ${renderStringList("Evidence", hypothesis.evidence || [])}
+      ${renderStringList("Contradicting Evidence", hypothesis.contradicting_evidence || [])}
+      ${renderPlots(hypothesis.plots || [])}
+    </article>
+  `;
+}
+
+function renderStringList(title, rows) {
+  if (!rows.length) return "";
+  return `
+    <div class="report-list">
+      <h4>${escapeHtml(title)}</h4>
+      <ul>
+        ${rows.map((row) => `<li>${escapeHtml(row)}</li>`).join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function renderPlots(plots) {
+  if (!plots.length) return "";
+  return `
+    <div class="plot-grid">
+      ${plots.map((plot) => `
+        <figure class="plot-card">
+          ${plot.path ? `<img src="${escapeAttr(artifactUrl(plot.path))}" alt="${escapeAttr(plot.title || "Analysis plot")}">` : ""}
+          <figcaption>
+            <strong>${escapeHtml(plot.title || "Plot")}</strong>
+            <span>${escapeHtml(plot.purpose || "")}</span>
+            ${plot.warnings?.length ? `<span class="plot-warning">${escapeHtml(plot.warnings.join("; "))}</span>` : ""}
+          </figcaption>
+        </figure>
+      `).join("")}
+    </div>
+  `;
+}
+
+function resetAnalysis() {
+  clearAnalysisPoll();
+  state.analysisRunId = null;
+  els.analysisButton.disabled = !state.payload;
+  els.analysisStatus.textContent = "Idle";
+  els.analysisProgress.innerHTML = "";
+  els.analysisReport.innerHTML = "";
+}
+
+function clearAnalysisPoll() {
+  if (state.analysisPollTimer) {
+    window.clearInterval(state.analysisPollTimer);
+    state.analysisPollTimer = null;
   }
 }
 
@@ -303,6 +492,30 @@ function timelineText(row) {
 
 function setStatus(text) {
   els.runStatus.textContent = text;
+}
+
+function setAnalysisStatus(text) {
+  els.analysisStatus.textContent = text;
+}
+
+function statusText(status, phase) {
+  const labels = {
+    queued: "Queued",
+    running: phase || "Running",
+    completed: "Complete",
+    failed: "Failed",
+  };
+  return labels[status] || status || "Idle";
+}
+
+function formatEventTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function artifactUrl(path) {
+  return `/artifacts?path=${encodeURIComponent(path)}`;
 }
 
 function showUploadProgress(percent) {
