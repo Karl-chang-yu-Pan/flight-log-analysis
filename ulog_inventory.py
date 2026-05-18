@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
 from pyulog import ULog
+from pyulog.px4_events import PX4Events
 
 
 EXPECTED_TIMELINE_TOPICS = [
@@ -12,6 +14,9 @@ EXPECTED_TIMELINE_TOPICS = [
     "vtol_vehicle_status",
     "mission_result",
 ]
+
+DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parent / "ref" / "PX4-Autopilot"
+
 
 IMPORTANT_PARAMETER_PREFIXES = (
     "SYS_",
@@ -29,47 +34,12 @@ IMPORTANT_PARAMETER_PREFIXES = (
     "SENS_",
 )
 
-TOPIC_FIELD_INVENTORY_TOPICS = {
-    "actuator_controls_0",
-    "actuator_controls_1",
-    "actuator_motors",
-    "actuator_outputs",
-    "actuator_servos",
-    "airspeed",
-    "airspeed_validated",
-    "battery_status",
-    "estimator_status",
-    "failsafe_flags",
-    "manual_control_setpoint",
-    "manual_control_switches",
-    "mission_result",
-    "position_setpoint_triplet",
-    "rate_ctrl_status",
-    "rc_channels",
-    "sensor_baro",
-    "sensor_combined",
-    "tecs_status",
-    "vehicle_air_data",
-    "vehicle_angular_velocity",
-    "vehicle_attitude",
-    "vehicle_attitude_setpoint",
-    "vehicle_global_position",
-    "vehicle_gps_position",
-    "vehicle_local_position",
-    "vehicle_local_position_setpoint",
-    "vehicle_rates_setpoint",
-    "vehicle_status",
-    "vehicle_thrust_setpoint",
-    "vehicle_torque_setpoint",
-    "vtol_vehicle_status",
-}
 
-
-def parse_ulog_inventory(log_path: Path) -> dict:
+def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> dict:
     inventory = _empty_inventory()
 
     try:
-        ulog = ULog(str(log_path))
+        ulog = ULog(str(log_path), None, disable_str_exceptions=True)
     except Exception as exc:
         inventory["warnings"].append(f"failed to parse ULog: {exc}")
         inventory["missing_topics"] = EXPECTED_TIMELINE_TOPICS.copy()
@@ -77,16 +47,19 @@ def parse_ulog_inventory(log_path: Path) -> dict:
 
     info = getattr(ulog, "msg_info_dict", {}) or {}
     available_topics = _extract_topic_names(ulog)
+    git_hash = _json_safe_value(info.get("ver_sw"))
 
-    inventory["firmware_version"] = _json_safe_value(
-        info.get("ver_sw_release") or info.get("sys_name")
-    )
-    inventory["git_hash"] = _json_safe_value(info.get("ver_sw"))
+    inventory["firmware_version"] = _extract_firmware_version(ulog)
+    inventory["firmware_branch"] = _json_safe_value(info.get("ver_sw_branch"))
+    inventory["git_hash"] = git_hash
+    inventory["airframe"] = _extract_airframe(ulog, source_path, git_hash)
     inventory["duration_s"] = _extract_duration_s(ulog)
     inventory["important_parameters"] = _extract_important_parameters(ulog)
     inventory["available_topics"] = available_topics
     inventory["topic_fields"] = _extract_topic_fields(ulog)
-    inventory["warnings"] = _extract_logged_warnings(ulog)
+    inventory["topic_instances"] = _extract_topic_instances(ulog)
+    inventory["logged_messages"] = _extract_logged_messages(ulog)
+    inventory["warnings"] = _extract_logged_warnings(ulog, inventory["logged_messages"])
     inventory["missing_topics"] = [
         topic for topic in EXPECTED_TIMELINE_TOPICS if topic not in available_topics
     ]
@@ -97,11 +70,15 @@ def parse_ulog_inventory(log_path: Path) -> dict:
 def _empty_inventory() -> dict:
     return {
         "firmware_version": None,
+        "firmware_branch": None,
         "git_hash": None,
+        "airframe": None,
         "duration_s": None,
         "important_parameters": {},
         "available_topics": [],
         "topic_fields": {},
+        "topic_instances": {},
+        "logged_messages": [],
         "warnings": [],
         "missing_topics": [],
     }
@@ -133,10 +110,15 @@ def _extract_topic_fields(ulog: Any) -> dict[str, list[str]]:
 
     for data in getattr(ulog, "data_list", []) or []:
         name = getattr(data, "name", None)
-        if not name or str(name) not in TOPIC_FIELD_INVENTORY_TOPICS:
+        if not name:
             continue
 
         fields = fields_by_topic.setdefault(str(name), set())
+        for field in getattr(data, "field_data", []) or []:
+            field_name = getattr(field, "field_name", None)
+            if field_name:
+                fields.add(str(field_name))
+
         fields.update(str(field) for field in (getattr(data, "data", {}) or {}).keys())
 
     _add_derived_attitude_fields(fields_by_topic)
@@ -144,6 +126,40 @@ def _extract_topic_fields(ulog: Any) -> dict[str, list[str]]:
     return {
         topic: sorted(fields)
         for topic, fields in sorted(fields_by_topic.items())
+    }
+
+
+def _extract_topic_instances(ulog: Any) -> dict[str, list[dict[str, Any]]]:
+    instances_by_topic: dict[str, list[dict[str, Any]]] = {}
+
+    for data in getattr(ulog, "data_list", []) or []:
+        name = getattr(data, "name", None)
+        if not name:
+            continue
+
+        fields = set()
+        for field in getattr(data, "field_data", []) or []:
+            field_name = getattr(field, "field_name", None)
+            if field_name:
+                fields.add(str(field_name))
+
+        data_dict = getattr(data, "data", {}) or {}
+        fields.update(str(field) for field in data_dict.keys())
+
+        timestamp_values = data_dict.get("timestamp")
+        sample_count = len(timestamp_values) if timestamp_values is not None else None
+
+        instances_by_topic.setdefault(str(name), []).append(
+            {
+                "multi_id": _json_safe_value(getattr(data, "multi_id", 0)),
+                "fields": sorted(fields),
+                "sample_count": sample_count,
+            }
+        )
+
+    return {
+        topic: sorted(instances, key=lambda item: item["multi_id"])
+        for topic, instances in sorted(instances_by_topic.items())
     }
 
 
@@ -179,6 +195,49 @@ def _extract_duration_s(ulog: Any) -> Optional[float]:
     return round((max(timestamps) - min(timestamps)) / 1_000_000, 3)
 
 
+def _extract_firmware_version(ulog: Any) -> Optional[str]:
+    get_version_info_str = getattr(ulog, "get_version_info_str", None)
+    if callable(get_version_info_str):
+        try:
+            version = get_version_info_str()
+        except Exception:
+            version = None
+        if version:
+            return str(version)
+
+    get_version_info = getattr(ulog, "get_version_info", None)
+    if not callable(get_version_info):
+        return None
+
+    try:
+        version_info = get_version_info()
+    except Exception:
+        return None
+    if not version_info or len(version_info) < 4:
+        return None
+
+    major, minor, patch, release_type = version_info[:4]
+    suffix = _release_type_suffix(release_type)
+    return f"v{major}.{minor}.{patch}{suffix}"
+
+
+def _release_type_suffix(release_type: Any) -> str:
+    try:
+        release_type_int = int(release_type)
+    except (TypeError, ValueError):
+        return ""
+
+    if release_type_int < 64:
+        return " (dev)"
+    if release_type_int < 128:
+        return " (alpha)"
+    if release_type_int < 192:
+        return " (beta)"
+    if release_type_int < 255:
+        return " (RC)"
+    return ""
+
+
 def _extract_important_parameters(ulog: Any) -> dict:
     parameters = getattr(ulog, "initial_parameters", {}) or {}
 
@@ -189,15 +248,54 @@ def _extract_important_parameters(ulog: Any) -> dict:
     }
 
 
-def _extract_logged_warnings(ulog: Any) -> list[str]:
-    warnings = []
+def _extract_logged_messages(ulog: Any) -> list[dict[str, Any]]:
+    messages = []
+
+    for timestamp, level, text in _extract_logged_events(ulog):
+        messages.append(
+            {
+                "timestamp": _json_safe_value(timestamp),
+                "time_s": _timestamp_to_seconds(timestamp),
+                "level": str(level),
+                "message": str(text),
+                "source": "event",
+            }
+        )
 
     for message in getattr(ulog, "logged_messages", []) or []:
-        level = str(getattr(message, "log_level_str", "") or "").lower()
         text = str(getattr(message, "message", "") or "")
+        if text.endswith("\t"):
+            continue
 
-        if level in {"warning", "warn", "error", "critical"}:
-            warnings.append(f"{level}: {text}" if level else text)
+        timestamp = getattr(message, "timestamp", None)
+        messages.append(
+            {
+                "timestamp": _json_safe_value(timestamp),
+                "time_s": _timestamp_to_seconds(timestamp),
+                "level": _logged_message_level(message),
+                "message": text,
+                "source": "logged_message",
+            }
+        )
+
+    return sorted(
+        messages,
+        key=lambda item: (
+            item["timestamp"] is None,
+            item["timestamp"] if item["timestamp"] is not None else 0,
+        ),
+    )
+
+
+def _extract_logged_warnings(ulog: Any, logged_messages: list[dict[str, Any]]) -> list[str]:
+    warnings = []
+
+    for message in logged_messages:
+        level = str(message.get("level") or "")
+        text = str(message.get("message") or "")
+
+        if _is_warning_or_worse(level):
+            warnings.append(f"{level.lower()}: {text}" if level else text)
 
     for dropout in getattr(ulog, "dropouts", []) or []:
         duration_ms = getattr(dropout, "duration", None)
@@ -205,3 +303,183 @@ def _extract_logged_warnings(ulog: Any) -> list[str]:
             warnings.append(f"dropout: {duration_ms} ms")
 
     return warnings
+
+
+def _extract_logged_events(ulog: Any) -> list[tuple[Any, str, str]]:
+    try:
+        parser = PX4Events()
+        parser.set_default_json_definitions_cb(lambda already_has_default_parser: None)
+        return parser.get_logged_events(ulog)
+    except Exception:
+        return []
+
+
+def _logged_message_level(message: Any) -> str:
+    level = getattr(message, "log_level_str", None)
+    if callable(level):
+        try:
+            return str(level())
+        except Exception:
+            pass
+    if level is not None:
+        return str(level)
+
+    raw_level = getattr(message, "log_level", None)
+    if raw_level is not None:
+        return {
+            ord("0"): "EMERGENCY",
+            ord("1"): "ALERT",
+            ord("2"): "CRITICAL",
+            ord("3"): "ERROR",
+            ord("4"): "WARNING",
+            ord("5"): "NOTICE",
+            ord("6"): "INFO",
+            ord("7"): "DEBUG",
+        }.get(raw_level, "UNKNOWN")
+
+    return "UNKNOWN"
+
+
+def _is_warning_or_worse(level: str) -> bool:
+    return level.upper() in {"EMERGENCY", "ALERT", "CRITICAL", "ERROR", "WARNING"}
+
+
+def _timestamp_to_seconds(timestamp: Any) -> Optional[float]:
+    if timestamp is None:
+        return None
+    try:
+        return round(float(_json_safe_value(timestamp)) / 1_000_000, 6)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_airframe(
+    ulog: Any,
+    source_path: Optional[Path],
+    git_hash: Any,
+) -> Optional[dict[str, Any]]:
+    parameters = getattr(ulog, "initial_parameters", {}) or {}
+    if "SYS_AUTOSTART" not in parameters:
+        return None
+
+    airframe_id = _json_safe_value(parameters["SYS_AUTOSTART"])
+    airframe = {"id": airframe_id}
+
+    metadata = _resolve_airframe_metadata(airframe_id, source_path, git_hash)
+    if metadata:
+        airframe.update(metadata)
+
+    return airframe
+
+
+def _resolve_airframe_metadata(
+    airframe_id: Any,
+    source_path: Optional[Path],
+    git_hash: Any,
+) -> Optional[dict[str, Any]]:
+    px4_source_path = Path(source_path) if source_path else DEFAULT_PX4_SOURCE_PATH
+    if not px4_source_path.exists():
+        return None
+
+    git_hash_str = _clean_string(git_hash)
+    if git_hash_str and _git_commit_exists(px4_source_path, git_hash_str):
+        metadata = _airframe_metadata_from_git(px4_source_path, git_hash_str, airframe_id)
+        if metadata:
+            return metadata
+
+    return _airframe_metadata_from_worktree(px4_source_path, airframe_id)
+
+
+def _airframe_metadata_from_git(
+    source_path: Path,
+    git_hash: str,
+    airframe_id: Any,
+) -> Optional[dict[str, Any]]:
+    airframe_file = _find_airframe_file_in_git(source_path, git_hash, airframe_id)
+    if airframe_file is None:
+        return None
+
+    result = _git(source_path, ["show", f"{git_hash}:{airframe_file}"])
+    if result.returncode != 0:
+        return None
+
+    metadata = _parse_airframe_script_metadata(result.stdout)
+    metadata["source"] = f"{source_path}@{git_hash[:8]}"
+    metadata["file"] = airframe_file
+    return metadata
+
+
+def _find_airframe_file_in_git(source_path: Path, git_hash: str, airframe_id: Any) -> Optional[str]:
+    prefix = f"{airframe_id}_"
+    for airframe_dir in _airframe_dirs():
+        result = _git(source_path, ["ls-tree", "-r", "--name-only", git_hash, airframe_dir])
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            if Path(line).name.startswith(prefix):
+                return line
+    return None
+
+
+def _airframe_metadata_from_worktree(source_path: Path, airframe_id: Any) -> Optional[dict[str, Any]]:
+    prefix = f"{airframe_id}_"
+    for airframe_dir in _airframe_dirs():
+        directory = source_path / airframe_dir
+        if not directory.is_dir():
+            continue
+        for file_path in sorted(directory.iterdir()):
+            if not file_path.is_file() or not file_path.name.startswith(prefix):
+                continue
+            metadata = _parse_airframe_script_metadata(
+                file_path.read_text(encoding="utf-8", errors="replace")
+            )
+            metadata["source"] = str(source_path)
+            metadata["file"] = str(file_path.relative_to(source_path))
+            return metadata
+    return None
+
+
+def _parse_airframe_script_metadata(text: str) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("# @"):
+            continue
+
+        tag, _, value = stripped[3:].partition(" ")
+        tag = tag.strip().lower()
+        value = value.strip()
+        if tag in {"name", "type", "class"} and value:
+            metadata[tag] = value
+    return metadata
+
+
+def _airframe_dirs() -> tuple[str, ...]:
+    return (
+        "ROMFS/px4fmu_common/init.d/airframes",
+        "ROMFS/px4fmu_common/init.d-posix/airframes",
+    )
+
+
+def _git_commit_exists(source_path: Path, git_hash: str) -> bool:
+    if not (source_path / ".git").exists():
+        return False
+    result = _git(source_path, ["cat-file", "-e", f"{git_hash}^{{commit}}"])
+    return result.returncode == 0
+
+
+def _git(source_path: Path, args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(source_path), *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _clean_string(value: Any) -> Optional[str]:
+    value = _json_safe_value(value)
+    if value is None:
+        return None
+    text = str(value).strip().rstrip("\x00")
+    return text or None

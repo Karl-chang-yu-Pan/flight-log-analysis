@@ -332,7 +332,9 @@ function renderFacts() {
   els.sidebarSummary.textContent = inputName || "Log loaded";
   const facts = [
     ["Firmware", inventory.firmware_version || "unknown"],
+    ["Branch", inventory.firmware_branch || "unknown"],
     ["Git hash", inventory.git_hash || "unknown"],
+    ["Airframe", formatAirframe(inventory.airframe)],
     ["Duration", formatDuration(inventory.duration_s)],
     ["Vehicle", assumptions.vehicle_type || "unknown"],
     ["Topics", String((inventory.available_topics || []).length)],
@@ -342,6 +344,18 @@ function renderFacts() {
   els.factGrid.innerHTML = facts
     .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`)
     .join("");
+}
+
+function formatAirframe(airframe) {
+  if (!airframe) {
+    return "unknown";
+  }
+
+  const label = [airframe.name, airframe.type].filter(Boolean).join(", ");
+  if (label && airframe.id !== undefined && airframe.id !== null) {
+    return `${label} (${airframe.id})`;
+  }
+  return label || String(airframe.id || "unknown");
 }
 
 function renderWarnings() {

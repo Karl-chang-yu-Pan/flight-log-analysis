@@ -22,6 +22,25 @@ import mission_parser
 import ulog_plots
 
 
+class FakeLoggedMessage:
+    def __init__(self, timestamp, level, message, log_level=None):
+        self.timestamp = timestamp
+        self._level = level
+        self.message = message
+        self.log_level = log_level
+
+    def log_level_str(self):
+        return self._level
+
+
+class FakePX4Events:
+    def set_default_json_definitions_cb(self, callback):
+        self.callback = callback
+
+    def get_logged_events(self, ulog):
+        return getattr(ulog, "logged_events", [])
+
+
 def load_runner(tmp_path: Path):
     """Load runner.py with SDK stubs so tool unit tests stay local-only."""
     pydantic_stub = types.ModuleType("pydantic")
@@ -128,13 +147,29 @@ def make_ctx(runner, tmp_path, source_path=None):
 
 def test_parse_ulog_inventory_extracts_inventory_from_pyulog(tmp_path, monkeypatch):
     log_path = tmp_path / "flight.ulg"
+    source_path = tmp_path / "PX4-Autopilot"
+    airframe_dir = source_path / "ROMFS" / "px4fmu_common" / "init.d" / "airframes"
+    airframe_dir.mkdir(parents=True)
+    (airframe_dir / "4001_quad_x").write_text(
+        "\n".join(
+            [
+                "#!/bin/sh",
+                "# @name Generic Quadcopter",
+                "# @type Quadrotor x",
+                "# @class Copter",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     class FakeULog:
-        def __init__(self, path):
+        def __init__(self, path, msg_filter=None, disable_str_exceptions=False):
             self.path = path
+            self.disable_str_exceptions = disable_str_exceptions
             self.msg_info_dict = {
-                "ver_sw_release": b"1.14.0\x00",
+                "ver_sw_release": 0x010E00FF,
                 "ver_sw": b"abcdef123456\x00",
+                "ver_sw_branch": b"release/1.14\x00",
             }
             self.initial_parameters = {
                 "SYS_AUTOSTART": 4001,
@@ -144,39 +179,145 @@ def test_parse_ulog_inventory_extracts_inventory_from_pyulog(tmp_path, monkeypat
             self.start_timestamp = 1_000_000
             self.last_timestamp = 6_500_000
             self.data_list = [
-                SimpleNamespace(name="vehicle_status", data={"timestamp": [1], "nav_state": [3]}),
+                SimpleNamespace(
+                    name="vehicle_status",
+                    field_data=[
+                        SimpleNamespace(field_name="timestamp"),
+                        SimpleNamespace(field_name="nav_state"),
+                    ],
+                    data={"timestamp": [1], "nav_state": [3]},
+                ),
+                SimpleNamespace(
+                    name="sensor_accel",
+                    multi_id=0,
+                    field_data=[
+                        SimpleNamespace(field_name="timestamp"),
+                        SimpleNamespace(field_name="x"),
+                    ],
+                    data={"timestamp": [1, 2], "x": [0.1, 0.2]},
+                ),
+                SimpleNamespace(
+                    name="sensor_accel",
+                    multi_id=1,
+                    field_data=[
+                        SimpleNamespace(field_name="timestamp"),
+                        SimpleNamespace(field_name="x"),
+                        SimpleNamespace(field_name="y"),
+                    ],
+                    data={"timestamp": [1], "x": [0.3], "y": [0.4]},
+                ),
                 SimpleNamespace(name="mission_result", data={"timestamp": [1], "seq_current": [1]}),
                 SimpleNamespace(name="sensor_combined", data={"timestamp": [1], "gyro_rad[0]": [0.1]}),
+                SimpleNamespace(
+                    name="debug_topic",
+                    field_data=[SimpleNamespace(field_name="custom_field")],
+                    data={"timestamp": [1], "custom_field": [42]},
+                ),
             ]
             self.logged_messages = [
-                SimpleNamespace(log_level_str="INFO", message="armed"),
-                SimpleNamespace(log_level_str="ERROR", message="mission failure"),
+                FakeLoggedMessage(1_050_000, "EMERGENCY", "hard failure", ord("0")),
+                FakeLoggedMessage(1_100_000, "INFO", "armed"),
+                FakeLoggedMessage(1_200_000, "WARNING", "duplicate event\t"),
+                FakeLoggedMessage(1_300_000, "ERROR", "mission failure"),
+            ]
+            self.logged_events = [
+                (1_250_000, "WARNING", "failsafe event"),
             ]
             self.dropouts = [SimpleNamespace(duration=42)]
 
-    monkeypatch.setattr(ulog_inventory, "ULog", FakeULog)
+        def get_version_info_str(self):
+            return "v1.14.0"
 
-    result = ulog_inventory.parse_ulog_inventory(log_path)
+        def get_version_info(self):
+            return (1, 14, 0, 255)
+
+    monkeypatch.setattr(ulog_inventory, "ULog", FakeULog)
+    monkeypatch.setattr(ulog_inventory, "PX4Events", FakePX4Events)
+
+    result = ulog_inventory.parse_ulog_inventory(log_path, source_path)
 
     assert result == {
-        "firmware_version": "1.14.0",
+        "firmware_version": "v1.14.0",
+        "firmware_branch": "release/1.14",
         "git_hash": "abcdef123456",
+        "airframe": {
+            "id": 4001,
+            "name": "Generic Quadcopter",
+            "type": "Quadrotor x",
+            "class": "Copter",
+            "source": str(source_path),
+            "file": "ROMFS/px4fmu_common/init.d/airframes/4001_quad_x",
+        },
         "duration_s": 5.5,
         "important_parameters": {
             "NAV_ACC_RAD": 10.0,
             "SYS_AUTOSTART": 4001,
         },
         "available_topics": [
+            "debug_topic",
             "mission_result",
+            "sensor_accel",
             "sensor_combined",
             "vehicle_status",
         ],
         "topic_fields": {
+            "debug_topic": ["custom_field", "timestamp"],
             "mission_result": ["seq_current", "timestamp"],
+            "sensor_accel": ["timestamp", "x", "y"],
             "sensor_combined": ["gyro_rad[0]", "timestamp"],
             "vehicle_status": ["nav_state", "timestamp"],
         },
+        "topic_instances": {
+            "debug_topic": [
+                {"multi_id": 0, "fields": ["custom_field", "timestamp"], "sample_count": 1}
+            ],
+            "mission_result": [
+                {"multi_id": 0, "fields": ["seq_current", "timestamp"], "sample_count": 1}
+            ],
+            "sensor_accel": [
+                {"multi_id": 0, "fields": ["timestamp", "x"], "sample_count": 2},
+                {"multi_id": 1, "fields": ["timestamp", "x", "y"], "sample_count": 1},
+            ],
+            "sensor_combined": [
+                {"multi_id": 0, "fields": ["gyro_rad[0]", "timestamp"], "sample_count": 1}
+            ],
+            "vehicle_status": [
+                {"multi_id": 0, "fields": ["nav_state", "timestamp"], "sample_count": 1}
+            ],
+        },
+        "logged_messages": [
+            {
+                "timestamp": 1_050_000,
+                "time_s": 1.05,
+                "level": "EMERGENCY",
+                "message": "hard failure",
+                "source": "logged_message",
+            },
+            {
+                "timestamp": 1_100_000,
+                "time_s": 1.1,
+                "level": "INFO",
+                "message": "armed",
+                "source": "logged_message",
+            },
+            {
+                "timestamp": 1_250_000,
+                "time_s": 1.25,
+                "level": "WARNING",
+                "message": "failsafe event",
+                "source": "event",
+            },
+            {
+                "timestamp": 1_300_000,
+                "time_s": 1.3,
+                "level": "ERROR",
+                "message": "mission failure",
+                "source": "logged_message",
+            },
+        ],
         "warnings": [
+            "emergency: hard failure",
+            "warning: failsafe event",
             "error: mission failure",
             "dropout: 42 ms",
         ],
@@ -187,9 +328,65 @@ def test_parse_ulog_inventory_extracts_inventory_from_pyulog(tmp_path, monkeypat
     }
 
 
+def test_parse_ulog_inventory_resolves_airframe_from_logged_git_revision(tmp_path, monkeypatch):
+    log_path = tmp_path / "flight.ulg"
+    source_path = tmp_path / "PX4-Autopilot"
+    airframe_dir = source_path / "ROMFS" / "px4fmu_common" / "init.d" / "airframes"
+    airframe_dir.mkdir(parents=True)
+    airframe_file = airframe_dir / "4001_quad_x"
+    airframe_file.write_text(
+        "# @name Logged Revision Quad\n# @type Quadrotor x\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=source_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "add", "."], cwd=source_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "old airframe"],
+        cwd=source_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    logged_hash = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    airframe_file.write_text(
+        "# @name Worktree Quad\n# @type Quadrotor changed\n",
+        encoding="utf-8",
+    )
+
+    class FakeULog:
+        def __init__(self, path, msg_filter=None, disable_str_exceptions=False):
+            self.msg_info_dict = {"ver_sw": logged_hash}
+            self.initial_parameters = {"SYS_AUTOSTART": 4001}
+            self.start_timestamp = 1_000_000
+            self.last_timestamp = 2_000_000
+            self.data_list = []
+            self.logged_messages = []
+            self.dropouts = []
+
+        def get_version_info_str(self):
+            return None
+
+        def get_version_info(self):
+            return None
+
+    monkeypatch.setattr(ulog_inventory, "ULog", FakeULog)
+
+    result = ulog_inventory.parse_ulog_inventory(log_path, source_path)
+
+    assert result["airframe"]["name"] == "Logged Revision Quad"
+    assert result["airframe"]["type"] == "Quadrotor x"
+    assert result["airframe"]["source"] == f"{source_path}@{logged_hash[:8]}"
+
+
 def test_parse_ulog_inventory_reports_parse_failure(tmp_path, monkeypatch):
     class FakeULog:
-        def __init__(self, path):
+        def __init__(self, path, msg_filter=None, disable_str_exceptions=False):
             raise ValueError("bad log")
 
     monkeypatch.setattr(ulog_inventory, "ULog", FakeULog)
@@ -203,7 +400,7 @@ def test_parse_ulog_inventory_reports_parse_failure(tmp_path, monkeypatch):
 
 def test_parse_ulog_inventory_includes_derived_attitude_plot_fields(tmp_path, monkeypatch):
     class FakeULog:
-        def __init__(self, path):
+        def __init__(self, path, msg_filter=None, disable_str_exceptions=False):
             self.msg_info_dict = {}
             self.initial_parameters = {}
             self.start_timestamp = 1_000_000
@@ -374,15 +571,16 @@ def test_build_basic_timeline_reports_parse_failure(tmp_path, monkeypatch):
 def test_runner_parse_ulog_inventory_delegates_to_inventory_module(tmp_path):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"
+    source_path = tmp_path / "PX4-Autopilot"
 
     with patch.object(
         runner,
         "parse_ulog_inventory_impl",
         return_value={"available_topics": ["vehicle_status"]},
     ) as parse_impl:
-        result = runner.parse_ulog_inventory(log_path)
+        result = runner.parse_ulog_inventory(log_path, source_path)
 
-    parse_impl.assert_called_once_with(log_path)
+    parse_impl.assert_called_once_with(log_path, source_path)
     assert result == {"available_topics": ["vehicle_status"]}
 
 
@@ -738,7 +936,7 @@ def test_analyze_flight_log_runs_staged_v2_workflow(tmp_path):
         )
 
     evaluate_signature.assert_called_once()
-    parse_inventory.assert_called_once_with(log_path)
+    parse_inventory.assert_called_once_with(log_path, source_path)
     build_timeline.assert_called_once_with(log_path)
     infer_surface.assert_called_once_with(log_path, source_path)
     parse_mission.assert_called_once_with(mission_path)

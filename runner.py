@@ -274,8 +274,8 @@ class ValidationResult(BaseModel):
 # 3. Deterministic pre-pass functions
 # ============================================================
 
-def parse_ulog_inventory(log_path: Path) -> dict:
-    return parse_ulog_inventory_impl(log_path)
+def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> dict:
+    return parse_ulog_inventory_impl(log_path, source_path)
 
 
 def build_basic_timeline(log_path: Path) -> list[dict]:
@@ -617,8 +617,9 @@ async def analyze_flight_log_v2(
             "prepass",
             "parse_ulog_inventory",
             parse_ulog_inventory,
-            {"log_path": str(log_path_obj)},
+            {"log_path": str(log_path_obj), "source_path": str(source_path_obj) if source_path_obj else None},
             log_path_obj,
+            source_path_obj,
         )
         timeline = _audit_sync_call(
             audit_logger,

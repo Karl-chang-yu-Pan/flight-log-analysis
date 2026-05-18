@@ -27,7 +27,7 @@ def build_preparse_payload(
     source_path_obj = Path(source_path) if source_path else None
     parameters_xml_path_obj = Path(parameters_xml_path) if parameters_xml_path else None
 
-    inventory = parse_ulog_inventory(log_path_obj)
+    inventory = parse_ulog_inventory(log_path_obj, source_path_obj)
     timeline = build_basic_timeline(log_path_obj)
     assumptions = infer_control_surface(log_path_obj, source_path_obj)
     mission = parse_mission_file(mission_path_obj)
