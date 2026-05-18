@@ -16,6 +16,7 @@ import ulog_timeline
 import ulog_control_surface
 import ulog_metrics
 import ulog_hypothesis_verifier
+import ulog_signature_evaluator
 import px4_source
 import mission_parser
 import ulog_plots
@@ -556,22 +557,139 @@ def test_runner_parse_mission_file_delegates_to_mission_parser(tmp_path):
     assert result == {"mission_file": str(mission_path), "items": []}
 
 
-def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path):
+def _sample_hypothesis_draft(runner):
+    return runner.HypothesisDraft(
+        title="Altitude drop after transition",
+        suspected_mechanism="TECS altitude controller changed demand during transition.",
+        why_plausible="The timeline shows a transition near the altitude loss.",
+        required_source_queries=["tecs transition altitude"],
+        likely_source_files=[],
+        required_signals=["vehicle_local_position.z"],
+        candidate_windows=[
+            runner.WindowSpec(name="event", start_s=10.0, end_s=20.0, reason="transition window")
+        ],
+        plausible_alternatives_to_exclude=["airspeed loss"],
+    )
+
+
+def _sample_source_mechanism(runner):
+    return runner.SourceMechanism(
+        mechanism_confirmed=True,
+        mechanism_name="TECS altitude demand",
+        summary="Source path found.",
+        source_refs=[
+            runner.CodeRef(
+                file="src/modules/fw_pos_control_l1/FixedwingPositionControl.cpp",
+                function="control_position",
+                start_line=100,
+                explanation="Applies TECS altitude setpoint.",
+            )
+        ],
+        parameters_used=[],
+        state_gates=["fixed-wing"],
+        conditions=[],
+        expected_logged_signature_hint=[],
+        unresolved_questions=[],
+        confidence="medium",
+    )
+
+
+def _sample_signature_spec(runner):
+    return runner.LogSignatureSpec(
+        mechanism_title="TECS altitude demand",
+        expected_signature=[
+            runner.ExpectedSignatureItem(
+                name="altitude tracking",
+                description="actual altitude follows setpoint",
+                signal="vehicle_local_position.z",
+            )
+        ],
+        candidate_windows=[
+            runner.WindowSpec(name="event", start_s=10.0, end_s=20.0, reason="transition window")
+        ],
+        required_signals=["vehicle_local_position.z"],
+        derived_signals=[],
+        events=[],
+        supporting_checks=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            runner.RelationshipCheckSpec(
+                type="compare",
+                signal="vehicle_local_position.z",
+                window="event",
+                metric="delta",
+                op="<=",
+                value=0.0,
+                supports="Altitude decreased during the event.",
+            )
+        ],
+        plot_requests=[],
+    )
+
+
+def _sample_report(runner, source_mechanism, signature_spec, plots):
+    return runner.FlightLogReport(
+        assumption_header="assumptions",
+        log_inventory_summary="inventory",
+        timeline_summary="timeline",
+        relevant_windows=["10-20s"],
+        ranked_hypotheses=[
+            runner.Hypothesis(
+                title="Altitude drop after transition",
+                known_px4_mechanism="TECS altitude demand",
+                mechanism="TECS changed altitude demand during transition.",
+                expected_logged_signature=signature_spec.expected_signature,
+                exclusion_checks=[],
+                numeric_checks=signature_spec.numeric_checks,
+                evidence=["Altitude decreased during the event."],
+                contradicting_evidence=[],
+                confidence="medium",
+                plots=plots,
+                code_references=source_mechanism.source_refs,
+                verifier_verdict="supported",
+                source_confirmed=True,
+                unresolved=[],
+            )
+        ],
+        confirmed=[],
+        unconfirmed=[],
+        final_summary="answered",
+    )
+
+
+def test_analyze_flight_log_runs_staged_v2_workflow(tmp_path):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"
     mission_path = tmp_path / "mission.plan"
     source_path = tmp_path / "PX4-Autopilot"
     output_dir = tmp_path / "outputs"
     dev_log_root = tmp_path / "dev_logs"
-    captured = {}
+    captured = []
+
+    draft = _sample_hypothesis_draft(runner)
+    source_mechanism = _sample_source_mechanism(runner)
+    signature_spec = _sample_signature_spec(runner)
+    final_report = _sample_report(runner, source_mechanism, signature_spec, plots=[])
 
     async def fake_run(agent, input, context, max_turns, hooks=None):
-        captured["agent"] = agent
-        captured["input"] = json.loads(input)
-        captured["context"] = context
-        captured["max_turns"] = max_turns
-        captured["hooks"] = hooks
-        return SimpleNamespace(final_output={"final_summary": "answered"})
+        captured.append(
+            {
+                "agent": agent,
+                "input": json.loads(input),
+                "context": context,
+                "max_turns": max_turns,
+                "hooks": hooks,
+            }
+        )
+        if agent is runner.hypothesis_drafter_agent:
+            return SimpleNamespace(final_output=runner.HypothesisDraftSet(hypotheses=[draft]))
+        if agent is runner.mechanism_resolver_agent:
+            return SimpleNamespace(final_output=source_mechanism)
+        if agent is runner.signature_builder_agent:
+            return SimpleNamespace(final_output=signature_spec)
+        if agent is runner.final_report_agent:
+            return SimpleNamespace(final_output=final_report)
+        raise AssertionError(f"unexpected agent: {agent}")
 
     runner.Runner.run = fake_run
 
@@ -591,9 +709,23 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
         runner,
         "parse_mission_file",
         return_value={"mission_file": str(mission_path), "items": []},
-    ) as parse_mission:
+    ) as parse_mission, patch.object(
+        runner,
+        "_evaluate_signature_for_runner",
+        return_value=runner.SignatureEvaluation(
+            mechanism_title="TECS altitude demand",
+            verdict="supported",
+            confidence_ceiling="high",
+            evidence=["Altitude decreased during the event."],
+            contradictions=[],
+            missing_required_signals=[],
+            check_results=[],
+            warnings=[],
+            raw={},
+        ),
+    ) as evaluate_signature:
         result = asyncio.run(
-            runner.analyze_flight_log_v1(
+            runner.analyze_flight_log(
                 log_path=str(log_path),
                 mission_path=str(mission_path),
                 source_path=str(source_path),
@@ -601,25 +733,35 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
                 dev_log_root=str(dev_log_root),
                 dev_run_id="web_run_001",
                 user_question="Why did it loiter before the waypoint?",
+                max_hypotheses=1,
             )
         )
 
+    evaluate_signature.assert_called_once()
     parse_inventory.assert_called_once_with(log_path)
     build_timeline.assert_called_once_with(log_path)
     infer_surface.assert_called_once_with(log_path, source_path)
     parse_mission.assert_called_once_with(mission_path)
 
-    assert result == {"final_summary": "answered"}
-    assert captured["agent"] is runner.flight_log_agent
-    assert captured["max_turns"] == 20
-    assert captured["hooks"] is not None
-    assert captured["context"] == runner.FlightLogContext(
-        log_path=log_path,
-        mission_path=mission_path,
-        source_path=source_path,
-        output_dir=output_dir,
+    assert result is final_report
+    assert [item["agent"] for item in captured] == [
+        runner.hypothesis_drafter_agent,
+        runner.mechanism_resolver_agent,
+        runner.signature_builder_agent,
+        runner.final_report_agent,
+    ]
+    assert [item["max_turns"] for item in captured] == [8, 12, 8, 8]
+    assert all(item["hooks"] is not None for item in captured)
+    assert all(
+        item["context"] == runner.FlightLogContext(
+            log_path=log_path,
+            mission_path=mission_path,
+            source_path=source_path,
+            output_dir=output_dir,
+        )
+        for item in captured
     )
-    assert captured["input"] == {
+    assert captured[0]["input"] == {
         "user_question": "Why did it loiter before the waypoint?",
         "log_inventory": {"available_topics": ["vehicle_status"]},
         "flight_timeline": [{"event": "initial_value"}],
@@ -628,65 +770,64 @@ def test_analyze_flight_log_v1_sends_user_question_and_context_to_agent(tmp_path
         "source_path": str(source_path),
         "suggestions_requested": False,
     }
-    assert output_dir.is_dir()
+    assert captured[1]["input"]["hypothesis_draft"]["title"] == "Altitude drop after transition"
+    assert captured[2]["input"]["source_mechanism"]["mechanism_name"] == "TECS altitude demand"
+    assert captured[3]["input"]["verified_hypothesis_packages"][0]["evaluation"]["verdict"] == "supported"
     run_dir = dev_log_root / "web_run_001"
+    assert output_dir.is_dir()
     assert run_dir.is_dir()
     assert (run_dir / "run_events.jsonl").is_file()
-    assert (run_dir / "usage.json").is_file()
-    assert json.loads((run_dir / "metadata.json").read_text())["report_path"] == str(
-        output_dir / "report.json"
-    )
+    metadata = json.loads((run_dir / "metadata.json").read_text())
+    assert metadata["runner_version"] == "v2_staged_verification"
+    assert metadata["report_path"] == str(output_dir / "report.json")
 
 
-def test_analyze_flight_log_v1_generates_plots_from_hypothesis_specs(tmp_path):
+def test_analyze_flight_log_generates_plots_from_v2_report(tmp_path):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"
     output_dir = tmp_path / "outputs"
     dev_log_root = tmp_path / "dev_logs"
     expected_plot_path = output_dir / "plots" / "altitude_drop.png"
 
-    report = runner.FlightLogReport(
-        assumption_header="assumptions",
-        log_inventory_summary="inventory",
-        timeline_summary="timeline",
-        relevant_windows=["10-20s"],
-        ranked_hypotheses=[
-            runner.Hypothesis(
-                title="Altitude drop after transition",
-                mechanism="Pitch demand changed during transition.",
-                evidence=["local z changed"],
-                contradicting_evidence=[],
-                confidence="medium",
-                plots=[
-                    runner.PlotRef(
-                        title="Altitude Drop",
-                        path="",
-                        purpose="Compare altitude estimate and setpoint during transition.",
-                        start_s=10.0,
-                        end_s=20.0,
-                        signals=[
-                            "vehicle_local_position.z",
-                            "vehicle_local_position_setpoint.z",
-                        ],
-                        overlays=[
-                            runner.PlotOverlay(
-                                start_s=12.5,
-                                label="transition",
-                                color="#d55e00",
-                            )
-                        ],
+    draft = _sample_hypothesis_draft(runner)
+    source_mechanism = _sample_source_mechanism(runner)
+    signature_spec = _sample_signature_spec(runner)
+    report = _sample_report(
+        runner,
+        source_mechanism,
+        signature_spec,
+        plots=[
+            runner.PlotRef(
+                title="Altitude Drop",
+                path="",
+                purpose="Compare altitude estimate and setpoint during transition.",
+                start_s=10.0,
+                end_s=20.0,
+                signals=[
+                    "vehicle_local_position.z",
+                    "vehicle_local_position_setpoint.z",
+                ],
+                overlays=[
+                    runner.PlotOverlay(
+                        start_s=12.5,
+                        label="transition",
+                        color="#d55e00",
                     )
                 ],
-                code_references=[],
             )
         ],
-        confirmed=[],
-        unconfirmed=[],
-        final_summary="summary",
     )
 
     async def fake_run(agent, input, context, max_turns, hooks=None):
-        return SimpleNamespace(final_output=report)
+        if agent is runner.hypothesis_drafter_agent:
+            return SimpleNamespace(final_output=runner.HypothesisDraftSet(hypotheses=[draft]))
+        if agent is runner.mechanism_resolver_agent:
+            return SimpleNamespace(final_output=source_mechanism)
+        if agent is runner.signature_builder_agent:
+            return SimpleNamespace(final_output=signature_spec)
+        if agent is runner.final_report_agent:
+            return SimpleNamespace(final_output=report)
+        raise AssertionError(f"unexpected agent: {agent}")
 
     runner.Runner.run = fake_run
 
@@ -706,6 +847,20 @@ def test_analyze_flight_log_v1_generates_plots_from_hypothesis_specs(tmp_path):
         runner,
         "parse_mission_file",
         return_value=None,
+    ), patch.object(
+        runner,
+        "_evaluate_signature_for_runner",
+        return_value=runner.SignatureEvaluation(
+            mechanism_title="TECS altitude demand",
+            verdict="supported",
+            confidence_ceiling="high",
+            evidence=["local z changed"],
+            contradictions=[],
+            missing_required_signals=[],
+            check_results=[],
+            warnings=[],
+            raw={},
+        ),
     ), patch.object(
         runner,
         "generate_signal_plot_impl",
@@ -731,11 +886,12 @@ def test_analyze_flight_log_v1_generates_plots_from_hypothesis_specs(tmp_path):
         },
     ) as plot_impl:
         result = asyncio.run(
-            runner.analyze_flight_log_v1(
+            runner.analyze_flight_log(
                 log_path=str(log_path),
                 output_dir=str(output_dir),
                 dev_log_root=str(dev_log_root),
                 user_question="Why did altitude drop after transition?",
+                max_hypotheses=1,
             )
         )
 
@@ -819,34 +975,112 @@ def test_generate_report_plots_warns_when_hypothesis_has_no_plot_spec(tmp_path):
     ]
 
 
-def test_flight_log_agent_instructions_require_hypothesis_plots_and_selected_overlays(tmp_path):
+def test_v2_agents_require_source_signature_verification_and_report_constraints(tmp_path):
     runner = load_runner(tmp_path)
 
-    instructions = runner.flight_log_agent.kwargs["instructions"]
+    signature_instructions = runner.signature_builder_agent.kwargs["instructions"]
+    report_instructions = runner.final_report_agent.kwargs["instructions"]
 
-    assert "Call verify_hypothesis_against_log for every hypothesis" in instructions
-    assert "known PX4 mechanism" in instructions
-    assert "expected logged signature" in instructions
-    assert "Use the verifier result as the log-evidence basis" in instructions
-    assert "For every hypothesis, include at least one plots entry" in instructions
-    assert "Set path to an empty string" in instructions
-    assert "generate the PNG after your final report" in instructions
-    assert "Decide which overlays are useful for each hypothesis plot" in instructions
-    assert "flight_timeline" in instructions
-    assert "compute_log_metrics transitions" in instructions
-    assert "avoid unrelated clutter" in instructions
+    assert "expected logged signature" in signature_instructions
+    assert "candidate windows" in signature_instructions
+    assert "required signals" in signature_instructions
+    assert "exclusion checks" in signature_instructions
+    assert "numeric checks" in signature_instructions
+    assert "plot requests" in signature_instructions
+    assert "evaluate_log_signature" in signature_instructions
+    assert "known PX4 mechanism" in report_instructions
+    assert "Confidence cannot exceed evaluation.confidence_ceiling" in report_instructions
+    assert "source_mechanism.mechanism_confirmed is false" in report_instructions
+    assert "Do not introduce new hypotheses" in report_instructions
+
+
+def test_run_agent_retries_rate_limit_errors(tmp_path):
+    runner = load_runner(tmp_path)
+    ctx = runner.FlightLogContext(
+        log_path=tmp_path / "flight.ulg",
+        mission_path=None,
+        source_path=None,
+        output_dir=tmp_path / "outputs",
+    )
+    calls = []
+    sleeps = []
+
+    async def fake_run(agent, input, context, max_turns, hooks=None):
+        calls.append(json.loads(input))
+        if len(calls) == 1:
+            raise RuntimeError(
+                "Rate limit reached for gpt-4.1 on tokens per min (TPM). "
+                "Please try again in 210ms."
+            )
+        return SimpleNamespace(final_output={"ok": True}, new_items=[])
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    runner.Runner.run = fake_run
+
+    with patch.object(runner.asyncio, "sleep", fake_sleep):
+        result = asyncio.run(
+            runner._run_agent(
+                audit_logger=None,
+                stage_name="draft_hypotheses",
+                agent=runner.hypothesis_drafter_agent,
+                payload={"user_question": "why"},
+                ctx=ctx,
+                max_turns=8,
+            )
+        )
+
+    assert result == {"ok": True}
+    assert len(calls) == 2
+    assert sleeps == [0.21]
+
+
+def test_run_agent_does_not_retry_non_rate_limit_errors(tmp_path):
+    runner = load_runner(tmp_path)
+    ctx = runner.FlightLogContext(
+        log_path=tmp_path / "flight.ulg",
+        mission_path=None,
+        source_path=None,
+        output_dir=tmp_path / "outputs",
+    )
+    calls = []
+
+    async def fake_run(agent, input, context, max_turns, hooks=None):
+        calls.append(json.loads(input))
+        raise RuntimeError("schema validation failed")
+
+    runner.Runner.run = fake_run
+
+    try:
+        asyncio.run(
+            runner._run_agent(
+                audit_logger=None,
+                stage_name="draft_hypotheses",
+                agent=runner.hypothesis_drafter_agent,
+                payload={"user_question": "why"},
+                ctx=ctx,
+                max_turns=8,
+            )
+        )
+    except RuntimeError as exc:
+        assert "schema validation failed" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert len(calls) == 1
 
 
 def test_runner_imports_with_real_sdk_function_tool_schema():
     result = subprocess.run(
-        [sys.executable, "-c", "import runner; print(runner.flight_log_agent.name)"],
+        [sys.executable, "-c", "import runner; print(runner.analyze_flight_log.__name__)"],
         capture_output=True,
         text=True,
         timeout=20,
     )
 
     assert result.returncode == 0, result.stderr
-    assert "PX4 Flight Log Analyst V1" in result.stdout
+    assert "analyze_flight_log_v2" in result.stdout
 
 
 def test_infer_control_surface_maps_ca_servo_types_to_pwm_outputs(tmp_path, monkeypatch):
@@ -1516,55 +1750,125 @@ def test_verify_hypothesis_against_log_reports_contradictions_and_missing_signal
     assert result["confidence"] == "low"
 
 
-def test_runner_verify_hypothesis_against_log_delegates_to_verifier_module(tmp_path):
-    runner = load_runner(tmp_path)
-    ctx = make_ctx(runner, tmp_path)
+def test_evaluate_log_signature_supports_generic_compare_and_tracking_error(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_local_position",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "z": [100.0, 99.0, 98.0],
+                    },
+                ),
+                SimpleNamespace(
+                    name="vehicle_local_position_setpoint",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "z": [100.0, 100.0, 100.0],
+                    },
+                ),
+                SimpleNamespace(
+                    name="tecs_status",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "throttle_sp": [0.8, 0.85, 0.9],
+                    },
+                ),
+            ]
 
-    with patch.object(
-        runner,
-        "verify_hypothesis_against_log_impl",
-        return_value={"confidence": "medium"},
-    ) as verify_impl:
-        result = runner.verify_hypothesis_against_log(
-            ctx,
-            mechanism="mechanism",
-            expected_signature=[
-                runner.VerifierSignatureItem(name="signature", description="expected behavior")
-            ],
-            candidate_windows=[
-                runner.VerifierWindow(name="event", start_s=1.0, end_s=2.0)
-            ],
-            required_signals=["vehicle_status.nav_state"],
-            exclusion_checks=[],
-            numeric_checks=[
-                runner.VerifierCheck(
-                    type="transition_occurs",
-                    signal="vehicle_status.nav_state",
-                    window="event",
-                    from_value=3,
-                    to_value=4,
-                )
-            ],
-        )
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
 
-    verify_impl.assert_called_once_with(
-        ctx.context.log_path,
-        "mechanism",
-        [{"name": "signature", "description": "expected behavior"}],
-        [{"name": "event", "start_s": 1.0, "end_s": 2.0}],
-        ["vehicle_status.nav_state"],
-        [],
-        [
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism_title="TECS demanded high throttle while altitude tracked setpoint.",
+        expected_signature=[],
+        candidate_windows=[{"name": "event", "start_s": 1.0, "end_s": 3.0}],
+        required_signals=[
+            "vehicle_local_position.z",
+            "vehicle_local_position_setpoint.z",
+            "tecs_status.throttle_sp",
+        ],
+        derived_signals=[],
+        events=[],
+        supporting_checks=[
             {
-                "type": "transition_occurs",
+                "type": "compare",
+                "signal": "tecs_status.throttle_sp",
                 "window": "event",
-                "signal": "vehicle_status.nav_state",
-                "from": 3,
-                "to": 4,
+                "metric": "mean",
+                "op": ">=",
+                "value": 0.8,
+                "supports": "Throttle demand was high.",
+            }
+        ],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "tracking_error",
+                "actual": "vehicle_local_position.z",
+                "setpoint": "vehicle_local_position_setpoint.z",
+                "window": "event",
+                "max_error": 2.1,
+                "supports": "Altitude remained close to setpoint.",
             }
         ],
     )
-    assert result == {"confidence": "medium"}
+
+    assert result["verdict"] == "supported"
+    assert result["confidence_ceiling"] == "high"
+    assert result["missing_required_signals"] == []
+    assert result["evidence"] == [
+        "Throttle demand was high.",
+        "Altitude remained close to setpoint.",
+    ]
+    assert result["contradictions"] == []
+    assert result["check_results"][1]["value"]["max_abs_error"] == 2.0
+
+
+def test_evaluate_log_signature_reports_contradictions_and_missing_signals(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.data_list = [
+                SimpleNamespace(
+                    name="tecs_status",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "throttle_sp": [0.2, 0.25],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism_title="High throttle caused altitude loss.",
+        expected_signature=[],
+        candidate_windows=[{"name": "event", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=["tecs_status.throttle_sp", "vehicle_air_data.baro_alt_meter"],
+        derived_signals=[],
+        events=[],
+        supporting_checks=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "compare",
+                "signal": "tecs_status.throttle_sp",
+                "window": "event",
+                "metric": "mean",
+                "op": ">=",
+                "value": 0.8,
+                "contradicts": "Throttle demand was low.",
+            }
+        ],
+    )
+
+    assert result["verdict"] == "contradicted"
+    assert result["confidence_ceiling"] == "low"
+    assert result["required_signals"]["present"] == ["tecs_status.throttle_sp"]
+    assert result["missing_required_signals"] == ["vehicle_air_data.baro_alt_meter"]
+    assert result["contradictions"] == ["Throttle demand was low."]
 
 
 def test_resolve_signal_extracts_windowed_numeric_values():

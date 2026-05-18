@@ -88,8 +88,23 @@ def test_analysis_event_message_maps_run_progress_events():
     })["message"] == "Computing log metrics"
     assert analysis_event_message({
         "event": "tool.started",
-        "tool_name": "verify_hypothesis_against_log",
-    })["message"] == "Verifying hypothesis against log"
+        "tool_name": "evaluate_log_signature",
+    })["message"] == "Verifying log signature"
+    assert analysis_event_message({
+        "event": "agent.draft_hypotheses.started",
+    })["message"] == "Drafting candidate hypotheses"
+    assert analysis_event_message({
+        "event": "agent.resolve_mechanism_1.finished",
+    })["message"] == "Resolved PX4 source mechanism"
+    assert analysis_event_message({
+        "event": "agent.build_signature_1.retrying",
+    })["message"] == "Retrying building log signature checks"
+    assert analysis_event_message({
+        "event": "verification.finished",
+    })["message"] == "Verified log signature"
+    assert analysis_event_message({
+        "event": "validation_after_repair.finished",
+    })["message"] == "Validated repaired report"
     assert analysis_event_message({
         "event": "postprocess_plot.started",
         "name": "generate_signal_plot",

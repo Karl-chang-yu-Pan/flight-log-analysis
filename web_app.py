@@ -355,6 +355,8 @@ def analysis_event_message(event: dict[str, Any]) -> dict[str, Any] | None:
         message = "Analysis complete"
     elif event_name == "run.failed":
         message = "Analysis failed"
+    elif event_name.startswith("agent."):
+        message = agent_progress_message(event_name)
     elif event_name == "prepass.started":
         message = {
             "parse_ulog_inventory": "Parsing log inventory",
@@ -377,6 +379,14 @@ def analysis_event_message(event: dict[str, Any]) -> dict[str, Any] | None:
         message = tool_progress_message(str(tool_name), started=True)
     elif event_name == "tool.finished":
         message = tool_progress_message(str(tool_name), started=False)
+    elif event_name == "verification.started":
+        message = "Verifying log signature"
+    elif event_name == "verification.finished":
+        message = "Verified log signature"
+    elif event_name == "validation.finished":
+        message = "Validated report"
+    elif event_name == "validation_after_repair.finished":
+        message = "Validated repaired report"
     elif event_name == "postprocess_plot.started":
         message = "Generating report plots"
     elif event_name == "postprocess_plot.finished":
@@ -394,14 +404,47 @@ def analysis_event_message(event: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def agent_progress_message(event_name: str) -> str | None:
+    parts = event_name.split(".")
+    if len(parts) < 3:
+        return None
+
+    stage = parts[1]
+    status = parts[2]
+    started = status == "started"
+    finished = status == "finished"
+    retrying = status == "retrying"
+    failed = status == "failed"
+
+    stage_messages = [
+        ("draft_hypotheses", "Drafting candidate hypotheses", "Drafted candidate hypotheses"),
+        ("resolve_mechanism_", "Resolving PX4 source mechanism", "Resolved PX4 source mechanism"),
+        ("build_signature_", "Building log signature checks", "Built log signature checks"),
+        ("final_report", "Writing final report", "Wrote final report"),
+        ("repair_report", "Repairing report", "Repaired report"),
+    ]
+    for prefix, started_message, finished_message in stage_messages:
+        if stage == prefix or stage.startswith(prefix):
+            if retrying:
+                return f"Retrying {started_message[0].lower()}{started_message[1:]}"
+            if failed:
+                return f"Failed while {started_message[0].lower()}{started_message[1:]}"
+            if started:
+                return started_message
+            if finished:
+                return finished_message
+
+    return None
+
+
 def tool_progress_message(tool_name: str, *, started: bool) -> str:
     action = "Finished" if not started else None
     if tool_name == "compute_log_metrics":
         return "Computing log metrics" if started else "Computed log metrics"
     if tool_name == "generate_signal_plot":
         return "Generating plot" if started else "Generated plot"
-    if tool_name == "verify_hypothesis_against_log":
-        return "Verifying hypothesis against log" if started else "Verified hypothesis against log"
+    if tool_name == "evaluate_log_signature":
+        return "Verifying log signature" if started else "Verified log signature"
     if tool_name == "search_px4_source":
         return "Searching PX4 source" if started else "Searched PX4 source"
     if tool_name == "checkout_px4_source":
@@ -437,13 +480,13 @@ def resolve_artifact_path(path_value: str) -> Path:
 def _run_analysis_job(run_id: str, user_question: str) -> None:
     _update_analysis_run(run_id, status="running", started_at=time.time())
     try:
-        from runner import analyze_flight_log_v1
+        from runner import analyze_flight_log
 
         with ANALYSIS_RUNS_LOCK:
             run = dict(ANALYSIS_RUNS[run_id])
 
         report = asyncio.run(
-            analyze_flight_log_v1(
+            analyze_flight_log(
                 log_path=run["log_path"],
                 user_question=user_question,
                 mission_path=run["mission_path"],
