@@ -83,28 +83,43 @@ def test_analysis_event_message_maps_run_progress_events():
         "message": "Parsing log inventory",
     }
     assert analysis_event_message({
-        "event": "tool.started",
-        "tool_name": "compute_log_metrics",
-    })["message"] == "Computing log metrics"
+        "event": "agent.question_intent.started",
+    })["message"] == "Normalizing question intent"
     assert analysis_event_message({
-        "event": "tool.started",
-        "tool_name": "evaluate_log_signature",
+        "event": "agent.resolve_mechanisms.finished",
+    })["message"] == "Resolved PX4 source mechanisms"
+    assert analysis_event_message({
+        "event": "agent.final_report.retrying",
+    })["message"] == "Retrying writing final report"
+    assert analysis_event_message({
+        "event": "source.started",
+        "name": "bounded_source_search",
+    })["message"] == "Searching PX4 source"
+    assert analysis_event_message({
+        "event": "source.finished",
+        "name": "checkout_px4_source_revision",
+    })["message"] == "Checked out PX4 source revision"
+    assert analysis_event_message({
+        "event": "mechanism_cache.started",
+        "name": "retrieve_mechanisms",
+    })["message"] == "Retrieving cached mechanisms"
+    assert analysis_event_message({
+        "event": "mechanism_cache.finished",
+        "name": "validate_mechanism_source:tecs",
+    })["message"] == "Finished mechanism cache step: validate_mechanism_source:tecs"
+    assert analysis_event_message({
+        "event": "applicability.started",
+        "name": "evaluate_applicability:TECS",
+    })["message"] == "Running mechanism applicability check: evaluate_applicability:TECS"
+    assert analysis_event_message({
+        "event": "verification.started",
     })["message"] == "Verifying log signature"
-    assert analysis_event_message({
-        "event": "agent.draft_hypotheses.started",
-    })["message"] == "Drafting candidate hypotheses"
-    assert analysis_event_message({
-        "event": "agent.resolve_mechanism_1.finished",
-    })["message"] == "Resolved PX4 source mechanism"
-    assert analysis_event_message({
-        "event": "agent.build_signature_1.retrying",
-    })["message"] == "Retrying building log signature checks"
     assert analysis_event_message({
         "event": "verification.finished",
     })["message"] == "Verified log signature"
     assert analysis_event_message({
-        "event": "validation_after_repair.finished",
-    })["message"] == "Validated repaired report"
+        "event": "validation_after_downgrade.finished",
+    })["message"] == "Validated downgraded report"
     assert analysis_event_message({
         "event": "postprocess_plot.started",
         "name": "generate_signal_plot",
@@ -116,15 +131,15 @@ def test_build_analysis_progress_uses_latest_progress_message():
         "running",
         [
             {"event": "run.started"},
-            {"event": "llm.started"},
-            {"event": "tool.started", "tool_name": "search_px4_source"},
+            {"event": "agent.question_intent.started"},
+            {"event": "source.started", "name": "bounded_source_search"},
         ],
     )
 
     assert progress["phase"] == "Searching PX4 source"
     assert [message["message"] for message in progress["messages"]] == [
         "Started analysis run",
-        "Analyzing with agent",
+        "Normalizing question intent",
         "Searching PX4 source",
     ]
 

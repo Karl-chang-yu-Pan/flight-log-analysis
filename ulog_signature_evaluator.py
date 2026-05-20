@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from pathlib import Path
 from statistics import mean, median, pstdev
 from typing import Any
@@ -8,574 +9,426 @@ from typing import Any
 from pyulog import ULog
 
 
+NUMERIC_METRICS = {"min", "max", "mean", "median", "std", "start", "end", "delta", "count"}
+
+
 def evaluate_log_signature(
     log_path: Path,
-    mechanism_title: str,
+    mechanism: str,
     expected_signature: list[dict],
     candidate_windows: list[dict],
     required_signals: list[str],
-    derived_signals: list[dict],
-    events: list[dict],
-    supporting_checks: list[dict],
     exclusion_checks: list[dict],
     numeric_checks: list[dict],
 ) -> dict:
     try:
         ulog = ULog(str(log_path))
     except Exception as exc:
-        return {
-            "mechanism_title": mechanism_title,
-            "expected_signature": expected_signature,
-            "required_signals": {"present": [], "missing": list(required_signals)},
-            "missing_required_signals": list(required_signals),
-            "window_results": [],
-            "check_results": [],
-            "evidence": [],
-            "contradictions": [],
-            "warnings": [f"failed to parse ULog: {exc}"],
-            "verdict": "unresolved",
-            "confidence_ceiling": "unresolved",
-            "summary": "Signature evaluator could not inspect the log.",
-        }
+        return _evaluation_result(
+            mechanism=mechanism,
+            expected_signature=expected_signature,
+            present=[],
+            missing=list(required_signals),
+            window_results=[],
+            numeric_results=[],
+            exclusion_results=[],
+            evidence=[],
+            contradictions=[],
+            unresolved=[f"failed to parse ULog: {exc}"],
+            warnings=[f"failed to parse ULog: {exc}"],
+        )
 
     topics = _topics_by_name(ulog)
     windows = _normalize_windows(candidate_windows)
-    event_index = _normalize_events(events)
     present, missing = _required_signal_status(topics, required_signals)
-    warnings = _derived_signal_warnings(derived_signals)
+    window_results = [
+        {
+            "name": window["name"],
+            "start_s": window["start_s"],
+            "end_s": window["end_s"],
+        }
+        for window in windows.values()
+    ]
 
-    check_results = []
-    for category, checks in (
-        ("supporting", supporting_checks),
-        ("numeric", numeric_checks),
-        ("exclusion", exclusion_checks),
-    ):
-        for check in checks or []:
-            check_results.append(_run_check(topics, windows, event_index, check, category))
+    numeric_results = [
+        _run_check(topics, windows, check, category="numeric")
+        for check in numeric_checks
+    ]
+    exclusion_results = [
+        _run_check(topics, windows, check, category="exclusion")
+        for check in exclusion_checks
+    ]
 
-    evidence = [
-        result["message"]
-        for result in check_results
-        if result["status"] == "passed"
-    ]
-    contradictions = [
-        result["message"]
-        for result in check_results
-        if result["status"] == "failed"
-    ]
-    unresolved = [
-        result["message"]
-        for result in check_results
-        if result["status"] == "unresolved"
-    ]
+    evidence = []
+    contradictions = []
+    unresolved = []
+    for result in [*numeric_results, *exclusion_results]:
+        if result["status"] == "passed":
+            evidence.append(result["message"])
+        elif result["status"] == "failed":
+            contradictions.append(result["message"])
+        else:
+            unresolved.append(result["message"])
 
     for signal in missing:
         unresolved.append(f"required signal is missing: {signal}")
 
-    verdict, ceiling = _verdict(evidence, contradictions, unresolved, missing)
-    return {
-        "mechanism_title": mechanism_title,
-        "expected_signature": expected_signature,
-        "required_signals": {
-            "present": present,
-            "missing": missing,
-        },
-        "missing_required_signals": missing,
-        "window_results": list(windows.values()),
-        "event_results": list(event_index.values()),
-        "check_results": check_results,
-        "evidence": evidence,
-        "contradictions": contradictions,
-        "unresolved": unresolved,
-        "warnings": warnings,
-        "verdict": verdict,
-        "confidence_ceiling": ceiling,
-        "summary": (
-            f"Signature verdict is {verdict}: {len(evidence)} supporting checks, "
-            f"{len(contradictions)} contradicting checks, {len(unresolved)} unresolved checks."
-        ),
-    }
+    return _evaluation_result(
+        mechanism=mechanism,
+        expected_signature=expected_signature,
+        present=present,
+        missing=missing,
+        window_results=window_results,
+        numeric_results=numeric_results,
+        exclusion_results=exclusion_results,
+        evidence=evidence,
+        contradictions=contradictions,
+        unresolved=unresolved,
+        warnings=[],
+    )
 
 
 def _run_check(
     topics: dict[str, Any],
     windows: dict[str, dict],
-    events: dict[str, dict],
     check: dict,
+    *,
     category: str,
 ) -> dict:
     check_type = str(check.get("type") or "").strip()
     handlers = {
-        "compare": _check_compare,
-        "tracking_error": _check_tracking_error,
-        "setpoint_actual_separation": _check_setpoint_actual_separation,
-        "before_after_delta": _check_before_after_delta,
-        "threshold_fraction": _check_threshold_fraction,
-        "saturation": _check_saturation,
-        "event_alignment": _check_event_alignment,
-        "rate_of_change": _check_rate_of_change,
-        "correlation": _check_correlation,
-        "lagged_correlation": _check_correlation,
+        "threshold": _check_threshold,
+        "transition_occurs": _check_transition_occurs,
+        "no_transition": _check_no_transition,
+        "state_equals": _check_state_equals,
+        "state_not_equals": _check_state_not_equals,
+        "tracks_setpoint": _check_tracks_setpoint,
+        "diverges_from_setpoint": _check_diverges_from_setpoint,
         "monotonic_change": _check_monotonic_change,
-        "missing_signal": _check_missing_signal,
+        "same_direction_change": _check_same_direction_change,
     }
     handler = handlers.get(check_type)
     if handler is None:
         return _check_result(
             check,
-            category,
-            "unresolved",
-            f"unsupported {category} check type: {check_type or 'missing'}",
+            status="unresolved",
+            message=f"unsupported {category} check type: {check_type or 'missing'}",
         )
 
     try:
-        return handler(topics, windows, events, check, category)
+        result = handler(topics, windows, check)
     except Exception as exc:
+        result = _check_result(
+            check,
+            status="unresolved",
+            message=f"{check_type} check could not be evaluated: {exc}",
+        )
+    result["category"] = category
+    return result
+
+
+def _check_threshold(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    signal = str(check.get("signal") or "")
+    samples_result = _check_samples(topics, windows, check, signal)
+    if "result" in samples_result:
+        return samples_result["result"]
+
+    samples = samples_result["samples"]
+    metric_name = str(check.get("metric") or "mean")
+    metrics = _sample_metrics(samples)
+    if metric_name not in metrics:
         return _check_result(
             check,
-            category,
-            "unresolved",
-            f"{check_type} check could not be evaluated: {exc}",
+            status="unresolved",
+            message=f"unsupported threshold metric '{metric_name}' for {signal}",
         )
 
-
-def _check_compare(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, dict],
-    check: dict,
-    category: str,
-) -> dict:
-    left_signal = str(check.get("left") or check.get("signal") or "")
-    left = _metric_value(topics, windows, check, left_signal)
-    if "result" in left:
-        return left["result"]
-
-    right_signal = check.get("right")
-    if right_signal:
-        right = _metric_value(topics, windows, check, str(right_signal))
-        if "result" in right:
-            return right["result"]
-        expected = right["value"]
-    else:
-        expected = _safe_float(check.get("value"))
-
-    if expected is None:
-        return _check_result(check, category, "unresolved", "compare value is missing")
-
     op = str(check.get("op") or ">=").strip()
-    passed = _compare(left["value"], op, expected, check)
-    return _checked(
+    actual = metrics[metric_name]
+    expected = _safe_float(check.get("value"))
+    if op in ("between", "outside"):
+        lower = _safe_float(check.get("lower"))
+        upper = _safe_float(check.get("upper"))
+        if lower is None or upper is None:
+            return _check_result(check, status="unresolved", message=f"{op} threshold requires lower and upper")
+        passed = lower <= actual <= upper
+        if op == "outside":
+            passed = not passed
+        expected_label = f"{lower}..{upper}"
+    else:
+        if expected is None:
+            return _check_result(check, status="unresolved", message="threshold value is missing")
+        passed = _compare(actual, op, expected)
+        expected_label = str(expected)
+    message = _message(
         check,
-        category,
         passed,
-        f"{left_signal} {left['metric']} {left['value']} {op} {expected}",
-        {
-            "left": left_signal,
-            "metric": left["metric"],
-            "actual": left["value"],
-            "op": op,
-            "expected": expected,
-        },
+        f"{signal} {metric_name} {actual} {op} {expected_label}",
+    )
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value={"metric": metric_name, "actual": actual, "op": op, "expected": expected_label},
     )
 
 
-def _check_tracking_error(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, dict],
-    check: dict,
-    category: str,
-) -> dict:
-    error_result = _aligned_errors(topics, windows, check)
+def _check_transition_occurs(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    signal = str(check.get("signal") or "")
+    samples_result = _check_samples(topics, windows, check, signal)
+    if "result" in samples_result:
+        return samples_result["result"]
+
+    transitions = _transitions(samples_result["samples"])
+    expected_from = check.get("from")
+    if expected_from is None:
+        expected_from = check.get("from_value")
+    expected_to = check.get("to")
+    if expected_to is None:
+        expected_to = check.get("to_value")
+    passed = any(
+        (expected_from is None or transition.get("from") == expected_from)
+        and (expected_to is None or transition.get("to") == expected_to)
+        for transition in transitions
+    )
+    message = _message(check, passed, f"{signal} transitions: {transitions}")
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value={"transitions": transitions},
+    )
+
+
+def _check_no_transition(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    signal = str(check.get("signal") or "")
+    samples_result = _check_samples(topics, windows, check, signal)
+    if "result" in samples_result:
+        return samples_result["result"]
+
+    transitions = _transitions(samples_result["samples"])
+    passed = not transitions
+    message = _message(check, passed, f"{signal} transitions: {transitions}")
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value={"transitions": transitions},
+    )
+
+
+def _check_state_equals(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    signal = str(check.get("signal") or "")
+    samples_result = _check_samples(topics, windows, check, signal)
+    if "result" in samples_result:
+        return samples_result["result"]
+
+    target = check.get("value")
+    values = [value for _, value in samples_result["samples"]]
+    mode = str(check.get("mode") or "any")
+    passed = all(value == target for value in values) if mode == "all" else any(value == target for value in values)
+    message = _message(check, passed, f"{signal} values include {dict(Counter(values))}")
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value={"target": target, "mode": mode, "counts": dict(Counter(values))},
+    )
+
+
+def _check_state_not_equals(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    signal = str(check.get("signal") or "")
+    samples_result = _check_samples(topics, windows, check, signal)
+    if "result" in samples_result:
+        return samples_result["result"]
+
+    target = check.get("value")
+    values = [value for _, value in samples_result["samples"]]
+    passed = all(value != target for value in values)
+    message = _message(check, passed, f"{signal} values include {dict(Counter(values))}")
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value={"target": target, "counts": dict(Counter(values))},
+    )
+
+
+def _check_tracks_setpoint(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    error_result = _aligned_error(topics, windows, check)
     if "result" in error_result:
         return error_result["result"]
 
     max_error = _safe_float(check.get("max_error"))
     if max_error is None:
-        return _check_result(check, category, "unresolved", "max_error is missing")
+        return _check_result(check, status="unresolved", message="max_error is missing")
 
-    max_abs_error = max(abs(error) for error in error_result["errors"])
-    passed = max_abs_error <= max_error
-    return _checked(
+    abs_errors = [abs(error) for error in error_result["errors"]]
+    actual_max = max(abs_errors)
+    passed = actual_max <= max_error
+    message = _message(check, passed, f"max absolute tracking error {actual_max} <= {max_error}")
+    return _check_result(
         check,
-        category,
-        passed,
-        f"max tracking error {max_abs_error} <= {max_error}",
-        {"max_abs_error": _round_float(max_abs_error), "max_error": max_error},
+        status="passed" if passed else "failed",
+        message=message,
+        value={"max_abs_error": _round_float(actual_max), "max_error": max_error},
     )
 
 
-def _check_setpoint_actual_separation(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, dict],
-    check: dict,
-    category: str,
-) -> dict:
-    error_result = _aligned_errors(topics, windows, check)
+def _check_diverges_from_setpoint(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    error_result = _aligned_error(topics, windows, check)
     if "result" in error_result:
         return error_result["result"]
 
-    threshold = _safe_float(check.get("min_delta"))
-    if threshold is None:
-        threshold = _safe_float(check.get("value"))
-    if threshold is None:
-        return _check_result(check, category, "unresolved", "separation threshold is missing")
+    min_error = _safe_float(check.get("min_error"))
+    if min_error is None:
+        return _check_result(check, status="unresolved", message="min_error is missing")
 
-    max_abs_error = max(abs(error) for error in error_result["errors"])
-    passed = max_abs_error >= threshold
-    return _checked(
+    direction = str(check.get("direction") or "absolute")
+    errors = error_result["errors"]
+    if direction == "below":
+        relevant_errors = [-error for error in errors]
+    elif direction == "above":
+        relevant_errors = errors
+    else:
+        relevant_errors = [abs(error) for error in errors]
+
+    actual_max = max(relevant_errors)
+    passed = actual_max >= min_error
+    message = _message(check, passed, f"setpoint divergence {actual_max} >= {min_error}")
+    return _check_result(
         check,
-        category,
-        passed,
-        f"max setpoint/actual separation {max_abs_error} >= {threshold}",
-        {"max_abs_error": _round_float(max_abs_error), "threshold": threshold},
+        status="passed" if passed else "failed",
+        message=message,
+        value={
+            "direction": direction,
+            "max_relevant_error": _round_float(actual_max),
+            "min_error": min_error,
+        },
     )
 
 
-def _check_before_after_delta(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, dict],
-    check: dict,
-    category: str,
-) -> dict:
-    signal = str(check.get("signal") or check.get("left") or "")
-    samples_result = _check_samples(topics, windows, check, signal)
-    if "result" in samples_result:
-        return samples_result["result"]
-
-    samples = [(t, float(v)) for t, v in samples_result["samples"] if _is_number(v)]
-    if len(samples) < 2:
-        return _check_result(check, category, "unresolved", f"not enough numeric samples for {signal}")
-
-    split_time = _event_time(events, check.get("event"))
-    if split_time is None:
-        window = samples_result["window"]
-        split_time = (window["start_s"] + window["end_s"]) / 2.0
-
-    before = [value for time_s, value in samples if time_s <= split_time]
-    after = [value for time_s, value in samples if time_s > split_time]
-    if not before or not after:
-        return _check_result(check, category, "unresolved", f"cannot split {signal} before/after event")
-
-    delta = mean(after) - mean(before)
-    threshold = _safe_float(check.get("min_delta"))
-    if threshold is None:
-        threshold = _safe_float(check.get("value")) or 0.0
-    op = str(check.get("op") or ">=").strip()
-    passed = _compare(delta, op, threshold, check)
-    return _checked(
-        check,
-        category,
-        passed,
-        f"{signal} before/after delta {delta} {op} {threshold}",
-        {"delta": _round_float(delta), "op": op, "threshold": threshold},
-    )
-
-
-def _check_threshold_fraction(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, dict],
-    check: dict,
-    category: str,
-) -> dict:
+def _check_monotonic_change(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
     signal = str(check.get("signal") or "")
     samples_result = _check_samples(topics, windows, check, signal)
     if "result" in samples_result:
         return samples_result["result"]
 
-    values = [float(value) for _, value in samples_result["samples"] if _is_number(value)]
-    threshold = _safe_float(check.get("value"))
-    if threshold is None:
-        return _check_result(check, category, "unresolved", "threshold_fraction value is missing")
-    if not values:
-        return _check_result(check, category, "unresolved", f"no numeric samples for {signal}")
+    values = [_number(value) for _, value in samples_result["samples"]]
+    values = [value for value in values if value is not None]
+    if len(values) < 2:
+        return _check_result(check, status="unresolved", message=f"not enough numeric samples for {signal}")
 
-    op = str(check.get("op") or ">=").strip()
-    fraction = sum(1 for value in values if _compare(value, op, threshold, check)) / len(values)
-    required_fraction = _safe_float(check.get("lower"))
-    if required_fraction is None:
-        required_fraction = 0.5
-    passed = fraction >= required_fraction
-    return _checked(
+    direction = str(check.get("direction") or "increase")
+    min_delta = _safe_float(check.get("min_delta")) or 0.0
+    delta = values[-1] - values[0]
+    passed = delta >= min_delta if direction == "increase" else delta <= -min_delta
+    message = _message(check, passed, f"{signal} delta {delta} direction {direction}")
+    return _check_result(
         check,
-        category,
-        passed,
-        f"{signal} fraction {fraction} satisfying {op} {threshold} >= {required_fraction}",
-        {"fraction": _round_float(fraction), "required_fraction": required_fraction},
+        status="passed" if passed else "failed",
+        message=message,
+        value={"delta": _round_float(delta), "direction": direction, "min_delta": min_delta},
     )
 
 
-def _check_saturation(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, dict],
-    check: dict,
-    category: str,
-) -> dict:
-    signal = str(check.get("signal") or "")
-    samples_result = _check_samples(topics, windows, check, signal)
-    if "result" in samples_result:
-        return samples_result["result"]
+def _check_same_direction_change(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    first = str(check.get("first") or "")
+    second = str(check.get("second") or "")
+    first_result = _check_samples(topics, windows, check, first)
+    if "result" in first_result:
+        return first_result["result"]
+    second_result = _check_samples(topics, windows, check, second)
+    if "result" in second_result:
+        return second_result["result"]
 
-    values = [float(value) for _, value in samples_result["samples"] if _is_number(value)]
-    if not values:
-        return _check_result(check, category, "unresolved", f"no numeric samples for {signal}")
+    first_delta = _numeric_delta(first_result["samples"])
+    second_delta = _numeric_delta(second_result["samples"])
+    min_delta = _safe_float(check.get("min_delta")) or 0.0
+    if first_delta is None or second_delta is None:
+        return _check_result(check, status="unresolved", message="same_direction_change needs numeric samples")
 
-    lower = _safe_float(check.get("lower"))
-    upper = _safe_float(check.get("upper"))
-    if lower is None and upper is None:
-        return _check_result(check, category, "unresolved", "saturation lower or upper bound is missing")
-
-    saturated = []
-    for value in values:
-        saturated.append((lower is not None and value <= lower) or (upper is not None and value >= upper))
-
-    fraction = sum(1 for value in saturated if value) / len(saturated)
-    required_fraction = _safe_float(check.get("value")) or 0.1
-    passed = fraction >= required_fraction
-    return _checked(
+    passed = abs(first_delta) >= min_delta and abs(second_delta) >= min_delta and first_delta * second_delta > 0
+    message = _message(check, passed, f"{first} delta {first_delta}; {second} delta {second_delta}")
+    return _check_result(
         check,
-        category,
-        passed,
-        f"{signal} saturation fraction {fraction} >= {required_fraction}",
-        {"fraction": _round_float(fraction), "required_fraction": required_fraction},
+        status="passed" if passed else "failed",
+        message=message,
+        value={
+            "first_delta": _round_float(first_delta),
+            "second_delta": _round_float(second_delta),
+            "min_delta": min_delta,
+        },
     )
 
 
-def _check_event_alignment(
+def _aligned_error(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+    actual = str(check.get("actual") or "")
+    setpoint = str(check.get("setpoint") or "")
+    actual_result = _check_samples(topics, windows, check, actual)
+    if "result" in actual_result:
+        return actual_result
+    setpoint_result = _check_samples(topics, windows, check, setpoint)
+    if "result" in setpoint_result:
+        return setpoint_result
+
+    setpoint_samples = [
+        (time_s, number)
+        for time_s, value in setpoint_result["samples"]
+        if (number := _number(value)) is not None
+    ]
+    setpoint_times = [time_s for time_s, _ in setpoint_samples]
+    setpoint_values = [value for _, value in setpoint_samples]
+    if not setpoint_times:
+        return {"result": _check_result(check, status="unresolved", message=f"no numeric setpoint samples for {setpoint}")}
+
+    errors = []
+    for time_s, value in actual_result["samples"]:
+        actual_value = _number(value)
+        if actual_value is None or time_s < setpoint_times[0] or time_s > setpoint_times[-1]:
+            continue
+        setpoint_value = _interpolated_value(setpoint_times, setpoint_values, time_s)
+        if setpoint_value is not None:
+            errors.append(actual_value - setpoint_value)
+
+    if not errors:
+        return {"result": _check_result(check, status="unresolved", message=f"no overlapping samples for {actual} and {setpoint}")}
+
+    return {"errors": errors}
+
+
+def _check_samples(
     topics: dict[str, Any],
     windows: dict[str, dict],
-    events: dict[str, dict],
     check: dict,
-    category: str,
+    signal: str,
 ) -> dict:
-    event_name = check.get("event")
-    event_time = _event_time(events, event_name)
-    if event_time is None:
-        return _check_result(check, category, "unresolved", f"unknown event: {event_name}")
+    if not signal:
+        return {"result": _check_result(check, status="unresolved", message="signal is missing")}
 
     window = _window_for_check(windows, check)
     if window is None:
-        return _check_result(check, category, "unresolved", f"unknown window: {check.get('window')}")
-
-    tolerance = _safe_float(check.get("value")) or 0.0
-    passed = window["start_s"] - tolerance <= event_time <= window["end_s"] + tolerance
-    return _checked(
-        check,
-        category,
-        passed,
-        f"event {event_name} at {event_time} aligns with window {window['name']}",
-        {"event_time_s": event_time, "window": window["name"], "tolerance_s": tolerance},
-    )
-
-
-def _check_rate_of_change(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, Any],
-    check: dict,
-    category: str,
-) -> dict:
-    signal = str(check.get("signal") or check.get("left") or "")
-    samples_result = _check_samples(topics, windows, check, signal)
-    if "result" in samples_result:
-        return samples_result["result"]
-
-    samples = [(time_s, float(value)) for time_s, value in samples_result["samples"] if _is_number(value)]
-    if len(samples) < 2:
-        return _check_result(check, category, "unresolved", f"not enough numeric samples for {signal}")
-
-    duration = samples[-1][0] - samples[0][0]
-    if duration <= 0:
-        return _check_result(check, category, "unresolved", f"invalid duration for {signal}")
-
-    rate = (samples[-1][1] - samples[0][1]) / duration
-    threshold = _safe_float(check.get("value"))
-    if threshold is None:
-        return _check_result(check, category, "unresolved", "rate_of_change value is missing")
-    op = str(check.get("op") or ">=").strip()
-    passed = _compare(rate, op, threshold, check)
-    return _checked(
-        check,
-        category,
-        passed,
-        f"{signal} rate {rate} {op} {threshold}",
-        {"rate": _round_float(rate), "op": op, "threshold": threshold},
-    )
-
-
-def _check_correlation(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, Any],
-    check: dict,
-    category: str,
-) -> dict:
-    left_signal = str(check.get("left") or check.get("actual") or "")
-    right_signal = str(check.get("right") or check.get("setpoint") or "")
-    aligned = _aligned_pairs(topics, windows, check, left_signal, right_signal)
-    if "result" in aligned:
-        return aligned["result"]
-
-    left = aligned["left"]
-    right = aligned["right"]
-    if len(left) < 2:
-        return _check_result(check, category, "unresolved", "not enough aligned samples for correlation")
-
-    corr = _pearson(left, right)
-    threshold = _safe_float(check.get("value"))
-    if threshold is None:
-        threshold = 0.5
-    op = str(check.get("op") or ">=").strip()
-    passed = _compare(corr, op, threshold, check)
-    return _checked(
-        check,
-        category,
-        passed,
-        f"correlation {left_signal} vs {right_signal} {corr} {op} {threshold}",
-        {"correlation": _round_float(corr), "op": op, "threshold": threshold},
-    )
-
-
-def _check_monotonic_change(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, Any],
-    check: dict,
-    category: str,
-) -> dict:
-    signal = str(check.get("signal") or check.get("left") or "")
-    samples_result = _check_samples(topics, windows, check, signal)
-    if "result" in samples_result:
-        return samples_result["result"]
-
-    values = [float(value) for _, value in samples_result["samples"] if _is_number(value)]
-    if len(values) < 2:
-        return _check_result(check, category, "unresolved", f"not enough numeric samples for {signal}")
-
-    delta = values[-1] - values[0]
-    min_delta = _safe_float(check.get("min_delta")) or _safe_float(check.get("value")) or 0.0
-    direction = str(check.get("direction") or "increase")
-    passed = delta >= min_delta if direction != "decrease" else delta <= -min_delta
-    return _checked(
-        check,
-        category,
-        passed,
-        f"{signal} delta {delta} direction {direction}",
-        {"delta": _round_float(delta), "direction": direction, "min_delta": min_delta},
-    )
-
-
-def _check_missing_signal(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    events: dict[str, Any],
-    check: dict,
-    category: str,
-) -> dict:
-    signal = str(check.get("signal") or "")
-    parsed = _parse_signal(signal)
-    missing = parsed is None
-    if parsed is not None:
-        topic_name, field_name = parsed
-        topic = topics.get(topic_name)
-        data = getattr(topic, "data", {}) or {} if topic is not None else {}
-        missing = topic is None or field_name not in data
-
-    return _checked(
-        check,
-        category,
-        missing,
-        f"signal missing: {signal}",
-        {"signal": signal, "missing": missing},
-    )
-
-
-def _metric_value(topics: dict[str, Any], windows: dict[str, dict], check: dict, signal: str) -> dict:
-    samples_result = _check_samples(topics, windows, check, signal)
-    if "result" in samples_result:
-        return samples_result
-
-    metric = str(check.get("metric") or "mean")
-    metrics = _sample_metrics(samples_result["samples"])
-    if metric not in metrics:
-        return {"result": _check_result(check, "numeric", "unresolved", f"unsupported metric '{metric}' for {signal}")}
-    return {"metric": metric, "value": metrics[metric]}
-
-
-def _aligned_errors(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
-    actual = str(check.get("actual") or check.get("left") or "")
-    setpoint = str(check.get("setpoint") or check.get("right") or "")
-    aligned = _aligned_pairs(topics, windows, check, actual, setpoint)
-    if "result" in aligned:
-        return aligned
-    return {"errors": [actual_value - setpoint_value for actual_value, setpoint_value in zip(aligned["left"], aligned["right"])]}
-
-
-def _aligned_pairs(
-    topics: dict[str, Any],
-    windows: dict[str, dict],
-    check: dict,
-    left_signal: str,
-    right_signal: str,
-) -> dict:
-    left_result = _check_samples(topics, windows, check, left_signal)
-    if "result" in left_result:
-        return left_result
-    right_result = _check_samples(topics, windows, check, right_signal)
-    if "result" in right_result:
-        return right_result
-
-    right_times = [time_s for time_s, value in right_result["samples"] if _is_number(value)]
-    right_values = [float(value) for _, value in right_result["samples"] if _is_number(value)]
-    if not right_times:
-        return {"result": _check_result(check, "numeric", "unresolved", f"no numeric samples for {right_signal}")}
-
-    left = []
-    right = []
-    for time_s, value in left_result["samples"]:
-        if not _is_number(value) or time_s < right_times[0] or time_s > right_times[-1]:
-            continue
-        interpolated = _interpolated_value(right_times, right_values, time_s)
-        if interpolated is not None:
-            left.append(float(value))
-            right.append(interpolated)
-
-    if not left:
-        return {"result": _check_result(check, "numeric", "unresolved", f"no overlapping samples for {left_signal} and {right_signal}")}
-    return {"left": left, "right": right}
-
-
-def _check_samples(topics: dict[str, Any], windows: dict[str, dict], check: dict, signal: str) -> dict:
-    if not signal:
-        return {"result": _check_result(check, "numeric", "unresolved", "signal is missing")}
+        return {"result": _check_result(check, status="unresolved", message=f"unknown window: {check.get('window')}")}
 
     parsed = _parse_signal(signal)
     if parsed is None:
-        return {"result": _check_result(check, "numeric", "unresolved", f"invalid signal: {signal}")}
-
-    window = _window_for_check(windows, check)
-    if window is None:
-        return {"result": _check_result(check, "numeric", "unresolved", f"unknown window: {check.get('window')}")}
+        return {"result": _check_result(check, status="unresolved", message=f"invalid signal: {signal}")}
 
     topic_name, field_name = parsed
     topic = topics.get(topic_name)
     if topic is None:
-        return {"result": _check_result(check, "numeric", "unresolved", f"missing topic for signal: {signal}")}
+        return {"result": _check_result(check, status="unresolved", message=f"missing topic for signal: {signal}")}
 
     data = getattr(topic, "data", {}) or {}
     timestamps = data.get("timestamp")
     values = data.get(field_name)
     if timestamps is None or values is None:
-        return {"result": _check_result(check, "numeric", "unresolved", f"missing field for signal: {signal}")}
+        return {"result": _check_result(check, status="unresolved", message=f"missing field for signal: {signal}")}
 
     samples = _window_samples(timestamps, values, window["start_s"], window["end_s"])
     if not samples:
-        return {"result": _check_result(check, "numeric", "unresolved", f"no samples for {signal} in window {window['name']}")}
+        return {"result": _check_result(check, status="unresolved", message=f"no samples for {signal} in window {window['name']}")}
+
     return {"samples": samples, "window": window}
 
 
@@ -598,24 +451,6 @@ def _normalize_windows(candidate_windows: list[dict]) -> dict[str, dict]:
         name = str(window.get("name") or f"window_{index + 1}")
         windows[name] = {"name": name, "start_s": start_s, "end_s": end_s}
     return windows
-
-
-def _normalize_events(events: list[dict]) -> dict[str, dict]:
-    normalized = {}
-    for event in events or []:
-        name = str(event.get("name") or "")
-        if not name:
-            continue
-        normalized[name] = {key: value for key, value in event.items() if value is not None}
-    return normalized
-
-
-def _derived_signal_warnings(derived_signals: list[dict]) -> list[str]:
-    if not derived_signals:
-        return []
-    return [
-        "Derived signal declarations were recorded, but this evaluator currently supports direct logged signals only."
-    ]
 
 
 def _required_signal_status(topics: dict[str, Any], required_signals: list[str]) -> tuple[list[str], list[str]]:
@@ -645,15 +480,6 @@ def _window_for_check(windows: dict[str, dict], check: dict) -> dict | None:
     return next(iter(windows.values()))
 
 
-def _event_time(events: dict[str, dict], event_name: Any) -> float | None:
-    if not event_name:
-        return None
-    event = events.get(str(event_name))
-    if event is None:
-        return None
-    return _safe_float(event.get("time_s"))
-
-
 def _parse_signal(signal: str) -> tuple[str, str] | None:
     if "." not in signal:
         return None
@@ -673,7 +499,8 @@ def _window_samples(timestamps: Any, values: Any, start_s: float, end_s: float) 
 
 
 def _sample_metrics(samples: list[tuple[float, Any]]) -> dict[str, Any]:
-    values = [float(value) for _, value in samples if _is_number(value)]
+    values = [_number(value) for _, value in samples]
+    values = [value for value in values if value is not None]
     if not values:
         return {"count": len(samples)}
     return {
@@ -689,7 +516,28 @@ def _sample_metrics(samples: list[tuple[float, Any]]) -> dict[str, Any]:
     }
 
 
-def _compare(actual: float, op: str, expected: float, check: dict) -> bool:
+def _transitions(samples: list[tuple[float, Any]]) -> list[dict]:
+    transitions = []
+    if not samples:
+        return transitions
+    previous = samples[0][1]
+    for time_s, value in samples[1:]:
+        if value == previous:
+            continue
+        transitions.append({"time_s": _round_float(time_s), "from": previous, "to": value})
+        previous = value
+    return transitions
+
+
+def _numeric_delta(samples: list[tuple[float, Any]]) -> float | None:
+    values = [_number(value) for _, value in samples]
+    values = [value for value in values if value is not None]
+    if len(values) < 2:
+        return None
+    return values[-1] - values[0]
+
+
+def _compare(actual: float, op: str, expected: float) -> bool:
     if op == ">":
         return actual > expected
     if op == ">=":
@@ -702,37 +550,23 @@ def _compare(actual: float, op: str, expected: float, check: dict) -> bool:
         return actual == expected
     if op == "!=":
         return actual != expected
-    if op == "between":
-        lower = _safe_float(check.get("lower"))
-        upper = _safe_float(check.get("upper"))
-        return lower is not None and upper is not None and lower <= actual <= upper
-    if op == "outside":
-        lower = _safe_float(check.get("lower"))
-        upper = _safe_float(check.get("upper"))
-        return lower is not None and upper is not None and not lower <= actual <= upper
     raise ValueError(f"unsupported operator: {op}")
 
 
-def _checked(check: dict, category: str, passed: bool, fallback: str, value: Any) -> dict:
-    return _check_result(
-        check,
-        category,
-        "passed" if passed else "failed",
-        _message(check, passed, fallback),
-        value,
-    )
+def _message(check: dict, passed: bool, fallback: str) -> str:
+    key = "supports" if passed else "contradicts"
+    return str(check.get(key) or check.get("description") or fallback)
 
 
 def _check_result(
     check: dict,
-    category: str,
+    *,
     status: str,
     message: str,
     value: Any = None,
 ) -> dict:
     result = {
         "type": check.get("type"),
-        "category": category,
         "window": check.get("window"),
         "status": status,
         "message": message,
@@ -742,9 +576,75 @@ def _check_result(
     return result
 
 
-def _message(check: dict, passed: bool, fallback: str) -> str:
-    key = "supports" if passed else "contradicts"
-    return str(check.get(key) or check.get("description") or fallback)
+def _evaluation_result(
+    *,
+    mechanism: str,
+    expected_signature: list[dict],
+    present: list[str],
+    missing: list[str],
+    window_results: list[dict],
+    numeric_results: list[dict],
+    exclusion_results: list[dict],
+    evidence: list[str],
+    contradictions: list[str],
+    unresolved: list[str],
+    warnings: list[str],
+) -> dict:
+    score, confidence = _confidence(numeric_results, exclusion_results, missing)
+    verdict, confidence_ceiling = _verdict(evidence, contradictions, unresolved, missing)
+    check_results = [*numeric_results, *exclusion_results]
+    summary = _summary(confidence, evidence, contradictions, unresolved)
+
+    return {
+        "mechanism": mechanism,
+        "expected_signature": expected_signature,
+        "required_signals": {
+            "present": present,
+            "missing": missing,
+        },
+        "missing_required_signals": missing,
+        "window_results": window_results,
+        "exclusion_checks": exclusion_results,
+        "numeric_checks": numeric_results,
+        "check_results": check_results,
+        "evidence": evidence,
+        "contradictions": contradictions,
+        "contradicting_evidence": contradictions,
+        "unresolved": unresolved,
+        "warnings": warnings,
+        "verdict": verdict,
+        "confidence": confidence,
+        "confidence_ceiling": confidence_ceiling,
+        "confidence_score": score,
+        "summary": summary,
+    }
+
+
+def _confidence(
+    numeric_results: list[dict],
+    exclusion_results: list[dict],
+    missing_signals: list[str],
+) -> tuple[float, str]:
+    results = [*numeric_results, *exclusion_results]
+    passed = sum(1 for result in results if result["status"] == "passed")
+    failed = sum(1 for result in results if result["status"] == "failed")
+    unresolved = sum(1 for result in results if result["status"] == "unresolved")
+    resolved = passed + failed
+    if resolved == 0:
+        return 0.0, "low"
+
+    score = passed / resolved
+    if missing_signals:
+        score *= 0.7
+    if unresolved:
+        score *= max(0.5, 1.0 - unresolved * 0.1)
+    score = _round_float(score)
+
+    if score >= 0.8 and not missing_signals:
+        return score, "high"
+    if score >= 0.6:
+        return score, "medium"
+    return score, "low"
 
 
 def _verdict(
@@ -757,7 +657,7 @@ def _verdict(
         verdict = "mixed"
     elif contradictions:
         verdict = "contradicted"
-    elif evidence and not missing:
+    elif evidence:
         verdict = "supported"
     else:
         verdict = "unresolved"
@@ -765,7 +665,7 @@ def _verdict(
     if missing:
         return verdict, "low"
     if verdict == "supported":
-        return verdict, "high" if not unresolved else "medium"
+        return verdict, "medium" if unresolved else "high"
     if verdict == "mixed":
         return verdict, "medium"
     if verdict == "contradicted":
@@ -773,36 +673,13 @@ def _verdict(
     return verdict, "unresolved"
 
 
-def _pearson(left: list[float], right: list[float]) -> float:
-    left_mean = mean(left)
-    right_mean = mean(right)
-    numerator = sum((x - left_mean) * (y - right_mean) for x, y in zip(left, right))
-    left_den = math.sqrt(sum((x - left_mean) ** 2 for x in left))
-    right_den = math.sqrt(sum((y - right_mean) ** 2 for y in right))
-    if left_den == 0 or right_den == 0:
-        return 0.0
-    return numerator / (left_den * right_den)
-
-
-def _interpolated_value(times: list[float], values: list[float], target: float) -> float | None:
-    if not times:
-        return None
-    if target <= times[0]:
-        return values[0]
-    if target >= times[-1]:
-        return values[-1]
-    for index in range(1, len(times)):
-        if times[index] < target:
-            continue
-        before_t = times[index - 1]
-        after_t = times[index]
-        before_v = values[index - 1]
-        after_v = values[index]
-        if after_t == before_t:
-            return after_v
-        ratio = (target - before_t) / (after_t - before_t)
-        return before_v + ratio * (after_v - before_v)
-    return None
+def _summary(confidence: str, evidence: list[str], contradictions: list[str], unresolved: list[str]) -> str:
+    return (
+        f"Log-evidence confidence is {confidence}: "
+        f"{len(evidence)} supporting checks, "
+        f"{len(contradictions)} contradicting checks, "
+        f"{len(unresolved)} unresolved checks."
+    )
 
 
 def _timestamp_to_seconds(timestamp: Any) -> float:
@@ -818,21 +695,47 @@ def _json_safe_value(value: Any) -> Any:
 
 
 def _safe_float(value: Any) -> float | None:
+    return _number(value)
+
+
+def _is_number(value: Any) -> bool:
+    return _number(value) is not None
+
+
+def _number(value: Any) -> float | None:
     if value is None:
         return None
     if hasattr(value, "item"):
         value = value.item()
+    if isinstance(value, bool):
+        return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _round_float(value: float) -> float:
     return round(float(value), 6)
 
 
-def _is_number(value: Any) -> bool:
-    if hasattr(value, "item"):
-        value = value.item()
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+def _interpolated_value(times: list[float], values: list[float], target_time: float) -> float | None:
+    if not times:
+        return None
+    if target_time <= times[0]:
+        return values[0]
+    if target_time >= times[-1]:
+        return values[-1]
+    for index in range(1, len(times)):
+        if times[index] < target_time:
+            continue
+        t0 = times[index - 1]
+        t1 = times[index]
+        v0 = values[index - 1]
+        v1 = values[index]
+        if t1 == t0:
+            return v0
+        ratio = (target_time - t0) / (t1 - t0)
+        return v0 + ratio * (v1 - v0)
+    return None

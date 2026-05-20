@@ -180,37 +180,56 @@ function renderProgressItem(item, isLatest, status) {
 
 function renderAnalysisReport(report) {
   const hypotheses = report.ranked_hypotheses || [];
+  const intentSummary = report.question_intent_summary || "";
+  const legacyAssumptions = report.assumption_header || "";
+  const legacyTimeline = report.timeline_summary || "";
   els.analysisReport.innerHTML = `
     <div class="report-block">
       <h3>Summary</h3>
       <p>${escapeHtml(report.final_summary || "")}</p>
     </div>
-    <div class="report-block">
-      <h3>Assumptions</h3>
-      <p>${escapeHtml(report.assumption_header || "")}</p>
-    </div>
-    <div class="report-block">
-      <h3>Timeline</h3>
-      <p>${escapeHtml(report.timeline_summary || "")}</p>
-    </div>
+    ${intentSummary ? renderReportBlock("Analysis Intent", intentSummary) : ""}
+    ${legacyAssumptions ? renderReportBlock("Assumptions", legacyAssumptions) : ""}
+    ${legacyTimeline ? renderReportBlock("Timeline", legacyTimeline) : ""}
     ${renderStringList("Confirmed", report.confirmed || [])}
     ${renderStringList("Unconfirmed", report.unconfirmed || [])}
+    ${renderStringList("Excluded Mechanisms", report.excluded_mechanisms || [])}
     <div class="hypothesis-list">
       ${hypotheses.map(renderHypothesis).join("")}
     </div>
   `;
 }
 
+function renderReportBlock(title, text) {
+  return `
+    <div class="report-block">
+      <h3>${escapeHtml(title)}</h3>
+      <p>${escapeHtml(text)}</p>
+    </div>
+  `;
+}
+
 function renderHypothesis(hypothesis, index) {
+  const applicability = hypothesis.applicability || {};
   return `
     <article class="hypothesis-card">
       <div class="section-title-row">
         <h3>${escapeHtml(`${index + 1}. ${hypothesis.title || "Hypothesis"}`)}</h3>
         <span class="status-badge">${escapeHtml(hypothesis.confidence || "unknown")}</span>
       </div>
+      ${hypothesis.known_px4_mechanism ? `<p><strong>PX4 mechanism:</strong> ${escapeHtml(hypothesis.known_px4_mechanism)}</p>` : ""}
       <p>${escapeHtml(hypothesis.mechanism || "")}</p>
       ${renderStringList("Evidence", hypothesis.evidence || [])}
       ${renderStringList("Contradicting Evidence", hypothesis.contradicting_evidence || [])}
+      ${renderStringList("Supported Conditions", applicability.supported_conditions || [])}
+      ${renderStringList("Unresolved Conditions", applicability.unresolved_conditions || [])}
+      ${renderStringList("Excluded By", applicability.excluded_by || [])}
+      ${renderStringList("Relevant Parameters", formatParameterValues(applicability.relevant_parameters || []))}
+      ${renderStringList("Missing Signals", applicability.missing_required_signals || [])}
+      ${renderSourceRefs(hypothesis.source_refs || hypothesis.code_references || [])}
+      ${renderSignatureItems(hypothesis.expected_logged_signature || [])}
+      ${renderCheckList("Numeric Checks", hypothesis.numeric_checks || [])}
+      ${renderCheckList("Exclusion Checks", hypothesis.exclusion_checks || [])}
       ${renderPlots(hypothesis.plots || [])}
     </article>
   `;
@@ -222,10 +241,90 @@ function renderStringList(title, rows) {
     <div class="report-list">
       <h4>${escapeHtml(title)}</h4>
       <ul>
-        ${rows.map((row) => `<li>${escapeHtml(row)}</li>`).join("")}
+        ${rows.map((row) => `<li>${escapeHtml(formatReportValue(row))}</li>`).join("")}
       </ul>
     </div>
   `;
+}
+
+function renderSourceRefs(refs) {
+  if (!refs.length) return "";
+  return `
+    <div class="report-list">
+      <h4>Source References</h4>
+      <ul>
+        ${refs.map((ref) => `
+          <li>
+            <code>${escapeHtml(sourceRefLabel(ref))}</code>
+            ${ref.explanation ? ` - ${escapeHtml(ref.explanation)}` : ""}
+          </li>
+        `).join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function renderSignatureItems(items) {
+  if (!items.length) return "";
+  return `
+    <div class="report-list">
+      <h4>Expected Logged Signature</h4>
+      <ul>
+        ${items.map((item) => `
+          <li>
+            <strong>${escapeHtml(item.name || "signature")}</strong>
+            ${item.signal ? ` <code>${escapeHtml(item.signal)}</code>` : ""}
+            ${item.description ? ` - ${escapeHtml(item.description)}` : ""}
+            ${item.expected_behavior ? ` (${escapeHtml(item.expected_behavior)})` : ""}
+          </li>
+        `).join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function renderCheckList(title, checks) {
+  if (!checks.length) return "";
+  return `
+    <div class="report-list">
+      <h4>${escapeHtml(title)}</h4>
+      <ul>
+        ${checks.map((check) => `
+          <li>
+            <code>${escapeHtml(check.type || "check")}</code>
+            ${check.window ? ` in ${escapeHtml(check.window)}` : ""}
+            ${check.signal ? ` on <code>${escapeHtml(check.signal)}</code>` : ""}
+            ${check.actual || check.setpoint ? ` ${escapeHtml([check.actual, check.setpoint].filter(Boolean).join(" vs "))}` : ""}
+            ${check.supports ? ` - ${escapeHtml(check.supports)}` : ""}
+            ${check.contradicts ? ` - ${escapeHtml(check.contradicts)}` : ""}
+            ${check.description && !check.supports && !check.contradicts ? ` - ${escapeHtml(check.description)}` : ""}
+          </li>
+        `).join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function sourceRefLabel(ref) {
+  const lineRange = ref.start_line
+    ? `:${ref.start_line}${ref.end_line ? `-${ref.end_line}` : ""}`
+    : "";
+  const fn = ref.function ? ` ${ref.function}` : "";
+  return `${ref.file || "source"}${lineRange}${fn}`;
+}
+
+function formatReportValue(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return JSON.stringify(value);
+}
+
+function formatParameterValues(parameters) {
+  return parameters.map((parameter) => {
+    if (!parameter || typeof parameter !== "object") return formatReportValue(parameter);
+    return `${parameter.name || "parameter"}=${parameter.value ?? ""}`;
+  });
 }
 
 function renderPlots(plots) {

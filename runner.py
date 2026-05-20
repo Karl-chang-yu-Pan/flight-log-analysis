@@ -1,32 +1,41 @@
 from __future__ import annotations
 
+"""
+
+Architecture goal:
+1. Prepass ULog to get PX4 version/git hash, vehicle_type, airframe/control-surface context,
+   parameters, topic catalog, timeline, and mission summary.
+2. Normalize the user question into source-search intent.
+3. Retrieve reusable PX4 source-code mechanisms from the mechanism cache using only:
+      px4_git_hash/version + vehicle_type + airframe/control-surface context + question intent.
+   Validate cached mechanisms against the current PX4 source footprint. If no valid
+   cache hit exists, run bounded source search and the mechanism resolver agent.
+   Do NOT use parameter values, full topic catalog, or detailed log samples here.
+4. Use parameters/timeline/mission/topic availability to eliminate impossible mechanisms.
+5. Use deterministic log-signature evaluation to verify surviving mechanisms.
+6. Write a report from verified mechanism results only.
+
+This is intentionally a skeleton. The important part is the data flow and context boundaries.
+"""
+
 import asyncio
 import json
-import random
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Literal
 
-try:
-    from pydantic import BaseModel, Field
-except ImportError:
-    from pydantic import BaseModel
-
-    def Field(default: Any = None, *, default_factory: Any = None, **_: Any) -> Any:
-        return default_factory() if default_factory is not None else default
-
-from agents import Agent, Runner, function_tool, RunContextWrapper, WebSearchTool
+from pydantic import BaseModel, Field
+from agents import Agent, Runner, RunContextWrapper, function_tool
 
 from px4_source import checkout_px4_source_revision, read_source_file, search_source
 from mission_parser import parse_mission_file as parse_mission_file_impl
 from ulog_control_surface import infer_control_surface as infer_control_surface_impl
 from ulog_inventory import parse_ulog_inventory as parse_ulog_inventory_impl
-from ulog_metrics import compute_log_metrics as compute_log_metrics_impl
-from ulog_signature_evaluator import evaluate_log_signature as evaluate_log_signature_impl
 from ulog_plots import generate_signal_plot as generate_signal_plot_impl
 from ulog_timeline import build_basic_timeline as build_basic_timeline_impl
+from ulog_signature_evaluator import evaluate_log_signature as evaluate_log_signature_impl
+
 from run_audit_log import (
     AgentRunAuditHooks,
     DEFAULT_DEV_LOG_ROOT,
@@ -34,9 +43,19 @@ from run_audit_log import (
     log_run_items,
 )
 
+from mechanism_cache import (
+    MechanismCacheConfig,
+    MechanismCacheWriter,
+    MechanismRecord,
+    MechanismRetriever,
+    MechanismRetrievalResult,
+    MechanismSourceValidation,
+    MechanismSourceValidator,
+)
+
 
 # ============================================================
-# 1. Context
+# 1. Runtime context
 # ============================================================
 
 @dataclass
@@ -48,17 +67,26 @@ class FlightLogContext:
 
 
 # ============================================================
-# 2. Shared structured models
+# 2. Core data models
 # ============================================================
+
+class CodeRef(BaseModel):
+    file: str
+    function: Optional[str] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    snippet: Optional[str] = None
+    explanation: str = ""
+
 
 class PlotOverlay(BaseModel):
     start_s: float
     end_s: Optional[float] = None
     label: Optional[str] = None
-    color: Optional[str] = None
-    alpha: Optional[float] = None
     kind: Optional[str] = None
     source: Optional[str] = None
+    color: Optional[str] = None
+    alpha: Optional[float] = None
     ymin: Optional[float] = None
     ymax: Optional[float] = None
 
@@ -77,20 +105,60 @@ class PlotRef(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-class CodeRef(BaseModel):
+class AirframeContext(BaseModel):
+    """
+    Minimal aircraft context for mechanism discovery.
+    vehicle_type should already include VTOL subtype, e.g.:
+      - "fixed_wing"
+      - "multicopter"
+      - "vtol_standard"
+      - "vtol_tailsitter"
+      - "vtol_tiltrotor"
+    """
+    px4_git_hash: Optional[str] = None
+    px4_version: Optional[str] = None
+    px4_tag: Optional[str] = None
+    vehicle_type: str = "unknown"
+    sys_autostart: Optional[int] = None
+    airframe_name: Optional[str] = None
+    control_surface_summary: str = "unknown"
+
+
+class QuestionIntent(BaseModel):
+    """
+    Produced from natural-language user question.
+    No parameters/log data are used to verify anything here.
+    """
+    original_question: str
+    problem_domain: str
+    concise_intent: str
+    source_queries: list[str]
+    likely_modules: list[str] = Field(default_factory=list)
+    likely_source_files: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class SourceSearchContext(BaseModel):
+    """
+    The only context allowed into source mechanism discovery.
+    No parameter values, no topic catalog, no detailed timeline.
+    """
+    airframe: AirframeContext
+    question_intent: QuestionIntent
+
+
+class SourceHit(BaseModel):
+    query: str
     file: str
-    function: Optional[str] = None
-    start_line: Optional[int] = None
-    end_line: Optional[int] = None
-    snippet: Optional[str] = None
-    explanation: str
+    line: Optional[int] = None
+    snippet: str
 
 
-class WindowSpec(BaseModel):
-    name: str
-    start_s: float
-    end_s: float
-    reason: Optional[str] = None
+class SourceEvidenceBundle(BaseModel):
+    search_context: SourceSearchContext
+    hits: list[SourceHit]
+    read_snippets: list[CodeRef] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ExpectedSignatureItem(BaseModel):
@@ -100,160 +168,142 @@ class ExpectedSignatureItem(BaseModel):
     expected_behavior: Optional[str] = None
 
 
-class DerivedSignalSpec(BaseModel):
-    """
-    Declarative derived signal. The evaluator implementation should support a
-    restricted expression grammar only. Do not eval arbitrary Python.
-    """
+class WindowSpec(BaseModel):
     name: str
-    expr: str
-    description: Optional[str] = None
-    unit: Optional[str] = None
-
-
-class EventSpec(BaseModel):
-    name: str
-    type: Literal[
-        "state_transition",
-        "threshold_crossing",
-        "step_change",
-        "local_extreme",
-        "time_marker",
-    ]
-    signal: Optional[str] = None
-    from_value: Optional[float | int | str | bool] = None
-    to_value: Optional[float | int | str | bool] = None
-    threshold: Optional[float] = None
-    direction: Optional[Literal["above", "below", "rising", "falling", "any"]] = None
-    time_s: Optional[float] = None
-    description: Optional[str] = None
+    start_s: float
+    end_s: float
+    reason: Optional[str] = None
 
 
 class RelationshipCheckSpec(BaseModel):
-    """
-    Generic check language used by the deterministic log evaluator.
-    Keep this declarative; runner/tools perform the actual calculation.
-    """
     type: Literal[
-        "compare",
-        "tracking_error",
-        "setpoint_actual_separation",
-        "before_after_delta",
-        "state_conditioned_mean",
-        "threshold_fraction",
-        "saturation",
-        "event_alignment",
-        "rate_of_change",
-        "correlation",
-        "lagged_correlation",
+        "threshold",
+        "transition_occurs",
+        "no_transition",
+        "state_equals",
+        "state_not_equals",
+        "tracks_setpoint",
+        "diverges_from_setpoint",
         "monotonic_change",
-        "missing_signal",
+        "same_direction_change",
         "custom",
     ]
     window: Optional[str] = None
     signal: Optional[str] = None
-    left: Optional[str] = None
-    right: Optional[str] = None
+    first: Optional[str] = None
+    second: Optional[str] = None
     actual: Optional[str] = None
     setpoint: Optional[str] = None
-    condition: Optional[str] = None
-    baseline_condition: Optional[str] = None
-    event: Optional[str] = None
     metric: Optional[str] = None
     op: Optional[Literal[">", ">=", "<", "<=", "==", "!=", "between", "outside"]] = None
-    value: Optional[float] = None
+    value: Optional[float | int | str | bool] = None
     lower: Optional[float] = None
     upper: Optional[float] = None
+    from_value: Optional[float | int | str | bool] = None
+    to_value: Optional[float | int | str | bool] = None
+    mode: Optional[Literal["any", "all"]] = None
+    direction: Optional[Literal["increase", "decrease", "above", "below", "absolute"]] = None
     max_error: Optional[float] = None
+    min_error: Optional[float] = None
     min_delta: Optional[float] = None
     supports: Optional[str] = None
     contradicts: Optional[str] = None
     description: Optional[str] = None
 
 
-class LogSignatureSpec(BaseModel):
-    mechanism_title: str
-    expected_signature: list[ExpectedSignatureItem]
-    candidate_windows: list[WindowSpec]
-    required_signals: list[str]
-    derived_signals: list[DerivedSignalSpec] = Field(default_factory=list)
-    events: list[EventSpec] = Field(default_factory=list)
-    supporting_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
+class MechanismCandidate(BaseModel):
+    """
+    Candidate produced from PX4 source. This is still only a possible mechanism.
+    Parameters/topics/log data have not verified it yet.
+    """
+    name: str
+    summary: str
+    source_refs: list[CodeRef]
+
+    vehicle_type_gates: list[str] = Field(default_factory=list)
+    airframe_gates: list[str] = Field(default_factory=list)
+    mode_state_gates: list[str] = Field(default_factory=list)
+    parameter_gates: list[str] = Field(default_factory=list)
+
+    required_parameters: list[str] = Field(default_factory=list)
+    required_signals: list[str] = Field(default_factory=list)
+    expected_logged_signature: list[ExpectedSignatureItem] = Field(default_factory=list)
     exclusion_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
     numeric_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
     plot_requests: list[PlotRef] = Field(default_factory=list)
 
 
-class SourceMechanism(BaseModel):
-    mechanism_confirmed: bool
-    mechanism_name: str
-    summary: str
-    source_refs: list[CodeRef]
-    parameters_used: list[str] = Field(default_factory=list)
-    state_gates: list[str] = Field(default_factory=list)
-    conditions: list[str] = Field(default_factory=list)
-    expected_logged_signature_hint: list[ExpectedSignatureItem] = Field(default_factory=list)
+class MechanismCandidateSet(BaseModel):
+    candidates: list[MechanismCandidate]
+    rejected_source_paths: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
-    confidence: Literal["high", "medium", "low", "unresolved"] = "unresolved"
 
 
-class HypothesisDraft(BaseModel):
-    title: str
-    suspected_mechanism: str
-    why_plausible: str
-    required_source_queries: list[str]
-    likely_source_files: list[str] = Field(default_factory=list)
-    required_signals: list[str]
-    candidate_windows: list[WindowSpec]
-    plausible_alternatives_to_exclude: list[str]
-
-
-class HypothesisDraftSet(BaseModel):
-    hypotheses: list[HypothesisDraft]
+class ApplicabilityResult(BaseModel):
+    candidate_name: str
+    applicable: bool
+    supported_conditions: list[str] = Field(default_factory=list)
+    excluded_by: list[str] = Field(default_factory=list)
+    unresolved_conditions: list[str] = Field(default_factory=list)
+    relevant_parameters: dict[str, Any] = Field(default_factory=dict)
+    candidate_windows: list[WindowSpec] = Field(default_factory=list)
+    available_required_signals: list[str] = Field(default_factory=list)
+    missing_required_signals: list[str] = Field(default_factory=list)
 
 
 class SignatureEvaluation(BaseModel):
-    mechanism_title: str
+    candidate_name: str
     verdict: Literal["supported", "contradicted", "mixed", "unresolved"]
     confidence_ceiling: Literal["high", "medium", "low", "unresolved"]
     evidence: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
-    missing_required_signals: list[str] = Field(default_factory=list)
     check_results: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
-class VerifiedHypothesisPackage(BaseModel):
-    draft: HypothesisDraft
-    source_mechanism: SourceMechanism
-    signature_spec: LogSignatureSpec
+class VerifiedMechanismResult(BaseModel):
+    candidate: MechanismCandidate
+    applicability: ApplicabilityResult
     evaluation: SignatureEvaluation
+    final_confidence: Literal["high", "medium", "low", "unresolved"]
 
 
-class Hypothesis(BaseModel):
+class ParameterValue(BaseModel):
+    name: str
+    value: str
+
+
+class ApplicabilityReport(BaseModel):
+    applicable: bool
+    supported_conditions: list[str] = Field(default_factory=list)
+    excluded_by: list[str] = Field(default_factory=list)
+    unresolved_conditions: list[str] = Field(default_factory=list)
+    relevant_parameters: list[ParameterValue] = Field(default_factory=list)
+    available_required_signals: list[str] = Field(default_factory=list)
+    missing_required_signals: list[str] = Field(default_factory=list)
+
+
+class HypothesisReportItem(BaseModel):
     title: str
-    known_px4_mechanism: str = ""
+    known_px4_mechanism: str
     mechanism: str
-    expected_logged_signature: list[ExpectedSignatureItem] = Field(default_factory=list)
-    exclusion_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
-    numeric_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
+    source_refs: list[CodeRef]
+    expected_logged_signature: list[ExpectedSignatureItem]
+    applicability: ApplicabilityReport
     evidence: list[str]
     contradicting_evidence: list[str]
+    exclusion_checks: list[RelationshipCheckSpec]
+    numeric_checks: list[RelationshipCheckSpec]
     confidence: Literal["high", "medium", "low", "unresolved"]
-    plots: list[PlotRef]
-    code_references: list[CodeRef]
-    verifier_verdict: Literal["supported", "contradicted", "mixed", "unresolved"] = "unresolved"
-    source_confirmed: bool = False
-    unresolved: list[str] = Field(default_factory=list)
+    plots: list[PlotRef] = Field(default_factory=list)
 
 
 class FlightLogReport(BaseModel):
-    assumption_header: str
-    log_inventory_summary: str
-    timeline_summary: str
-    relevant_windows: list[str]
-    ranked_hypotheses: list[Hypothesis]
+    airframe_summary: str
+    question_intent_summary: str
+    ranked_hypotheses: list[HypothesisReportItem]
+    excluded_mechanisms: list[str]
     confirmed: list[str]
     unconfirmed: list[str]
     final_summary: str
@@ -271,7 +321,7 @@ class ValidationResult(BaseModel):
 
 
 # ============================================================
-# 3. Deterministic pre-pass functions
+# 3. Prepass wrappers
 # ============================================================
 
 def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> dict:
@@ -286,109 +336,81 @@ def infer_control_surface(log_path: Path, source_path: Optional[Path]) -> dict:
     return infer_control_surface_impl(log_path, source_path)
 
 
-def infer_control_mapping(log_path: Path, source_path: Optional[Path]) -> dict:
-    return infer_control_surface(log_path, source_path)
-
-
 def parse_mission_file(mission_path: Optional[Path]) -> Optional[dict]:
     return parse_mission_file_impl(mission_path)
 
 
 # ============================================================
-# 4. Tools available to agents
+# 4. Small agents
 # ============================================================
 
-@function_tool
-def search_px4_source(
-    ctx: RunContextWrapper[FlightLogContext],
-    query: str,
-    max_results: int = 8,
-) -> list[dict]:
-    source_path = ctx.context.source_path
-    if source_path is None:
-        return [{"error": "No PX4 source path provided."}]
-    return search_source(source_path, query, max_results=max_results)
+question_intent_agent = Agent(
+    name="Question Intent Normalizer",
+    instructions="""
+Convert the user's natural-language PX4 flight-log question into a source-search intent.
+
+Input is only:
+- user question
+- minimal airframe context
+
+Output must include concise intent and source search queries.
+Do not use parameter values, topic lists, or log evidence to verify anything.
+Do not draft hypotheses. Do not assign confidence.
+""",
+    tools=[],
+    output_type=QuestionIntent,
+)
 
 
-@function_tool
-def checkout_px4_source(
-    ctx: RunContextWrapper[FlightLogContext],
-    revision: str,
-) -> dict:
-    source_path = ctx.context.source_path
-    if source_path is None:
-        return {"error": "No PX4 source path provided."}
-    return checkout_px4_source_revision(source_path, revision)
+mechanism_resolver_agent = Agent(
+    name="PX4 Mechanism Resolver",
+    instructions="""
+Resolve reusable PX4 source-code mechanisms from bounded source-search evidence.
+
+Important separation:
+- You are only extracting source-level PX4 behavior that could explain the
+  normalized question intent for this PX4 source version and vehicle/control domain.
+- Do not use parameter values or detailed log evidence to decide whether the
+  mechanism happened in the flight.
+- Emit cacheable mechanism candidates. For every candidate, include source_refs,
+  mechanism summary, source-level gates, required parameters/signals, expected
+  logged signature, exclusion checks, numeric checks, and useful plot requests.
+- Do not assign confidence that the mechanism happened in the flight.
+- The output may be written to the mechanism cache; avoid flight-specific language
+  such as "this log shows" or "this aircraft did".
+""",
+    tools=[],
+    output_type=MechanismCandidateSet,
+)
+
+# Backward-compatible name for older code/tests.
+mechanism_candidate_agent = mechanism_resolver_agent
 
 
-@function_tool
-def read_px4_source_file(
-    ctx: RunContextWrapper[FlightLogContext],
-    relative_path: str,
-    start_line: int = 1,
-    end_line: Optional[int] = None,
-) -> dict:
-    source_path = ctx.context.source_path
-    if source_path is None:
-        return {"error": "No PX4 source path provided."}
-    return read_source_file(source_path, relative_path, start_line, end_line)
+final_report_agent = Agent(
+    name="Verified Mechanism Report Writer",
+    instructions="""
+Write the final report only from VerifiedMechanismResult objects.
+
+Rules:
+- Do not introduce new mechanisms.
+- Do not claim a mechanism happened unless applicability and log evaluation support it.
+- Separate source mechanism, applicability filtering, numeric log verification,
+  contradictions, and confidence.
+- Confidence cannot exceed evaluation.confidence_ceiling.
+- If applicability is false, confidence must be low or unresolved.
+- If evaluation is unresolved or contradicted, confidence must be low or unresolved.
+- In report applicability, relevant_parameters must be a list of {name, value}
+  objects using string values, not a JSON object/map.
+""",
+    tools=[],
+    output_type=FlightLogReport,
+)
 
 
-@function_tool
-def resolve_px4_mechanism(
-    ctx: RunContextWrapper[FlightLogContext],
-    hypothesis_title: str,
-    suspected_mechanism: str,
-    source_queries: list[str],
-    likely_source_files: Optional[list[str]] = None,
-    max_results_per_query: int = 8,
-) -> dict:
-    """
-    Source evidence gathering helper. It does not decide final confidence.
-    The mechanism_resolver_agent must convert this raw evidence into a
-    SourceMechanism with concrete files/functions/conditions.
-    """
-    source_path = ctx.context.source_path
-    if source_path is None:
-        return {"error": "No PX4 source path provided."}
-
-    evidence: dict[str, Any] = {
-        "hypothesis_title": hypothesis_title,
-        "suspected_mechanism": suspected_mechanism,
-        "search_results": [],
-        "file_reads": [],
-    }
-
-    for query in source_queries:
-        evidence["search_results"].append(
-            {
-                "query": query,
-                "results": search_source(source_path, query, max_results=max_results_per_query),
-            }
-        )
-
-    for relative_path in likely_source_files or []:
-        try:
-            evidence["file_reads"].append(
-                read_source_file(source_path, relative_path, 1, None)
-            )
-        except Exception as exc:
-            evidence["file_reads"].append(
-                {"file": relative_path, "error": repr(exc)}
-            )
-
-    return evidence
-
-
-@function_tool
-def compute_log_metrics(
-    ctx: RunContextWrapper[FlightLogContext],
-    start_s: float,
-    end_s: float,
-    signals: list[str],
-) -> dict:
-    return compute_log_metrics_impl(ctx.context.log_path, start_s, end_s, signals)
-
+# ============================================================
+# 5. Optional low-level tools, not exposed to broad agents
+# ============================================================
 
 @function_tool
 def generate_signal_plot(
@@ -412,165 +434,15 @@ def generate_signal_plot(
         purpose,
         plot_type=plot_type,
         bins=bins,
-        overlays=[overlay.model_dump(exclude_none=True) for overlay in overlays] if overlays else None,
-    )
-
-
-@function_tool
-def evaluate_log_signature(
-    ctx: RunContextWrapper[FlightLogContext],
-    mechanism_title: str,
-    expected_signature: list[ExpectedSignatureItem],
-    candidate_windows: list[WindowSpec],
-    required_signals: list[str],
-    derived_signals: list[DerivedSignalSpec],
-    events: list[EventSpec],
-    supporting_checks: list[RelationshipCheckSpec],
-    exclusion_checks: list[RelationshipCheckSpec],
-    numeric_checks: list[RelationshipCheckSpec],
-) -> dict:
-    """
-    General deterministic log relationship evaluator.
-
-    Recommended implementation direction:
-    - Support a restricted derived-signal expression grammar.
-    - Evaluate signal relationships, event alignment, tracking error,
-      saturation, before/after deltas, state-conditioned means, etc.
-    - Return support/contradiction/missing-signal details per check.
-
-    Backed by ulog_signature_evaluator, which evaluates generic relationship
-    checks and returns normalized support, contradiction, and missing-signal
-    details.
-    """
-    return evaluate_log_signature_impl(
-        ctx.context.log_path,
-        mechanism_title,
-        [_model_to_dict(item) for item in expected_signature],
-        [_window_to_legacy_dict(window) for window in candidate_windows],
-        required_signals,
-        [_model_to_dict(signal) for signal in derived_signals],
-        [_model_to_dict(event) for event in events],
-        [_relationship_to_legacy_check(check) for check in supporting_checks],
-        [_relationship_to_legacy_check(check) for check in exclusion_checks],
-        [_relationship_to_legacy_check(check) for check in numeric_checks],
+        overlays=[o.model_dump(exclude_none=True) for o in overlays] if overlays else None,
     )
 
 
 # ============================================================
-# 5. Agents for staged workflow
+# 6. Main runner
 # ============================================================
 
-hypothesis_drafter_agent = Agent(
-    name="PX4 Hypothesis Drafter",
-    instructions="""
-You draft candidate hypotheses only. Do not assign confidence.
-
-For each hypothesis, provide:
-- one specific suspected PX4 mechanism, not a bundle of alternatives
-- why it is plausible from inventory/timeline/user question
-- source queries/files needed to confirm the mechanism
-- required log signals
-- candidate windows
-- plausible alternatives that must be excluded
-
-Do not write final evidence. Do not claim the mechanism is confirmed.
-""",
-    tools=[WebSearchTool()],
-    output_type=HypothesisDraftSet,
-)
-
-
-mechanism_resolver_agent = Agent(
-    name="PX4 Mechanism Resolver",
-    instructions="""
-Resolve one hypothesis against PX4 source code.
-
-Rules:
-- Use local PX4 source tools. Web search is only for discovery, never final code truth.
-- Return mechanism_confirmed=false if you cannot identify a concrete code path.
-- A confirmed mechanism needs concrete source refs: file, function when possible,
-  line range when possible, and a short snippet when possible.
-- Identify parameters, state gates, and branch conditions that select this behavior.
-- Convert source behavior into hints for expected logged signatures.
-- Do not assign flight-log confidence. Only resolve source mechanism confidence.
-""",
-    tools=[
-        WebSearchTool(),
-        checkout_px4_source,
-        search_px4_source,
-        read_px4_source_file,
-        resolve_px4_mechanism,
-    ],
-    output_type=SourceMechanism,
-)
-
-
-signature_builder_agent = Agent(
-    name="PX4 Log Signature Builder",
-    instructions="""
-Build a deterministic log-verification spec from a source-resolved mechanism.
-
-Output must include:
-- expected logged signature
-- candidate windows
-- required signals
-- optional derived signals using a restricted expression-style description
-- events if useful
-- supporting relationship checks
-- exclusion checks for plausible alternate causes
-- numeric checks
-- plot requests that visualize only relevant signals/windows
-
-Do not assign confidence. Do not write final report text.
-Make checks generic and declarative so evaluate_log_signature can execute them.
-""",
-    tools=[compute_log_metrics],
-    output_type=LogSignatureSpec,
-)
-
-
-final_report_agent = Agent(
-    name="PX4 Final Report Writer",
-    instructions="""
-Write the final report only from verified hypothesis packages.
-
-Rules:
-- Keep the exact chain visible: known PX4 mechanism, expected logged signature,
-  exclusion checks, numeric checks, contradictions, confidence.
-- Do not introduce new hypotheses that were not verified.
-- Confidence cannot exceed evaluation.confidence_ceiling.
-- If source_mechanism.mechanism_confirmed is false, confidence must be low or unresolved.
-- If required signals are missing for a key check, confidence must be low or unresolved.
-- If evaluation verdict is contradicted, do not present the hypothesis as likely.
-- Separate observed log evidence, source-code inference, parameter inference, and unknowns.
-- Do not provide tuning/fix suggestions unless suggestions_requested is true.
-""",
-    tools=[],
-    output_type=FlightLogReport,
-)
-
-
-report_repair_agent = Agent(
-    name="PX4 Report Repairer",
-    instructions="""
-Repair a report so it satisfies validation issues.
-
-Rules:
-- Do not add unsupported evidence.
-- Downgrade confidence rather than inventing support.
-- Preserve the verified packages as the only source of truth.
-- Explicitly mark unresolved mechanisms/checks as unresolved.
-""",
-    tools=[],
-    output_type=FlightLogReport,
-)
-
-
-# ============================================================
-# 6. Main V2 runner
-# ============================================================
-
-async def analyze_flight_log_v2(
+async def analyze_flight_log(
     log_path: str,
     user_question: str,
     mission_path: Optional[str] = None,
@@ -578,7 +450,9 @@ async def analyze_flight_log_v2(
     output_dir: str = "outputs/run_001",
     dev_log_root: str = str(DEFAULT_DEV_LOG_ROOT),
     dev_run_id: Optional[str] = None,
-    max_hypotheses: int = 4,
+    max_candidates: int = 5,
+    mechanism_cache_dir: str = ".flightlog_cache/mechanisms",
+    force_mechanism_refresh: bool = False,
 ) -> FlightLogReport:
     log_path_obj = Path(log_path)
     mission_path_obj = Path(mission_path) if mission_path else None
@@ -591,35 +465,35 @@ async def analyze_flight_log_v2(
 
     audit_logger.save_metadata(
         {
-            "runner_version": "v2_staged_verification",
+            "runner_version": "v3_mechanism_first",
             "log_path": str(log_path_obj),
             "mission_path": str(mission_path_obj) if mission_path_obj else None,
             "source_path": str(source_path_obj) if source_path_obj else None,
             "output_dir": str(output_dir_obj),
             "report_path": str(report_path),
+            "mechanism_cache_dir": mechanism_cache_dir,
+            "force_mechanism_refresh": force_mechanism_refresh,
         }
     )
-    audit_logger.log_event(
-        "run.started",
-        input={
-            "log_path": str(log_path_obj),
-            "user_question": user_question,
-            "mission_path": str(mission_path_obj) if mission_path_obj else None,
-            "source_path": str(source_path_obj) if source_path_obj else None,
-            "output_dir": str(output_dir_obj),
-            "max_hypotheses": max_hypotheses,
-        },
+
+    ctx = FlightLogContext(
+        log_path=log_path_obj,
+        mission_path=mission_path_obj,
+        source_path=source_path_obj,
+        output_dir=output_dir_obj,
     )
 
     try:
+        # ------------------------------------------------------------
+        # Stage 1: deterministic prepass
+        # ------------------------------------------------------------
         inventory = _audit_sync_call(
             audit_logger,
             "prepass",
             "parse_ulog_inventory",
             parse_ulog_inventory,
-            {"log_path": str(log_path_obj), "source_path": str(source_path_obj) if source_path_obj else None},
+            {"log_path": str(log_path_obj)},
             log_path_obj,
-            source_path_obj,
         )
         timeline = _audit_sync_call(
             audit_logger,
@@ -629,7 +503,7 @@ async def analyze_flight_log_v2(
             {"log_path": str(log_path_obj)},
             log_path_obj,
         )
-        assumptions = _audit_sync_call(
+        control_surface = _audit_sync_call(
             audit_logger,
             "prepass",
             "infer_control_surface",
@@ -647,130 +521,239 @@ async def analyze_flight_log_v2(
             mission_path_obj,
         )
 
-        ctx = FlightLogContext(
-            log_path=log_path_obj,
-            mission_path=mission_path_obj,
-            source_path=source_path_obj,
-            output_dir=output_dir_obj,
+        # Only this compact object may enter mechanism discovery.
+        airframe_context = build_airframe_context(inventory, control_surface)
+
+        # Optional: checkout exact PX4 revision before source search.
+        if source_path_obj is not None and airframe_context.px4_git_hash:
+            _audit_sync_call(
+                audit_logger,
+                "source",
+                "checkout_px4_source_revision",
+                checkout_px4_source_revision,
+                {"revision": airframe_context.px4_git_hash},
+                source_path_obj,
+                airframe_context.px4_git_hash,
+            )
+
+        # ------------------------------------------------------------
+        # Stage 2: normalize question into source-search intent
+        # ------------------------------------------------------------
+        question_intent = await _run_agent(
+            audit_logger,
+            "question_intent",
+            question_intent_agent,
+            {
+                "user_question": user_question,
+                "airframe_context": airframe_context.model_dump(),
+            },
+            ctx,
+            max_turns=2,
         )
 
-        base_payload = {
-            "user_question": user_question,
-            "log_inventory": inventory,
-            "flight_timeline": timeline,
-            "detected_assumptions": assumptions,
-            "mission_summary": mission,
-            "source_path": str(source_path_obj) if source_path_obj else None,
-            "suggestions_requested": _suggestions_requested(user_question),
+        source_search_context = SourceSearchContext(
+            airframe=airframe_context,
+            question_intent=question_intent,
+        )
+
+        # ------------------------------------------------------------
+        # Stage 3: retrieve and validate cached source mechanisms
+        # ------------------------------------------------------------
+        mechanism_cache_config = MechanismCacheConfig(cache_root=Path(mechanism_cache_dir))
+        mechanism_cache_summary: dict[str, Any] = {
+            "cache_dir": str(mechanism_cache_config.cache_root),
+            "force_mechanism_refresh": force_mechanism_refresh,
+            "retrieval": None,
+            "source_validations": [],
+            "cache_hit_candidate_names": [],
+            "written_records": [],
         }
 
-        drafts = await _run_agent(
-            audit_logger,
-            "draft_hypotheses",
-            hypothesis_drafter_agent,
-            base_payload,
-            ctx,
-            max_turns=8,
-        )
-        draft_list = drafts.hypotheses[:max_hypotheses]
-
-        verified_packages: list[VerifiedHypothesisPackage] = []
-
-        for index, draft in enumerate(draft_list, start=1):
-            stage_payload = {
-                **base_payload,
-                "hypothesis_index": index,
-                "hypothesis_draft": draft.model_dump(),
-            }
-
-            source_mechanism = await _run_agent(
+        cached_records: list[MechanismRecord] = []
+        cache_retrieval = MechanismRetrievalResult()
+        if not force_mechanism_refresh:
+            cache_retrieval = _audit_sync_call(
                 audit_logger,
-                f"resolve_mechanism_{index}",
+                "mechanism_cache",
+                "retrieve_mechanisms",
+                retrieve_cached_mechanisms,
+                {
+                    "mechanism_cache_dir": mechanism_cache_dir,
+                    "source_search_context": source_search_context.model_dump(),
+                    "max_records": max_candidates,
+                },
+                mechanism_cache_config,
+                source_search_context,
+                max_candidates,
+            )
+            mechanism_cache_summary["retrieval"] = cache_retrieval.model_dump()
+
+            for record in cache_retrieval.records:
+                validation = _audit_sync_call(
+                    audit_logger,
+                    "mechanism_cache",
+                    f"validate_mechanism_source:{record.mechanism_id}",
+                    validate_cached_mechanism_source,
+                    {
+                        "mechanism_id": record.mechanism_id,
+                        "source_path": str(source_path_obj) if source_path_obj else None,
+                        "current_git_hash": airframe_context.px4_git_hash,
+                    },
+                    source_path_obj,
+                    airframe_context.px4_git_hash,
+                    record,
+                )
+                mechanism_cache_summary["source_validations"].append(validation.model_dump())
+                if validation.usable:
+                    cached_records.append(record)
+
+        cached_candidates = mechanism_records_to_candidates(cached_records, max_candidates)
+        mechanism_cache_summary["cache_hit_candidate_names"] = [c.name for c in cached_candidates]
+
+        if cached_candidates:
+            source_evidence: Optional[SourceEvidenceBundle] = None
+            candidate_set = MechanismCandidateSet(
+                candidates=cached_candidates,
+                rejected_source_paths=[],
+                unresolved_questions=[
+                    f"Used {len(cached_candidates)} source-validated mechanism cache hit(s); source resolver agent was skipped."
+                ],
+            )
+        else:
+            # ------------------------------------------------------------
+            # Stage 4A: deterministic bounded source search on cache miss
+            # ------------------------------------------------------------
+            source_evidence = _audit_sync_call(
+                audit_logger,
+                "source",
+                "bounded_source_search",
+                bounded_source_search,
+                {"source_search_context": source_search_context.model_dump()},
+                source_path_obj,
+                source_search_context,
+            )
+
+            # ------------------------------------------------------------
+            # Stage 4B: resolve source mechanisms, then write cache records
+            # ------------------------------------------------------------
+            candidate_set = await _run_agent(
+                audit_logger,
+                "resolve_mechanisms",
                 mechanism_resolver_agent,
-                stage_payload,
-                ctx,
-                max_turns=12,
-            )
-
-            signature_spec = await _run_agent(
-                audit_logger,
-                f"build_signature_{index}",
-                signature_builder_agent,
                 {
-                    **stage_payload,
-                    "source_mechanism": source_mechanism.model_dump(),
+                    "source_search_context": source_search_context.model_dump(),
+                    "source_evidence": source_evidence.model_dump(),
                 },
                 ctx,
-                max_turns=8,
+                max_turns=3,
             )
 
-            evaluation = _audit_sync_call(
+            written_records = _audit_sync_call(
                 audit_logger,
-                "verification",
-                "evaluate_log_signature",
-                _evaluate_signature_for_runner,
+                "mechanism_cache",
+                "write_resolved_mechanisms",
+                write_resolved_mechanisms_to_cache,
                 {
-                    "mechanism_title": signature_spec.mechanism_title,
-                    "required_signals": signature_spec.required_signals,
-                    "candidate_windows": [w.model_dump() for w in signature_spec.candidate_windows],
-                    "supporting_checks": [c.model_dump(exclude_none=True) for c in signature_spec.supporting_checks],
-                    "exclusion_checks": [c.model_dump(exclude_none=True) for c in signature_spec.exclusion_checks],
-                    "numeric_checks": [c.model_dump(exclude_none=True) for c in signature_spec.numeric_checks],
+                    "mechanism_cache_dir": mechanism_cache_dir,
+                    "candidate_count": len(candidate_set.candidates),
                 },
-                ctx,
-                signature_spec,
+                mechanism_cache_config,
+                candidate_set,
+                airframe_context,
+                question_intent,
+                source_path_obj,
+                source_evidence,
+            )
+            mechanism_cache_summary["written_records"] = written_records
+
+        candidates = candidate_set.candidates[:max_candidates]
+
+        # ------------------------------------------------------------
+        # Stage 5: deterministic applicability + log verification
+        # ------------------------------------------------------------
+        verified_results: list[VerifiedMechanismResult] = []
+        for candidate in candidates:
+            applicability = _audit_sync_call(
+                audit_logger,
+                "applicability",
+                f"evaluate_applicability:{candidate.name}",
+                evaluate_candidate_applicability,
+                {"candidate": candidate.model_dump()},
+                candidate,
+                inventory,
+                timeline,
+                mission,
             )
 
-            verified_packages.append(
-                VerifiedHypothesisPackage(
-                    draft=draft,
-                    source_mechanism=source_mechanism,
-                    signature_spec=signature_spec,
+            if not applicability.applicable:
+                evaluation = SignatureEvaluation(
+                    candidate_name=candidate.name,
+                    verdict="unresolved",
+                    confidence_ceiling="low",
+                    evidence=[],
+                    contradictions=[f"Mechanism excluded before log verification: {applicability.excluded_by}"],
+                    warnings=["Log verification skipped because applicability failed."],
+                )
+            else:
+                evaluation = _audit_sync_call(
+                    audit_logger,
+                    "verification",
+                    f"evaluate_signature:{candidate.name}",
+                    evaluate_candidate_log_signature,
+                    {
+                        "candidate": candidate.model_dump(),
+                        "applicability": applicability.model_dump(),
+                    },
+                    ctx,
+                    candidate,
+                    applicability,
+                )
+
+            verified_results.append(
+                VerifiedMechanismResult(
+                    candidate=candidate,
+                    applicability=applicability,
                     evaluation=evaluation,
+                    final_confidence=derive_confidence(applicability, evaluation),
                 )
             )
 
+        # ------------------------------------------------------------
+        # Stage 6: final report, then deterministic validation/plots
+        # ------------------------------------------------------------
         report = await _run_agent(
             audit_logger,
             "final_report",
             final_report_agent,
             {
-                **base_payload,
-                "verified_hypothesis_packages": [pkg.model_dump() for pkg in verified_packages],
+                "airframe_context": airframe_context.model_dump(),
+                "question_intent": question_intent.model_dump(),
+                "verified_mechanism_results": [r.model_dump() for r in verified_results],
+                "excluded_source_paths": candidate_set.rejected_source_paths,
+                "unresolved_source_questions": candidate_set.unresolved_questions,
+                "mechanism_cache": mechanism_cache_summary,
             },
             ctx,
-            max_turns=8,
+            max_turns=4,
         )
 
-        report = generate_report_plots(report, ctx, audit_logger=audit_logger)
+        report = generate_report_plots(report, ctx, audit_logger)
         validation = validate_report(report)
         audit_logger.log_event("validation.finished", output=validation.model_dump())
 
         if not validation.passed:
-            report = await _run_agent(
-                audit_logger,
-                "repair_report",
-                report_repair_agent,
-                {
-                    **base_payload,
-                    "report": report.model_dump(),
-                    "validation": validation.model_dump(),
-                    "verified_hypothesis_packages": [pkg.model_dump() for pkg in verified_packages],
-                },
-                ctx,
-                max_turns=6,
-            )
-            report = generate_report_plots(report, ctx, audit_logger=audit_logger)
+            # Prefer deterministic downgrade instead of another LLM repair loop.
+            report = enforce_validation_downgrades(report, validation)
             validation = validate_report(report)
-            audit_logger.log_event("validation_after_repair.finished", output=validation.model_dump())
+            audit_logger.log_event("validation_after_downgrade.finished", output=validation.model_dump())
 
         save_report(report, report_path)
         audit_logger.log_event(
             "run.finished",
             output={
                 "report_path": str(report_path),
-                "dev_log_dir": str(audit_logger.run_dir),
                 "validation_passed": validation.passed,
+                "dev_log_dir": str(audit_logger.run_dir),
             },
         )
         return report
@@ -780,67 +763,299 @@ async def analyze_flight_log_v2(
         raise
 
 
-analyze_flight_log = analyze_flight_log_v2
 
 
 # ============================================================
-# 7. Verification, validation, and plot materialization
+# 7. Deterministic stage implementations
 # ============================================================
 
-def _evaluate_signature_for_runner(
+def build_airframe_context(inventory: dict, control_surface: dict) -> AirframeContext:
+    params = inventory.get("parameters") or inventory.get("important_parameters") or {}
+
+    px4_git_hash = (
+        inventory.get("git_hash")
+        or inventory.get("px4_git_hash")
+        or inventory.get("firmware_git_hash")
+    )
+    px4_version = inventory.get("firmware_version") or inventory.get("px4_version")
+    px4_tag = inventory.get("px4_tag") or inventory.get("git_tag")
+
+    sys_autostart = _maybe_int(params.get("SYS_AUTOSTART"))
+    vehicle_type = infer_vehicle_type_string(inventory, params, control_surface)
+
+    return AirframeContext(
+        px4_git_hash=px4_git_hash,
+        px4_version=px4_version,
+        px4_tag=px4_tag,
+        vehicle_type=vehicle_type,
+        sys_autostart=sys_autostart,
+        airframe_name=str(control_surface.get("airframe") or control_surface.get("airframe_name") or ""),
+        control_surface_summary=summarize_control_surface(control_surface),
+    )
+
+
+def infer_vehicle_type_string(inventory: dict, params: dict, control_surface: dict) -> str:
+    # Replace this with your actual inventory/parameter conventions.
+    vehicle_type = str(control_surface.get("vehicle_type") or inventory.get("vehicle_type") or "unknown").lower()
+    vt_type = params.get("VT_TYPE")
+
+    if "vtol" in vehicle_type or vt_type is not None:
+        vt_type_i = _maybe_int(vt_type)
+        if vt_type_i == 1:
+            return "vtol_tailsitter"
+        if vt_type_i == 2:
+            return "vtol_standard"
+        if vt_type_i == 3:
+            return "vtol_tiltrotor"
+        return "vtol_unknown_subtype"
+
+    if "fixed" in vehicle_type or "fw" in vehicle_type:
+        return "fixed_wing"
+    if "multi" in vehicle_type or "mc" in vehicle_type:
+        return "multicopter"
+    return vehicle_type or "unknown"
+
+
+def summarize_control_surface(control_surface: dict) -> str:
+    # Keep this compact. No full parameter dump.
+    if not control_surface:
+        return "unknown"
+    keys = [
+        "vehicle_type",
+        "assumed_actuator_mapping",
+        "control_surfaces",
+        "confidence",
+        "warning",
+    ]
+    compact = {k: control_surface.get(k) for k in keys if k in control_surface}
+    return json.dumps(compact, separators=(",", ":"), default=str)[:2000]
+
+
+def retrieve_cached_mechanisms(
+    cache_config: MechanismCacheConfig,
+    source_search_context: SourceSearchContext,
+    max_records: int,
+) -> MechanismRetrievalResult:
+    retriever = MechanismRetriever(cache_config)
+    return retriever.retrieve(source_search_context, max_records=max_records)
+
+
+def validate_cached_mechanism_source(
+    source_path: Optional[Path],
+    current_git_hash: Optional[str],
+    record: MechanismRecord,
+) -> MechanismSourceValidation:
+    validator = MechanismSourceValidator(source_path, current_git_hash=current_git_hash)
+    return validator.validate_record(record)
+
+
+def mechanism_records_to_candidates(
+    records: list[MechanismRecord],
+    max_candidates: int,
+) -> list[MechanismCandidate]:
+    candidates: list[MechanismCandidate] = []
+    for record in records[:max_candidates]:
+        try:
+            candidate = MechanismCandidate.model_validate(record.candidate_payload)
+        except Exception:
+            continue
+        candidates.append(candidate)
+    return candidates
+
+
+def write_resolved_mechanisms_to_cache(
+    cache_config: MechanismCacheConfig,
+    candidate_set: MechanismCandidateSet,
+    airframe_context: AirframeContext,
+    question_intent: QuestionIntent,
+    source_path: Optional[Path],
+    source_evidence: SourceEvidenceBundle,
+) -> list[dict[str, Any]]:
+    writer = MechanismCacheWriter(cache_config)
+    written: list[dict[str, Any]] = []
+    for candidate in candidate_set.candidates:
+        record = writer.write_candidate(
+            candidate_payload=candidate.model_dump(),
+            airframe_context=airframe_context.model_dump(),
+            question_intent=question_intent.model_dump(),
+            source_path=source_path,
+            source_evidence=source_evidence.model_dump(),
+        )
+        written.append({
+            "mechanism_id": record.mechanism_id,
+            "name": record.name,
+            "vehicle_control_domain": record.vehicle_control_domain,
+            "px4_git_hash": record.source_identity.px4_git_hash,
+            "source_ref_count": len(record.source_refs),
+        })
+    return written
+
+
+def bounded_source_search(
+    source_path: Optional[Path],
+    search_context: SourceSearchContext,
+    max_hits_total: int = 40,
+    max_hits_per_query: int = 8,
+    max_snippet_chars: int = 1600,
+) -> SourceEvidenceBundle:
+    if source_path is None:
+        return SourceEvidenceBundle(
+            search_context=search_context,
+            hits=[],
+            warnings=["No PX4 source path provided."],
+        )
+
+    hits: list[SourceHit] = []
+    warnings: list[str] = []
+
+    queries = dedupe_keep_order(search_context.question_intent.source_queries)
+    for query in queries:
+        if len(hits) >= max_hits_total:
+            break
+
+        raw_results = search_source(source_path, query, max_results=max_hits_per_query)
+        for item in _flatten_source_results(query, raw_results):
+            if len(hits) >= max_hits_total:
+                break
+            item.snippet = item.snippet[:max_snippet_chars]
+            hits.append(item)
+
+    # Optional: read only bounded snippets from likely files. Never read whole files.
+    read_snippets: list[CodeRef] = []
+    for file in search_context.question_intent.likely_source_files[:6]:
+        try:
+            result = read_source_file(source_path, file, 1, 220)
+            read_snippets.append(
+                CodeRef(
+                    file=file,
+                    start_line=1,
+                    end_line=220,
+                    snippet=json.dumps(result, default=str)[:max_snippet_chars],
+                    explanation="Bounded top-of-file/context read from likely source file.",
+                )
+            )
+        except Exception as exc:
+            warnings.append(f"Failed to read likely source file {file}: {exc!r}")
+
+    return SourceEvidenceBundle(
+        search_context=search_context,
+        hits=hits,
+        read_snippets=read_snippets,
+        warnings=warnings,
+    )
+
+
+def evaluate_candidate_applicability(
+    candidate: MechanismCandidate,
+    inventory: dict,
+    timeline: list[dict],
+    mission: Optional[dict],
+) -> ApplicabilityResult:
+    """
+    Use actual parameters/timeline/mission/topic availability to eliminate mechanisms.
+    This is where parameters and topics enter the workflow.
+    """
+    params = inventory.get("parameters") or inventory.get("important_parameters") or {}
+    topic_fields = inventory.get("topic_fields") or {}
+    available_topics = set(inventory.get("available_topics") or topic_fields.keys())
+
+    relevant_parameters = {
+        name: params.get(name)
+        for name in candidate.required_parameters
+        if name in params
+    }
+
+    supported: list[str] = []
+    excluded: list[str] = []
+    unresolved: list[str] = []
+
+    for param_name in candidate.required_parameters:
+        if param_name in params:
+            supported.append(f"Parameter present: {param_name}={params.get(param_name)}")
+        else:
+            unresolved.append(f"Required/candidate parameter not found in log: {param_name}")
+
+    available_required_signals, missing_required_signals = check_required_signals(
+        candidate.required_signals,
+        available_topics,
+        topic_fields,
+    )
+
+    if missing_required_signals:
+        unresolved.append(f"Missing required signals: {missing_required_signals}")
+
+    # TODO: implement candidate.mode_state_gates against timeline.
+    candidate_windows = derive_candidate_windows(candidate, timeline, mission)
+    if not candidate_windows:
+        unresolved.append("No candidate verification window could be derived from timeline/mission.")
+
+    # A candidate is applicable unless a hard exclusion is found.
+    # Missing data makes it unresolved, not necessarily excluded.
+    applicable = len(excluded) == 0
+
+    return ApplicabilityResult(
+        candidate_name=candidate.name,
+        applicable=applicable,
+        supported_conditions=supported,
+        excluded_by=excluded,
+        unresolved_conditions=unresolved,
+        relevant_parameters=relevant_parameters,
+        candidate_windows=candidate_windows,
+        available_required_signals=available_required_signals,
+        missing_required_signals=missing_required_signals,
+    )
+
+
+def evaluate_candidate_log_signature(
     ctx: FlightLogContext,
-    spec: LogSignatureSpec,
+    candidate: MechanismCandidate,
+    applicability: ApplicabilityResult,
 ) -> SignatureEvaluation:
     raw = evaluate_log_signature_impl(
         ctx.log_path,
-        spec.mechanism_title,
-        [_model_to_dict(item) for item in spec.expected_signature],
-        [_window_to_legacy_dict(window) for window in spec.candidate_windows],
-        spec.required_signals,
-        [_model_to_dict(signal) for signal in spec.derived_signals],
-        [_model_to_dict(event) for event in spec.events],
-        [_relationship_to_legacy_check(check) for check in spec.supporting_checks],
-        [_relationship_to_legacy_check(check) for check in spec.exclusion_checks],
-        [_relationship_to_legacy_check(check) for check in spec.numeric_checks],
+        candidate.name,
+        [_model_to_dict(x) for x in candidate.expected_logged_signature],
+        [_model_to_dict(x) for x in applicability.candidate_windows],
+        candidate.required_signals,
+        [_model_to_dict(x) for x in candidate.exclusion_checks],
+        [_model_to_dict(x) for x in candidate.numeric_checks],
     )
-    return _normalize_evaluation_result(
-        mechanism_title=spec.mechanism_title,
-        raw=raw,
-        derived_signals=spec.derived_signals,
-        events=spec.events,
-    )
+    return normalize_signature_evaluation(candidate.name, raw, applicability)
 
 
-def _normalize_evaluation_result(
-    mechanism_title: str,
-    raw: dict[str, Any],
-    derived_signals: list[DerivedSignalSpec],
-    events: list[EventSpec],
+def normalize_signature_evaluation(
+    candidate_name: str,
+    raw: Any,
+    applicability: ApplicabilityResult,
 ) -> SignatureEvaluation:
-    missing = _extract_list(raw, ["missing_required_signals", "missing_signals"])
+    if not isinstance(raw, dict):
+        raw = {"raw": raw}
+
     evidence = _extract_list(raw, ["evidence", "supporting_evidence", "supports"])
     contradictions = _extract_list(raw, ["contradictions", "contradicting_evidence", "contradicts"])
     warnings = _extract_list(raw, ["warnings"])
 
+    if applicability.missing_required_signals:
+        warnings.append(f"Missing required signals: {applicability.missing_required_signals}")
+
     verdict_raw = str(raw.get("verdict") or raw.get("status") or "").lower()
     if "support" in verdict_raw:
-        verdict: Literal["supported", "contradicted", "mixed", "unresolved"] = "supported"
+        verdict = "supported"
     elif "contrad" in verdict_raw:
         verdict = "contradicted"
     elif "mixed" in verdict_raw:
         verdict = "mixed"
+    elif evidence and contradictions:
+        verdict = "mixed"
+    elif evidence:
+        verdict = "supported"
+    elif contradictions:
+        verdict = "contradicted"
     else:
-        if contradictions and evidence:
-            verdict = "mixed"
-        elif contradictions:
-            verdict = "contradicted"
-        elif evidence and not missing:
-            verdict = "supported"
-        else:
-            verdict = "unresolved"
+        verdict = "unresolved"
 
-    if missing:
-        ceiling: Literal["high", "medium", "low", "unresolved"] = "low"
+    if applicability.missing_required_signals:
+        ceiling = "low"
     elif verdict == "supported":
         ceiling = "high"
     elif verdict == "mixed":
@@ -850,30 +1065,68 @@ def _normalize_evaluation_result(
     else:
         ceiling = "unresolved"
 
-    if derived_signals:
-        warnings.append(
-            "Derived signals were declared; make sure the evaluator implementation supports the restricted expression grammar."
-        )
-    if events:
-        warnings.append(
-            "Events were declared; make sure event detection results are represented in check_results."
-        )
-
-    check_results = raw.get("check_results")
-    if not isinstance(check_results, list):
-        check_results = raw.get("checks") if isinstance(raw.get("checks"), list) else []
+    check_results = raw.get("check_results") if isinstance(raw.get("check_results"), list) else []
 
     return SignatureEvaluation(
-        mechanism_title=mechanism_title,
+        candidate_name=candidate_name,
         verdict=verdict,
         confidence_ceiling=ceiling,
         evidence=[str(x) for x in evidence],
         contradictions=[str(x) for x in contradictions],
-        missing_required_signals=[str(x) for x in missing],
         check_results=check_results,
         warnings=[str(x) for x in warnings],
         raw=raw,
     )
+
+
+def derive_confidence(
+    applicability: ApplicabilityResult,
+    evaluation: SignatureEvaluation,
+) -> Literal["high", "medium", "low", "unresolved"]:
+    if not applicability.applicable:
+        return "low"
+    if applicability.missing_required_signals:
+        return "low"
+    return evaluation.confidence_ceiling
+
+
+def derive_candidate_windows(
+    candidate: MechanismCandidate,
+    timeline: list[dict],
+    mission: Optional[dict],
+) -> list[WindowSpec]:
+    # Skeleton: replace with real timeline interpretation.
+    # For now, use candidate plot windows if provided.
+    windows: list[WindowSpec] = []
+    for plot in candidate.plot_requests:
+        if plot.start_s is not None and plot.end_s is not None:
+            windows.append(
+                WindowSpec(
+                    name=plot.title.lower().replace(" ", "_"),
+                    start_s=float(plot.start_s),
+                    end_s=float(plot.end_s),
+                    reason=plot.purpose,
+                )
+            )
+    return windows
+
+
+def check_required_signals(
+    required_signals: list[str],
+    available_topics: set[str],
+    topic_fields: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    available: list[str] = []
+    missing: list[str] = []
+
+    for signal in required_signals:
+        topic = signal.split(".", 1)[0]
+        if topic in available_topics:
+            available.append(signal)
+        else:
+            missing.append(signal)
+
+    return available, missing
 
 
 def validate_report(report: FlightLogReport) -> ValidationResult:
@@ -881,139 +1134,95 @@ def validate_report(report: FlightLogReport) -> ValidationResult:
 
     for i, hyp in enumerate(report.ranked_hypotheses):
         path = f"ranked_hypotheses[{i}]"
-
-        if hyp.confidence in ("high", "medium") and not hyp.source_confirmed:
-            issues.append(
-                ValidationIssue(
-                    severity="error",
-                    path=f"{path}.confidence",
-                    message="Confidence is medium/high but source mechanism is not confirmed.",
-                )
-            )
-
-        if hyp.source_confirmed and not hyp.code_references:
-            issues.append(
-                ValidationIssue(
-                    severity="error",
-                    path=f"{path}.code_references",
-                    message="Source-confirmed hypothesis has no code references.",
-                )
-            )
-
-        for j, ref in enumerate(hyp.code_references):
-            if hyp.source_confirmed and not ref.snippet and ref.start_line is None:
-                issues.append(
-                    ValidationIssue(
-                        severity="warning",
-                        path=f"{path}.code_references[{j}]",
-                        message="Code reference lacks both snippet and line range.",
-                    )
-                )
-
-        if hyp.confidence in ("high", "medium") and hyp.verifier_verdict in ("unresolved", "contradicted"):
-            issues.append(
-                ValidationIssue(
-                    severity="error",
-                    path=f"{path}.verifier_verdict",
-                    message="Confidence is medium/high but verifier verdict is unresolved or contradicted.",
-                )
-            )
-
-        if hyp.confidence == "high" and hyp.contradicting_evidence:
-            issues.append(
-                ValidationIssue(
-                    severity="warning",
-                    path=f"{path}.contradicting_evidence",
-                    message="High confidence hypothesis still has contradicting evidence.",
-                )
-            )
-
+        if hyp.confidence in ("high", "medium") and not hyp.source_refs:
+            issues.append(ValidationIssue(
+                severity="error",
+                path=f"{path}.source_refs",
+                message="Medium/high confidence mechanism has no source references.",
+            ))
+        if hyp.confidence in ("high", "medium") and not hyp.numeric_checks:
+            issues.append(ValidationIssue(
+                severity="error",
+                path=f"{path}.numeric_checks",
+                message="Medium/high confidence mechanism has no numeric checks.",
+            ))
+        if hyp.confidence in ("high", "medium") and hyp.applicability.missing_required_signals:
+            issues.append(ValidationIssue(
+                severity="error",
+                path=f"{path}.applicability.missing_required_signals",
+                message="Medium/high confidence mechanism is missing required signals.",
+            ))
         if not hyp.expected_logged_signature:
-            issues.append(
-                ValidationIssue(
-                    severity="error",
-                    path=f"{path}.expected_logged_signature",
-                    message="Hypothesis has no expected logged signature.",
-                )
-            )
+            issues.append(ValidationIssue(
+                severity="error",
+                path=f"{path}.expected_logged_signature",
+                message="Mechanism has no expected logged signature.",
+            ))
 
-        if not hyp.numeric_checks:
-            issues.append(
-                ValidationIssue(
-                    severity="error",
-                    path=f"{path}.numeric_checks",
-                    message="Hypothesis has no numeric checks.",
-                )
-            )
+    return ValidationResult(
+        passed=not any(issue.severity == "error" for issue in issues),
+        issues=issues,
+    )
 
-        for j, plot in enumerate(hyp.plots):
-            if plot.missing_signals and hyp.confidence in ("high", "medium"):
-                issues.append(
-                    ValidationIssue(
-                        severity="warning",
-                        path=f"{path}.plots[{j}].missing_signals",
-                        message="Plot has missing signals while hypothesis confidence is medium/high.",
-                    )
-                )
 
-    passed = not any(issue.severity == "error" for issue in issues)
-    return ValidationResult(passed=passed, issues=issues)
+def enforce_validation_downgrades(report: FlightLogReport, validation: ValidationResult) -> FlightLogReport:
+    # Conservative fallback: if validation reports structural evidence errors,
+    # downgrade affected hypotheses instead of launching another repair agent.
+    for issue in validation.issues:
+        if issue.severity != "error":
+            continue
+        if not issue.path.startswith("ranked_hypotheses["):
+            continue
+        idx_str = issue.path.split("[", 1)[1].split("]", 1)[0]
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            continue
+        if 0 <= idx < len(report.ranked_hypotheses):
+            hyp = report.ranked_hypotheses[idx]
+            if hyp.confidence in ("high", "medium"):
+                hyp.confidence = "low"
+                hyp.contradicting_evidence.append(f"Confidence downgraded by validation: {issue.message}")
+    return report
 
 
 def generate_report_plots(
     report: FlightLogReport,
     ctx: FlightLogContext,
-    audit_logger: Optional[DeveloperAuditLogger] = None,
+    audit_logger: Optional[DeveloperAuditLogger],
 ) -> FlightLogReport:
-    hypotheses = getattr(report, "ranked_hypotheses", None)
-    if not hypotheses:
-        return report
-
-    for hypothesis in hypotheses:
-        generated_count = 0
-
-        plots = getattr(hypothesis, "plots", None) or []
-        for plot in plots:
-            spec = _plot_generation_spec(plot)
-            if spec is None:
+    for hyp in report.ranked_hypotheses:
+        for plot in hyp.plots:
+            if plot.start_s is None or plot.end_s is None or not plot.signals:
                 continue
-
             result = _audit_sync_call(
                 audit_logger,
                 "postprocess_plot",
                 "generate_signal_plot",
                 generate_signal_plot_impl,
                 {
-                    "log_path": str(ctx.log_path),
-                    "output_dir": str(ctx.output_dir),
-                    **spec,
+                    "title": plot.title,
+                    "start_s": plot.start_s,
+                    "end_s": plot.end_s,
+                    "signals": plot.signals,
                 },
                 ctx.log_path,
                 ctx.output_dir,
-                spec["title"],
-                spec["start_s"],
-                spec["end_s"],
-                spec["signals"],
-                spec["purpose"],
-                plot_type=spec["plot_type"],
-                bins=spec["bins"],
-                overlays=spec["overlays"],
+                plot.title,
+                float(plot.start_s),
+                float(plot.end_s),
+                plot.signals,
+                plot.purpose,
+                plot_type=plot.plot_type,
+                bins=plot.bins,
+                overlays=[o.model_dump(exclude_none=True) for o in plot.overlays],
             )
             _apply_plot_result(plot, result)
-            generated_count += 1
-
-        if generated_count == 0 and not _has_existing_plot_file(plots):
-            title = getattr(hypothesis, "title", "untitled hypothesis")
-            _append_unconfirmed(
-                report,
-                f"Plot generation was not attempted for hypothesis '{title}' because no complete plot spec was returned.",
-            )
-
     return report
 
 
 # ============================================================
-# 8. Helpers
+# 8. Utility helpers
 # ============================================================
 
 async def _run_agent(
@@ -1023,50 +1232,18 @@ async def _run_agent(
     payload: dict[str, Any],
     ctx: FlightLogContext,
     max_turns: int,
-    max_attempts: int = 5,
 ) -> Any:
     started_at = time.perf_counter()
     if audit_logger is not None:
         audit_logger.log_event(f"agent.{stage_name}.started", input=payload)
 
-    result = None
-    serialized_input = json.dumps(payload, indent=2, default=str)
-    for attempt in range(1, max_attempts + 1):
-        try:
-            result = await Runner.run(
-                agent,
-                input=serialized_input,
-                context=ctx,
-                max_turns=max_turns,
-                hooks=AgentRunAuditHooks(audit_logger) if audit_logger is not None else None,
-            )
-            break
-        except Exception as exc:
-            if attempt >= max_attempts or not _is_rate_limit_error(exc):
-                if audit_logger is not None:
-                    audit_logger.log_event(
-                        f"agent.{stage_name}.failed",
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                        error=repr(exc),
-                        duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
-                    )
-                raise
-
-            delay_s = _rate_limit_retry_delay_s(exc, attempt)
-            if audit_logger is not None:
-                audit_logger.log_event(
-                    f"agent.{stage_name}.retrying",
-                    attempt=attempt,
-                    next_attempt=attempt + 1,
-                    max_attempts=max_attempts,
-                    delay_s=round(delay_s, 3),
-                    error=repr(exc),
-                )
-            await asyncio.sleep(delay_s)
-
-    if result is None:
-        raise RuntimeError(f"agent.{stage_name} did not return a result")
+    result = await Runner.run(
+        agent,
+        input=json.dumps(payload, separators=(",", ":"), default=str),
+        context=ctx,
+        max_turns=max_turns,
+        hooks=AgentRunAuditHooks(audit_logger) if audit_logger is not None else None,
+    )
 
     if audit_logger is not None:
         log_run_items(audit_logger, getattr(result, "new_items", []) or [])
@@ -1115,122 +1292,59 @@ def _audit_sync_call(
     return result
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(
-        marker in text
-        for marker in (
-            "rate limit",
-            "rate_limit",
-            "tokens per min",
-            "tpm",
-            "429",
-            "too many requests",
-        )
-    )
-
-
-def _rate_limit_retry_delay_s(exc: Exception, attempt: int) -> float:
-    suggested_delay = _parse_retry_delay_s(str(exc))
-    if suggested_delay is not None:
-        return max(0.0, suggested_delay)
-
-    base_delay = min(8.0, 0.5 * (2 ** max(0, attempt - 1)))
-    jitter = random.uniform(0.0, min(0.25, base_delay * 0.25))
-    return base_delay + jitter
-
-
-def _parse_retry_delay_s(message: str) -> Optional[float]:
-    match = re.search(r"try again in\s+([0-9]*\.?[0-9]+)\s*(ms|s|sec|secs|second|seconds)\b", message, re.IGNORECASE)
-    if match is None:
-        return None
-
-    value = float(match.group(1))
-    unit = match.group(2).lower()
-    if unit == "ms":
-        return value / 1000.0
-    return value
-
-
 def save_report(report: FlightLogReport, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if hasattr(report, "model_dump_json"):
-        report_json = report.model_dump_json(indent=2)
+    path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _flatten_source_results(query: str, raw_results: Any) -> list[SourceHit]:
+    """
+    Adapter around your existing px4_source.search_source return format.
+    Fill this in once you standardize search_source output.
+    """
+    hits: list[SourceHit] = []
+
+    if isinstance(raw_results, list):
+        for item in raw_results:
+            if isinstance(item, dict):
+                file = str(item.get("file") or item.get("path") or "unknown")
+                line = _maybe_int(item.get("line") or item.get("line_number"))
+                snippet = str(item.get("snippet") or item.get("text") or item.get("match") or item)
+            else:
+                file = "unknown"
+                line = None
+                snippet = str(item)
+            hits.append(SourceHit(query=query, file=file, line=line, snippet=snippet))
     else:
-        report_json = json.dumps(report, indent=2, default=str)
-    path.write_text(report_json, encoding="utf-8")
+        hits.append(SourceHit(query=query, file="unknown", line=None, snippet=str(raw_results)))
 
-
-def _plot_generation_spec(plot: Any) -> Optional[dict[str, Any]]:
-    start_s = getattr(plot, "start_s", None)
-    end_s = getattr(plot, "end_s", None)
-    signals = getattr(plot, "signals", None) or []
-    if start_s is None or end_s is None or not signals:
-        return None
-    return {
-        "title": getattr(plot, "title", "Flight Log Plot"),
-        "purpose": getattr(plot, "purpose", ""),
-        "start_s": float(start_s),
-        "end_s": float(end_s),
-        "signals": list(signals),
-        "plot_type": getattr(plot, "plot_type", "timeseries") or "timeseries",
-        "bins": int(getattr(plot, "bins", 50) or 50),
-        "overlays": [_model_to_dict(overlay) for overlay in (getattr(plot, "overlays", None) or [])],
-    }
-
-
-def _apply_plot_result(plot: Any, result: dict[str, Any]) -> None:
-    for key in (
-        "title",
-        "path",
-        "purpose",
-        "signals",
-        "plot_type",
-        "overlays",
-        "missing_signals",
-        "warnings",
-    ):
-        if key in result:
-            setattr(plot, key, result[key])
-
-
-def _has_existing_plot_file(plots: list[Any]) -> bool:
-    return any(getattr(plot, "path", "") and Path(getattr(plot, "path")).is_file() for plot in plots)
-
-
-def _append_unconfirmed(report: Any, message: str) -> None:
-    unconfirmed = getattr(report, "unconfirmed", None)
-    if unconfirmed is None:
-        return
-    if message not in unconfirmed:
-        unconfirmed.append(message)
+    return hits
 
 
 def _model_to_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
-        return {key: item for key, item in value.items() if item is not None}
+        return {k: v for k, v in value.items() if v is not None}
     if hasattr(value, "model_dump"):
         return value.model_dump(exclude_none=True)
     if hasattr(value, "__dict__"):
-        return {key: item for key, item in vars(value).items() if item is not None}
+        return {k: v for k, v in vars(value).items() if v is not None}
     return dict(value)
 
 
-def _window_to_legacy_dict(window: WindowSpec) -> dict[str, Any]:
-    return {
-        "name": window.name,
-        "start_s": window.start_s,
-        "end_s": window.end_s,
-    }
+def _safe_model_dump(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, list):
+        return [_safe_model_dump(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _safe_model_dump(v) for k, v in value.items()}
+    return value
 
 
-def _relationship_to_legacy_check(check: RelationshipCheckSpec) -> dict[str, Any]:
-    data = _model_to_dict(check)
-    if "from_value" in data:
-        data["from"] = data.pop("from_value")
-    if "to_value" in data:
-        data["to"] = data.pop("to_value")
-    return data
+def _apply_plot_result(plot: PlotRef, result: dict[str, Any]) -> None:
+    for key in ("title", "path", "purpose", "signals", "plot_type", "overlays", "missing_signals", "warnings"):
+        if key in result:
+            setattr(plot, key, result[key])
 
 
 def _extract_list(raw: dict[str, Any], keys: list[str]) -> list[Any]:
@@ -1243,19 +1357,25 @@ def _extract_list(raw: dict[str, Any], keys: list[str]) -> list[Any]:
     return []
 
 
-def _safe_model_dump(value: Any) -> Any:
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if isinstance(value, list):
-        return [_safe_model_dump(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _safe_model_dump(item) for key, item in value.items()}
-    return value
+def _maybe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
-def _suggestions_requested(user_question: str) -> bool:
-    q = user_question.lower()
-    return any(token in q for token in ("suggest", "fix", "tune", "recommend", "what should i change"))
+def dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
 
 
 # ============================================================
@@ -1269,10 +1389,7 @@ if __name__ == "__main__":
             mission_path="missions/test.plan",
             source_path="PX4-Autopilot",
             output_dir="outputs/test_case_001",
-            user_question=(
-                "Why did the aircraft start loitering before reaching "
-                "the next waypoint? Do not provide suggestions."
-            ),
+            user_question="Why did RTL climb higher than expected? Do not provide suggestions.",
         )
     )
     print(report.model_dump_json(indent=2))

@@ -383,10 +383,51 @@ def analysis_event_message(event: dict[str, Any]) -> dict[str, Any] | None:
         message = "Verifying log signature"
     elif event_name == "verification.finished":
         message = "Verified log signature"
+    elif event_name.startswith("source."):
+        message = named_stage_progress_message(
+            event_name,
+            str(name),
+            {
+                "checkout_px4_source_revision": (
+                    "Checking out PX4 source revision",
+                    "Checked out PX4 source revision",
+                ),
+                "bounded_source_search": (
+                    "Searching PX4 source",
+                    "Searched PX4 source",
+                ),
+            },
+            "source step",
+        )
+    elif event_name.startswith("mechanism_cache."):
+        message = named_stage_progress_message(
+            event_name,
+            str(name),
+            {
+                "retrieve_mechanisms": (
+                    "Retrieving cached mechanisms",
+                    "Retrieved cached mechanisms",
+                ),
+                "write_resolved_mechanisms": (
+                    "Writing mechanism cache",
+                    "Wrote mechanism cache",
+                ),
+            },
+            "mechanism cache step",
+        )
+    elif event_name.startswith("applicability."):
+        message = named_stage_progress_message(
+            event_name,
+            str(name),
+            {},
+            "mechanism applicability check",
+        )
     elif event_name == "validation.finished":
         message = "Validated report"
     elif event_name == "validation_after_repair.finished":
         message = "Validated repaired report"
+    elif event_name == "validation_after_downgrade.finished":
+        message = "Validated downgraded report"
     elif event_name == "postprocess_plot.started":
         message = "Generating report plots"
     elif event_name == "postprocess_plot.finished":
@@ -417,6 +458,8 @@ def agent_progress_message(event_name: str) -> str | None:
     failed = status == "failed"
 
     stage_messages = [
+        ("question_intent", "Normalizing question intent", "Normalized question intent"),
+        ("resolve_mechanisms", "Resolving PX4 source mechanisms", "Resolved PX4 source mechanisms"),
         ("draft_hypotheses", "Drafting candidate hypotheses", "Drafted candidate hypotheses"),
         ("resolve_mechanism_", "Resolving PX4 source mechanism", "Resolved PX4 source mechanism"),
         ("build_signature_", "Building log signature checks", "Built log signature checks"),
@@ -434,6 +477,33 @@ def agent_progress_message(event_name: str) -> str | None:
             if finished:
                 return finished_message
 
+    return None
+
+
+def named_stage_progress_message(
+    event_name: str,
+    name: str,
+    known_messages: dict[str, tuple[str, str]],
+    fallback_label: str,
+) -> str | None:
+    status = event_name.rsplit(".", 1)[-1]
+    started = status == "started"
+    finished = status == "finished"
+    failed = status == "failed"
+
+    started_message, finished_message = known_messages.get(
+        name,
+        (
+            f"Running {fallback_label}: {name}",
+            f"Finished {fallback_label}: {name}",
+        ),
+    )
+    if started:
+        return started_message
+    if finished:
+        return finished_message
+    if failed:
+        return f"Failed while {started_message[0].lower()}{started_message[1:]}"
     return None
 
 
