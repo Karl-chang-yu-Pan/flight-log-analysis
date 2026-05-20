@@ -26,10 +26,29 @@
 
         <section class="fact-section">
           <div class="section-title-row">
-            <h2>Warnings</h2>
+            <h2>Messages</h2>
             <span class="count-pill" id="warningCount">0</span>
           </div>
-          <div class="message-list" id="warningsList"></div>
+          <div class="toolbar compact-toolbar">
+            <input id="messageSearch" type="search" placeholder="Search messages">
+            <select id="messageFilter">
+              <option value="important">Important</option>
+              <option value="errors">Errors only</option>
+              <option value="all">All messages</option>
+            </select>
+          </div>
+          <div class="message-table-shell scroll-panel messages-panel">
+            <table class="dense-table message-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Level</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody id="warningsList"></tbody>
+            </table>
+          </div>
         </section>
 
         <section class="fact-section">
@@ -50,7 +69,7 @@
               Hide RC/CAL
             </label>
           </div>
-          <div class="table-shell">
+          <div class="table-shell scroll-panel parameters-panel">
             <table class="dense-table">
               <thead>
                 <tr>
@@ -73,7 +92,7 @@
           <div class="toolbar">
             <input id="topicSearch" type="search" placeholder="Search topics and fields">
           </div>
-          <div id="topicRows" class="topic-list"></div>
+          <div id="topicRows" class="topic-list scroll-panel topics-panel"></div>
         </section>
       </aside>
 

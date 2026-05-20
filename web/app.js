@@ -17,6 +17,8 @@ const els = {
   factGrid: document.getElementById("factGrid"),
   warningsList: document.getElementById("warningsList"),
   warningCount: document.getElementById("warningCount"),
+  messageSearch: document.getElementById("messageSearch"),
+  messageFilter: document.getElementById("messageFilter"),
   parameterSearch: document.getElementById("parameterSearch"),
   parameterStatus: document.getElementById("parameterStatus"),
   hideRcCal: document.getElementById("hideRcCal"),
@@ -43,6 +45,8 @@ els.form.addEventListener("submit", async (event) => {
 els.parameterSearch.addEventListener("input", renderParameters);
 els.parameterStatus.addEventListener("change", renderParameters);
 els.hideRcCal.addEventListener("change", renderParameters);
+els.messageSearch.addEventListener("input", renderWarnings);
+els.messageFilter.addEventListener("change", renderWarnings);
 els.topicSearch.addEventListener("input", renderTopics);
 els.analysisButton.addEventListener("click", startAnalysis);
 
@@ -359,11 +363,72 @@ function formatAirframe(airframe) {
 }
 
 function renderWarnings() {
-  const warnings = state.payload?.inventory?.warnings || [];
-  els.warningCount.textContent = String(warnings.length);
-  els.warningsList.innerHTML = warnings.length
-    ? warnings.map((warning) => `<div class="message-item">${escapeHtml(warning)}</div>`).join("")
-    : `<p class="empty-state">No warnings reported by the parser.</p>`;
+  const messages = inventoryMessages(state.payload?.inventory || {});
+  const query = els.messageSearch.value.trim().toLowerCase();
+  const filter = els.messageFilter.value;
+  const filtered = messages.filter((message) => {
+    if (filter === "important" && !isImportantLevel(message.level)) return false;
+    if (filter === "errors" && !isErrorLevel(message.level)) return false;
+    if (!query) return true;
+    return [
+      message.time,
+      message.level,
+      message.message,
+      message.source,
+    ]
+      .map((value) => String(value || "").toLowerCase())
+      .some((value) => value.includes(query));
+  });
+
+  els.warningCount.textContent = `${filtered.length}/${messages.length}`;
+  els.warningsList.innerHTML = filtered.length
+    ? filtered.map(renderMessageRow).join("")
+    : `<tr><td colspan="3" class="empty-state">No messages match the current filter.</td></tr>`;
+}
+
+function inventoryMessages(inventory) {
+  const loggedMessages = inventory.logged_messages || [];
+  if (loggedMessages.length) {
+    return loggedMessages.map((message) => ({
+      time: formatLogTime(message.time_s),
+      level: String(message.level || "UNKNOWN").toUpperCase(),
+      message: String(message.message || ""),
+      source: message.source || "",
+    }));
+  }
+
+  return (inventory.warnings || []).map((warning) => ({
+    time: "",
+    level: "WARNING",
+    message: String(warning || ""),
+    source: "warning",
+  }));
+}
+
+function renderMessageRow(message) {
+  const levelClass = messageLevelClass(message.level);
+  return `
+    <tr class="${levelClass}">
+      <td>${escapeHtml(message.time)}</td>
+      <td><span class="level-pill">${escapeHtml(message.level)}</span></td>
+      <td>${escapeHtml(message.message)}</td>
+    </tr>
+  `;
+}
+
+function isImportantLevel(level) {
+  return ["EMERGENCY", "ALERT", "CRITICAL", "ERROR", "WARNING"].includes(String(level || "").toUpperCase());
+}
+
+function isErrorLevel(level) {
+  return ["EMERGENCY", "ALERT", "CRITICAL", "ERROR"].includes(String(level || "").toUpperCase());
+}
+
+function messageLevelClass(level) {
+  const normalized = String(level || "").toLowerCase();
+  if (["emergency", "alert", "critical", "error"].includes(normalized)) return "message-error";
+  if (normalized === "warning") return "message-warning";
+  return "message-info";
 }
 
 function renderParameters() {
@@ -555,6 +620,17 @@ function basename(path) {
 
 function formatDuration(value) {
   return value == null ? "unknown" : `${value}s`;
+}
+
+function formatLogTime(value) {
+  if (value == null || value === "") return "";
+  const totalSeconds = Number(value);
+  if (!Number.isFinite(totalSeconds)) return "";
+  const wholeSeconds = Math.floor(totalSeconds);
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+  const seconds = wholeSeconds % 60;
+  return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function statusLabel(status) {

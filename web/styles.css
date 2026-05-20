@@ -164,9 +164,78 @@ h2 {
   font-size: 12px;
 }
 
-.message-list {
-  display: grid;
-  gap: 6px;
+.compact-toolbar {
+  grid-template-columns: minmax(0, 1fr) minmax(110px, 0.45fr);
+}
+
+.scroll-panel {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.messages-panel {
+  max-height: 220px;
+}
+
+.parameters-panel {
+  max-height: 300px;
+}
+
+.topics-panel {
+  max-height: 280px;
+  padding-right: 2px;
+}
+
+.message-table-shell {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.message-table th:nth-child(1),
+.message-table td:nth-child(1) {
+  width: 58px;
+}
+
+.message-table th:nth-child(2),
+.message-table td:nth-child(2) {
+  width: 74px;
+}
+
+.message-table td {
+  font-size: 11px;
+}
+
+.message-table td:first-child {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: nowrap;
+}
+
+.level-pill {
+  display: inline-flex;
+  max-width: 100%;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-subtle);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.message-error .level-pill {
+  background: #ffe1df;
+  color: var(--danger);
+}
+
+.message-warning .level-pill {
+  background: #fff0dc;
+  color: var(--warn);
+}
+
+.message-info .level-pill {
+  background: var(--surface-subtle);
+  color: var(--muted);
 }
 
 .message-item {
