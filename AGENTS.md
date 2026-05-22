@@ -5,6 +5,7 @@
 - After code changes, run pytest.
 - Keep changes focused on the requested scope.
 - Prefer simple, runnable code over abstract architecture.
+- When creating commits, use the format `type(scope): description` and include a list-format body describing the changes.
 - Before editing a file or creating a new file, explain to the user what you're about to change and ask for approval.
 - Do not edit or create files until the user approves the proposed change.
 - AGENTS.md is for Codex build/edit instructions; runtime flight-log agent behavior belongs in code prompts or agent instructions.
