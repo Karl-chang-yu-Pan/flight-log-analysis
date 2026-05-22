@@ -39,6 +39,10 @@ select {
   min-height: 100vh;
 }
 
+.app-shell.sidebar-collapsed {
+  grid-template-columns: 48px minmax(0, 1fr);
+}
+
 .sidebar {
   overflow-y: auto;
   max-height: 100vh;
@@ -258,7 +262,7 @@ h2 {
   margin-bottom: 9px;
 }
 
-.toolbar input,
+.toolbar input[type="search"],
 .toolbar select,
 .input-bar input {
   width: 100%;
@@ -276,6 +280,14 @@ h2 {
   gap: 7px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.check-row input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
 }
 
 .table-shell {
@@ -321,6 +333,23 @@ h2 {
 
 .dense-table td {
   overflow-wrap: anywhere;
+}
+
+.parameter-table th:nth-child(1),
+.parameter-table td:nth-child(1) {
+  width: 45%;
+}
+
+.parameter-table th:nth-child(2),
+.parameter-table td:nth-child(2),
+.parameter-table th:nth-child(3),
+.parameter-table td:nth-child(3) {
+  width: 20%;
+}
+
+.parameter-table th:nth-child(4),
+.parameter-table td:nth-child(4) {
+  width: 15%;
 }
 
 .topic-list {
@@ -666,6 +695,10 @@ h2 {
 
 @media (max-width: 980px) {
   .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .app-shell.sidebar-collapsed {
     grid-template-columns: 1fr;
   }
 

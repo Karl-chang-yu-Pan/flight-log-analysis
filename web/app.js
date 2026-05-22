@@ -6,6 +6,7 @@ const state = {
 };
 
 const els = {
+  appShell: document.getElementById("appShell"),
   form: document.getElementById("preparseForm"),
   logFile: document.getElementById("logFile"),
   runStatus: document.getElementById("runStatus"),
@@ -52,6 +53,7 @@ els.analysisButton.addEventListener("click", startAnalysis);
 
 els.sidebarToggle.addEventListener("click", () => {
   state.sidebarCollapsed = !state.sidebarCollapsed;
+  els.appShell.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
   els.sidebar.classList.toggle("collapsed", state.sidebarCollapsed);
   els.sidebarToggle.title = state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar";
   els.sidebarToggle.setAttribute(
@@ -575,8 +577,8 @@ function renderParameterRow(row) {
   return `
     <tr title="${escapeAttr(title)}">
       <td><code>${escapeHtml(row.name)}</code></td>
-      <td>${escapeHtml(formatCell(row.value))}</td>
-      <td>${escapeHtml(formatCell(row.default))}</td>
+      <td>${escapeHtml(formatParameterCell(row.value))}</td>
+      <td>${escapeHtml(formatParameterCell(row.default))}</td>
       <td><span class="status-badge ${escapeAttr(statusClass)}">${escapeHtml(statusLabel(row.default_status))}</span></td>
     </tr>
   `;
@@ -744,6 +746,22 @@ function formatCell(value) {
   if (value == null || value === "") return "";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
+}
+
+function formatParameterCell(value) {
+  if (value == null || value === "") return "";
+  if (typeof value === "object") return JSON.stringify(value);
+
+  const text = String(value).trim();
+  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(text)) {
+    return String(value);
+  }
+
+  const numeric = Number(text);
+  if (!Number.isFinite(numeric)) return String(value);
+
+  const rounded = Math.round(numeric * 10000) / 10000;
+  return Object.is(rounded, -0) ? "0" : String(rounded);
 }
 
 function escapeHtml(value) {
