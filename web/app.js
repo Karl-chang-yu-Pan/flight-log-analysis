@@ -1,8 +1,13 @@
 const state = {
   payload: null,
+  plotPayload: null,
+  plotLoadToken: 0,
+  plotTrackers: {},
+  hiddenPlotSeries: {},
   analysisRunId: null,
   analysisPollTimer: null,
   sidebarCollapsed: false,
+  plotSidebarCollapsed: false,
 };
 
 const els = {
@@ -15,6 +20,10 @@ const els = {
   sidebar: document.getElementById("sidebar"),
   sidebarToggle: document.getElementById("sidebarToggle"),
   sidebarSummary: document.getElementById("sidebarSummary"),
+  plotSidebar: document.getElementById("plotSidebar"),
+  plotSidebarToggle: document.getElementById("plotSidebarToggle"),
+  plotSidebarStatus: document.getElementById("plotSidebarStatus"),
+  plotRows: document.getElementById("plotRows"),
   factGrid: document.getElementById("factGrid"),
   warningsList: document.getElementById("warningsList"),
   warningCount: document.getElementById("warningCount"),
@@ -61,6 +70,24 @@ els.sidebarToggle.addEventListener("click", () => {
     state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar",
   );
   els.sidebarToggle.querySelector("span").textContent = state.sidebarCollapsed ? "›" : "‹";
+  window.requestAnimationFrame(() => drawInteractivePlots(state.plotPayload?.plots || []));
+});
+
+els.plotSidebarToggle.addEventListener("click", () => {
+  state.plotSidebarCollapsed = !state.plotSidebarCollapsed;
+  els.appShell.classList.toggle("plot-sidebar-collapsed", state.plotSidebarCollapsed);
+  els.plotSidebar.classList.toggle("collapsed", state.plotSidebarCollapsed);
+  els.plotSidebarToggle.title = state.plotSidebarCollapsed ? "Expand plots" : "Collapse plots";
+  els.plotSidebarToggle.setAttribute(
+    "aria-label",
+    state.plotSidebarCollapsed ? "Expand plots" : "Collapse plots",
+  );
+  els.plotSidebarToggle.querySelector("span").textContent = state.plotSidebarCollapsed ? "‹" : "›";
+  window.requestAnimationFrame(() => drawInteractivePlots(state.plotPayload?.plots || []));
+});
+
+window.addEventListener("resize", () => {
+  window.requestAnimationFrame(() => drawInteractivePlots(state.plotPayload?.plots || []));
 });
 
 async function preparseLog() {
@@ -73,8 +100,12 @@ async function preparseLog() {
       ? await uploadAndPreparse(formData)
       : await preparseLocalPath(formData);
     state.payload = result;
+    state.plotPayload = null;
+    state.plotTrackers = {};
+    state.hiddenPlotSeries = {};
     resetAnalysis();
     renderAll();
+    loadInteractivePlots();
     setStatus("Loaded");
   } catch (error) {
     setStatus("Failed");
@@ -426,6 +457,601 @@ function renderAll() {
   renderMainSummary();
   renderChangedParameters();
   renderTimeline();
+  renderInteractivePlots();
+}
+
+async function loadInteractivePlots() {
+  const logPath = state.payload?.inputs?.log_path;
+  if (!logPath) {
+    els.plotSidebarStatus.textContent = "Missing log path";
+    els.plotRows.innerHTML = `<p class="plot-empty">No log path available for plots.</p>`;
+    return;
+  }
+
+  const token = state.plotLoadToken + 1;
+  state.plotLoadToken = token;
+  els.plotSidebarStatus.textContent = "Loading plots...";
+  els.plotRows.innerHTML = `<p class="plot-empty">Extracting plot samples...</p>`;
+
+  try {
+    const response = await fetch("/api/interactive-plots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ log_path: logPath }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    if (token !== state.plotLoadToken) return;
+
+    state.plotPayload = result;
+    initializePlotTrackers(result.plots || []);
+    renderInteractivePlots();
+  } catch (error) {
+    if (token !== state.plotLoadToken) return;
+    els.plotSidebarStatus.textContent = "Plot load failed";
+    els.plotRows.innerHTML = `<p class="plot-empty">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function initializePlotTrackers(plots) {
+  plots.forEach((plot) => {
+    if (state.plotTrackers[plot.id] !== undefined) return;
+    const [start, end] = plot.time_range_s || [0, 0];
+    state.plotTrackers[plot.id] = Number.isFinite(start) ? start : 0;
+    if (Number.isFinite(end) && end > state.plotTrackers[plot.id]) {
+      state.plotTrackers[plot.id] = start + (end - start) * 0.5;
+    }
+  });
+}
+
+function renderInteractivePlots() {
+  const plots = state.plotPayload?.plots || [];
+  if (!state.payload) {
+    els.plotSidebarStatus.textContent = "Load a log";
+    els.plotRows.innerHTML = `<p class="plot-empty">Load a ULog to view Flight Review plots.</p>`;
+    return;
+  }
+
+  if (!state.plotPayload) {
+    els.plotSidebarStatus.textContent = "Plots pending";
+    els.plotRows.innerHTML = `<p class="plot-empty">Plots will load after pre-parse completes.</p>`;
+    return;
+  }
+
+  els.plotSidebarStatus.textContent = plots.length ? `${plots.length} plots` : "No plottable data";
+  els.plotRows.innerHTML = plots.length
+    ? plots.map(renderInteractivePlot).join("")
+    : `<p class="plot-empty">No Flight Review plot signals were available in this log.</p>`;
+
+  bindInteractivePlots(plots);
+  window.requestAnimationFrame(() => drawInteractivePlots(plots));
+}
+
+function renderInteractivePlot(plot) {
+  const [start, end] = plot.time_range_s || [0, 0];
+  const tracker = clampTracker(plot.id, start, end);
+  const sources = plot.kind === "local_position" ? (plot.traces || []) : (plot.series || []);
+  const step = Math.max((end - start) / 1000, 0.001);
+
+  return `
+    <section class="interactive-plot" data-plot-id="${escapeAttr(plot.id)}">
+      <div class="interactive-plot-header">
+        <h3>${escapeHtml(plot.title)}</h3>
+        <span class="plot-time" id="plotTime-${escapeAttr(plot.id)}">${escapeHtml(formatLogTime(tracker))}</span>
+      </div>
+      <canvas class="plot-canvas" id="plotCanvas-${escapeAttr(plot.id)}"></canvas>
+      <div class="plot-tracker">
+        <input
+          id="plotTracker-${escapeAttr(plot.id)}"
+          type="range"
+          min="${escapeAttr(start)}"
+          max="${escapeAttr(end)}"
+          step="${escapeAttr(step)}"
+          value="${escapeAttr(tracker)}"
+          ${end <= start ? "disabled" : ""}
+        >
+      </div>
+      <div class="plot-legend">
+        ${sources.map((source) => renderPlotToggle(plot.id, source)).join("")}
+      </div>
+      <div class="plot-readout" id="plotReadout-${escapeAttr(plot.id)}"></div>
+    </section>
+  `;
+}
+
+function renderPlotToggle(plotId, source) {
+  const checked = isPlotSourceVisible(plotId, source.key) ? "checked" : "";
+  return `
+    <label class="plot-toggle">
+      <input type="checkbox" data-plot-id="${escapeAttr(plotId)}" data-source-key="${escapeAttr(source.key)}" ${checked}>
+      <span class="legend-swatch" style="background:${escapeAttr(source.color)}"></span>
+      ${escapeHtml(source.label)}
+    </label>
+  `;
+}
+
+function bindInteractivePlots(plots) {
+  plots.forEach((plot) => {
+    const slider = document.getElementById(`plotTracker-${plot.id}`);
+    const canvas = document.getElementById(`plotCanvas-${plot.id}`);
+    if (slider) {
+      slider.addEventListener("input", () => {
+        state.plotTrackers[plot.id] = Number(slider.value);
+        drawInteractivePlot(plot);
+      });
+    }
+
+    if (canvas && plot.kind !== "local_position") {
+      canvas.addEventListener("click", (event) => {
+        const time = canvasTimeFromEvent(canvas, plot, event);
+        if (time == null) return;
+        state.plotTrackers[plot.id] = time;
+        if (slider) slider.value = String(time);
+        drawInteractivePlot(plot);
+      });
+    }
+  });
+
+  els.plotRows.querySelectorAll(".plot-toggle input").forEach((input) => {
+    input.addEventListener("change", () => {
+      const plotId = input.dataset.plotId;
+      const sourceKey = input.dataset.sourceKey;
+      if (!plotId || !sourceKey) return;
+      state.hiddenPlotSeries[`${plotId}:${sourceKey}`] = !input.checked;
+      const plot = (state.plotPayload?.plots || []).find((candidate) => candidate.id === plotId);
+      if (plot) drawInteractivePlot(plot);
+    });
+  });
+}
+
+function drawInteractivePlots(plots) {
+  plots.forEach(drawInteractivePlot);
+}
+
+function drawInteractivePlot(plot) {
+  const canvas = document.getElementById(`plotCanvas-${plot.id}`);
+  if (!canvas) return;
+
+  const ctx = prepareCanvas(canvas);
+  const bounds = plotBounds(canvas);
+  drawPlotFrame(ctx, canvas, bounds);
+
+  if (plot.kind === "local_position") {
+    drawLocalPositionPlot(ctx, canvas, bounds, plot);
+  } else {
+    drawTimeseriesPlot(ctx, canvas, bounds, plot);
+  }
+
+  updatePlotReadout(plot);
+}
+
+function prepareCanvas(canvas) {
+  const ratio = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width * ratio));
+  const height = Math.max(1, Math.round(rect.height * ratio));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  return ctx;
+}
+
+function plotBounds(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    left: 42,
+    top: 14,
+    right: rect.width - 10,
+    bottom: rect.height - 24,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function drawPlotFrame(ctx, canvas, bounds) {
+  ctx.clearRect(0, 0, bounds.width, bounds.height);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, bounds.width, bounds.height);
+  ctx.strokeStyle = "#d8ded6";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+}
+
+function drawTimeseriesPlot(ctx, canvas, bounds, plot) {
+  const visibleSeries = (plot.series || []).filter((series) => isPlotSourceVisible(plot.id, series.key));
+  const xRange = plot.time_range_s || [0, 1];
+  const yRange = plot.y_range || numericRange(visibleSeries.flatMap((series) => series.values || []));
+  drawTimeOverlays(ctx, bounds, xRange, plot.overlays || []);
+  drawGrid(ctx, bounds);
+
+  visibleSeries.forEach((series) => {
+    drawLine(
+      ctx,
+      series.time_s || [],
+      series.values || [],
+      bounds,
+      xRange,
+      yRange,
+      series.color,
+    );
+  });
+
+  const tracker = clampTracker(plot.id, xRange[0], xRange[1]);
+  drawTimeTracker(ctx, bounds, tracker, xRange);
+  drawTimeseriesTrackerPoints(ctx, bounds, visibleSeries, tracker, xRange, yRange);
+  updatePlotTime(plot.id, tracker);
+}
+
+function drawLocalPositionPlot(ctx, canvas, bounds, plot) {
+  const visibleTraces = (plot.traces || []).filter((trace) => isPlotSourceVisible(plot.id, trace.key));
+  const range = localPositionRange(plot, visibleTraces, bounds);
+  drawGrid(ctx, bounds);
+
+  visibleTraces.forEach((trace) => {
+    if (trace.marker_only) {
+      drawScatter(ctx, trace.x || [], trace.y || [], bounds, range.x, range.y, trace.color);
+    } else {
+      drawLine(
+        ctx,
+        trace.x || [],
+        trace.y || [],
+        bounds,
+        range.x,
+        range.y,
+        trace.color,
+      );
+    }
+  });
+
+  const tracker = clampTracker(plot.id, plot.time_range_s?.[0] || 0, plot.time_range_s?.[1] || 0);
+  visibleTraces.forEach((trace) => {
+    const marker = sampleTraceAtTime(trace, tracker);
+    if (!marker) return;
+    drawMarker(
+      ctx,
+      xToCanvas(marker.x, bounds, range.x),
+      yToCanvas(marker.y, bounds, range.y),
+      trace.color,
+      trace.marker_only,
+    );
+  });
+  updatePlotTime(plot.id, tracker);
+}
+
+function drawTimeOverlays(ctx, bounds, xRange, overlays) {
+  overlays.forEach((overlay) => {
+    const start = Number(overlay.start_s);
+    const end = Number(overlay.end_s ?? overlay.start_s);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+    const x1 = xToCanvas(start, bounds, xRange);
+    const x2 = xToCanvas(end, bounds, xRange);
+    ctx.save();
+    ctx.globalAlpha = Number(overlay.alpha) || 0.12;
+    ctx.fillStyle = overlay.color || "#b7c0b5";
+    const top = overlay.band === "bottom"
+      ? bounds.bottom - Math.min(40, bounds.bottom - bounds.top)
+      : bounds.top;
+    const bottom = bounds.bottom;
+    if (Math.abs(x2 - x1) < 1) {
+      ctx.fillRect(x1, top, 1, bottom - top);
+    } else {
+      ctx.fillRect(Math.min(x1, x2), top, Math.max(1, Math.abs(x2 - x1)), bottom - top);
+    }
+    ctx.restore();
+  });
+}
+
+function drawGrid(ctx, bounds) {
+  ctx.save();
+  ctx.strokeStyle = "#eef1ec";
+  ctx.lineWidth = 1;
+  for (let index = 1; index < 4; index += 1) {
+    const y = bounds.top + ((bounds.bottom - bounds.top) * index) / 4;
+    ctx.beginPath();
+    ctx.moveTo(bounds.left, y);
+    ctx.lineTo(bounds.right, y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawLine(ctx, xs, ys, bounds, xRange, yRange, color) {
+  if (!xs.length || !ys.length) return;
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  let started = false;
+  xs.forEach((xValue, index) => {
+    const yValue = ys[index];
+    if (!Number.isFinite(xValue) || !Number.isFinite(yValue)) return;
+    const x = xToCanvas(xValue, bounds, xRange);
+    const y = yToCanvas(yValue, bounds, yRange);
+    if (!started) {
+      ctx.moveTo(x, y);
+      started = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  });
+  if (started) ctx.stroke();
+  ctx.restore();
+}
+
+function drawScatter(ctx, xs, ys, bounds, xRange, yRange, color) {
+  if (!xs.length || !ys.length) return;
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = "#ffffff";
+  ctx.lineWidth = 1.5;
+  xs.forEach((xValue, index) => {
+    const yValue = ys[index];
+    if (!Number.isFinite(xValue) || !Number.isFinite(yValue)) return;
+    const x = xToCanvas(xValue, bounds, xRange);
+    const y = yToCanvas(yValue, bounds, yRange);
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
+function drawTimeTracker(ctx, bounds, time, xRange) {
+  const x = xToCanvas(time, bounds, xRange);
+  ctx.save();
+  ctx.strokeStyle = "#202620";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x, bounds.top);
+  ctx.lineTo(x, bounds.bottom);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawTimeseriesTrackerPoints(ctx, bounds, seriesList, tracker, xRange, yRange) {
+  seriesList.forEach((series) => {
+    const value = sampleSeriesAtTime(series, tracker);
+    if (value == null) return;
+    drawMarker(ctx, xToCanvas(tracker, bounds, xRange), yToCanvas(value, bounds, yRange), series.color);
+  });
+}
+
+function drawMarker(ctx, x, y, color, filled = false) {
+  ctx.save();
+  ctx.fillStyle = filled ? color : "#ffffff";
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x, y, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function canvasTimeFromEvent(canvas, plot, event) {
+  const bounds = plotBounds(canvas);
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  if (x < bounds.left || x > bounds.right) return null;
+  const [start, end] = plot.time_range_s || [0, 0];
+  const ratio = (x - bounds.left) / Math.max(1, bounds.right - bounds.left);
+  return start + ratio * (end - start);
+}
+
+function updatePlotReadout(plot) {
+  const readout = document.getElementById(`plotReadout-${plot.id}`);
+  if (!readout) return;
+  const tracker = state.plotTrackers[plot.id] ?? 0;
+
+  if (plot.kind === "local_position") {
+    readout.innerHTML = localPositionReadout(plot, tracker);
+  } else {
+    readout.innerHTML = timeseriesReadout(plot, tracker);
+  }
+}
+
+function timeseriesReadout(plot, tracker) {
+  const rows = (plot.series || [])
+    .filter((series) => isPlotSourceVisible(plot.id, series.key))
+    .map((series) => {
+      const value = sampleSeriesAtTime(series, tracker);
+      const suffix = series.unit ? ` ${series.unit}` : "";
+      return readoutRow(series.label, value == null ? "n/a" : `${formatNumber(value)}${suffix}`);
+    });
+  return rows.length ? rows.join("") : readoutRow("Visible series", "none");
+}
+
+function localPositionReadout(plot, tracker) {
+  const samples = {};
+  const rows = (plot.traces || [])
+    .filter((trace) => isPlotSourceVisible(plot.id, trace.key))
+    .map((trace) => {
+      const sample = sampleTraceAtTime(trace, tracker);
+      samples[trace.key] = sample;
+      if (!sample) return readoutRow(trace.label, "n/a");
+      const zText = sample.z == null ? "" : `, z=${formatNumber(sample.z)}`;
+      return readoutRow(trace.label, `plot x=${formatNumber(sample.x)}, plot y=${formatNumber(sample.y)}${zText}`);
+    });
+
+  const current = samples.position;
+  const setpoint = samples.setpoint;
+  if (current && setpoint) {
+    const dz = current.z == null || setpoint.z == null ? "" : `, dz=${formatNumber(setpoint.z - current.z)}`;
+    rows.push(readoutRow("Setpoint delta", `dx=${formatNumber(setpoint.x - current.x)}, dy=${formatNumber(setpoint.y - current.y)}${dz}`));
+  }
+
+  const missionSetpoint = samples.position_setpoints;
+  if (current && missionSetpoint) {
+    const horizontal = Math.hypot(missionSetpoint.x - current.x, missionSetpoint.y - current.y);
+    const vertical = current.z == null || missionSetpoint.z == null
+      ? "n/a"
+      : formatNumber(missionSetpoint.z - current.z);
+    rows.push(readoutRow("Mission distance", `horizontal=${formatNumber(horizontal)} m, vertical=${vertical}${vertical === "n/a" ? "" : " m"}`));
+  }
+
+  return rows.length ? rows.join("") : readoutRow("Visible traces", "none");
+}
+
+function readoutRow(label, value) {
+  return `<div class="plot-readout-row"><span>${escapeHtml(label)}</span><span>${escapeHtml(value)}</span></div>`;
+}
+
+function sampleTraceAtTime(trace, time) {
+  const mode = trace.marker_only ? "previous" : "linear";
+  const x = sampleSeriesAtTime({ time_s: trace.time_s, values: trace.x }, time, mode);
+  const y = sampleSeriesAtTime({ time_s: trace.time_s, values: trace.y }, time, mode);
+  if (x == null || y == null) return null;
+  const z = trace.z ? sampleSeriesAtTime(trace.z, time, mode) : null;
+  return { x, y, z };
+}
+
+function sampleSeriesAtTime(series, time, mode = "linear") {
+  const times = series.time_s || [];
+  const values = series.values || [];
+  if (!times.length || !values.length) return null;
+  if (time <= times[0]) return values[0];
+  if (time >= times[times.length - 1]) return values[values.length - 1];
+
+  let low = 0;
+  let high = times.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (times[mid] === time) return values[mid];
+    if (times[mid] < time) low = mid + 1;
+    else high = mid - 1;
+  }
+
+  const before = Math.max(0, low - 1);
+  const after = Math.min(times.length - 1, low);
+  const t0 = times[before];
+  const t1 = times[after];
+  const v0 = values[before];
+  const v1 = values[after];
+  if (mode === "previous") {
+    return v0;
+  }
+  if (mode === "nearest") {
+    return Math.abs(time - t0) <= Math.abs(t1 - time) ? v0 : v1;
+  }
+  if (t1 === t0) return v0;
+  const ratio = (time - t0) / (t1 - t0);
+  return v0 + (v1 - v0) * ratio;
+}
+
+function numericRange(values) {
+  const numeric = values.filter((value) => Number.isFinite(value));
+  if (!numeric.length) return [0, 1];
+  let min = Math.min(...numeric);
+  let max = Math.max(...numeric);
+  if (min === max) {
+    const pad = Math.max(1, Math.abs(min) * 0.1);
+    min -= pad;
+    max += pad;
+  }
+  const padding = (max - min) * 0.08;
+  return [min - padding, max + padding];
+}
+
+function xyRange(traces, bounds) {
+  const xRange = numericRange(traces.flatMap((trace) => trace.x || []));
+  const yRange = numericRange(traces.flatMap((trace) => trace.y || []));
+  const plotWidth = Math.max(1, bounds.right - bounds.left);
+  const plotHeight = Math.max(1, bounds.bottom - bounds.top);
+  const xSpan = xRange[1] - xRange[0];
+  const ySpan = yRange[1] - yRange[0];
+  const targetYSpan = xSpan * (plotHeight / plotWidth);
+  const targetXSpan = ySpan * (plotWidth / plotHeight);
+
+  if (targetYSpan > ySpan) {
+    const center = (yRange[0] + yRange[1]) / 2;
+    yRange[0] = center - targetYSpan / 2;
+    yRange[1] = center + targetYSpan / 2;
+  } else if (targetXSpan > xSpan) {
+    const center = (xRange[0] + xRange[1]) / 2;
+    xRange[0] = center - targetXSpan / 2;
+    xRange[1] = center + targetXSpan / 2;
+  }
+
+  return { x: xRange, y: yRange };
+}
+
+function localPositionRange(plot, visibleTraces, bounds) {
+  const scaleTrace = (plot.traces || []).find((trace) => trace.key === plot.scale_from);
+  const sourceTraces = scaleTrace ? [scaleTrace] : visibleTraces;
+  const xValues = sourceTraces.flatMap((trace) => trace.x || []);
+  const yValues = sourceTraces.flatMap((trace) => trace.y || []);
+  if (!xValues.length || !yValues.length) {
+    return xyRange(visibleTraces, bounds);
+  }
+
+  let minX = Math.min(...xValues);
+  let maxX = Math.max(...xValues);
+  let minY = Math.min(...yValues);
+  let maxY = Math.max(...yValues);
+  let xDiff = Math.max(maxX - minX, Number(plot.min_range) || 5);
+  let yDiff = Math.max(maxY - minY, Number(plot.min_range) || 5);
+  const xCenter = (minX + maxX) / 2;
+  const yCenter = (minY + maxY) / 2;
+  const aspect = Math.max(1, bounds.right - bounds.left) / Math.max(1, bounds.bottom - bounds.top);
+
+  if (aspect > xDiff / yDiff) {
+    xDiff = yDiff * aspect;
+  } else {
+    yDiff = xDiff / aspect;
+  }
+
+  const zoom = Number(plot.zoom_out_factor) || 1.3;
+  return {
+    x: [xCenter - (xDiff / 2) * zoom, xCenter + (xDiff / 2) * zoom],
+    y: [yCenter - (yDiff / 2) * zoom, yCenter + (yDiff / 2) * zoom],
+  };
+}
+
+function xToCanvas(value, bounds, range) {
+  const span = range[1] - range[0] || 1;
+  return bounds.left + ((value - range[0]) / span) * (bounds.right - bounds.left);
+}
+
+function yToCanvas(value, bounds, range) {
+  const span = range[1] - range[0] || 1;
+  return bounds.bottom - ((value - range[0]) / span) * (bounds.bottom - bounds.top);
+}
+
+function isPlotSourceVisible(plotId, sourceKey) {
+  return !state.hiddenPlotSeries[`${plotId}:${sourceKey}`];
+}
+
+function clampTracker(plotId, start, end) {
+  const current = Number(state.plotTrackers[plotId]);
+  const fallback = Number.isFinite(start) ? start : 0;
+  const value = Number.isFinite(current) ? current : fallback;
+  const lower = Number.isFinite(start) ? start : 0;
+  const upper = Number.isFinite(end) ? end : lower;
+  const clamped = Math.min(Math.max(value, lower), upper);
+  state.plotTrackers[plotId] = clamped;
+  return clamped;
+}
+
+function updatePlotTime(plotId, tracker) {
+  const time = document.getElementById(`plotTime-${plotId}`);
+  if (time) time.textContent = formatLogTime(tracker);
+}
+
+function formatNumber(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  if (Math.abs(value) >= 1000 || (Math.abs(value) > 0 && Math.abs(value) < 0.001)) {
+    return value.toExponential(3);
+  }
+  return String(Math.round(value * 10000) / 10000);
 }
 
 function renderFacts() {

@@ -19,6 +19,7 @@ from urllib.request import urlopen
 from pyulog import ULog
 from preparse_view import build_preparse_payload
 from run_audit_log import DEFAULT_DEV_LOG_ROOT, make_json_safe
+from ulog_interactive_plots import build_interactive_plot_payload
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -76,6 +77,10 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/analyze-runs":
             self._handle_start_analysis()
+            return
+
+        if parsed.path == "/api/interactive-plots":
+            self._handle_interactive_plots()
             return
 
         self._send_json({"error": "not found"}, status=404)
@@ -172,6 +177,26 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json(snapshot)
+
+    def _handle_interactive_plots(self) -> None:
+        try:
+            payload = self._read_json_body()
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        log_path = str(payload.get("log_path") or "").strip()
+        if not log_path:
+            self._send_json({"error": "log_path is required"}, status=400)
+            return
+
+        try:
+            result = build_interactive_plot_payload(log_path)
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
+            return
+
+        self._send_json(result)
 
     def _handle_artifact(self, query: str) -> None:
         path_values = parse_qs(query).get("path") or []

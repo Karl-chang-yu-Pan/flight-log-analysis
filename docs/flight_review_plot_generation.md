@@ -109,11 +109,16 @@ not shown.
 ### `DataPlot2D`
 
 `DataPlot2D` renders x/y traces instead of time-series data. The main use is the
-local-position map-like plot:
+local-position plot shown above the Leaflet map:
 
 - x-axis and y-axis are selected fields from one dataset.
 - NaNs are removed.
-- The first line can force equal aspect ratio.
+- The first successful line can force equal aspect ratio. For the local-position
+  plot, Flight Review uses the `Estimated` trace to set the initial x/y ranges
+  with `plot_set_equal_aspect_ratio()`, a minimum span of 5 meters, and a 1.3
+  zoom-out factor.
+- The local-position plot calls `add_graph('y', 'x', ...)`, so the horizontal
+  axis is local `y` and the vertical axis is local `x`.
 - It does not use dynamic downsampling.
 
 ### `DataPlotSpec`
@@ -168,6 +173,8 @@ The flight-mode background comes from:
 - Extracted by `get_flight_mode_changes()`, which calls
   `ulog.get_dataset('vehicle_status').list_value_changes('nav_state')`
 - The final marker is `(ulog.last_timestamp, -1)`.
+- Colors come from `config_tables.flight_modes_table`; Flight Review renders
+  the background boxes with `fill_alpha=0.09`.
 
 For VTOL logs, an additional VTOL-mode band is added using:
 
@@ -178,12 +185,18 @@ For VTOL logs, an additional VTOL-mode band is added using:
   - `vehicle_type`
   - `in_transition_mode`
   - old fallback: `is_rotary_wing`
+- VTOL colors come from `config_tables.vtol_modes_table`; the VTOL overlay is
+  drawn as a lower screen band with `fill_alpha=0.09`.
 
 Changed parameter labels come from `ulog.changed_parameters`, except replay logs
 are skipped because they can contain many parameter changes.
 
-Logging dropouts come from `ulog.dropouts`. Each dropout becomes a small shaded
-rectangle from `dropout.timestamp` to `dropout.timestamp + duration_ms * 1000`.
+Logging dropouts come from `ulog.dropouts`. Each dropout becomes a red shaded
+rectangle with `fill_alpha=0.15` from `dropout.timestamp` to
+`dropout.timestamp + duration_ms * 1000`.
+
+Most time-series plots use an initial x range from
+`ulog.start_timestamp - 5% duration` to `ulog.last_timestamp + 5% duration`.
 
 ## Default Log Plot Catalog
 
@@ -192,7 +205,7 @@ The table below lists the normal `/plot_app?log=<id>` plots created by
 
 | Plot | Topic(s) | Field(s) / Signal(s) | Processing |
 | --- | --- | --- | --- |
-| Local Position 2D | `vehicle_local_position`, `vehicle_local_position_setpoint`, `vehicle_local_position_groundtruth`, `vehicle_gps_position`, `position_setpoint_triplet` | `vehicle_local_position.y` vs `x`; setpoint `y` vs `x`; groundtruth `y` vs `x`; GPS lat/lon; position setpoint lat/lon | 2D local XY plot. GPS is projected into local meters. Setpoints are circles. |
+| Local Position 2D | `vehicle_local_position`, `vehicle_local_position_setpoint`, `vehicle_local_position_groundtruth`, `vehicle_gps_position`, `position_setpoint_triplet` | `vehicle_local_position.y` vs `x` as `Estimated`; `vehicle_local_position_setpoint.y` vs `x` as `Setpoint`; `vehicle_local_position_groundtruth.y` vs `x` as `Groundtruth`; GPS lat/lon as `GPS (projected)`; mission setpoint lat/lon as `Position Setpoints` | 2D local XY plot. GPS and mission setpoints are projected into local meters. Mission position setpoints are circles. Initial x/y scaling comes from the `Estimated` trace. `Estimated` uses `colors2[0]`, `Setpoint` uses `colors2[1]`, GPS uses `plot_config['maps_line_color']`, and mission setpoints use `plot_config['mission_setpoint_color']`. |
 | Leaflet map | `vehicle_gps_position`, `vehicle_status` | GPS lat/lon, `fix_type`, `timestamp`; `vehicle_status.nav_state` | Generated as template data by `ulog_to_polyline()`. Uses only `fix_type > 2`, throttles path points to about 10 Hz, colors segments by flight mode. |
 | Altitude Estimate | `vehicle_gps_position`, `vehicle_air_data` or `sensor_combined`, `vehicle_global_position`, `position_setpoint_triplet` | GPS altitude; `baro_alt_meter`; `vehicle_global_position.alt`; `position_setpoint_triplet.current.alt` | GPS altitude uses `altitude_msl_m` for new logs or `alt * 0.001` for old logs. Setpoint plotted as circles. |
 | Roll/Pitch/Yaw Angle | `vehicle_attitude`, `vehicle_attitude_setpoint`, `vehicle_attitude_groundtruth` | `roll`, `pitch`, `yaw`; setpoint `roll_d`, `pitch_d`, `yaw_d`; `yaw_sp_move_rate`; groundtruth `roll`, `pitch`, `yaw` | Radians converted to degrees. Setpoints use step lines. Tailsitter VTOL logs use converted attitude from `vtol_tailsitter.tailsitter_orientation()`. |
@@ -206,7 +219,7 @@ The table below lists the normal `/plot_app?log=<id>` plots created by
 | Visual Odometry Latency | `vehicle_visual_odometry` | `timestamp`, `timestamp_sample` | Derived latency: `1e-3 * (timestamp - timestamp_sample)`, in ms. |
 | Airspeed | `vehicle_global_position`, `airspeed_validated` or `airspeed`, `vehicle_gps_position`, `tecs_status` | `vel_n`, `vel_e`; `true_airspeed_m_s` or `true_ground_minus_wind_m_s`; old `indicated_airspeed_m_s`; `vehicle_gps_position.vel_m_s`; `tecs_status.true_airspeed_sp` | Estimated groundspeed is `sqrt(vel_n^2 + vel_e^2)`. Uses `airspeed_validated` when present, otherwise old `airspeed`. |
 | TECS | `tecs_status` | `height_rate`, `height_rate_setpoint` | Fixed-wing/VTOL energy controller height-rate trace. |
-| Manual Control Inputs | `manual_control_setpoint`, `manual_control_switches` or old `manual_control_setpoint` | New: `roll`, `pitch`, `yaw`, `throttle`, `aux1`, `aux2`; old: `y`, `x`, `r`, `z`; switches: `mode_slot`, `kill_switch` | Old logs remap stick fields. `mode_slot` is divided by 6. `kill_switch` is converted to boolean `== 1`. |
+| Manual Control Inputs | `manual_control_setpoint`, `manual_control_switches` or old `manual_control_setpoint` | New: `roll`, `pitch`, `yaw`, `throttle`, `aux1`, `aux2`; old: `y`, `x`, `r`, `z`; switches: `mode_slot`, `kill_switch` | Old logs remap stick fields. `mode_slot` is divided by 6. `kill_switch` is converted to boolean `== 1`. Y range is fixed to `[-1.1, 1.1]`. |
 | Raw Radio Control Inputs | `rc_channels` | `channels[0..N]`, `channel_count` | Fallback when `manual_control_setpoint` is absent. Plots up to 8 channels. Channel labels can use `px4_ulog.get_configured_rc_input_names(i)`. |
 | Actuator Controls | Dynamic allocation: `vehicle_torque_setpoint`, `vehicle_thrust_setpoint`; old allocation: `actuator_controls_0` | Dynamic torque: `xyz[0..2]`; dynamic thrust vector `xyz`; old torque: `control[0..2]`; old thrust: `control[3]` | `ActuatorControls` abstracts old/new topics. Dynamic thrust norm is `sqrt(x^2+y^2+z^2)`. Upward thrust is `-xyz[2]`; forward thrust is `xyz[0]`. |
 | Actuator Controls FFT | Same as Actuator Controls torque topic | Torque axes | FFT amplitude. Marks `MC_DTERM_CUTOFF`, `IMU_DGYRO_CUTOFF`, and `IMU_GYRO_CUTOFF` parameter frequencies when present. |
@@ -215,7 +228,7 @@ The table below lists the normal `/plot_app?log=<id>` plots created by
 | Actuator Controls 1 | Dynamic allocation instance 1 or old `actuator_controls_1` | Torque axes plus forward thrust | Intended for VTOL fixed-wing-mode controls. Dynamic thrust for nonzero instance is resampled to the target thrust timestamp array. |
 | Motor Outputs | `actuator_motors` | `control[0..N]` | Dynamic-control-allocation logs only. Stops when a control field is missing or all NaN. |
 | Servo Outputs | `actuator_servos` | `control[0..N]` | Dynamic-control-allocation logs only. Same selection logic as motor outputs. |
-| Actuator Outputs Main/AUX/EXTRA | `actuator_outputs` instances 0, 1, 2 | `output[0..N]`, `noutputs` | Old logs only. Plots up to 16 outputs, but only if at least one output is not constant. |
+| Actuator Outputs Main/AUX/EXTRA | `actuator_outputs` instances 0, 1, 2 | `output[0..N]`, `noutputs` | Old logs only. Plots up to 16 outputs, but only if at least one output is not constant. Y range is fixed to `[-1, 1]`. |
 | Motor RPM | `esc_status` | `esc_count`, `esc[i].esc_rpm` | Plots each ESC RPM if field exists and max RPM is greater than 0.001. |
 | Raw Acceleration | `sensor_combined` | `accelerometer_m_s2[0..2]` | Direct m/s^2 axes. |
 | Vibration Metrics | `vehicle_imu_status` instances 0..3 | `accel_vibration_metric` | Adds green/orange/red background zones with limits 4.905 and 9.81 m/s^2. |
@@ -230,14 +243,14 @@ The table below lists the normal `/plot_app?log=<id>` plots created by
 | Gyro PSD FIFO | `sensor_gyro_fifo_virtual` | `x`, `y`, `z` | Spectrogram PSD on expanded FIFO samples. |
 | Raw Magnetic Field Strength | `vehicle_magnetometer` or old `sensor_combined` | `magnetometer_ga[0..2]` | Direct gauss axes. |
 | Distance Sensor | `distance_sensor`, `vehicle_local_position` | `current_distance`, `variance`, `dist_bottom`, `dist_bottom_valid` | Combines rangefinder data with estimator bottom-distance estimate. |
-| GPS Uncertainty | `vehicle_gps_position` | `eph`, `epv`, `hdop`, `vdop`, `s_variance_m_s`, `satellites_used`, `fix_type` | Y range capped to 0..40 for readability. |
+| GPS Uncertainty | `vehicle_gps_position` | `eph`, `epv`, `hdop`, `vdop`, `s_variance_m_s`, `satellites_used`, `fix_type` | Y range is fixed to `[0, 40]` for readability. |
 | GPS Noise & Jamming | `vehicle_gps_position` | `noise_per_ms`, `jamming_indicator` | Direct fields. |
 | Thrust and Magnetic Field | `vehicle_magnetometer` or old `sensor_combined`, actuator thrust topic(s) | Magnetic norm from `magnetometer_ga[0..2]`; thrust from `ActuatorControls` | Magnetic norm is `sqrt(mx^2+my^2+mz^2)`. Thrust is dynamic thrust norm or old `control[3]`. |
 | Power | `battery_status`, `system_power` | `voltage_v`, `current_a`, `discharged_mah`, `remaining`, optional `ocv_estimate`, `internal_resistance_estimate`, `voltage5v_v`, `sensors3v3[0]` | `discharged_mah` is divided by 100. `remaining` is multiplied by 10. Internal resistance is multiplied by 1000 to mOhm. |
 | Temperature | `sensor_baro`, `sensor_accel`, `airspeed`, `battery_status`, `esc_status` | `temperature`, `air_temperature_celsius`, `esc[i].esc_temperature` | ESC temperature plotted per ESC if present and nonzero. |
 | Estimator Flags | `estimator_status` | `health_flags`, `timeout_flags`, `innovation_check_flags` | Decodes selected bits from `innovation_check_flags`. Plots only nonzero flags, max 8 lines. If none are nonzero, plots health flags so absence is not ambiguous. |
 | Failsafe Flags | `vehicle_status`, `failsafe_flags` | `vehicle_status.failsafe`, `failsafe_and_user_took_over`, all nonzero fields from `failsafe_flags` except `timestamp` and `mode_req_*` | Skips always-set `auto_mission_missing` and `offboard_control_signal_lost`. Field names are converted from underscores to spaces for legends. |
-| CPU & RAM | `cpuload` | `ram_usage`, `load` | Adds horizontal mean spans for both `load` and `ram_usage`. |
+| CPU & RAM | `cpuload` | `ram_usage`, `load` | Adds horizontal mean spans for both `load` and `ram_usage`. Y range is fixed to `[0, 1]`. |
 | Sampling Regularity of Sensor Data | `sensor_combined`, `estimator_status` | `sensor_combined.timestamp`, `estimator_status.time_slip` | Derived `np.diff(sensor_combined.timestamp)` plus `time_slip * 1e6`. Adds dropout rectangles. |
 
 After these plots, Flight Review appends:

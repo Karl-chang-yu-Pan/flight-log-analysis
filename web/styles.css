@@ -35,12 +35,20 @@ select {
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(340px, 440px) minmax(0, 1fr);
+  grid-template-columns: minmax(340px, 440px) minmax(0, 1fr) minmax(360px, 480px);
   min-height: 100vh;
 }
 
 .app-shell.sidebar-collapsed {
-  grid-template-columns: 48px minmax(0, 1fr);
+  grid-template-columns: 48px minmax(0, 1fr) minmax(360px, 480px);
+}
+
+.app-shell.plot-sidebar-collapsed {
+  grid-template-columns: minmax(340px, 440px) minmax(0, 1fr) 48px;
+}
+
+.app-shell.sidebar-collapsed.plot-sidebar-collapsed {
+  grid-template-columns: 48px minmax(0, 1fr) 48px;
 }
 
 .sidebar {
@@ -73,6 +81,44 @@ select {
   padding: 14px 14px 12px;
   border-bottom: 1px solid var(--line);
   background: var(--surface);
+}
+
+.plot-sidebar {
+  overflow-y: auto;
+  max-height: 100vh;
+  border-left: 1px solid var(--line);
+  background: #fbfbf8;
+}
+
+.plot-sidebar.collapsed {
+  width: 48px;
+  min-width: 48px;
+  overflow: hidden;
+}
+
+.plot-sidebar.collapsed .plot-list,
+.plot-sidebar.collapsed .plot-sidebar-header p,
+.plot-sidebar.collapsed .plot-sidebar-header h2 {
+  display: none;
+}
+
+.plot-sidebar-header {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 14px 12px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfbf8;
+}
+
+.plot-sidebar-header p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 h1,
@@ -642,6 +688,126 @@ h2 {
   color: var(--warn);
 }
 
+.plot-list {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+
+.interactive-plot {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.interactive-plot-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-subtle);
+}
+
+.interactive-plot-header h3 {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.plot-time {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.plot-canvas {
+  display: block;
+  width: 100%;
+  height: 190px;
+  background: #ffffff;
+  cursor: crosshair;
+}
+
+.plot-tracker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.plot-tracker input[type="range"] {
+  width: 100%;
+}
+
+.plot-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.plot-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.plot-toggle input {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+}
+
+.legend-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+
+.plot-readout {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.plot-readout-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.8fr) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.plot-readout-row span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.plot-empty {
+  padding: 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .summary-kpis {
   display: grid;
   grid-template-columns: repeat(4, minmax(110px, 1fr));
@@ -698,7 +864,9 @@ h2 {
     grid-template-columns: 1fr;
   }
 
-  .app-shell.sidebar-collapsed {
+  .app-shell.sidebar-collapsed,
+  .app-shell.plot-sidebar-collapsed,
+  .app-shell.sidebar-collapsed.plot-sidebar-collapsed {
     grid-template-columns: 1fr;
   }
 
@@ -706,6 +874,12 @@ h2 {
     max-height: none;
     border-right: 0;
     border-bottom: 1px solid var(--line);
+  }
+
+  .plot-sidebar {
+    max-height: none;
+    border-left: 0;
+    border-top: 1px solid var(--line);
   }
 
   .input-bar {

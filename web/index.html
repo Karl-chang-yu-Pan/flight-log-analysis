@@ -184,6 +184,18 @@
           <div id="timelineRows" class="timeline-list"></div>
         </section>
       </main>
+      <aside class="plot-sidebar" id="plotSidebar">
+        <div class="plot-sidebar-header">
+          <div>
+            <h2>Flight Review Plots</h2>
+            <p id="plotSidebarStatus">Load a log</p>
+          </div>
+          <button class="icon-button" id="plotSidebarToggle" type="button" title="Collapse plots" aria-label="Collapse plots">
+            <span aria-hidden="true">›</span>
+          </button>
+        </div>
+        <div id="plotRows" class="plot-list"></div>
+      </aside>
     </div>
     <script src="/app.js"></script>
   </body>
