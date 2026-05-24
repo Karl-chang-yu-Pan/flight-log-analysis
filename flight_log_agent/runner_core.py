@@ -9,8 +9,9 @@ Architecture goal:
 3. Retrieve reusable PX4 source-code mechanisms from the mechanism cache using only:
       px4_git_hash/version + vehicle_type + airframe/control-surface context + question intent.
    Validate cached mechanisms against the current PX4 source footprint. If no valid
-   cache hit exists, run bounded source search and the mechanism resolver agent.
-   Do NOT use parameter values, full topic catalog, or detailed log samples here.
+   cache hit exists, run iterative source-mechanism discovery. The source resolver may
+   use static parameter values and topic/field inventory to narrow source branches,
+   but it must not use dynamic time-series samples or final log evidence.
 4. Use parameters/timeline/mission/topic availability to eliminate impossible mechanisms.
 5. Use deterministic log-signature evaluation to verify surviving mechanisms.
 6. Write a report from verified mechanism results only.
@@ -76,11 +77,21 @@ from flight_log_agent.models import (
 )
 from flight_log_agent.analysis.signature_verification import derive_confidence
 from flight_log_agent.analysis.signature_verification import evaluate_candidate_log_signature as evaluate_candidate_log_signature_impl
-from flight_log_agent.analysis.source_evidence import bounded_source_search
 from flight_log_agent.ulog.control_surface import infer_control_surface as infer_control_surface_impl
 from flight_log_agent.ulog.inventory import parse_ulog_inventory as parse_ulog_inventory_impl
 from flight_log_agent.ulog.plots import generate_signal_plot as generate_signal_plot_impl
 from flight_log_agent.ulog.timeline import build_basic_timeline as build_basic_timeline_impl
+from flight_log_agent.px4.source_mechanism_models import (
+    ParameterRequirement,
+    SourceDiscoveryLogContext,
+    SourceFieldRef,
+    SourceMechanismCandidate,
+    SourceMechanismCandidateSet,
+)
+from flight_log_agent.px4.source_mechanism_resolver import (
+    SourceMechanismResolver,
+    build_source_discovery_log_context,
+)
 
 from flight_log_agent.audit import (
     AgentRunAuditHooks,
@@ -170,35 +181,6 @@ Do not draft hypotheses. Do not assign confidence.
     tools=[],
     output_type=QuestionIntent,
 )
-
-
-mechanism_resolver_agent = Agent(
-    name="PX4 Mechanism Resolver",
-    model="gpt-5.5",
-    instructions="""
-Resolve reusable PX4 source-code mechanisms from bounded source-search evidence.
-
-Important separation:
-- You are only extracting source-level PX4 behavior that could explain the
-  normalized question intent for this PX4 source version and vehicle/control domain.
-- Do not use parameter values or detailed log evidence to decide whether the
-  mechanism happened in the flight.
-- Emit cacheable mechanism candidates. For every candidate, include source_refs,
-  mechanism summary, source-level gates, required parameters/signals, expected
-  logged signature, exclusion checks, numeric checks, and useful plot requests.
-- Put PX4 parameters only in required_parameters. Put only logged ULog signals
-  in required_signals, using exact topic.field names. Do not put parameter names,
-  mission-file values, expressions, or source-code variables in required_signals.
-- Do not assign confidence that the mechanism happened in the flight.
-- The output may be written to the mechanism cache; avoid flight-specific language
-  such as "this log shows" or "this aircraft did".
-""",
-    tools=[],
-    output_type=MechanismCandidateSet,
-)
-
-# Backward-compatible name for older code/tests.
-mechanism_candidate_agent = mechanism_resolver_agent
 
 
 final_report_agent = Agent(
@@ -431,7 +413,7 @@ async def analyze_flight_log(
         mechanism_cache_summary["cache_hit_candidate_names"] = [c.name for c in cached_candidates]
 
         if cached_candidates:
-            source_evidence: Optional[SourceEvidenceBundle] = None
+            source_evidence = empty_source_discovery_evidence(source_search_context)
             candidate_set = MechanismCandidateSet(
                 candidates=cached_candidates,
                 rejected_source_paths=[],
@@ -441,39 +423,37 @@ async def analyze_flight_log(
             )
         else:
             # ------------------------------------------------------------
-            # Stage 4A: deterministic bounded source search on cache miss
+            # Stage 4: iterative source-mechanism discovery on cache miss
             # ------------------------------------------------------------
-            source_evidence = _audit_sync_call(
+            source_discovery_log_context = build_source_discovery_log_context(
+                inventory,
+                airframe_context,
+                mode_state_constraints=compact_timeline_constraints(timeline),
+            )
+            source_candidate_set = _audit_sync_call(
                 audit_logger,
                 "source",
-                "bounded_source_search",
-                bounded_source_search,
-                {"source_search_context": source_search_context.model_dump()},
+                "discover_source_mechanisms",
+                discover_source_mechanisms,
+                {
+                    "source_path": str(source_path_obj) if source_path_obj else None,
+                    "question_intent": question_intent.model_dump(),
+                    "static_log_context": source_discovery_log_context.model_dump(),
+                    "max_candidates": max_candidates,
+                },
                 source_path_obj,
+                question_intent,
+                source_discovery_log_context,
+                max_candidates,
+            )
+            candidate_set = source_mechanisms_to_candidates(source_candidate_set)
+            source_evidence = empty_source_discovery_evidence(
                 source_search_context,
+                warnings=[
+                    "Mechanisms were discovered by the iterative source resolver; "
+                    "bounded one-shot source evidence is not used."
+                ],
             )
-
-            # ------------------------------------------------------------
-            # Stage 4B: resolve source mechanisms, then write cache records
-            # ------------------------------------------------------------
-            candidate_set = await _run_agent(
-                audit_logger,
-                "resolve_mechanisms",
-                mechanism_resolver_agent,
-                build_mechanism_resolver_input(
-                    source_search_context,
-                    source_evidence,
-                    inventory,
-                    timeline,
-                    mission,
-                ),
-                ctx,
-                max_turns=3,
-            )
-            candidate_set.candidates = [
-                sanitize_mechanism_candidate_contract(candidate)
-                for candidate in candidate_set.candidates
-            ]
 
             written_records = _audit_sync_call(
                 audit_logger,
@@ -603,63 +583,135 @@ def retrieve_cached_mechanisms(
     return retriever.retrieve(source_search_context, max_records=max_records)
 
 
-def build_mechanism_resolver_input(
+def discover_source_mechanisms(
+    source_path: Optional[Path],
+    question_intent: QuestionIntent,
+    log_context: SourceDiscoveryLogContext,
+    max_candidates: int,
+) -> SourceMechanismCandidateSet:
+    if source_path is None:
+        return SourceMechanismCandidateSet(
+            candidates=[],
+            expansion_queries=list(question_intent.source_queries),
+            unresolved_questions=["PX4 source path is unavailable for source-mechanism discovery."],
+        )
+
+    resolver = SourceMechanismResolver(source_path)
+    return resolver.discover(
+        question_intent.original_question,
+        log_context,
+        seed_queries=[
+            question_intent.original_question,
+            question_intent.problem_domain,
+            question_intent.concise_intent,
+            *question_intent.source_queries,
+            *question_intent.likely_modules,
+            *question_intent.likely_source_files,
+        ],
+        max_total_files=max(max_candidates * 8, 8),
+    )
+
+
+def source_mechanisms_to_candidates(
+    source_candidate_set: SourceMechanismCandidateSet,
+) -> MechanismCandidateSet:
+    return MechanismCandidateSet(
+        candidates=[
+            source_mechanism_to_candidate(candidate)
+            for candidate in source_candidate_set.candidates
+        ],
+        rejected_source_paths=[],
+        unresolved_questions=list(source_candidate_set.unresolved_questions),
+    )
+
+
+def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) -> MechanismCandidate:
+    required_parameters = dedupe_keep_order([
+        requirement.name
+        for requirement in getattr(source_candidate, "controlling_parameters", []) or []
+        if requirement.name and requirement.name != "unknown"
+    ])
+    required_signals = source_candidate_required_signals(source_candidate)
+    return sanitize_mechanism_candidate_contract(
+        MechanismCandidate(
+            name=source_candidate.title,
+            summary=source_candidate.source_mechanism,
+            source_refs=list(source_candidate.source_chain),
+            vehicle_type_gates=[],
+            airframe_gates=[],
+            mode_state_gates=list(source_candidate.branch_conditions),
+            parameter_gates=[
+                requirement.effect
+                for requirement in getattr(source_candidate, "controlling_parameters", []) or []
+            ],
+            required_parameters=required_parameters,
+            required_signals=required_signals,
+            expected_logged_signature=[
+                ExpectedSignatureItem(
+                    name=f"source_signature_{index + 1}",
+                    description=description,
+                    signal=signal if signal in required_signals else None,
+                    expected_behavior=description,
+                )
+                for index, (description, signal) in enumerate(
+                    signature_descriptions_with_signals(source_candidate, required_signals)
+                )
+            ],
+            exclusion_checks=[
+                RelationshipCheckSpec(type="custom", description=check)
+                for check in getattr(source_candidate, "contradiction_checks", []) or []
+            ],
+            numeric_checks=[
+                RelationshipCheckSpec(type="custom", description=evidence)
+                for evidence in getattr(source_candidate, "required_log_evidence", []) or []
+            ],
+            plot_requests=[],
+        )
+    )
+
+
+def source_candidate_required_signals(source_candidate: SourceMechanismCandidate) -> list[str]:
+    signals = []
+    for field in getattr(source_candidate, "relevant_fields", []) or []:
+        if field.topic and field.field:
+            signals.append(f"{field.topic}.{field.field}")
+    for topic_ref in (
+        list(getattr(source_candidate, "published_topics", []) or [])
+        + list(getattr(source_candidate, "subscribed_topics", []) or [])
+    ):
+        if topic_ref.topic and topic_ref.field:
+            signals.append(f"{topic_ref.topic}.{topic_ref.field}")
+    return dedupe_keep_order(signals)
+
+
+def signature_descriptions_with_signals(
+    source_candidate: SourceMechanismCandidate,
+    required_signals: list[str],
+) -> list[tuple[str, Optional[str]]]:
+    descriptions = list(getattr(source_candidate, "expected_log_signature", []) or [])
+    if not descriptions:
+        descriptions = list(getattr(source_candidate, "required_log_evidence", []) or [])
+
+    pairs: list[tuple[str, Optional[str]]] = []
+    for description in descriptions:
+        signal = next(
+            (candidate_signal for candidate_signal in required_signals if candidate_signal in description),
+            None,
+        )
+        pairs.append((description, signal))
+    return pairs
+
+
+def empty_source_discovery_evidence(
     source_search_context: SourceSearchContext,
-    source_evidence: SourceEvidenceBundle,
-    inventory: Optional[dict[str, Any]] = None,
-    timeline: Optional[list[dict[str, Any]]] = None,
-    mission: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    return {
-        "mechanism_discovery_context": build_mechanism_discovery_context(
-            source_search_context,
-            inventory or {},
-            timeline or [],
-            mission,
-        ),
-        "source_evidence": compact_source_evidence(source_evidence),
-    }
-
-
-def build_mechanism_discovery_context(
-    source_search_context: SourceSearchContext,
-    inventory: dict[str, Any],
-    timeline: list[dict[str, Any]],
-    mission: Optional[dict[str, Any]],
-) -> dict[str, Any]:
-    airframe = source_search_context.airframe
-    intent = source_search_context.question_intent
-    return {
-        "source_identity": {
-            "px4_git_hash": getattr(airframe, "px4_git_hash", None),
-            "px4_version": getattr(airframe, "px4_version", None),
-            "px4_tag": getattr(airframe, "px4_tag", None),
-        },
-        "vehicle": {
-            "vehicle_type": getattr(airframe, "vehicle_type", None),
-            "sys_autostart": getattr(airframe, "sys_autostart", None),
-            "airframe_name": getattr(airframe, "airframe_name", None),
-            "control_surface_summary": getattr(airframe, "control_surface_summary", None),
-        },
-        "question_intent": compact_question_intent(intent),
-        "source_domain_constraints": {
-            "mode_state_timeline": compact_timeline_constraints(timeline),
-            "parameter_gates": compact_parameter_gates(inventory, intent, airframe),
-            "mission": compact_mission_context(mission),
-        },
-        "available_log_interfaces": compact_log_interfaces(inventory),
-    }
-
-
-def compact_question_intent(question_intent: QuestionIntent) -> dict[str, Any]:
-    return {
-        "original_question": getattr(question_intent, "original_question", None),
-        "problem_domain": getattr(question_intent, "problem_domain", None),
-        "concise_intent": getattr(question_intent, "concise_intent", None),
-        "source_queries": list(getattr(question_intent, "source_queries", []) or []),
-        "likely_modules": list(getattr(question_intent, "likely_modules", []) or []),
-        "likely_source_files": list(getattr(question_intent, "likely_source_files", []) or []),
-    }
+    warnings: Optional[list[str]] = None,
+) -> SourceEvidenceBundle:
+    return SourceEvidenceBundle(
+        search_context=source_search_context,
+        hits=[],
+        read_snippets=[],
+        warnings=warnings or [],
+    )
 
 
 def compact_timeline_constraints(timeline: list[dict[str, Any]], max_events: int = 80) -> dict[str, Any]:
@@ -694,123 +746,6 @@ def compact_timeline_constraints(timeline: list[dict[str, Any]], max_events: int
             if event.get("topic") and event.get("field")
         ]) - len(events), 0),
     }
-
-
-def compact_parameter_gates(
-    inventory: dict[str, Any],
-    question_intent: QuestionIntent,
-    airframe_context: AirframeContext,
-) -> dict[str, Any]:
-    parameters = inventory.get("parameters") or {}
-    requested = set(_parameter_names_from_question_intent(question_intent))
-    for name in ("SYS_AUTOSTART", "VT_TYPE"):
-        if name in parameters:
-            requested.add(name)
-
-    if getattr(airframe_context, "sys_autostart", None) is not None:
-        requested.add("SYS_AUTOSTART")
-
-    values = {
-        name: parameters[name]
-        for name in sorted(requested)
-        if name in parameters
-    }
-    if "SYS_AUTOSTART" not in values and getattr(airframe_context, "sys_autostart", None) is not None:
-        values["SYS_AUTOSTART"] = getattr(airframe_context, "sys_autostart")
-
-    return {
-        "values": values,
-        "matched_parameter_names": sorted(requested),
-        "available_parameter_count": len(parameters),
-    }
-
-
-def compact_log_interfaces(inventory: dict[str, Any], max_fields_per_topic: int = 80) -> dict[str, Any]:
-    available_topics = sorted(str(topic) for topic in (inventory.get("available_topics") or []))
-    topic_fields = inventory.get("topic_fields") or {}
-    compact_fields = {}
-    for topic in available_topics:
-        fields = topic_fields.get(topic)
-        if not fields:
-            continue
-        compact_fields[topic] = [str(field) for field in list(fields)[:max_fields_per_topic]]
-
-    return {
-        "available_topics": available_topics,
-        "topic_fields": compact_fields,
-        "topic_count": len(available_topics),
-    }
-
-
-def compact_mission_context(mission: Optional[dict[str, Any]], max_items: int = 20) -> Optional[dict[str, Any]]:
-    if mission is None:
-        return None
-
-    items = mission.get("items") or []
-    altitudes = [
-        item.get("altitude")
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get("altitude"), (int, float))
-    ]
-    return {
-        "has_mission": True,
-        "format": mission.get("format"),
-        "planned_home_position": mission.get("planned_home_position"),
-        "vehicle_type": mission.get("vehicle_type"),
-        "item_count": len(items),
-        "command_names": dedupe_keep_order([
-            str(item.get("command_name"))
-            for item in items
-            if isinstance(item, dict) and item.get("command_name")
-        ]),
-        "frame_names": dedupe_keep_order([
-            str(item.get("frame_name"))
-            for item in items
-            if isinstance(item, dict) and item.get("frame_name")
-        ]),
-        "altitude_range": {
-            "min": min(altitudes),
-            "max": max(altitudes),
-        } if altitudes else None,
-        "items": [
-            {
-                "sequence": item.get("sequence"),
-                "command_name": item.get("command_name"),
-                "frame_name": item.get("frame_name"),
-                "altitude": item.get("altitude"),
-            }
-            for item in items[:max_items]
-            if isinstance(item, dict)
-        ],
-        "omitted_item_count": max(len(items) - max_items, 0),
-        "warnings": list(mission.get("warnings") or []),
-    }
-
-
-def compact_source_evidence(source_evidence: SourceEvidenceBundle) -> dict[str, Any]:
-    evidence = source_evidence.model_dump()
-    return {
-        "hits": evidence.get("hits", []),
-        "read_snippets": evidence.get("read_snippets", []),
-        "warnings": evidence.get("warnings", []),
-    }
-
-
-def _parameter_names_from_question_intent(question_intent: QuestionIntent) -> list[str]:
-    parts = [
-        getattr(question_intent, "original_question", None),
-        getattr(question_intent, "problem_domain", None),
-        getattr(question_intent, "concise_intent", None),
-        *(getattr(question_intent, "source_queries", []) or []),
-        *(getattr(question_intent, "likely_modules", []) or []),
-        *(getattr(question_intent, "likely_source_files", []) or []),
-        *(getattr(question_intent, "notes", []) or []),
-    ]
-    text = " ".join(str(part) for part in parts if part)
-    return dedupe_keep_order([
-        name for name in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", text)
-        if is_px4_parameter_name(name)
-    ])
 
 
 def build_final_report_input(

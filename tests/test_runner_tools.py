@@ -903,13 +903,56 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
         concise_intent="explain altitude drop",
         source_queries=["TECS altitude setpoint"],
     )
-    candidate = _sample_mechanism_candidate(runner)
-    candidate_set = runner.MechanismCandidateSet(candidates=[candidate])
-    source_context = runner.SourceSearchContext(
-        airframe=runner.AirframeContext(vehicle_type="fixed_wing"),
-        question_intent=question_intent,
+    source_candidate = runner.SourceMechanismCandidate(
+        title="Source mechanism path for rtl",
+        source_mechanism="PX4 source can command an altitude setpoint before the waypoint.",
+        source_chain=[
+            runner.CodeRef(
+                file="src/modules/navigator/rtl.cpp",
+                start_line=10,
+                snippet="sp.alt = target_alt;",
+                explanation="source match",
+            )
+        ],
+        source_files=["src/modules/navigator/rtl.cpp"],
+        controlling_parameters=[
+            runner.ParameterRequirement(
+                name="SYS_AUTOSTART",
+                role="branch_selector",
+                source_predicate="SYS_AUTOSTART == 4001",
+                actual_value=4001,
+                gate_result="satisfied",
+                effect="SYS_AUTOSTART satisfies the fixed-wing source branch.",
+                source_file="src/modules/navigator/rtl.cpp",
+                source_line=10,
+            )
+        ],
+        published_topics=[],
+        subscribed_topics=[],
+        relevant_fields=[
+            runner.SourceFieldRef(
+                topic="vehicle_local_position_setpoint",
+                field="z",
+                variable="sp",
+                source_file="src/modules/navigator/rtl.cpp",
+                source_line=11,
+            )
+        ],
+        branch_conditions=["SYS_AUTOSTART == 4001"],
+        expected_log_signature=[
+            "Verify later whether vehicle_local_position_setpoint.z follows the source-expected behavior."
+        ],
+        required_log_evidence=["Fetch time-series for vehicle_local_position_setpoint.z."],
+        contradiction_checks=[],
+        source_confidence="medium",
+        resolver_notes=["No time-series signal comparison was computed."],
     )
-    source_evidence = runner.SourceEvidenceBundle(search_context=source_context, hits=[])
+    source_candidate_set = runner.SourceMechanismCandidateSet(
+        candidates=[source_candidate],
+        expansion_queries=["TECS altitude setpoint"],
+        unresolved_questions=[],
+    )
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
     applicability = _sample_applicability(runner, candidate)
     evaluation = runner.SignatureEvaluation(
         candidate_name=candidate.name,
@@ -935,8 +978,6 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
         )
         if agent is runner.question_intent_agent:
             return SimpleNamespace(final_output=question_intent, new_items=[])
-        if agent is runner.mechanism_resolver_agent:
-            return SimpleNamespace(final_output=candidate_set, new_items=[])
         if agent is runner.final_report_agent:
             return SimpleNamespace(final_output=final_report, new_items=[])
         raise AssertionError(f"unexpected agent: {agent}")
@@ -967,9 +1008,9 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
         return_value={"mission_file": str(mission_path), "items": []},
     ) as parse_mission, patch.object(
         runner,
-        "bounded_source_search",
-        return_value=source_evidence,
-    ) as source_search, patch.object(
+        "discover_source_mechanisms",
+        return_value=source_candidate_set,
+    ) as source_discovery, patch.object(
         runner,
         "write_resolved_mechanisms_to_cache",
         return_value=[],
@@ -997,7 +1038,7 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
             )
         )
 
-    source_search.assert_called_once()
+    source_discovery.assert_called_once()
     write_cache.assert_called_once()
     evaluate_applicability.assert_called_once()
     evaluate_signature.assert_called_once()
@@ -1009,27 +1050,26 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     assert result is final_report
     assert [item["agent"] for item in captured] == [
         runner.question_intent_agent,
-        runner.mechanism_resolver_agent,
         runner.final_report_agent,
     ]
-    assert [item["max_turns"] for item in captured] == [2, 3, 4]
+    assert [item["max_turns"] for item in captured] == [2, 4]
     assert all(item["hooks"] is not None for item in captured)
     assert captured[0]["input"]["user_question"] == "Why did it loiter before the waypoint?"
     assert "log_inventory" not in captured[0]["input"]
-    assert "source_evidence" in captured[1]["input"]
-    assert "mechanism_discovery_context" in captured[1]["input"]
-    assert "source_search_context" not in captured[1]["input"]
-    assert "search_context" not in captured[1]["input"]["source_evidence"]
-    assert captured[1]["input"]["mechanism_discovery_context"]["vehicle"]["vehicle_type"] == "fixed_wing"
-    assert captured[1]["input"]["mechanism_discovery_context"]["source_domain_constraints"]["parameter_gates"]["values"] == {
-        "SYS_AUTOSTART": 4001,
-    }
-    assert list(captured[2]["input"].keys()) == ["verified_mechanism_results"]
-    assert captured[2]["input"]["verified_mechanism_results"][0]["final_confidence"] == "medium"
-    assert "raw" not in captured[2]["input"]["verified_mechanism_results"][0]["evaluation"]
-    assert "airframe_context" not in captured[2]["input"]
-    assert "question_intent" not in captured[2]["input"]
-    assert "mechanism_cache" not in captured[2]["input"]
+    discovery_args = source_discovery.call_args.args
+    assert discovery_args[0] == source_path
+    assert discovery_args[1] is question_intent
+    assert discovery_args[2].parameters == {"SYS_AUTOSTART": 4001}
+    assert discovery_args[2].available_topics == [
+        "vehicle_local_position",
+        "vehicle_local_position_setpoint",
+    ]
+    assert list(captured[1]["input"].keys()) == ["verified_mechanism_results"]
+    assert captured[1]["input"]["verified_mechanism_results"][0]["final_confidence"] == "medium"
+    assert "raw" not in captured[1]["input"]["verified_mechanism_results"][0]["evaluation"]
+    assert "airframe_context" not in captured[1]["input"]
+    assert "question_intent" not in captured[1]["input"]
+    assert "mechanism_cache" not in captured[1]["input"]
     assert final_report.airframe_summary == "vehicle_type=fixed_wing; SYS_AUTOSTART=4001"
     assert final_report.question_intent_summary == "fixed_wing_altitude: explain altitude drop"
     run_dir = dev_log_root / "web_run_001"
@@ -1161,17 +1201,11 @@ def test_v3_agents_enforce_source_mechanism_context_boundaries(tmp_path):
     runner = load_runner(tmp_path)
 
     intent_instructions = runner.question_intent_agent.kwargs["instructions"]
-    resolver_instructions = runner.mechanism_resolver_agent.kwargs["instructions"]
     report_instructions = runner.final_report_agent.kwargs["instructions"]
 
     assert runner.question_intent_agent.kwargs["model"] == "gpt-5.4-nano"
-    assert runner.mechanism_resolver_agent.kwargs["model"] == "gpt-5.5"
     assert runner.final_report_agent.kwargs["model"] == "gpt-5.4"
     assert "Do not use parameter values" in intent_instructions
-    assert "Do not use parameter values or detailed log evidence" in resolver_instructions
-    assert "Emit cacheable mechanism candidates" in resolver_instructions
-    assert "Put PX4 parameters only in required_parameters" in resolver_instructions
-    assert "only logged ULog signals" in resolver_instructions
     assert "verifiedmechanismresult" in report_instructions.lower()
     assert "Confidence cannot exceed evaluation.confidence_ceiling" in report_instructions
     assert "Do not introduce new mechanisms" in report_instructions
@@ -1267,113 +1301,6 @@ def test_final_report_input_is_compact_and_summaries_are_deterministic(tmp_path)
         "SYS_AUTOSTART=13000; airframe=Test VTOL"
     )
     assert report.question_intent_summary == "RTL altitude: explain RTL climb"
-
-
-def test_mechanism_resolver_input_includes_discovery_context_without_source_duplication(tmp_path):
-    runner = load_runner(tmp_path)
-    question_intent = runner.QuestionIntent(
-        original_question="Why did RTL climb despite RTL_RETURN_ALT?",
-        problem_domain="RTL altitude",
-        concise_intent="explain RTL altitude selection",
-        source_queries=["RTL_RETURN_ALT", "navigator RTL altitude"],
-        likely_modules=["navigator"],
-        likely_source_files=["src/modules/navigator/rtl.cpp"],
-        notes=["Use source-domain constraints only."],
-    )
-    airframe = runner.AirframeContext(
-        px4_git_hash="abcdef1234567890",
-        px4_version="v1.14.3",
-        vehicle_type="vtol_standard",
-        sys_autostart=13000,
-    )
-    source_context = runner.SourceSearchContext(
-        airframe=airframe,
-        question_intent=question_intent,
-    )
-    source_evidence = runner.SourceEvidenceBundle(
-        search_context=source_context,
-        hits=[
-            {
-                "query": "RTL_RETURN_ALT",
-                "file": "src/modules/navigator/rtl.cpp",
-                "line": 10,
-                "snippet": "return altitude",
-            }
-        ],
-    )
-    inventory = {
-        "parameters": {
-            "RTL_RETURN_ALT": 10,
-            "SYS_AUTOSTART": 13000,
-            "UNMENTIONED_PARAM": 1,
-            "VT_TYPE": 2,
-        },
-        "available_topics": ["vehicle_status", "vtol_vehicle_status"],
-        "topic_fields": {
-            "vehicle_status": ["timestamp", "nav_state"],
-            "vtol_vehicle_status": ["timestamp", "vehicle_vtol_state"],
-        },
-    }
-    timeline = [
-        {
-            "time_s": 1.0,
-            "event": "initial_value",
-            "topic": "vehicle_status",
-            "field": "nav_state",
-            "value": 5,
-        },
-        {
-            "time_s": 2.0,
-            "event": "value_changed",
-            "topic": "vtol_vehicle_status",
-            "field": "vehicle_vtol_state",
-            "value": 3,
-        },
-    ]
-    mission = {
-        "format": "qgroundcontrol_plan",
-        "planned_home_position": [1, 2, 3],
-        "vehicle_type": 2,
-        "items": [
-            {
-                "sequence": 1,
-                "command_name": "MAV_CMD_NAV_RETURN_TO_LAUNCH",
-                "frame_name": "MAV_FRAME_GLOBAL_RELATIVE_ALT",
-                "altitude": 40,
-            }
-        ],
-        "warnings": [],
-    }
-
-    payload = runner.build_mechanism_resolver_input(
-        source_context,
-        source_evidence,
-        inventory,
-        timeline,
-        mission,
-    )
-
-    assert list(payload.keys()) == ["mechanism_discovery_context", "source_evidence"]
-    assert "search_context" not in payload["source_evidence"]
-    context = payload["mechanism_discovery_context"]
-    assert context["source_identity"]["px4_git_hash"] == "abcdef1234567890"
-    assert context["vehicle"]["vehicle_type"] == "vtol_standard"
-    assert context["source_domain_constraints"]["parameter_gates"]["values"] == {
-        "RTL_RETURN_ALT": 10,
-        "SYS_AUTOSTART": 13000,
-        "VT_TYPE": 2,
-    }
-    assert context["source_domain_constraints"]["mode_state_timeline"]["observed_values"] == {
-        "vehicle_status.nav_state": [5],
-        "vtol_vehicle_status.vehicle_vtol_state": [3],
-    }
-    assert context["available_log_interfaces"]["topic_fields"]["vehicle_status"] == [
-        "timestamp",
-        "nav_state",
-    ]
-    assert context["source_domain_constraints"]["mission"]["command_names"] == [
-        "MAV_CMD_NAV_RETURN_TO_LAUNCH",
-    ]
 
 
 def test_v3_agent_output_schemas_are_strict_json_compatible():
