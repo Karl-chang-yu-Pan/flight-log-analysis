@@ -83,6 +83,8 @@ from flight_log_agent.ulog.plots import generate_signal_plot as generate_signal_
 from flight_log_agent.ulog.timeline import build_basic_timeline as build_basic_timeline_impl
 from flight_log_agent.px4.source_mechanism_models import (
     ParameterRequirement,
+    SourceDiscoveryDecision,
+    SourceDiscoveryIterationPacket,
     SourceDiscoveryLogContext,
     SourceFieldRef,
     SourceMechanismCandidate,
@@ -180,6 +182,38 @@ Do not draft hypotheses. Do not assign confidence.
 """,
     tools=[],
     output_type=QuestionIntent,
+)
+
+
+source_discovery_agent = Agent(
+    name="PX4 Source Mechanism Discovery Decision",
+    model="gpt-5.5",
+    instructions="""
+Guide iterative PX4 source-mechanism discovery from compact profiler output.
+
+Input is a SourceDiscoveryIterationPacket containing:
+- current user question and active expansion queries
+- source files already visited and newly profiled
+- deterministic source facts: related files, parameters, uORB topics, fields,
+  function calls, branch conditions, and parameter predicates
+- parameter feasibility results only for parameters discovered from source
+- topic fields only for topics discovered from source
+
+Rules:
+- Do not perform final dynamic log verification.
+- Do not claim a mechanism happened in the flight.
+- Do not use timestamps, plots, signal comparisons, distance calculations, or
+  final root-cause confidence.
+- Decide which source files are mechanism-relevant, what expansion queries to
+  run next, and whether the source chain is complete enough.
+- Candidate drafts must be source-level mechanisms plus verification plans.
+- Use required_log_evidence and expected_log_signature to request later
+  MechanismVerifier checks; do not compute those checks yourself.
+- If the current source evidence is insufficient, return expansion_queries and
+  leave candidate_drafts empty.
+""",
+    tools=[],
+    output_type=SourceDiscoveryDecision,
 )
 
 
@@ -430,7 +464,17 @@ async def analyze_flight_log(
                 airframe_context,
                 mode_state_constraints=compact_timeline_constraints(timeline),
             )
-            source_candidate_set = _audit_sync_call(
+            async def decide_source_discovery(packet: SourceDiscoveryIterationPacket) -> SourceDiscoveryDecision:
+                return await _run_agent(
+                    audit_logger,
+                    "source_discovery_decision",
+                    source_discovery_agent,
+                    packet.model_dump(),
+                    ctx,
+                    max_turns=2,
+                )
+
+            source_candidate_set = await _audit_async_call(
                 audit_logger,
                 "source",
                 "discover_source_mechanisms",
@@ -445,6 +489,7 @@ async def analyze_flight_log(
                 question_intent,
                 source_discovery_log_context,
                 max_candidates,
+                decide_source_discovery,
             )
             candidate_set = source_mechanisms_to_candidates(source_candidate_set)
             source_evidence = empty_source_discovery_evidence(
@@ -583,11 +628,12 @@ def retrieve_cached_mechanisms(
     return retriever.retrieve(source_search_context, max_records=max_records)
 
 
-def discover_source_mechanisms(
+async def discover_source_mechanisms(
     source_path: Optional[Path],
     question_intent: QuestionIntent,
     log_context: SourceDiscoveryLogContext,
     max_candidates: int,
+    decide,
 ) -> SourceMechanismCandidateSet:
     if source_path is None:
         return SourceMechanismCandidateSet(
@@ -597,7 +643,7 @@ def discover_source_mechanisms(
         )
 
     resolver = SourceMechanismResolver(source_path)
-    return resolver.discover(
+    return await resolver.discover(
         question_intent.original_question,
         log_context,
         seed_queries=[
@@ -608,6 +654,7 @@ def discover_source_mechanisms(
             *question_intent.likely_modules,
             *question_intent.likely_source_files,
         ],
+        decide=decide,
         max_total_files=max(max_candidates * 8, 8),
     )
 
@@ -1010,6 +1057,40 @@ def _audit_sync_call(
     audit_logger.log_event(f"{event_prefix}.started", name=name, input=input_payload)
     try:
         result = func(*args, **kwargs)
+    except Exception as exc:
+        audit_logger.log_event(
+            f"{event_prefix}.failed",
+            name=name,
+            error=repr(exc),
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+        )
+        raise
+
+    audit_logger.log_event(
+        f"{event_prefix}.finished",
+        name=name,
+        output=_safe_model_dump(result),
+        duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+    )
+    return result
+
+
+async def _audit_async_call(
+    audit_logger: Optional[DeveloperAuditLogger],
+    event_prefix: str,
+    name: str,
+    func: Any,
+    input_payload: dict[str, Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    if audit_logger is None:
+        return await func(*args, **kwargs)
+
+    started_at = time.perf_counter()
+    audit_logger.log_event(f"{event_prefix}.started", name=name, input=input_payload)
+    try:
+        result = await func(*args, **kwargs)
     except Exception as exc:
         audit_logger.log_event(
             f"{event_prefix}.failed",

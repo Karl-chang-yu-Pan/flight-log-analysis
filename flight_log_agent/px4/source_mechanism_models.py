@@ -68,3 +68,38 @@ class SourceMechanismCandidateSet(BaseModel):
     candidates: list[SourceMechanismCandidate] = Field(default_factory=list)
     expansion_queries: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
+
+
+class SourceDiscoveryCandidateDraft(BaseModel):
+    title: str
+    source_mechanism: str
+    source_files: list[str] = Field(default_factory=list)
+    source_chain: list[CodeRef] = Field(default_factory=list)
+    controlling_parameter_names: list[str] = Field(default_factory=list)
+    relevant_signals: list[str] = Field(default_factory=list)
+    branch_conditions: list[str] = Field(default_factory=list)
+    expected_log_signature: list[str] = Field(default_factory=list)
+    required_log_evidence: list[str] = Field(default_factory=list)
+    contradiction_checks: list[str] = Field(default_factory=list)
+    source_confidence: Literal["low", "medium", "high"] = "low"
+    resolver_notes: list[str] = Field(default_factory=list)
+
+
+class SourceDiscoveryIterationPacket(BaseModel):
+    user_question: str
+    depth: int
+    active_queries: list[str] = Field(default_factory=list)
+    visited_files: list[str] = Field(default_factory=list)
+    new_files: list[str] = Field(default_factory=list)
+    source_profile: dict[str, Any] = Field(default_factory=dict)
+    parameter_requirements: list[ParameterRequirement] = Field(default_factory=list)
+    static_log_context: dict[str, Any] = Field(default_factory=dict)
+    prior_decision_notes: list[str] = Field(default_factory=list)
+
+
+class SourceDiscoveryDecision(BaseModel):
+    relevant_files: list[str] = Field(default_factory=list)
+    expansion_queries: list[str] = Field(default_factory=list)
+    stop: bool = False
+    candidate_drafts: list[SourceDiscoveryCandidateDraft] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)

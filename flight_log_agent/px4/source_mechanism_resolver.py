@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from flight_log_agent.models import AirframeContext, CodeRef
 from flight_log_agent.px4.mechanism_source_profiler import (
@@ -17,6 +17,9 @@ from flight_log_agent.px4.mechanism_source_profiler import (
 )
 from flight_log_agent.px4.source_mechanism_models import (
     ParameterRequirement,
+    SourceDiscoveryCandidateDraft,
+    SourceDiscoveryDecision,
+    SourceDiscoveryIterationPacket,
     SourceDiscoveryLogContext,
     SourceFieldRef,
     SourceMechanismCandidate,
@@ -62,12 +65,13 @@ class SourceMechanismResolver:
         self.profiler = profiler or MechanismSourceProfiler(self.source_path)
         self.parameter_gate = parameter_gate or ParameterFeasibilityGate()
 
-    def discover(
+    async def discover(
         self,
         user_question: str,
         log_context: SourceDiscoveryLogContext,
         *,
         seed_queries: Optional[list[str]] = None,
+        decide: Optional[Callable[[SourceDiscoveryIterationPacket], Awaitable[SourceDiscoveryDecision]]] = None,
         max_depth: int = 2,
         max_files_per_query: int = 8,
         max_total_files: int = 18,
@@ -85,8 +89,11 @@ class SourceMechanismResolver:
         function_calls: list[FunctionCallRef] = []
         branch_conditions: list[BranchConditionRef] = []
         parameter_predicates: list[ParameterPredicateRef] = []
+        decision_notes: list[str] = []
+        candidate_drafts: list[SourceDiscoveryCandidateDraft] = []
+        relevant_files: list[str] = []
 
-        for _depth in range(max(max_depth, 1)):
+        for depth in range(max(max_depth, 1)):
             if not active_queries or len(visited_files) >= max_total_files:
                 break
 
@@ -115,6 +122,10 @@ class SourceMechanismResolver:
             function_calls.extend(self.profiler.extract_function_calls_from_source(new_files))
             branch_conditions.extend(self.profiler.extract_branch_conditions_from_source(new_files))
             parameter_predicates.extend(self.profiler.extract_parameter_predicates_from_source(new_files))
+            parameter_requirements = self.parameter_gate.evaluate(
+                dedupe_parameter_predicates(parameter_predicates),
+                log_context,
+            )
 
             expansions = self._build_expansion_queries(
                 parameter_refs,
@@ -123,6 +134,45 @@ class SourceMechanismResolver:
                 function_calls,
                 max_queries=max_expansion_queries,
             )
+            if decide is not None:
+                decision = await decide(
+                    self._build_iteration_packet(
+                        user_question=user_question,
+                        depth=depth,
+                        active_queries=active_queries,
+                        visited_files=visited_files,
+                        new_files=new_files,
+                        hits=list(hits_by_file.values()),
+                        parameter_refs=parameter_refs,
+                        published_topics=published_topics,
+                        subscribed_topics=subscribed_topics,
+                        assigned_fields=assigned_fields,
+                        read_fields=read_fields,
+                        function_calls=function_calls,
+                        branch_conditions=branch_conditions,
+                        parameter_predicates=parameter_predicates,
+                        parameter_requirements=parameter_requirements,
+                        log_context=log_context,
+                        prior_decision_notes=decision_notes,
+                    )
+                )
+                relevant_files.extend([
+                    path for path in decision.relevant_files
+                    if path in visited_files
+                ])
+                candidate_drafts.extend(decision.candidate_drafts)
+                decision_notes.extend(decision.notes)
+                expansions = dedupe_keep_order([
+                    *decision.expansion_queries,
+                    *expansions,
+                ])[:max_expansion_queries]
+                if decision.stop:
+                    all_queries.extend([
+                        query for query in expansions
+                        if query not in all_queries
+                    ])
+                    break
+
             active_queries = [
                 query for query in expansions
                 if query not in all_queries
@@ -140,9 +190,10 @@ class SourceMechanismResolver:
             dedupe_parameter_predicates(parameter_predicates),
             log_context,
         )
-        candidate = self._build_candidate(
+        selected_files = dedupe_keep_order(relevant_files) or visited_files
+        candidates = self._build_candidates(
             user_question=user_question,
-            source_files=visited_files,
+            source_files=selected_files,
             hits=list(hits_by_file.values()),
             parameter_requirements=parameter_requirements,
             published_topics=dedupe_topic_refs(published_topics),
@@ -150,11 +201,93 @@ class SourceMechanismResolver:
             fields=dedupe_field_refs(assigned_fields + read_fields),
             branch_conditions=dedupe_branch_conditions(branch_conditions),
             log_context=log_context,
+            candidate_drafts=candidate_drafts,
+            decision_notes=decision_notes,
         )
         return SourceMechanismCandidateSet(
-            candidates=[candidate],
+            candidates=candidates,
             expansion_queries=all_queries,
             unresolved_questions=[],
+        )
+
+    def _build_iteration_packet(
+        self,
+        *,
+        user_question: str,
+        depth: int,
+        active_queries: list[str],
+        visited_files: list[str],
+        new_files: list[str],
+        hits: list[SourceFileHit],
+        parameter_refs: list[ParameterRef],
+        published_topics: list[TopicRef],
+        subscribed_topics: list[TopicRef],
+        assigned_fields: list[FieldRef],
+        read_fields: list[FieldRef],
+        function_calls: list[FunctionCallRef],
+        branch_conditions: list[BranchConditionRef],
+        parameter_predicates: list[ParameterPredicateRef],
+        parameter_requirements: list[ParameterRequirement],
+        log_context: SourceDiscoveryLogContext,
+        prior_decision_notes: list[str],
+    ) -> SourceDiscoveryIterationPacket:
+        discovered_topics = dedupe_keep_order([
+            ref.topic
+            for ref in published_topics + subscribed_topics
+            if ref.topic
+        ])
+        discovered_topics.extend([
+            ref.topic
+            for ref in assigned_fields + read_fields
+            if ref.topic and ref.topic not in discovered_topics
+        ])
+        discovered_parameter_names = dedupe_keep_order([
+            ref.name for ref in parameter_refs if ref.name
+        ])
+        discovered_parameter_names.extend([
+            requirement.name
+            for requirement in parameter_requirements
+            if requirement.name and requirement.name != "unknown" and requirement.name not in discovered_parameter_names
+        ])
+        return SourceDiscoveryIterationPacket(
+            user_question=user_question,
+            depth=depth,
+            active_queries=active_queries,
+            visited_files=visited_files,
+            new_files=new_files,
+            source_profile={
+                "related_files": [_safe_model_dump(hit) for hit in hits],
+                "referenced_parameters": [_safe_model_dump(ref) for ref in dedupe_parameter_refs(parameter_refs)],
+                "published_topics": [_safe_model_dump(ref) for ref in dedupe_topic_refs(published_topics)],
+                "subscribed_topics": [_safe_model_dump(ref) for ref in dedupe_topic_refs(subscribed_topics)],
+                "assigned_fields": [_safe_model_dump(ref) for ref in dedupe_field_refs(assigned_fields)],
+                "read_fields": [_safe_model_dump(ref) for ref in dedupe_field_refs(read_fields)],
+                "function_calls": [_safe_model_dump(ref) for ref in dedupe_function_call_refs(function_calls)],
+                "branch_conditions": [_safe_model_dump(ref) for ref in dedupe_branch_conditions(branch_conditions)],
+                "parameter_predicates": [
+                    _safe_model_dump(ref) for ref in dedupe_parameter_predicates(parameter_predicates)
+                ],
+            },
+            parameter_requirements=parameter_requirements,
+            static_log_context={
+                "vehicle_type": log_context.vehicle_type,
+                "mode_state_constraints": log_context.mode_state_constraints,
+                "discovered_parameter_values": {
+                    name: log_context.parameters.get(name)
+                    for name in discovered_parameter_names
+                    if name in log_context.parameters
+                },
+                "discovered_topic_fields": {
+                    topic: log_context.topic_fields.get(topic, [])
+                    for topic in discovered_topics
+                    if topic in log_context.topic_fields
+                },
+                "available_discovered_topics": [
+                    topic for topic in discovered_topics
+                    if topic in log_context.available_topics
+                ],
+            },
+            prior_decision_notes=prior_decision_notes,
         )
 
     def _seed_queries(self, user_question: str) -> list[str]:
@@ -181,6 +314,53 @@ class SourceMechanismResolver:
         queries.extend(ref.name for ref in function_calls if self._is_relevant_function_name(ref.name))
         return dedupe_keep_order([query for query in queries if query])[:max_queries]
 
+    def _build_candidates(
+        self,
+        *,
+        user_question: str,
+        source_files: list[str],
+        hits: list[SourceFileHit],
+        parameter_requirements: list[ParameterRequirement],
+        published_topics: list[TopicRef],
+        subscribed_topics: list[TopicRef],
+        fields: list[FieldRef],
+        branch_conditions: list[BranchConditionRef],
+        log_context: SourceDiscoveryLogContext,
+        candidate_drafts: list[SourceDiscoveryCandidateDraft],
+        decision_notes: list[str],
+    ) -> list[SourceMechanismCandidate]:
+        if candidate_drafts:
+            return [
+                self._build_candidate_from_draft(
+                    draft,
+                    fallback_user_question=user_question,
+                    fallback_source_files=source_files,
+                    fallback_hits=hits,
+                    parameter_requirements=parameter_requirements,
+                    published_topics=published_topics,
+                    subscribed_topics=subscribed_topics,
+                    fields=fields,
+                    branch_conditions=branch_conditions,
+                    log_context=log_context,
+                    decision_notes=decision_notes,
+                )
+                for draft in candidate_drafts
+            ]
+        return [
+            self._build_candidate(
+                user_question=user_question,
+                source_files=source_files,
+                hits=hits,
+                parameter_requirements=parameter_requirements,
+                published_topics=published_topics,
+                subscribed_topics=subscribed_topics,
+                fields=fields,
+                branch_conditions=branch_conditions,
+                log_context=log_context,
+                decision_notes=decision_notes,
+            )
+        ]
+
     def _build_candidate(
         self,
         *,
@@ -193,6 +373,7 @@ class SourceMechanismResolver:
         fields: list[FieldRef],
         branch_conditions: list[BranchConditionRef],
         log_context: SourceDiscoveryLogContext,
+        decision_notes: list[str],
     ) -> SourceMechanismCandidate:
         source_chain = self._source_chain_from_hits(hits)
         relevant_fields = [
@@ -239,6 +420,74 @@ class SourceMechanismResolver:
             resolver_notes=[
                 "Source resolver used only static source facts and static log inventory/parameters.",
                 "No time-series signal comparison, event timestamp proof, plots, or final root-cause confidence were computed.",
+                *decision_notes,
+            ],
+        )
+
+    def _build_candidate_from_draft(
+        self,
+        draft: SourceDiscoveryCandidateDraft,
+        *,
+        fallback_user_question: str,
+        fallback_source_files: list[str],
+        fallback_hits: list[SourceFileHit],
+        parameter_requirements: list[ParameterRequirement],
+        published_topics: list[TopicRef],
+        subscribed_topics: list[TopicRef],
+        fields: list[FieldRef],
+        branch_conditions: list[BranchConditionRef],
+        log_context: SourceDiscoveryLogContext,
+        decision_notes: list[str],
+    ) -> SourceMechanismCandidate:
+        source_files = draft.source_files or fallback_source_files
+        required_parameters = set(draft.controlling_parameter_names)
+        controlling_parameters = [
+            requirement for requirement in parameter_requirements
+            if not required_parameters or requirement.name in required_parameters
+        ]
+        relevant_fields = [
+            SourceFieldRef(
+                field=field.field,
+                topic=field.topic,
+                variable=field.variable,
+                source_file=field.file,
+                source_line=field.line,
+            )
+            for field in fields
+            if not draft.relevant_signals
+            or (field.topic and f"{field.topic}.{field.field}" in draft.relevant_signals)
+        ]
+        fallback = self._build_candidate(
+            user_question=fallback_user_question,
+            source_files=source_files,
+            hits=fallback_hits,
+            parameter_requirements=controlling_parameters,
+            published_topics=published_topics,
+            subscribed_topics=subscribed_topics,
+            fields=fields,
+            branch_conditions=branch_conditions,
+            log_context=log_context,
+            decision_notes=decision_notes,
+        )
+        return SourceMechanismCandidate(
+            title=draft.title or fallback.title,
+            source_mechanism=draft.source_mechanism or fallback.source_mechanism,
+            source_chain=draft.source_chain or fallback.source_chain,
+            source_files=source_files,
+            controlling_parameters=controlling_parameters,
+            published_topics=fallback.published_topics,
+            subscribed_topics=fallback.subscribed_topics,
+            relevant_fields=relevant_fields or fallback.relevant_fields,
+            branch_conditions=draft.branch_conditions or fallback.branch_conditions,
+            expected_log_signature=draft.expected_log_signature or fallback.expected_log_signature,
+            required_log_evidence=draft.required_log_evidence or fallback.required_log_evidence,
+            contradiction_checks=draft.contradiction_checks or fallback.contradiction_checks,
+            source_confidence=draft.source_confidence,
+            resolver_notes=[
+                "Source candidate was drafted by the source-discovery decision agent.",
+                "No time-series signal comparison, event timestamp proof, plots, or final root-cause confidence were computed.",
+                *draft.resolver_notes,
+                *decision_notes,
             ],
         )
 
@@ -485,11 +734,35 @@ def dedupe_topic_refs(refs: list[TopicRef]) -> list[TopicRef]:
     return out
 
 
+def dedupe_parameter_refs(refs: list[ParameterRef]) -> list[ParameterRef]:
+    seen = set()
+    out: list[ParameterRef] = []
+    for ref in refs:
+        key = (ref.name, ref.member, ref.file, ref.line, ref.access_pattern)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
 def dedupe_field_refs(refs: list[FieldRef]) -> list[FieldRef]:
     seen = set()
     out: list[FieldRef] = []
     for ref in refs:
         key = (ref.topic, ref.variable, ref.field, ref.file, ref.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
+def dedupe_function_call_refs(refs: list[FunctionCallRef]) -> list[FunctionCallRef]:
+    seen = set()
+    out: list[FunctionCallRef] = []
+    for ref in refs:
+        key = (ref.name, ref.receiver, ref.file, ref.line)
         if key in seen:
             continue
         seen.add(key)
@@ -507,6 +780,16 @@ def dedupe_branch_conditions(refs: list[BranchConditionRef]) -> list[BranchCondi
         seen.add(key)
         out.append(ref)
     return out
+
+
+def _safe_model_dump(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, list):
+        return [_safe_model_dump(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _safe_model_dump(item) for key, item in value.items()}
+    return value
 
 
 def dedupe_parameter_predicates(refs: list[ParameterPredicateRef]) -> list[ParameterPredicateRef]:

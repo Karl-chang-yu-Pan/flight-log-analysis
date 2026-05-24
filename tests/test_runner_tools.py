@@ -1201,11 +1201,16 @@ def test_v3_agents_enforce_source_mechanism_context_boundaries(tmp_path):
     runner = load_runner(tmp_path)
 
     intent_instructions = runner.question_intent_agent.kwargs["instructions"]
+    source_discovery_instructions = runner.source_discovery_agent.kwargs["instructions"]
     report_instructions = runner.final_report_agent.kwargs["instructions"]
 
     assert runner.question_intent_agent.kwargs["model"] == "gpt-5.4-nano"
+    assert runner.source_discovery_agent.kwargs["model"] == "gpt-5.5"
     assert runner.final_report_agent.kwargs["model"] == "gpt-5.4"
     assert "Do not use parameter values" in intent_instructions
+    assert "Do not perform final dynamic log verification" in source_discovery_instructions
+    assert "Candidate drafts must be source-level mechanisms" in source_discovery_instructions
+    assert "MechanismVerifier checks" in source_discovery_instructions
     assert "verifiedmechanismresult" in report_instructions.lower()
     assert "Confidence cannot exceed evaluation.confidence_ceiling" in report_instructions
     assert "Do not introduce new mechanisms" in report_instructions
@@ -1310,6 +1315,7 @@ def test_v3_agent_output_schemas_are_strict_json_compatible():
 
     for output_type in (
         runner.QuestionIntent,
+        runner.SourceDiscoveryDecision,
         runner.MechanismCandidateSet,
         runner.FlightLogReport,
     ):
