@@ -729,6 +729,8 @@ class MechanismSourceProfiler:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("//"):
                     continue
+                if self._PARAM_DECL_PATTERN.search(stripped):
+                    continue
                 if not self._line_mentions_parameter(stripped, member_to_param):
                     continue
 
