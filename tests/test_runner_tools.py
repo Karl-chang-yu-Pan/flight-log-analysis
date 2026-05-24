@@ -269,9 +269,10 @@ def test_parse_ulog_inventory_extracts_inventory_from_pyulog(tmp_path, monkeypat
             "file": "ROMFS/px4fmu_common/init.d/airframes/4001_quad_x",
         },
         "duration_s": 5.5,
-        "important_parameters": {
+        "parameters": {
             "NAV_ACC_RAD": 10.0,
             "SYS_AUTOSTART": 4001,
+            "UNRELATED_PARAM": 99,
         },
         "available_topics": [
             "debug_topic",
@@ -413,7 +414,7 @@ def test_parse_ulog_inventory_reports_parse_failure(tmp_path, monkeypatch):
 
     result = ulog_inventory.parse_ulog_inventory(tmp_path / "flight.ulg")
 
-    assert result["important_parameters"] == {}
+    assert result["parameters"] == {}
     assert result["missing_topics"] == ulog_inventory.EXPECTED_TIMELINE_TOPICS
     assert result["warnings"] == ["failed to parse ULog: bad log"]
 
@@ -1133,12 +1134,56 @@ def test_v3_agents_enforce_source_mechanism_context_boundaries(tmp_path):
     resolver_instructions = runner.mechanism_resolver_agent.kwargs["instructions"]
     report_instructions = runner.final_report_agent.kwargs["instructions"]
 
+    assert runner.question_intent_agent.kwargs["model"] == "gpt-5.4-nano"
+    assert runner.mechanism_resolver_agent.kwargs["model"] == "gpt-5.5"
+    assert runner.final_report_agent.kwargs["model"] == "gpt-5.4"
     assert "Do not use parameter values" in intent_instructions
     assert "Do not use parameter values or detailed log evidence" in resolver_instructions
     assert "Emit cacheable mechanism candidates" in resolver_instructions
+    assert "Put PX4 parameters only in required_parameters" in resolver_instructions
+    assert "only logged ULog signals" in resolver_instructions
     assert "verifiedmechanismresult" in report_instructions.lower()
     assert "Confidence cannot exceed evaluation.confidence_ceiling" in report_instructions
     assert "Do not introduce new mechanisms" in report_instructions
+
+
+def test_sanitize_mechanism_candidate_contract_separates_parameters_from_signals(tmp_path):
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Candidate",
+        summary="summary",
+        source_refs=[],
+        required_parameters=["SYS_AUTOSTART"],
+        required_signals=[
+            "vehicle_status.nav_state",
+            "MISPLACED_PARAM",
+            "position_setpoint_triplet.current.alt",
+            "position_setpoint_triplet.current.alt + MISPLACED_PARAM",
+            "MISPLACED_PARAM",
+        ],
+        expected_logged_signature=[
+            runner.ExpectedSignatureItem(
+                name="parameter",
+                description="parameter value",
+                signal="MISPLACED_PARAM",
+            ),
+            runner.ExpectedSignatureItem(
+                name="signal",
+                description="logged signal",
+                signal="vehicle_status.nav_state",
+            ),
+        ],
+    )
+
+    result = runner.sanitize_mechanism_candidate_contract(candidate)
+
+    assert result.required_parameters == ["SYS_AUTOSTART", "MISPLACED_PARAM"]
+    assert result.required_signals == [
+        "vehicle_status.nav_state",
+        "position_setpoint_triplet.current.alt",
+    ]
+    assert result.expected_logged_signature[0].signal is None
+    assert result.expected_logged_signature[1].signal == "vehicle_status.nav_state"
 
 
 def test_v3_agent_output_schemas_are_strict_json_compatible():

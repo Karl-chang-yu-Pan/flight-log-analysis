@@ -15,7 +15,7 @@ def evaluate_candidate_applicability(
     Use actual parameters/timeline/mission/topic availability to eliminate mechanisms.
     This is where parameters and topics enter the workflow.
     """
-    params = inventory.get("parameters") or inventory.get("important_parameters") or {}
+    params = inventory.get("parameters") or {}
     topic_fields = inventory.get("topic_fields") or {}
     available_topics = set(inventory.get("available_topics") or topic_fields.keys())
 

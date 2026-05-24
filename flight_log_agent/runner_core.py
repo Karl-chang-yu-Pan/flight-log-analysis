@@ -21,6 +21,7 @@ This is intentionally a skeleton. The important part is the data flow and contex
 import asyncio
 import importlib
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -143,6 +144,7 @@ def parse_mission_file(mission_path: Optional[Path]) -> Optional[dict]:
 
 question_intent_agent = Agent(
     name="Question Intent Normalizer",
+    model="gpt-5.4-nano",
     instructions="""
 Convert the user's natural-language PX4 flight-log question into a source-search intent.
 
@@ -161,6 +163,7 @@ Do not draft hypotheses. Do not assign confidence.
 
 mechanism_resolver_agent = Agent(
     name="PX4 Mechanism Resolver",
+    model="gpt-5.5",
     instructions="""
 Resolve reusable PX4 source-code mechanisms from bounded source-search evidence.
 
@@ -172,6 +175,9 @@ Important separation:
 - Emit cacheable mechanism candidates. For every candidate, include source_refs,
   mechanism summary, source-level gates, required parameters/signals, expected
   logged signature, exclusion checks, numeric checks, and useful plot requests.
+- Put PX4 parameters only in required_parameters. Put only logged ULog signals
+  in required_signals, using exact topic.field names. Do not put parameter names,
+  mission-file values, expressions, or source-code variables in required_signals.
 - Do not assign confidence that the mechanism happened in the flight.
 - The output may be written to the mechanism cache; avoid flight-specific language
   such as "this log shows" or "this aircraft did".
@@ -186,6 +192,7 @@ mechanism_candidate_agent = mechanism_resolver_agent
 
 final_report_agent = Agent(
     name="Verified Mechanism Report Writer",
+    model="gpt-5.4",
     instructions="""
 Write the final report only from VerifiedMechanismResult objects.
 
@@ -404,7 +411,10 @@ async def analyze_flight_log(
                 if validation.usable:
                     cached_records.append(record)
 
-        cached_candidates = mechanism_records_to_candidates(cached_records, max_candidates)
+        cached_candidates = [
+            sanitize_mechanism_candidate_contract(candidate)
+            for candidate in mechanism_records_to_candidates(cached_records, max_candidates)
+        ]
         mechanism_cache_summary["cache_hit_candidate_names"] = [c.name for c in cached_candidates]
 
         if cached_candidates:
@@ -444,6 +454,10 @@ async def analyze_flight_log(
                 ctx,
                 max_turns=3,
             )
+            candidate_set.candidates = [
+                sanitize_mechanism_candidate_contract(candidate)
+                for candidate in candidate_set.candidates
+            ]
 
             written_records = _audit_sync_call(
                 audit_logger,
@@ -463,6 +477,10 @@ async def analyze_flight_log(
             )
             mechanism_cache_summary["written_records"] = written_records
 
+        candidate_set.candidates = [
+            sanitize_mechanism_candidate_contract(candidate)
+            for candidate in candidate_set.candidates
+        ]
         candidates = candidate_set.candidates[:max_candidates]
 
         # ------------------------------------------------------------
@@ -573,6 +591,55 @@ def retrieve_cached_mechanisms(
 ) -> MechanismRetrievalResult:
     retriever = MechanismRetriever(cache_config)
     return retriever.retrieve(source_search_context, max_records=max_records)
+
+
+def sanitize_mechanism_candidate_contract(candidate: MechanismCandidate) -> MechanismCandidate:
+    """
+    Enforce the source-candidate schema boundary before deterministic checks.
+
+    The resolver sometimes treats "things needed for verification" as signals.
+    Only ULog topic.field references belong in required_signals; bare PX4-style
+    identifiers are parameters, and expressions are not log signals.
+    """
+    required_parameters = list(candidate.required_parameters or [])
+    required_signals: list[str] = []
+
+    for signal in candidate.required_signals or []:
+        signal_name = str(signal).strip()
+        if is_logged_signal_reference(signal_name):
+            required_signals.append(signal_name)
+        elif is_px4_parameter_name(signal_name):
+            required_parameters.append(signal_name)
+
+    candidate.required_parameters = dedupe_keep_order(required_parameters)
+    candidate.required_signals = dedupe_keep_order(required_signals)
+
+    for item in candidate.expected_logged_signature or []:
+        signal = str(getattr(item, "signal", "") or "").strip()
+        if signal and not is_logged_signal_reference(signal):
+            item.signal = None
+
+    return candidate
+
+
+def is_logged_signal_reference(value: str) -> bool:
+    signal_part = r"[A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?"
+    return bool(re.fullmatch(rf"[a-z][a-z0-9_]*\.{signal_part}(?:\.{signal_part})*", value))
+
+
+def is_px4_parameter_name(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", value)) and "_" in value
+
+
+def dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 def validate_cached_mechanism_source(

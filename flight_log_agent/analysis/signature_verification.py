@@ -12,12 +12,17 @@ def evaluate_candidate_log_signature(
     candidate: MechanismCandidate,
     applicability: ApplicabilityResult,
 ) -> SignatureEvaluation:
+    required_signals = [
+        signal
+        for signal in candidate.required_signals
+        if _is_logged_signal_reference(signal)
+    ]
     raw = evaluate_log_signature(
         log_path,
         candidate.name,
         [_model_to_dict(x) for x in candidate.expected_logged_signature],
         [_model_to_dict(x) for x in applicability.candidate_windows],
-        candidate.required_signals,
+        required_signals,
         [_model_to_dict(x) for x in candidate.exclusion_checks],
         [_model_to_dict(x) for x in candidate.numeric_checks],
     )
@@ -107,3 +112,13 @@ def _extract_list(raw: dict[str, Any], keys: list[str]) -> list[Any]:
         if value:
             return [value]
     return []
+
+
+def _is_logged_signal_reference(value: str) -> bool:
+    if not isinstance(value, str) or "." not in value:
+        return False
+    topic, field = value.split(".", 1)
+    if not topic or not field:
+        return False
+    invalid_chars = set(" +-*/()")
+    return not any(char in invalid_chars for char in value)

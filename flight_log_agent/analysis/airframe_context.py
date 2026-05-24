@@ -7,7 +7,7 @@ from flight_log_agent.models import AirframeContext
 
 
 def build_airframe_context(inventory: dict, control_surface: dict) -> AirframeContext:
-    params = inventory.get("parameters") or inventory.get("important_parameters") or {}
+    params = inventory.get("parameters") or {}
 
     px4_git_hash = (
         inventory.get("git_hash")

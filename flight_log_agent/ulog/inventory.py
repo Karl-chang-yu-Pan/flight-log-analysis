@@ -18,23 +18,6 @@ EXPECTED_TIMELINE_TOPICS = [
 DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parent / "ref" / "PX4-Autopilot"
 
 
-IMPORTANT_PARAMETER_PREFIXES = (
-    "SYS_",
-    "COM_",
-    "NAV_",
-    "FW_",
-    "MC_",
-    "MPC_",
-    "VT_",
-    "CA_",
-    "PWM_",
-    "UAVCAN_",
-    "CBRK_",
-    "EKF2_",
-    "SENS_",
-)
-
-
 def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> dict:
     inventory = _empty_inventory()
 
@@ -54,7 +37,7 @@ def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> 
     inventory["git_hash"] = git_hash
     inventory["airframe"] = _extract_airframe(ulog, source_path, git_hash)
     inventory["duration_s"] = _extract_duration_s(ulog)
-    inventory["important_parameters"] = _extract_important_parameters(ulog)
+    inventory["parameters"] = _extract_parameters(ulog)
     inventory["available_topics"] = available_topics
     inventory["topic_fields"] = _extract_topic_fields(ulog)
     inventory["topic_instances"] = _extract_topic_instances(ulog)
@@ -74,7 +57,7 @@ def _empty_inventory() -> dict:
         "git_hash": None,
         "airframe": None,
         "duration_s": None,
-        "important_parameters": {},
+        "parameters": {},
         "available_topics": [],
         "topic_fields": {},
         "topic_instances": {},
@@ -238,13 +221,12 @@ def _release_type_suffix(release_type: Any) -> str:
     return ""
 
 
-def _extract_important_parameters(ulog: Any) -> dict:
+def _extract_parameters(ulog: Any) -> dict:
     parameters = getattr(ulog, "initial_parameters", {}) or {}
 
     return {
         name: _json_safe_value(value)
         for name, value in sorted(parameters.items())
-        if name.startswith(IMPORTANT_PARAMETER_PREFIXES)
     }
 
 
