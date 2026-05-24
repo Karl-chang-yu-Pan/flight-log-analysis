@@ -122,12 +122,13 @@ async function startAnalysis() {
   }
 
   const inputs = state.payload.inputs || {};
+  const currentSourcePath = stringOrNull(new FormData(els.form).get("source_path"));
   const question = els.analysisQuestion.value.trim()
     || "Analyze this flight log and identify the most likely root causes.";
   const payload = {
     log_path: inputs.log_path,
     mission_path: inputs.mission_path,
-    source_path: inputs.source_path,
+    source_path: currentSourcePath || inputs.source_path,
     user_question: question,
   };
 

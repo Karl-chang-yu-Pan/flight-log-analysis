@@ -15,7 +15,7 @@ EXPECTED_TIMELINE_TOPICS = [
     "mission_result",
 ]
 
-DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parent / "ref" / "PX4-Autopilot"
+DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parents[2] / "ref" / "PX4-Autopilot"
 
 
 def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> dict:

@@ -605,6 +605,22 @@ def test_runner_parse_ulog_inventory_delegates_to_inventory_module(tmp_path):
     assert result == {"available_topics": ["vehicle_status"]}
 
 
+def test_resolve_source_path_uses_repo_default_when_available(tmp_path):
+    runner = load_runner(tmp_path)
+    default_source = tmp_path / "ref" / "PX4-Autopilot"
+    default_source.mkdir(parents=True)
+    explicit_source = tmp_path / "custom-px4"
+
+    runner.DEFAULT_PX4_SOURCE_PATH = default_source
+
+    assert runner.resolve_source_path(None) == default_source
+    assert runner.resolve_source_path("") == default_source
+    assert runner.resolve_source_path(explicit_source) == explicit_source
+
+    runner.DEFAULT_PX4_SOURCE_PATH = tmp_path / "missing"
+    assert runner.resolve_source_path(None) is None
+
+
 def test_runner_build_basic_timeline_delegates_to_timeline_module(tmp_path):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"

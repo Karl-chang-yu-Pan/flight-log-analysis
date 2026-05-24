@@ -100,6 +100,9 @@ from flight_log_agent.px4.mechanism_cache import (
 )
 
 
+DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parents[1] / "ref" / "PX4-Autopilot"
+
+
 # ============================================================
 # 1. Runtime context
 # ============================================================
@@ -136,6 +139,14 @@ def infer_control_surface(log_path: Path, source_path: Optional[Path]) -> dict:
 
 def parse_mission_file(mission_path: Optional[Path]) -> Optional[dict]:
     return parse_mission_file_impl(mission_path)
+
+
+def resolve_source_path(source_path: Optional[str | Path]) -> Optional[Path]:
+    if source_path:
+        return Path(source_path)
+    if DEFAULT_PX4_SOURCE_PATH.exists():
+        return DEFAULT_PX4_SOURCE_PATH
+    return None
 
 
 # ============================================================
@@ -260,7 +271,7 @@ async def analyze_flight_log(
 ) -> FlightLogReport:
     log_path_obj = Path(log_path)
     mission_path_obj = Path(mission_path) if mission_path else None
-    source_path_obj = Path(source_path) if source_path else None
+    source_path_obj = resolve_source_path(source_path)
     output_dir_obj = Path(output_dir)
     output_dir_obj.mkdir(parents=True, exist_ok=True)
 
