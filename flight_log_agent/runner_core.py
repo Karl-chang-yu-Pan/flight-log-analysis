@@ -205,9 +205,11 @@ final_report_agent = Agent(
     name="Verified Mechanism Report Writer",
     model="gpt-5.4",
     instructions="""
-Write the final report only from VerifiedMechanismResult objects.
+Write the final report only from compact VerifiedMechanismResult objects.
 
 Rules:
+- The runner deterministically overwrites airframe_summary and
+  question_intent_summary after this step; set them to concise placeholders.
 - Do not introduce new mechanisms.
 - Do not claim a mechanism happened unless applicability and log evaluation support it.
 - Separate source mechanism, applicability filtering, numeric log verification,
@@ -458,10 +460,13 @@ async def analyze_flight_log(
                 audit_logger,
                 "resolve_mechanisms",
                 mechanism_resolver_agent,
-                {
-                    "source_search_context": source_search_context.model_dump(),
-                    "source_evidence": source_evidence.model_dump(),
-                },
+                build_mechanism_resolver_input(
+                    source_search_context,
+                    source_evidence,
+                    inventory,
+                    timeline,
+                    mission,
+                ),
                 ctx,
                 max_turns=3,
             )
@@ -551,18 +556,12 @@ async def analyze_flight_log(
             audit_logger,
             "final_report",
             final_report_agent,
-            {
-                "airframe_context": airframe_context.model_dump(),
-                "question_intent": question_intent.model_dump(),
-                "verified_mechanism_results": [r.model_dump() for r in verified_results],
-                "excluded_source_paths": candidate_set.rejected_source_paths,
-                "unresolved_source_questions": candidate_set.unresolved_questions,
-                "mechanism_cache": mechanism_cache_summary,
-            },
+            build_final_report_input(verified_results),
             ctx,
             max_turns=4,
         )
 
+        apply_deterministic_report_summaries(report, airframe_context, question_intent)
         report = generate_report_plots(report, ctx, audit_logger)
         validation = validate_report(report)
         audit_logger.log_event("validation.finished", output=validation.model_dump())
@@ -602,6 +601,302 @@ def retrieve_cached_mechanisms(
 ) -> MechanismRetrievalResult:
     retriever = MechanismRetriever(cache_config)
     return retriever.retrieve(source_search_context, max_records=max_records)
+
+
+def build_mechanism_resolver_input(
+    source_search_context: SourceSearchContext,
+    source_evidence: SourceEvidenceBundle,
+    inventory: Optional[dict[str, Any]] = None,
+    timeline: Optional[list[dict[str, Any]]] = None,
+    mission: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    return {
+        "mechanism_discovery_context": build_mechanism_discovery_context(
+            source_search_context,
+            inventory or {},
+            timeline or [],
+            mission,
+        ),
+        "source_evidence": compact_source_evidence(source_evidence),
+    }
+
+
+def build_mechanism_discovery_context(
+    source_search_context: SourceSearchContext,
+    inventory: dict[str, Any],
+    timeline: list[dict[str, Any]],
+    mission: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    airframe = source_search_context.airframe
+    intent = source_search_context.question_intent
+    return {
+        "source_identity": {
+            "px4_git_hash": getattr(airframe, "px4_git_hash", None),
+            "px4_version": getattr(airframe, "px4_version", None),
+            "px4_tag": getattr(airframe, "px4_tag", None),
+        },
+        "vehicle": {
+            "vehicle_type": getattr(airframe, "vehicle_type", None),
+            "sys_autostart": getattr(airframe, "sys_autostart", None),
+            "airframe_name": getattr(airframe, "airframe_name", None),
+            "control_surface_summary": getattr(airframe, "control_surface_summary", None),
+        },
+        "question_intent": compact_question_intent(intent),
+        "source_domain_constraints": {
+            "mode_state_timeline": compact_timeline_constraints(timeline),
+            "parameter_gates": compact_parameter_gates(inventory, intent, airframe),
+            "mission": compact_mission_context(mission),
+        },
+        "available_log_interfaces": compact_log_interfaces(inventory),
+    }
+
+
+def compact_question_intent(question_intent: QuestionIntent) -> dict[str, Any]:
+    return {
+        "original_question": getattr(question_intent, "original_question", None),
+        "problem_domain": getattr(question_intent, "problem_domain", None),
+        "concise_intent": getattr(question_intent, "concise_intent", None),
+        "source_queries": list(getattr(question_intent, "source_queries", []) or []),
+        "likely_modules": list(getattr(question_intent, "likely_modules", []) or []),
+        "likely_source_files": list(getattr(question_intent, "likely_source_files", []) or []),
+    }
+
+
+def compact_timeline_constraints(timeline: list[dict[str, Any]], max_events: int = 80) -> dict[str, Any]:
+    events = []
+    observed_values: dict[str, list[Any]] = {}
+    for event in timeline:
+        topic = event.get("topic")
+        field = event.get("field")
+        if not topic or not field:
+            continue
+
+        value = event.get("value")
+        key = f"{topic}.{field}"
+        values = observed_values.setdefault(key, [])
+        if value not in values:
+            values.append(value)
+
+        if len(events) < max_events:
+            events.append({
+                "time_s": event.get("time_s"),
+                "event": event.get("event"),
+                "topic": topic,
+                "field": field,
+                "value": value,
+            })
+
+    return {
+        "observed_values": observed_values,
+        "events": events,
+        "omitted_event_count": max(len([
+            event for event in timeline
+            if event.get("topic") and event.get("field")
+        ]) - len(events), 0),
+    }
+
+
+def compact_parameter_gates(
+    inventory: dict[str, Any],
+    question_intent: QuestionIntent,
+    airframe_context: AirframeContext,
+) -> dict[str, Any]:
+    parameters = inventory.get("parameters") or {}
+    requested = set(_parameter_names_from_question_intent(question_intent))
+    for name in ("SYS_AUTOSTART", "VT_TYPE"):
+        if name in parameters:
+            requested.add(name)
+
+    if getattr(airframe_context, "sys_autostart", None) is not None:
+        requested.add("SYS_AUTOSTART")
+
+    values = {
+        name: parameters[name]
+        for name in sorted(requested)
+        if name in parameters
+    }
+    if "SYS_AUTOSTART" not in values and getattr(airframe_context, "sys_autostart", None) is not None:
+        values["SYS_AUTOSTART"] = getattr(airframe_context, "sys_autostart")
+
+    return {
+        "values": values,
+        "matched_parameter_names": sorted(requested),
+        "available_parameter_count": len(parameters),
+    }
+
+
+def compact_log_interfaces(inventory: dict[str, Any], max_fields_per_topic: int = 80) -> dict[str, Any]:
+    available_topics = sorted(str(topic) for topic in (inventory.get("available_topics") or []))
+    topic_fields = inventory.get("topic_fields") or {}
+    compact_fields = {}
+    for topic in available_topics:
+        fields = topic_fields.get(topic)
+        if not fields:
+            continue
+        compact_fields[topic] = [str(field) for field in list(fields)[:max_fields_per_topic]]
+
+    return {
+        "available_topics": available_topics,
+        "topic_fields": compact_fields,
+        "topic_count": len(available_topics),
+    }
+
+
+def compact_mission_context(mission: Optional[dict[str, Any]], max_items: int = 20) -> Optional[dict[str, Any]]:
+    if mission is None:
+        return None
+
+    items = mission.get("items") or []
+    altitudes = [
+        item.get("altitude")
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("altitude"), (int, float))
+    ]
+    return {
+        "has_mission": True,
+        "format": mission.get("format"),
+        "planned_home_position": mission.get("planned_home_position"),
+        "vehicle_type": mission.get("vehicle_type"),
+        "item_count": len(items),
+        "command_names": dedupe_keep_order([
+            str(item.get("command_name"))
+            for item in items
+            if isinstance(item, dict) and item.get("command_name")
+        ]),
+        "frame_names": dedupe_keep_order([
+            str(item.get("frame_name"))
+            for item in items
+            if isinstance(item, dict) and item.get("frame_name")
+        ]),
+        "altitude_range": {
+            "min": min(altitudes),
+            "max": max(altitudes),
+        } if altitudes else None,
+        "items": [
+            {
+                "sequence": item.get("sequence"),
+                "command_name": item.get("command_name"),
+                "frame_name": item.get("frame_name"),
+                "altitude": item.get("altitude"),
+            }
+            for item in items[:max_items]
+            if isinstance(item, dict)
+        ],
+        "omitted_item_count": max(len(items) - max_items, 0),
+        "warnings": list(mission.get("warnings") or []),
+    }
+
+
+def compact_source_evidence(source_evidence: SourceEvidenceBundle) -> dict[str, Any]:
+    evidence = source_evidence.model_dump()
+    return {
+        "hits": evidence.get("hits", []),
+        "read_snippets": evidence.get("read_snippets", []),
+        "warnings": evidence.get("warnings", []),
+    }
+
+
+def _parameter_names_from_question_intent(question_intent: QuestionIntent) -> list[str]:
+    parts = [
+        getattr(question_intent, "original_question", None),
+        getattr(question_intent, "problem_domain", None),
+        getattr(question_intent, "concise_intent", None),
+        *(getattr(question_intent, "source_queries", []) or []),
+        *(getattr(question_intent, "likely_modules", []) or []),
+        *(getattr(question_intent, "likely_source_files", []) or []),
+        *(getattr(question_intent, "notes", []) or []),
+    ]
+    text = " ".join(str(part) for part in parts if part)
+    return dedupe_keep_order([
+        name for name in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", text)
+        if is_px4_parameter_name(name)
+    ])
+
+
+def build_final_report_input(
+    verified_results: list[VerifiedMechanismResult],
+) -> dict[str, Any]:
+    return {
+        "verified_mechanism_results": [
+            compact_verified_mechanism_result(result)
+            for result in verified_results
+        ],
+    }
+
+
+def compact_verified_mechanism_result(result: VerifiedMechanismResult) -> dict[str, Any]:
+    candidate = result.candidate
+    evaluation = result.evaluation
+    return {
+        "candidate": {
+            "name": candidate.name,
+            "summary": candidate.summary,
+            "source_refs": _safe_model_dump(candidate.source_refs),
+            "required_parameters": list(candidate.required_parameters),
+            "required_signals": list(candidate.required_signals),
+            "expected_logged_signature": _safe_model_dump(candidate.expected_logged_signature),
+            "exclusion_checks": _safe_model_dump(candidate.exclusion_checks),
+            "numeric_checks": _safe_model_dump(candidate.numeric_checks),
+            "plot_requests": _safe_model_dump(candidate.plot_requests),
+        },
+        "applicability": _safe_model_dump(result.applicability),
+        "evaluation": {
+            "candidate_name": evaluation.candidate_name,
+            "verdict": evaluation.verdict,
+            "confidence_ceiling": evaluation.confidence_ceiling,
+            "evidence": list(evaluation.evidence),
+            "contradictions": list(evaluation.contradictions),
+            "check_results": _safe_model_dump(evaluation.check_results),
+            "warnings": list(evaluation.warnings),
+        },
+        "final_confidence": result.final_confidence,
+    }
+
+
+def apply_deterministic_report_summaries(
+    report: FlightLogReport,
+    airframe_context: AirframeContext,
+    question_intent: QuestionIntent,
+) -> FlightLogReport:
+    report.airframe_summary = build_airframe_summary(airframe_context)
+    report.question_intent_summary = build_question_intent_summary(question_intent)
+    return report
+
+
+def build_airframe_summary(airframe_context: AirframeContext) -> str:
+    parts = []
+    px4_version = getattr(airframe_context, "px4_version", None)
+    px4_git_hash = getattr(airframe_context, "px4_git_hash", None)
+    vehicle_type = getattr(airframe_context, "vehicle_type", None)
+    sys_autostart = getattr(airframe_context, "sys_autostart", None)
+    airframe_name = getattr(airframe_context, "airframe_name", None)
+
+    if px4_version:
+        parts.append(f"PX4 {px4_version}")
+    if px4_git_hash:
+        parts.append(f"git {str(px4_git_hash)[:12]}")
+    if vehicle_type and vehicle_type != "unknown":
+        parts.append(f"vehicle_type={vehicle_type}")
+    if sys_autostart is not None:
+        parts.append(f"SYS_AUTOSTART={sys_autostart}")
+    if airframe_name:
+        parts.append(f"airframe={airframe_name}")
+    return "; ".join(parts) if parts else "Airframe context unavailable."
+
+
+def build_question_intent_summary(question_intent: QuestionIntent) -> str:
+    parts = []
+    problem_domain = getattr(question_intent, "problem_domain", None)
+    concise_intent = getattr(question_intent, "concise_intent", None)
+    original_question = getattr(question_intent, "original_question", None)
+
+    if problem_domain:
+        parts.append(str(problem_domain))
+    if concise_intent:
+        parts.append(str(concise_intent))
+    if not parts and original_question:
+        parts.append(str(original_question))
+    return ": ".join(parts) if parts else "Question intent unavailable."
 
 
 def sanitize_mechanism_candidate_contract(candidate: MechanismCandidate) -> MechanismCandidate:

@@ -1017,7 +1017,21 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     assert captured[0]["input"]["user_question"] == "Why did it loiter before the waypoint?"
     assert "log_inventory" not in captured[0]["input"]
     assert "source_evidence" in captured[1]["input"]
+    assert "mechanism_discovery_context" in captured[1]["input"]
+    assert "source_search_context" not in captured[1]["input"]
+    assert "search_context" not in captured[1]["input"]["source_evidence"]
+    assert captured[1]["input"]["mechanism_discovery_context"]["vehicle"]["vehicle_type"] == "fixed_wing"
+    assert captured[1]["input"]["mechanism_discovery_context"]["source_domain_constraints"]["parameter_gates"]["values"] == {
+        "SYS_AUTOSTART": 4001,
+    }
+    assert list(captured[2]["input"].keys()) == ["verified_mechanism_results"]
     assert captured[2]["input"]["verified_mechanism_results"][0]["final_confidence"] == "medium"
+    assert "raw" not in captured[2]["input"]["verified_mechanism_results"][0]["evaluation"]
+    assert "airframe_context" not in captured[2]["input"]
+    assert "question_intent" not in captured[2]["input"]
+    assert "mechanism_cache" not in captured[2]["input"]
+    assert final_report.airframe_summary == "vehicle_type=fixed_wing; SYS_AUTOSTART=4001"
+    assert final_report.question_intent_summary == "fixed_wing_altitude: explain altitude drop"
     run_dir = dev_log_root / "web_run_001"
     assert output_dir.is_dir()
     assert run_dir.is_dir()
@@ -1200,6 +1214,166 @@ def test_sanitize_mechanism_candidate_contract_separates_parameters_from_signals
     ]
     assert result.expected_logged_signature[0].signal is None
     assert result.expected_logged_signature[1].signal == "vehicle_status.nav_state"
+
+
+def test_final_report_input_is_compact_and_summaries_are_deterministic(tmp_path):
+    runner = load_runner(tmp_path)
+    candidate = _sample_mechanism_candidate(runner)
+    applicability = _sample_applicability(runner, candidate)
+    evaluation = runner.SignatureEvaluation(
+        candidate_name=candidate.name,
+        verdict="supported",
+        confidence_ceiling="medium",
+        evidence=["numeric support"],
+        contradictions=[],
+        check_results=[{"status": "passed", "message": "check passed"}],
+        warnings=[],
+        raw={"large": "debug payload"},
+    )
+    verified = runner.VerifiedMechanismResult(
+        candidate=candidate,
+        applicability=applicability,
+        evaluation=evaluation,
+        final_confidence="medium",
+    )
+
+    payload = runner.build_final_report_input([verified])
+
+    assert list(payload.keys()) == ["verified_mechanism_results"]
+    compact = payload["verified_mechanism_results"][0]
+    assert compact["candidate"]["name"] == candidate.name
+    assert compact["evaluation"]["evidence"] == ["numeric support"]
+    assert "raw" not in compact["evaluation"]
+
+    airframe_context = runner.AirframeContext(
+        px4_git_hash="abcdef1234567890",
+        px4_version="v1.14.3",
+        vehicle_type="vtol_standard",
+        sys_autostart=13000,
+        airframe_name="Test VTOL",
+    )
+    question_intent = runner.QuestionIntent(
+        original_question="Why did it climb?",
+        problem_domain="RTL altitude",
+        concise_intent="explain RTL climb",
+        source_queries=[],
+    )
+    report = _sample_report(runner, candidate, applicability)
+
+    runner.apply_deterministic_report_summaries(report, airframe_context, question_intent)
+
+    assert report.airframe_summary == (
+        "PX4 v1.14.3; git abcdef123456; vehicle_type=vtol_standard; "
+        "SYS_AUTOSTART=13000; airframe=Test VTOL"
+    )
+    assert report.question_intent_summary == "RTL altitude: explain RTL climb"
+
+
+def test_mechanism_resolver_input_includes_discovery_context_without_source_duplication(tmp_path):
+    runner = load_runner(tmp_path)
+    question_intent = runner.QuestionIntent(
+        original_question="Why did RTL climb despite RTL_RETURN_ALT?",
+        problem_domain="RTL altitude",
+        concise_intent="explain RTL altitude selection",
+        source_queries=["RTL_RETURN_ALT", "navigator RTL altitude"],
+        likely_modules=["navigator"],
+        likely_source_files=["src/modules/navigator/rtl.cpp"],
+        notes=["Use source-domain constraints only."],
+    )
+    airframe = runner.AirframeContext(
+        px4_git_hash="abcdef1234567890",
+        px4_version="v1.14.3",
+        vehicle_type="vtol_standard",
+        sys_autostart=13000,
+    )
+    source_context = runner.SourceSearchContext(
+        airframe=airframe,
+        question_intent=question_intent,
+    )
+    source_evidence = runner.SourceEvidenceBundle(
+        search_context=source_context,
+        hits=[
+            {
+                "query": "RTL_RETURN_ALT",
+                "file": "src/modules/navigator/rtl.cpp",
+                "line": 10,
+                "snippet": "return altitude",
+            }
+        ],
+    )
+    inventory = {
+        "parameters": {
+            "RTL_RETURN_ALT": 10,
+            "SYS_AUTOSTART": 13000,
+            "UNMENTIONED_PARAM": 1,
+            "VT_TYPE": 2,
+        },
+        "available_topics": ["vehicle_status", "vtol_vehicle_status"],
+        "topic_fields": {
+            "vehicle_status": ["timestamp", "nav_state"],
+            "vtol_vehicle_status": ["timestamp", "vehicle_vtol_state"],
+        },
+    }
+    timeline = [
+        {
+            "time_s": 1.0,
+            "event": "initial_value",
+            "topic": "vehicle_status",
+            "field": "nav_state",
+            "value": 5,
+        },
+        {
+            "time_s": 2.0,
+            "event": "value_changed",
+            "topic": "vtol_vehicle_status",
+            "field": "vehicle_vtol_state",
+            "value": 3,
+        },
+    ]
+    mission = {
+        "format": "qgroundcontrol_plan",
+        "planned_home_position": [1, 2, 3],
+        "vehicle_type": 2,
+        "items": [
+            {
+                "sequence": 1,
+                "command_name": "MAV_CMD_NAV_RETURN_TO_LAUNCH",
+                "frame_name": "MAV_FRAME_GLOBAL_RELATIVE_ALT",
+                "altitude": 40,
+            }
+        ],
+        "warnings": [],
+    }
+
+    payload = runner.build_mechanism_resolver_input(
+        source_context,
+        source_evidence,
+        inventory,
+        timeline,
+        mission,
+    )
+
+    assert list(payload.keys()) == ["mechanism_discovery_context", "source_evidence"]
+    assert "search_context" not in payload["source_evidence"]
+    context = payload["mechanism_discovery_context"]
+    assert context["source_identity"]["px4_git_hash"] == "abcdef1234567890"
+    assert context["vehicle"]["vehicle_type"] == "vtol_standard"
+    assert context["source_domain_constraints"]["parameter_gates"]["values"] == {
+        "RTL_RETURN_ALT": 10,
+        "SYS_AUTOSTART": 13000,
+        "VT_TYPE": 2,
+    }
+    assert context["source_domain_constraints"]["mode_state_timeline"]["observed_values"] == {
+        "vehicle_status.nav_state": [5],
+        "vtol_vehicle_status.vehicle_vtol_state": [3],
+    }
+    assert context["available_log_interfaces"]["topic_fields"]["vehicle_status"] == [
+        "timestamp",
+        "nav_state",
+    ]
+    assert context["source_domain_constraints"]["mission"]["command_names"] == [
+        "MAV_CMD_NAV_RETURN_TO_LAUNCH",
+    ]
 
 
 def test_v3_agent_output_schemas_are_strict_json_compatible():
