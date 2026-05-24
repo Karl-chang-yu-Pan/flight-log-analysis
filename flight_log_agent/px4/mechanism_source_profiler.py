@@ -87,6 +87,33 @@ class FieldRef(BaseModel):
     assignment_operator: Optional[str] = None
 
 
+class FunctionCallRef(BaseModel):
+    name: str
+    file: str
+    line: int
+    evidence: str
+    receiver: Optional[str] = None
+
+
+class BranchConditionRef(BaseModel):
+    kind: str
+    condition: str
+    file: str
+    line: int
+    evidence: str
+
+
+class ParameterPredicateRef(BaseModel):
+    name: Optional[str]
+    predicate: str
+    file: str
+    line: int
+    evidence: str
+    member: Optional[str] = None
+    operator: Optional[str] = None
+    compared_value: Optional[str] = None
+
+
 class MechanismSourceProfile(BaseModel):
     query: str
     source_root: str
@@ -96,6 +123,10 @@ class MechanismSourceProfile(BaseModel):
     unknown_direction_topics: List[TopicRef]
     referenced_parameters: List[ParameterRef]
     assigned_fields: List[FieldRef]
+    read_fields: List[FieldRef] = Field(default_factory=list)
+    function_calls: List[FunctionCallRef] = Field(default_factory=list)
+    branch_conditions: List[BranchConditionRef] = Field(default_factory=list)
+    parameter_predicates: List[ParameterPredicateRef] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
 
 
@@ -206,7 +237,23 @@ class MechanismSourceProfiler:
     _FIELD_ASSIGN_PATTERN = re.compile(
         r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<access>\.|->)\s*"
         r"(?P<field>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*"
-        r"(?P<op>=|\+=|-=|\*=|/=|%=|\|=|&=|\^=)"
+        r"(?P<op>\+=|-=|\*=|/=|%=|\|=|&=|\^=|=(?!=))"
+    )
+    _FIELD_ACCESS_PATTERN = re.compile(
+        r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<access>\.|->)\s*"
+        r"(?P<field>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+    )
+    _FUNCTION_CALL_PATTERN = re.compile(
+        r"(?<![#A-Za-z0-9_])(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)\s*\("
+    )
+    _BRANCH_CONDITION_PATTERN = re.compile(
+        r"\b(?P<kind>if|else\s+if|while|switch)\s*\((?P<condition>[^;\n]*)\)"
+    )
+    _CASE_CONDITION_PATTERN = re.compile(r"\bcase\s+(?P<condition>[^:\n]+)\s*:")
+    _PARAM_COMPARISON_PATTERN = re.compile(
+        r"(?P<left>[A-Za-z_][A-Za-z0-9_.:]*\s*(?:\.\s*get\s*\(\s*\))?)\s*"
+        r"(?P<op>>=|<=|==|!=|>|<)\s*"
+        r"(?P<right>-?[A-Za-z_][A-Za-z0-9_:]*|-?\d+(?:\.\d+)?|true|false)"
     )
 
     def __init__(
@@ -524,6 +571,210 @@ class MechanismSourceProfiler:
 
         return self._dedupe_field_refs(refs)
 
+    def extract_read_fields_from_source(
+        self,
+        files: Sequence[Union[str, Path]],
+    ) -> List[FieldRef]:
+        """
+        Extract non-assignment field accesses from source files.
+
+        This is intentionally conservative. It keeps fields that can be mapped
+        to a visible uORB struct variable, plus likely setpoint/status accesses
+        that may need a resolver decision.
+        """
+        refs: List[FieldRef] = []
+
+        for path in self._expand_companion_files(files):
+            text = self._read_text(path)
+            if text is None:
+                continue
+
+            rel_file = self._rel(path)
+            var_to_struct = self._extract_struct_variables(text)
+
+            for line_no, line in self._iter_code_lines(text):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("//"):
+                    continue
+
+                assignment_spans = [match.span() for match in self._FIELD_ASSIGN_PATTERN.finditer(line)]
+                for match in self._FIELD_ACCESS_PATTERN.finditer(line):
+                    if any(start <= match.start() < end for start, end in assignment_spans):
+                        continue
+
+                    var = match.group("var")
+                    field_name = self._clean_field_path(match.group("field"))
+                    struct = var_to_struct.get(var)
+                    if struct is None and not self._looks_like_relevant_assignment(var, field_name):
+                        continue
+
+                    topic = self._topic_from_struct(struct) if struct else None
+                    refs.append(
+                        FieldRef(
+                            variable=var,
+                            field=field_name,
+                            topic=topic,
+                            struct=struct,
+                            file=rel_file,
+                            line=line_no,
+                            evidence=stripped,
+                        )
+                    )
+
+        return self._dedupe_field_refs(refs)
+
+    def extract_function_calls_from_source(
+        self,
+        files: Sequence[Union[str, Path]],
+    ) -> List[FunctionCallRef]:
+        refs: List[FunctionCallRef] = []
+        ignored = {
+            "if",
+            "for",
+            "while",
+            "switch",
+            "return",
+            "sizeof",
+            "catch",
+            "static_cast",
+            "reinterpret_cast",
+            "const_cast",
+            "dynamic_cast",
+        }
+
+        for path in self._expand_companion_files(files):
+            text = self._read_text(path)
+            if text is None:
+                continue
+
+            rel_file = self._rel(path)
+            for line_no, line in self._iter_code_lines(text):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("//"):
+                    continue
+
+                for match in self._FUNCTION_CALL_PATTERN.finditer(line):
+                    name = match.group("name")
+                    if name in ignored:
+                        continue
+                    receiver = self._call_receiver(line, match.start())
+                    refs.append(
+                        FunctionCallRef(
+                            name=name,
+                            receiver=receiver,
+                            file=rel_file,
+                            line=line_no,
+                            evidence=stripped,
+                        )
+                    )
+
+        return self._dedupe_function_call_refs(refs)
+
+    def extract_branch_conditions_from_source(
+        self,
+        files: Sequence[Union[str, Path]],
+    ) -> List[BranchConditionRef]:
+        refs: List[BranchConditionRef] = []
+
+        for path in self._expand_companion_files(files):
+            text = self._read_text(path)
+            if text is None:
+                continue
+
+            rel_file = self._rel(path)
+            for line_no, line in self._iter_code_lines(text):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("//"):
+                    continue
+
+                for match in self._BRANCH_CONDITION_PATTERN.finditer(line):
+                    refs.append(
+                        BranchConditionRef(
+                            kind=" ".join(match.group("kind").split()),
+                            condition=match.group("condition").strip(),
+                            file=rel_file,
+                            line=line_no,
+                            evidence=stripped,
+                        )
+                    )
+
+                for match in self._CASE_CONDITION_PATTERN.finditer(line):
+                    refs.append(
+                        BranchConditionRef(
+                            kind="case",
+                            condition=match.group("condition").strip(),
+                            file=rel_file,
+                            line=line_no,
+                            evidence=stripped,
+                        )
+                    )
+
+        return self._dedupe_branch_condition_refs(refs)
+
+    def extract_parameter_predicates_from_source(
+        self,
+        files: Sequence[Union[str, Path]],
+    ) -> List[ParameterPredicateRef]:
+        refs: List[ParameterPredicateRef] = []
+        expanded_files = self._expand_companion_files(files)
+        member_to_param = self._collect_param_member_map(expanded_files)
+
+        for path in expanded_files:
+            text = self._read_text(path)
+            if text is None:
+                continue
+
+            rel_file = self._rel(path)
+            for line_no, line in self._iter_code_lines(text):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("//"):
+                    continue
+                if not self._line_mentions_parameter(stripped, member_to_param):
+                    continue
+
+                for comparison in self._PARAM_COMPARISON_PATTERN.finditer(stripped):
+                    name, member = self._resolve_parameter_operand(
+                        comparison.group("left"),
+                        member_to_param,
+                    )
+                    right_name, right_member = self._resolve_parameter_operand(
+                        comparison.group("right"),
+                        member_to_param,
+                    )
+                    if name is None and right_name is not None:
+                        name = right_name
+                        member = right_member
+
+                    refs.append(
+                        ParameterPredicateRef(
+                            name=name,
+                            member=member,
+                            predicate=comparison.group(0).strip(),
+                            operator=comparison.group("op"),
+                            compared_value=comparison.group("right").strip(),
+                            file=rel_file,
+                            line=line_no,
+                            evidence=stripped,
+                        )
+                    )
+
+                if not refs or refs[-1].line != line_no or refs[-1].file != rel_file:
+                    for member, name in member_to_param.items():
+                        if member and member in stripped:
+                            refs.append(
+                                ParameterPredicateRef(
+                                    name=name,
+                                    member=member,
+                                    predicate=stripped,
+                                    file=rel_file,
+                                    line=line_no,
+                                    evidence=stripped,
+                                )
+                            )
+                            break
+
+        return self._dedupe_parameter_predicate_refs(refs)
+
     def profile_mechanism(
         self,
         queries: Union[str, Sequence[str]],
@@ -547,6 +798,10 @@ class MechanismSourceProfiler:
         uorb = self.extract_uorb_io_from_source(files)
         params = self.extract_params_from_source(files)
         fields = self.extract_assigned_fields_from_source(files)
+        read_fields = self.extract_read_fields_from_source(files)
+        function_calls = self.extract_function_calls_from_source(files)
+        branch_conditions = self.extract_branch_conditions_from_source(files)
+        parameter_predicates = self.extract_parameter_predicates_from_source(files)
 
         notes: List[str] = []
         if not hits:
@@ -565,6 +820,10 @@ class MechanismSourceProfiler:
             unknown_direction_topics=uorb["unknown_direction_topics"],
             referenced_parameters=params,
             assigned_fields=fields,
+            read_fields=read_fields,
+            function_calls=function_calls,
+            branch_conditions=branch_conditions,
+            parameter_predicates=parameter_predicates,
             notes=notes,
         )
         return profile.model_dump()
@@ -770,6 +1029,52 @@ class MechanismSourceProfiler:
                     mapping[var] = struct
         return mapping
 
+    def _collect_param_member_map(self, files: Sequence[Path]) -> Dict[str, str]:
+        member_to_param: Dict[str, str] = {}
+        for path in files:
+            text = self._read_text(path)
+            if text is None:
+                continue
+            for _, line in self._iter_code_lines(text):
+                for match in self._PARAM_DECL_PATTERN.finditer(line):
+                    name = match.group("name")
+                    member = match.groupdict().get("member")
+                    if member:
+                        member_to_param[member] = name
+                        member_to_param[member.lstrip("_ ")] = name
+        return member_to_param
+
+    def _line_mentions_parameter(self, line: str, member_to_param: Dict[str, str]) -> bool:
+        if self._PX4_PARAM_PATTERN.search(line) or self._PARAM_FIND_PATTERN.search(line):
+            return True
+        return any(member and member in line for member in member_to_param)
+
+    def _resolve_parameter_operand(
+        self,
+        operand: str,
+        member_to_param: Dict[str, str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        operand = operand.strip()
+        px4_match = self._PX4_PARAM_PATTERN.search(operand)
+        if px4_match:
+            return px4_match.group("name"), None
+
+        if operand.endswith(".get()"):
+            member_expr = operand[:-6].strip()
+            member = member_expr.split(".")[-1]
+            return member_to_param.get(member_expr) or member_to_param.get(member), member_expr
+
+        member = operand.split(".")[-1]
+        return member_to_param.get(operand) or member_to_param.get(member), operand if operand in member_to_param else None
+
+    @staticmethod
+    def _call_receiver(line: str, call_start: int) -> Optional[str]:
+        prefix = line[:call_start].rstrip()
+        match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\.|->)\s*$", prefix)
+        if not match:
+            return None
+        return match.group(1)
+
     @staticmethod
     def _topic_from_struct(struct: Optional[str]) -> Optional[str]:
         if not struct:
@@ -879,6 +1184,42 @@ class MechanismSourceProfiler:
         out: List[FieldRef] = []
         for ref in refs:
             key = (ref.topic, ref.struct, ref.variable, ref.field, ref.file, ref.line, ref.assignment_operator)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ref)
+        return out
+
+    @staticmethod
+    def _dedupe_function_call_refs(refs: Sequence[FunctionCallRef]) -> List[FunctionCallRef]:
+        seen = set()
+        out: List[FunctionCallRef] = []
+        for ref in refs:
+            key = (ref.name, ref.receiver, ref.file, ref.line)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ref)
+        return out
+
+    @staticmethod
+    def _dedupe_branch_condition_refs(refs: Sequence[BranchConditionRef]) -> List[BranchConditionRef]:
+        seen = set()
+        out: List[BranchConditionRef] = []
+        for ref in refs:
+            key = (ref.kind, ref.condition, ref.file, ref.line)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ref)
+        return out
+
+    @staticmethod
+    def _dedupe_parameter_predicate_refs(refs: Sequence[ParameterPredicateRef]) -> List[ParameterPredicateRef]:
+        seen = set()
+        out: List[ParameterPredicateRef] = []
+        for ref in refs:
+            key = (ref.name, ref.member, ref.predicate, ref.file, ref.line)
             if key in seen:
                 continue
             seen.add(key)

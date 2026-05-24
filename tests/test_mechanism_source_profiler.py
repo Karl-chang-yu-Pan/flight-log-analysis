@@ -1,13 +1,20 @@
 from pathlib import Path
 
 from flight_log_agent.px4.mechanism_source_profiler import (
+    BranchConditionRef,
     FieldRef,
+    FunctionCallRef,
     MechanismSourceProfile,
+    ParameterPredicateRef,
     MechanismSourceProfiler,
     ParameterRef,
     SourceFileHit,
     SourceMatch,
     TopicRef,
+)
+from flight_log_agent.px4.source_mechanism_resolver import (
+    ParameterFeasibilityGate,
+    build_source_discovery_log_context,
 )
 
 
@@ -62,6 +69,46 @@ def test_profiler_models_are_pydantic_serializable():
                 assignment_operator="=",
             )
         ],
+        read_fields=[
+            FieldRef(
+                topic="vehicle_status",
+                struct="vehicle_status_s",
+                variable="status",
+                field="nav_state",
+                file="src/modules/navigator/rtl.cpp",
+                line=45,
+                evidence="if (status.nav_state == NAVIGATION_STATE_AUTO_RTL) {",
+            )
+        ],
+        function_calls=[
+            FunctionCallRef(
+                name="navigateTo",
+                file="src/modules/navigator/rtl.cpp",
+                line=50,
+                evidence="navigateTo(sp);",
+            )
+        ],
+        branch_conditions=[
+            BranchConditionRef(
+                kind="if",
+                condition="_param_rtl_return_alt.get() > 0",
+                file="src/modules/navigator/rtl.cpp",
+                line=55,
+                evidence="if (_param_rtl_return_alt.get() > 0) {",
+            )
+        ],
+        parameter_predicates=[
+            ParameterPredicateRef(
+                name="RTL_RETURN_ALT",
+                member="_param_rtl_return_alt",
+                predicate="_param_rtl_return_alt.get() > 0",
+                operator=">",
+                compared_value="0",
+                file="src/modules/navigator/rtl.cpp",
+                line=55,
+                evidence="if (_param_rtl_return_alt.get() > 0) {",
+            )
+        ],
     )
 
     dumped = profile.model_dump()
@@ -70,6 +117,10 @@ def test_profiler_models_are_pydantic_serializable():
     assert dumped["published_topics"][0]["topic"] == "position_setpoint_triplet"
     assert dumped["referenced_parameters"][0]["name"] == "RTL_RETURN_ALT"
     assert dumped["assigned_fields"][0]["field"] == "alt"
+    assert dumped["read_fields"][0]["field"] == "nav_state"
+    assert dumped["function_calls"][0]["name"] == "navigateTo"
+    assert dumped["branch_conditions"][0]["kind"] == "if"
+    assert dumped["parameter_predicates"][0]["operator"] == ">"
 
 
 def test_profile_mechanism_returns_plain_dict_with_current_extractions(tmp_path):
@@ -91,7 +142,12 @@ class RtlTest {
     {
         vehicle_status_s status{};
         position_setpoint_s sp{};
-        sp.alt = _param_rtl_return_alt.get();
+        if (_param_rtl_return_alt.get() > 0) {
+            sp.alt = _param_rtl_return_alt.get();
+        }
+        if (status.nav_state == 5) {
+            navigateTo(sp);
+        }
         orb_copy(ORB_ID(vehicle_status), 0, &status);
         orb_publish(ORB_ID(position_setpoint_triplet), 0, nullptr);
     }
@@ -118,3 +174,63 @@ class RtlTest {
         ref["topic"] == "position_setpoint" and ref["field"] == "alt"
         for ref in profile["assigned_fields"]
     )
+    assert any(
+        ref["topic"] == "vehicle_status" and ref["field"] == "nav_state"
+        for ref in profile["read_fields"]
+    )
+    assert any(ref["name"] == "navigateTo" for ref in profile["function_calls"])
+    assert any(
+        ref["kind"] == "if" and "_param_rtl_return_alt.get() > 0" in ref["condition"]
+        for ref in profile["branch_conditions"]
+    )
+    assert any(
+        ref["name"] == "RTL_RETURN_ALT" and ref["operator"] == ">"
+        for ref in profile["parameter_predicates"]
+    )
+
+
+def test_parameter_feasibility_gate_uses_only_discovered_parameters():
+    context = build_source_discovery_log_context(
+        {
+            "parameters": {
+                "VT_TYPE": 2,
+                "NAV_ACC_RAD": 10,
+                "UNRELATED": 1,
+            },
+            "topic_fields": {"vehicle_status": ["timestamp", "nav_state"]},
+            "available_topics": ["vehicle_status"],
+        }
+    )
+    gate = ParameterFeasibilityGate()
+    requirements = gate.evaluate(
+        [
+            ParameterPredicateRef(
+                name="VT_TYPE",
+                member="_param_vt_type",
+                predicate="_param_vt_type.get() == 2",
+                operator="==",
+                compared_value="2",
+                file="src/modules/navigator/rtl.cpp",
+                line=12,
+                evidence="if (_param_vt_type.get() == 2) {",
+            ),
+            ParameterPredicateRef(
+                name="NAV_ACC_RAD",
+                member="_param_nav_acc_rad",
+                predicate="_param_nav_acc_rad.get() < distance_to_wp",
+                operator="<",
+                compared_value="distance_to_wp",
+                file="src/modules/navigator/mission.cpp",
+                line=30,
+                evidence="if (_param_nav_acc_rad.get() < distance_to_wp) {",
+            ),
+        ],
+        context,
+    )
+
+    assert requirements[0].name == "VT_TYPE"
+    assert requirements[0].actual_value == 2
+    assert requirements[0].gate_result == "satisfied"
+    assert requirements[1].name == "NAV_ACC_RAD"
+    assert requirements[1].role == "threshold"
+    assert requirements[1].gate_result == "verification_required"
