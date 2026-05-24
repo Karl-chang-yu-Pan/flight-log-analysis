@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-import ulog_interactive_plots
+import flight_log_agent.ulog.interactive_plots as ulog_interactive_plots
 
 
 def test_build_interactive_plot_payload_includes_local_position_xy(monkeypatch):

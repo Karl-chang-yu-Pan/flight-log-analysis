@@ -2,7 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from run_audit_log import AgentRunAuditHooks, DeveloperAuditLogger, log_run_items
+from flight_log_agent.audit import AgentRunAuditHooks, DeveloperAuditLogger, log_run_items
 
 
 def read_events(run_dir):

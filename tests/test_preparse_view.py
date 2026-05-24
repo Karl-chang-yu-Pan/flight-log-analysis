@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-import preparse_view
+import flight_log_agent.ulog.preparse_view as preparse_view
 
 
 def test_build_parameter_rows_classifies_defaults_by_flight_review_order():

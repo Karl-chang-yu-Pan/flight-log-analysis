@@ -11,14 +11,14 @@ from unittest.mock import patch
 
 import numpy as np
 
-import ulog_inventory
-import ulog_timeline
-import ulog_control_surface
-import ulog_metrics
-import ulog_signature_evaluator
-import px4_source
-import mission_parser
-import ulog_plots
+import flight_log_agent.ulog.inventory as ulog_inventory
+import flight_log_agent.ulog.timeline as ulog_timeline
+import flight_log_agent.ulog.control_surface as ulog_control_surface
+import flight_log_agent.ulog.metrics as ulog_metrics
+import flight_log_agent.ulog.signature_evaluator as ulog_signature_evaluator
+import flight_log_agent.px4.source as px4_source
+import flight_log_agent.mission.parser as mission_parser
+import flight_log_agent.ulog.plots as ulog_plots
 
 
 class FakeLoggedMessage:
@@ -115,12 +115,17 @@ def load_runner(tmp_path: Path):
     agents_stub.function_tool = function_tool
 
     module_name = f"runner_under_test_{tmp_path.name}"
-    runner_path = Path(__file__).resolve().parents[1] / "runner.py"
+    runner_path = Path(__file__).resolve().parents[1] / "flight_log_agent" / "runner_core.py"
     spec = importlib.util.spec_from_file_location(module_name, runner_path)
     module = importlib.util.module_from_spec(spec)
 
     original_pydantic = sys.modules.get("pydantic")
     original_agents = sys.modules.get("agents")
+    original_flight_log_agent_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "flight_log_agent" or name.startswith("flight_log_agent.")
+    }
     sys.modules["pydantic"] = pydantic_stub
     sys.modules["agents"] = agents_stub
     sys.modules[module_name] = module
@@ -128,6 +133,15 @@ def load_runner(tmp_path: Path):
     try:
         spec.loader.exec_module(module)
     finally:
+        for name in list(sys.modules):
+            if (
+                (name == "flight_log_agent" or name.startswith("flight_log_agent."))
+                and name not in original_flight_log_agent_modules
+            ):
+                sys.modules.pop(name, None)
+        for name, original_module in original_flight_log_agent_modules.items():
+            sys.modules[name] = original_module
+
         if original_pydantic is None:
             sys.modules.pop("pydantic", None)
         else:

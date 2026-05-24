@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 from pyulog import ULog
 
-import web_app
-from web_app import (
+import flight_log_agent.web.server as web_app
+from flight_log_agent.web.server import (
     analysis_event_message,
     build_analysis_progress,
     public_ngrok_url,

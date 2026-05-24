@@ -7,7 +7,7 @@ from typing import Any
 
 from pyulog import ULog
 
-from ulog_plots import (
+from flight_log_agent.ulog.plots import (
     _json_safe_value,
     _timestamp_to_seconds,
     prepare_ulog_for_plotting,

@@ -4,6 +4,7 @@
 __pycache__/
 .pytest_cache/
 .dev_logs/
+.flightlog_cache/
 
 outputs/
 logs/
