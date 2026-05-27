@@ -3,7 +3,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
+from flight_log_agent.models import RelationshipCheckSpec
 from flight_log_agent.px4.source_mechanism_models import (
+    SourceBackedParameterPredicate,
+    SourceBackedVerificationCheck,
     SourceDiscoveryCandidateDraft,
     SourceDiscoveryDecision,
 )
@@ -248,6 +251,8 @@ class RtlTest {
     assert profile_packet.static_log_context["discovered_topic_fields"] == {
         "position_setpoint": ["alt"],
     }
+    assert profile_packet.source_profile["source_snippets"][0]["file"] == "src/modules/navigator/rtl.cpp"
+    assert "_param_vt_type.get() == 2" in profile_packet.source_profile["source_snippets"][0]["text"]
     assert "unrelated_topic" not in profile_packet.static_log_context["discovered_topic_fields"]
     assert result.candidates[0].title == "LLM drafted RTL altitude mechanism"
     assert result.candidates[0].source_confidence == "medium"
@@ -370,3 +375,133 @@ class RtlTest {
         for candidate in result.candidates
         for requirement in candidate.controlling_parameters
     )
+
+
+def test_source_mechanism_resolver_gates_agent_produced_predicates(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "rtl.cpp").write_text(
+        """
+void update()
+{
+    if (_param_vt_type.get() == 2) {
+        navigateTo();
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+
+    async def decide(packet):
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision(relevant_files=["src/modules/navigator/rtl.cpp"])
+        return SourceDiscoveryDecision(
+            relevant_files=["src/modules/navigator/rtl.cpp"],
+            stop=True,
+            candidate_drafts=[
+                SourceDiscoveryCandidateDraft(
+                    title="Agent interpreted VTOL branch",
+                    source_mechanism="Agent says VT_TYPE gates the branch.",
+                    source_files=["src/modules/navigator/rtl.cpp"],
+                    interpreted_parameter_predicates=[
+                        SourceBackedParameterPredicate(
+                            name="VT_TYPE",
+                            role="branch_selector",
+                            predicate="_param_vt_type.get() == 2",
+                            operator="==",
+                            compared_value=2,
+                            effect="VT_TYPE satisfies the VTOL branch.",
+                            source_file="src/modules/navigator/rtl.cpp",
+                            source_line=4,
+                        )
+                    ],
+                    verification_checks=[
+                        SourceBackedVerificationCheck(
+                            check=RelationshipCheckSpec(
+                                type="branch_parameter_satisfied",
+                                parameter="VT_TYPE",
+                                op="==",
+                                value=2,
+                            ),
+                            source_file="src/modules/navigator/rtl.cpp",
+                            source_line=4,
+                        )
+                    ],
+                )
+            ],
+        )
+
+    result = asyncio.run(
+        resolver.discover(
+            "Why did it use the VTOL branch?",
+            build_source_discovery_log_context({"parameters": {"VT_TYPE": 2}}),
+            seed_queries=["navigateTo"],
+            decide=decide,
+            max_depth=1,
+        )
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.title == "Agent interpreted VTOL branch"
+    assert candidate.controlling_parameters[0].name == "VT_TYPE"
+    assert candidate.controlling_parameters[0].gate_result == "satisfied"
+    assert candidate.verification_checks[0].check.type == "branch_parameter_satisfied"
+
+
+def test_source_mechanism_resolver_discards_uncited_agent_facts(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "rtl.cpp").write_text("void update() { navigateTo(); }\n", encoding="utf-8")
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+
+    async def decide(packet):
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision(relevant_files=["src/modules/navigator/rtl.cpp"])
+        return SourceDiscoveryDecision(
+            relevant_files=["src/modules/navigator/rtl.cpp"],
+            stop=True,
+            candidate_drafts=[
+                SourceDiscoveryCandidateDraft(
+                    title="Uncited agent facts",
+                    source_mechanism="Agent omitted source refs.",
+                    source_files=["src/modules/navigator/rtl.cpp"],
+                    interpreted_parameter_predicates=[
+                        SourceBackedParameterPredicate(
+                            name="VT_TYPE",
+                            role="branch_selector",
+                            predicate="VT_TYPE == 2",
+                            operator="==",
+                            compared_value=2,
+                        )
+                    ],
+                    verification_checks=[
+                        SourceBackedVerificationCheck(
+                            check=RelationshipCheckSpec(type="parameter_equals", parameter="VT_TYPE", value=2)
+                        )
+                    ],
+                )
+            ],
+        )
+
+    result = asyncio.run(
+        resolver.discover(
+            "Why did it use the VTOL branch?",
+            build_source_discovery_log_context({"parameters": {"VT_TYPE": 2}}),
+            seed_queries=["navigateTo"],
+            decide=decide,
+            max_depth=1,
+        )
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.interpreted_parameter_predicates == []
+    assert candidate.verification_checks == []

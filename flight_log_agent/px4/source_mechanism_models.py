@@ -4,7 +4,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from flight_log_agent.models import CodeRef
+from flight_log_agent.models import CodeRef, RelationshipCheckSpec
 
 
 class SourceDiscoveryLogContext(BaseModel):
@@ -47,6 +47,31 @@ class ParameterRequirement(BaseModel):
     source_line: Optional[int] = None
 
 
+class SourceSnippet(BaseModel):
+    file: str
+    start_line: int
+    end_line: int
+    text: str
+
+
+class SourceBackedParameterPredicate(BaseModel):
+    name: str
+    role: Literal["branch_selector", "threshold", "tuning_or_shaping", "unknown"]
+    predicate: str
+    operator: Optional[Literal[">", ">=", "<", "<=", "==", "!="]] = None
+    compared_value: float | int | str | bool | None = None
+    effect: str = ""
+    source_file: Optional[str] = None
+    source_line: Optional[int] = None
+
+
+class SourceBackedVerificationCheck(BaseModel):
+    check: RelationshipCheckSpec
+    source_file: Optional[str] = None
+    source_line: Optional[int] = None
+    rationale: str = ""
+
+
 class SourceMechanismCandidate(BaseModel):
     title: str
     source_mechanism: str
@@ -59,6 +84,8 @@ class SourceMechanismCandidate(BaseModel):
     branch_conditions: list[str] = Field(default_factory=list)
     expected_log_signature: list[str] = Field(default_factory=list)
     required_log_evidence: list[str] = Field(default_factory=list)
+    interpreted_parameter_predicates: list[SourceBackedParameterPredicate] = Field(default_factory=list)
+    verification_checks: list[SourceBackedVerificationCheck] = Field(default_factory=list)
     contradiction_checks: list[str] = Field(default_factory=list)
     source_confidence: Literal["low", "medium", "high"] = "low"
     resolver_notes: list[str] = Field(default_factory=list)
@@ -80,6 +107,8 @@ class SourceDiscoveryCandidateDraft(BaseModel):
     branch_conditions: list[str] = Field(default_factory=list)
     expected_log_signature: list[str] = Field(default_factory=list)
     required_log_evidence: list[str] = Field(default_factory=list)
+    interpreted_parameter_predicates: list[SourceBackedParameterPredicate] = Field(default_factory=list)
+    verification_checks: list[SourceBackedVerificationCheck] = Field(default_factory=list)
     contradiction_checks: list[str] = Field(default_factory=list)
     source_confidence: Literal["low", "medium", "high"] = "low"
     resolver_notes: list[str] = Field(default_factory=list)

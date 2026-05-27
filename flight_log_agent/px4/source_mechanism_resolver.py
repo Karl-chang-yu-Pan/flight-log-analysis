@@ -17,6 +17,8 @@ from flight_log_agent.px4.mechanism_source_profiler import (
 )
 from flight_log_agent.px4.source_mechanism_models import (
     ParameterRequirement,
+    SourceBackedParameterPredicate,
+    SourceBackedVerificationCheck,
     SourceDiscoveryCandidateDraft,
     SourceDiscoveryDecision,
     SourceDiscoveryIterationPacket,
@@ -24,6 +26,7 @@ from flight_log_agent.px4.source_mechanism_models import (
     SourceFieldRef,
     SourceMechanismCandidate,
     SourceMechanismCandidateSet,
+    SourceSnippet,
     TopicFieldRef,
 )
 
@@ -133,6 +136,7 @@ class SourceMechanismResolver:
                         self._filter_candidate_drafts_by_parameter_gate(
                             search_decision.candidate_drafts,
                             [],
+                            log_context,
                         )
                     )
                 requested_files = [
@@ -216,6 +220,7 @@ class SourceMechanismResolver:
                     self._filter_candidate_drafts_by_parameter_gate(
                         decision.candidate_drafts,
                         parameter_requirements,
+                        log_context,
                     )
                 )
                 decision_notes.extend(decision.notes)
@@ -329,6 +334,10 @@ class SourceMechanismResolver:
                 "parameter_predicates": [
                     compact_ref(ref) for ref in dedupe_parameter_predicates(parameter_predicates)[:40]
                 ],
+                "source_snippets": [
+                    _safe_model_dump(snippet)
+                    for snippet in self._source_snippets_for_files(new_files)
+                ],
             },
             parameter_requirements=parameter_requirements,
             static_log_context={
@@ -360,18 +369,51 @@ class SourceMechanismResolver:
         self,
         drafts: list[SourceDiscoveryCandidateDraft],
         parameter_requirements: list[ParameterRequirement],
+        log_context: SourceDiscoveryLogContext,
     ) -> list[SourceDiscoveryCandidateDraft]:
+        cited_drafts = [self._drop_uncited_agent_facts(draft) for draft in drafts]
         contradicted = {
             requirement.name
             for requirement in parameter_requirements
             if is_contradicted_branch_selector(requirement)
         }
+        for draft in cited_drafts:
+            agent_requirements = self.parameter_gate.evaluate_source_predicates(
+                draft.interpreted_parameter_predicates,
+                log_context,
+            )
+            contradicted.update(
+                requirement.name
+                for requirement in agent_requirements
+                if is_contradicted_branch_selector(requirement)
+            )
         if not contradicted:
-            return drafts
+            return cited_drafts
         return [
-            draft for draft in drafts
+            draft for draft in cited_drafts
             if not any(name in contradicted for name in draft.controlling_parameter_names)
+            and not any(
+                predicate.name in contradicted
+                for predicate in draft.interpreted_parameter_predicates
+            )
         ]
+
+    def _drop_uncited_agent_facts(
+        self,
+        draft: SourceDiscoveryCandidateDraft,
+    ) -> SourceDiscoveryCandidateDraft:
+        return draft.model_copy(
+            update={
+                "interpreted_parameter_predicates": [
+                    predicate for predicate in draft.interpreted_parameter_predicates
+                    if predicate.source_file and predicate.source_line is not None
+                ],
+                "verification_checks": [
+                    check for check in draft.verification_checks
+                    if check.source_file and check.source_line is not None
+                ],
+            }
+        )
 
     def _build_search_iteration_packet(
         self,
@@ -404,6 +446,40 @@ class SourceMechanismResolver:
             },
             prior_decision_notes=prior_decision_notes,
         )
+
+    def _source_snippets_for_files(
+        self,
+        files: list[str],
+        *,
+        max_lines_per_file: int = 220,
+        max_chars_per_file: int = 12_000,
+    ) -> list[SourceSnippet]:
+        snippets: list[SourceSnippet] = []
+        for file in files:
+            path = (self.source_path / file).resolve()
+            try:
+                path.relative_to(self.source_path.resolve())
+            except ValueError:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            lines = text.splitlines()
+            selected = lines[:max_lines_per_file]
+            snippet_text = "\n".join(selected)
+            if len(snippet_text) > max_chars_per_file:
+                snippet_text = snippet_text[: max_chars_per_file - 3] + "..."
+            snippets.append(
+                SourceSnippet(
+                    file=file,
+                    start_line=1,
+                    end_line=min(len(lines), len(selected)),
+                    text=snippet_text,
+                )
+            )
+        return snippets
 
     def _seed_queries(self, user_question: str) -> list[str]:
         queries = [user_question.strip()]
@@ -560,6 +636,13 @@ class SourceMechanismResolver:
             requirement for requirement in parameter_requirements
             if not required_parameters or requirement.name in required_parameters
         ]
+        controlling_parameters = dedupe_parameter_requirements([
+            *controlling_parameters,
+            *self.parameter_gate.evaluate_source_predicates(
+                draft.interpreted_parameter_predicates,
+                log_context,
+            ),
+        ])
         relevant_fields = [
             SourceFieldRef(
                 field=field.field,
@@ -596,6 +679,8 @@ class SourceMechanismResolver:
             branch_conditions=draft.branch_conditions or fallback.branch_conditions,
             expected_log_signature=draft.expected_log_signature or fallback.expected_log_signature,
             required_log_evidence=draft.required_log_evidence or fallback.required_log_evidence,
+            interpreted_parameter_predicates=draft.interpreted_parameter_predicates,
+            verification_checks=draft.verification_checks,
             contradiction_checks=draft.contradiction_checks or fallback.contradiction_checks,
             source_confidence=draft.source_confidence,
             resolver_notes=[
@@ -721,6 +806,52 @@ class ParameterFeasibilityGate:
                 )
             )
         return requirements
+
+    def evaluate_source_predicates(
+        self,
+        predicates: list[SourceBackedParameterPredicate],
+        log_context: SourceDiscoveryLogContext,
+    ) -> list[ParameterRequirement]:
+        requirements: list[ParameterRequirement] = []
+        for predicate in predicates:
+            actual_value = log_context.parameters.get(predicate.name)
+            gate_result = self._evaluate_source_predicate(predicate, actual_value)
+            requirements.append(
+                ParameterRequirement(
+                    name=predicate.name,
+                    role=predicate.role,
+                    source_predicate=predicate.predicate,
+                    actual_value=actual_value,
+                    gate_result=gate_result,
+                    effect=predicate.effect or self._effect_text(predicate.name, predicate.role, gate_result),
+                    source_file=predicate.source_file or "unknown",
+                    source_line=predicate.source_line,
+                )
+            )
+        return requirements
+
+    def _evaluate_source_predicate(
+        self,
+        predicate: SourceBackedParameterPredicate,
+        actual_value: Any,
+    ) -> str:
+        if actual_value is None:
+            return "unknown"
+        if predicate.role != "branch_selector":
+            return "verification_required"
+        if not predicate.operator or predicate.compared_value is None:
+            return "unknown"
+
+        expected = _coerce_literal(predicate.compared_value)
+        actual = _coerce_literal(actual_value)
+        if expected is None or actual is None:
+            return "unknown"
+
+        try:
+            satisfied = _compare_values(actual, predicate.operator, expected)
+        except TypeError:
+            return "unknown"
+        return "satisfied" if satisfied else "contradicted"
 
     def _unknown_requirement(
         self,
@@ -890,6 +1021,18 @@ def dedupe_branch_conditions(refs: list[BranchConditionRef]) -> list[BranchCondi
     out: list[BranchConditionRef] = []
     for ref in refs:
         key = (ref.kind, ref.condition, ref.file, ref.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
+def dedupe_parameter_requirements(refs: list[ParameterRequirement]) -> list[ParameterRequirement]:
+    seen = set()
+    out: list[ParameterRequirement] = []
+    for ref in refs:
+        key = (ref.name, ref.source_predicate, ref.source_file, ref.source_line)
         if key in seen:
             continue
         seen.add(key)

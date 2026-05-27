@@ -901,6 +901,19 @@ def test_source_mechanism_conversion_emits_executable_checks(tmp_path):
             )
         ],
         required_log_evidence=["Fetch time-series for position_setpoint.alt."],
+        verification_checks=[
+            runner.SourceBackedVerificationCheck(
+                check=runner.RelationshipCheckSpec(
+                    type="tracks_parameter_value",
+                    signal="position_setpoint.alt",
+                    parameter="RTL_RETURN_ALT",
+                    window="rtl",
+                    max_error=0.5,
+                ),
+                source_file="src/modules/navigator/rtl.cpp",
+                source_line=12,
+            )
+        ],
     )
 
     candidate = runner.source_mechanism_to_candidate(source_candidate)
@@ -909,8 +922,10 @@ def test_source_mechanism_conversion_emits_executable_checks(tmp_path):
     assert candidate.exclusion_checks[0].parameter == "VT_TYPE"
     assert candidate.exclusion_checks[0].op == "=="
     assert candidate.exclusion_checks[0].value == 2
-    assert candidate.numeric_checks[0].type == "topic_field_present"
-    assert candidate.numeric_checks[0].signal == "position_setpoint.alt"
+    assert candidate.numeric_checks[0].type == "tracks_parameter_value"
+    assert candidate.numeric_checks[0].parameter == "RTL_RETURN_ALT"
+    assert candidate.numeric_checks[1].type == "topic_field_present"
+    assert candidate.numeric_checks[1].signal == "position_setpoint.alt"
 
 
 def _sample_report(runner, candidate, applicability, plots=None):

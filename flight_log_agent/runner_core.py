@@ -83,6 +83,8 @@ from flight_log_agent.ulog.plots import generate_signal_plot as generate_signal_
 from flight_log_agent.ulog.timeline import build_basic_timeline as build_basic_timeline_impl
 from flight_log_agent.px4.source_mechanism_models import (
     ParameterRequirement,
+    SourceBackedParameterPredicate,
+    SourceBackedVerificationCheck,
     SourceDiscoveryDecision,
     SourceDiscoveryIterationPacket,
     SourceDiscoveryLogContext,
@@ -196,6 +198,7 @@ Input is a SourceDiscoveryIterationPacket containing:
 - source files already visited and newly profiled
 - deterministic source facts: related files, parameters, uORB topics, fields,
   function calls, branch conditions, and parameter predicates
+- selected source snippets for mechanism-level C++ interpretation
 - parameter feasibility results only for parameters discovered from source
 - topic fields only for topics discovered from source
 
@@ -207,6 +210,10 @@ Rules:
 - Decide which source files are mechanism-relevant, what expansion queries to
   run next, and whether the source chain is complete enough.
 - Candidate drafts must be source-level mechanisms plus verification plans.
+- Put semantically interpreted C++ parameter predicates in
+  interpreted_parameter_predicates and executable later checks in
+  verification_checks. Every interpreted predicate/check must include the exact
+  source_file and source_line that supports it.
 - Use required_log_evidence and expected_log_signature to request later
   MechanismVerifier checks; do not compute those checks yourself.
 - If the current source evidence is insufficient, return expansion_queries and
@@ -680,6 +687,26 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
     ])
     required_signals = source_candidate_required_signals(source_candidate)
     parameter_checks = source_candidate_parameter_checks(source_candidate)
+    explicit_exclusion_checks = source_candidate_verification_checks(
+        source_candidate,
+        {"parameter_equals", "branch_parameter_satisfied"},
+    )
+    explicit_numeric_checks = source_candidate_verification_checks(
+        source_candidate,
+        {
+            "threshold",
+            "transition_occurs",
+            "no_transition",
+            "state_equals",
+            "state_not_equals",
+            "tracks_setpoint",
+            "diverges_from_setpoint",
+            "monotonic_change",
+            "same_direction_change",
+            "tracks_parameter_value",
+            "topic_field_present",
+        },
+    )
     return sanitize_mechanism_candidate_contract(
         MechanismCandidate(
             name=source_candidate.title,
@@ -707,12 +734,14 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
             ],
             exclusion_checks=[
                 *parameter_checks,
+                *explicit_exclusion_checks,
                 *[
                     RelationshipCheckSpec(type="custom", description=check)
                     for check in getattr(source_candidate, "contradiction_checks", []) or []
                 ],
             ],
             numeric_checks=[
+                *explicit_numeric_checks,
                 *source_candidate_signal_presence_checks(source_candidate, required_signals),
             ],
             plot_requests=[],
@@ -760,6 +789,18 @@ def source_candidate_signal_presence_checks(
         )
         for signal in dedupe_keep_order(signals)
     ]
+
+
+def source_candidate_verification_checks(
+    source_candidate: SourceMechanismCandidate,
+    check_types: set[str],
+) -> list[RelationshipCheckSpec]:
+    checks = []
+    for source_check in getattr(source_candidate, "verification_checks", []) or []:
+        check = source_check.check
+        if check.type in check_types and source_check.source_file and source_check.source_line is not None:
+            checks.append(check)
+    return checks
 
 
 def source_candidate_required_signals(source_candidate: SourceMechanismCandidate) -> list[str]:
