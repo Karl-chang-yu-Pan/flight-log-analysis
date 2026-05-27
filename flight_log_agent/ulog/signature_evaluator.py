@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from pathlib import Path
 from statistics import mean, median, pstdev
@@ -39,6 +40,7 @@ def evaluate_log_signature(
         )
 
     topics = _topics_by_name(ulog)
+    parameters = getattr(ulog, "initial_parameters", {}) or {}
     windows = _normalize_windows(candidate_windows)
     present, missing = _required_signal_status(topics, required_signals)
     window_results = [
@@ -51,11 +53,11 @@ def evaluate_log_signature(
     ]
 
     numeric_results = [
-        _run_check(topics, windows, check, category="numeric")
+        _run_check(topics, windows, parameters, check, category="numeric")
         for check in numeric_checks
     ]
     exclusion_results = [
-        _run_check(topics, windows, check, category="exclusion")
+        _run_check(topics, windows, parameters, check, category="exclusion")
         for check in exclusion_checks
     ]
 
@@ -91,6 +93,7 @@ def evaluate_log_signature(
 def _run_check(
     topics: dict[str, Any],
     windows: dict[str, dict],
+    parameters: dict[str, Any],
     check: dict,
     *,
     category: str,
@@ -106,6 +109,10 @@ def _run_check(
         "diverges_from_setpoint": _check_diverges_from_setpoint,
         "monotonic_change": _check_monotonic_change,
         "same_direction_change": _check_same_direction_change,
+        "parameter_equals": _check_parameter_equals,
+        "branch_parameter_satisfied": _check_branch_parameter_satisfied,
+        "tracks_parameter_value": _check_tracks_parameter_value,
+        "topic_field_present": _check_topic_field_present,
     }
     handler = handlers.get(check_type)
     if handler is None:
@@ -116,7 +123,7 @@ def _run_check(
         )
 
     try:
-        result = handler(topics, windows, check)
+        result = handler(topics, windows, parameters, check)
     except Exception as exc:
         result = _check_result(
             check,
@@ -127,7 +134,7 @@ def _run_check(
     return result
 
 
-def _check_threshold(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_threshold(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     signal = str(check.get("signal") or "")
     samples_result = _check_samples(topics, windows, check, signal)
     if "result" in samples_result:
@@ -173,7 +180,7 @@ def _check_threshold(topics: dict[str, Any], windows: dict[str, dict], check: di
     )
 
 
-def _check_transition_occurs(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_transition_occurs(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     signal = str(check.get("signal") or "")
     samples_result = _check_samples(topics, windows, check, signal)
     if "result" in samples_result:
@@ -200,7 +207,7 @@ def _check_transition_occurs(topics: dict[str, Any], windows: dict[str, dict], c
     )
 
 
-def _check_no_transition(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_no_transition(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     signal = str(check.get("signal") or "")
     samples_result = _check_samples(topics, windows, check, signal)
     if "result" in samples_result:
@@ -217,7 +224,7 @@ def _check_no_transition(topics: dict[str, Any], windows: dict[str, dict], check
     )
 
 
-def _check_state_equals(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_state_equals(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     signal = str(check.get("signal") or "")
     samples_result = _check_samples(topics, windows, check, signal)
     if "result" in samples_result:
@@ -236,7 +243,7 @@ def _check_state_equals(topics: dict[str, Any], windows: dict[str, dict], check:
     )
 
 
-def _check_state_not_equals(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_state_not_equals(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     signal = str(check.get("signal") or "")
     samples_result = _check_samples(topics, windows, check, signal)
     if "result" in samples_result:
@@ -254,7 +261,7 @@ def _check_state_not_equals(topics: dict[str, Any], windows: dict[str, dict], ch
     )
 
 
-def _check_tracks_setpoint(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_tracks_setpoint(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     error_result = _aligned_error(topics, windows, check)
     if "result" in error_result:
         return error_result["result"]
@@ -275,7 +282,7 @@ def _check_tracks_setpoint(topics: dict[str, Any], windows: dict[str, dict], che
     )
 
 
-def _check_diverges_from_setpoint(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_diverges_from_setpoint(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     error_result = _aligned_error(topics, windows, check)
     if "result" in error_result:
         return error_result["result"]
@@ -308,7 +315,7 @@ def _check_diverges_from_setpoint(topics: dict[str, Any], windows: dict[str, dic
     )
 
 
-def _check_monotonic_change(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_monotonic_change(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     signal = str(check.get("signal") or "")
     samples_result = _check_samples(topics, windows, check, signal)
     if "result" in samples_result:
@@ -332,7 +339,7 @@ def _check_monotonic_change(topics: dict[str, Any], windows: dict[str, dict], ch
     )
 
 
-def _check_same_direction_change(topics: dict[str, Any], windows: dict[str, dict], check: dict) -> dict:
+def _check_same_direction_change(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     first = str(check.get("first") or "")
     second = str(check.get("second") or "")
     first_result = _check_samples(topics, windows, check, first)
@@ -359,6 +366,117 @@ def _check_same_direction_change(topics: dict[str, Any], windows: dict[str, dict
             "second_delta": _round_float(second_delta),
             "min_delta": min_delta,
         },
+    )
+
+
+def _check_parameter_equals(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
+    parameter = str(check.get("parameter") or "")
+    if not parameter:
+        return _check_result(check, status="unresolved", message="parameter is missing")
+    if parameter not in parameters:
+        return _check_result(check, status="unresolved", message=f"missing parameter: {parameter}")
+
+    op = str(check.get("op") or "==").strip()
+    expected = check.get("value")
+    if expected is None:
+        return _check_result(check, status="unresolved", message=f"expected value is missing for {parameter}")
+
+    actual = _json_safe_value(parameters.get(parameter))
+    tolerance = _safe_float(check.get("max_error"))
+    passed = _compare_literal(actual, op, expected, tolerance=tolerance)
+    message = _message(check, passed, f"{parameter} actual {actual} {op} expected {expected}")
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value={"parameter": parameter, "actual": actual, "op": op, "expected": expected},
+    )
+
+
+def _check_branch_parameter_satisfied(
+    topics: dict[str, Any],
+    windows: dict[str, dict],
+    parameters: dict[str, Any],
+    check: dict,
+) -> dict:
+    normalized = dict(check)
+    if normalized.get("value") is None or not normalized.get("op"):
+        parsed = _parse_parameter_predicate(
+            str(normalized.get("source_predicate") or ""),
+            str(normalized.get("parameter") or ""),
+        )
+        if parsed is not None:
+            _, op, expected = parsed
+            normalized.setdefault("op", op)
+            normalized.setdefault("value", expected)
+    result = _check_parameter_equals(topics, windows, parameters, normalized)
+    result["type"] = check.get("type")
+    return result
+
+
+def _check_tracks_parameter_value(
+    topics: dict[str, Any],
+    windows: dict[str, dict],
+    parameters: dict[str, Any],
+    check: dict,
+) -> dict:
+    parameter = str(check.get("parameter") or "")
+    signal = str(check.get("signal") or "")
+    if not parameter:
+        return _check_result(check, status="unresolved", message="parameter is missing")
+    if parameter not in parameters:
+        return _check_result(check, status="unresolved", message=f"missing parameter: {parameter}")
+
+    expected = _number(parameters.get(parameter))
+    if expected is None:
+        return _check_result(check, status="unresolved", message=f"parameter is not numeric: {parameter}")
+
+    samples_result = _check_samples(topics, windows, check, signal)
+    if "result" in samples_result:
+        return samples_result["result"]
+
+    values = [_number(value) for _, value in samples_result["samples"]]
+    values = [value for value in values if value is not None]
+    if not values:
+        return _check_result(check, status="unresolved", message=f"no numeric samples for {signal}")
+
+    max_error = _safe_float(check.get("max_error"))
+    if max_error is None:
+        max_error = 0.0
+
+    actual_max = max(abs(value - expected) for value in values)
+    passed = actual_max <= max_error
+    message = _message(check, passed, f"{signal} max error from {parameter} {actual_max} <= {max_error}")
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value={
+            "signal": signal,
+            "parameter": parameter,
+            "parameter_value": _round_float(expected),
+            "max_abs_error": _round_float(actual_max),
+            "max_error": max_error,
+        },
+    )
+
+
+def _check_topic_field_present(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
+    signal = str(check.get("signal") or "")
+    parsed = _parse_signal(signal)
+    if parsed is None:
+        return _check_result(check, status="unresolved", message=f"invalid signal: {signal or 'missing'}")
+
+    topic_name, field_name = parsed
+    topic = topics.get(topic_name)
+    data = getattr(topic, "data", {}) or {} if topic is not None else {}
+    passed = topic is not None and field_name in data and "timestamp" in data
+    message = _message(check, passed, f"{signal} is logged" if passed else f"{signal} is not logged")
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value={"signal": signal, "topic_present": topic is not None, "field_present": field_name in data},
     )
 
 
@@ -551,6 +669,65 @@ def _compare(actual: float, op: str, expected: float) -> bool:
     if op == "!=":
         return actual != expected
     raise ValueError(f"unsupported operator: {op}")
+
+
+def _compare_literal(actual: Any, op: str, expected: Any, *, tolerance: float | None = None) -> bool:
+    actual_number = _number(actual)
+    expected_number = _number(expected)
+    if actual_number is not None and expected_number is not None:
+        if op == "==" and tolerance is not None:
+            return abs(actual_number - expected_number) <= tolerance
+        if op == "!=" and tolerance is not None:
+            return abs(actual_number - expected_number) > tolerance
+        return _compare(actual_number, op, expected_number)
+
+    if op == "==":
+        return _normalized_literal(actual) == _normalized_literal(expected)
+    if op == "!=":
+        return _normalized_literal(actual) != _normalized_literal(expected)
+    raise ValueError(f"operator {op} requires numeric values")
+
+
+def _normalized_literal(value: Any) -> Any:
+    value = _json_safe_value(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        return value.strip()
+    return value
+
+
+def _parse_parameter_predicate(predicate: str, parameter: str) -> tuple[str, str, Any] | None:
+    if not predicate:
+        return None
+    pattern = re.compile(
+        r"(?P<left>[A-Za-z_][A-Za-z0-9_.:]*\s*(?:\.\s*get\s*\(\s*\))?)\s*"
+        r"(?P<op>>=|<=|==|!=|>|<)\s*"
+        r"(?P<right>-?[A-Za-z_][A-Za-z0-9_:]*|-?\d+(?:\.\d+)?|true|false)"
+    )
+    for match in pattern.finditer(predicate):
+        left = match.group("left").replace(" ", "")
+        if parameter and parameter not in left and ".get()" not in left:
+            continue
+        return parameter, match.group("op"), _parse_literal(match.group("right"))
+    return None
+
+
+def _parse_literal(value: str) -> Any:
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    number = _number(value)
+    if number is not None:
+        if float(number).is_integer() and "." not in value:
+            return int(number)
+        return number
+    return value
 
 
 def _message(check: dict, passed: bool, fallback: str) -> str:

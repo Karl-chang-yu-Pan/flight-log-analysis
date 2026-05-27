@@ -121,10 +121,16 @@ class RelationshipCheckSpec(BaseModel):
         "diverges_from_setpoint",
         "monotonic_change",
         "same_direction_change",
+        "parameter_equals",
+        "branch_parameter_satisfied",
+        "tracks_parameter_value",
+        "topic_field_present",
         "custom",
     ]
     window: Optional[str] = None
     signal: Optional[str] = None
+    parameter: Optional[str] = None
+    source_predicate: Optional[str] = None
     first: Optional[str] = None
     second: Optional[str] = None
     actual: Optional[str] = None

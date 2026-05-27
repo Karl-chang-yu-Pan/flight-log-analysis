@@ -89,8 +89,17 @@ def check_required_signals(
     missing: list[str] = []
 
     for signal in required_signals:
-        topic = signal.split(".", 1)[0]
-        if topic in available_topics:
+        if "." not in signal:
+            if signal in available_topics:
+                available.append(signal)
+            else:
+                missing.append(signal)
+            continue
+
+        topic, field = signal.split(".", 1)
+        fields = topic_fields.get(topic)
+        field_known = topic not in topic_fields or field in (fields or [])
+        if topic in available_topics and field_known:
             available.append(signal)
         else:
             missing.append(signal)

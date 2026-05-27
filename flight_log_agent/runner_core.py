@@ -679,6 +679,7 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
         if requirement.name and requirement.name != "unknown"
     ])
     required_signals = source_candidate_required_signals(source_candidate)
+    parameter_checks = source_candidate_parameter_checks(source_candidate)
     return sanitize_mechanism_candidate_contract(
         MechanismCandidate(
             name=source_candidate.title,
@@ -705,16 +706,60 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
                 )
             ],
             exclusion_checks=[
-                RelationshipCheckSpec(type="custom", description=check)
-                for check in getattr(source_candidate, "contradiction_checks", []) or []
+                *parameter_checks,
+                *[
+                    RelationshipCheckSpec(type="custom", description=check)
+                    for check in getattr(source_candidate, "contradiction_checks", []) or []
+                ],
             ],
             numeric_checks=[
-                RelationshipCheckSpec(type="custom", description=evidence)
-                for evidence in getattr(source_candidate, "required_log_evidence", []) or []
+                *source_candidate_signal_presence_checks(source_candidate, required_signals),
             ],
             plot_requests=[],
         )
     )
+
+
+def source_candidate_parameter_checks(source_candidate: SourceMechanismCandidate) -> list[RelationshipCheckSpec]:
+    checks: list[RelationshipCheckSpec] = []
+    for requirement in getattr(source_candidate, "controlling_parameters", []) or []:
+        if not requirement.name or requirement.name == "unknown" or requirement.role != "branch_selector":
+            continue
+        parsed = parse_parameter_predicate(requirement.source_predicate or "", requirement.name)
+        kwargs: dict[str, Any] = {
+            "type": "branch_parameter_satisfied",
+            "parameter": requirement.name,
+            "source_predicate": requirement.source_predicate,
+            "description": requirement.effect,
+            "supports": requirement.effect,
+            "contradicts": f"{requirement.name} does not satisfy source branch predicate.",
+        }
+        if parsed is not None:
+            _, op, value = parsed
+            kwargs["op"] = op
+            kwargs["value"] = value
+        checks.append(RelationshipCheckSpec(**kwargs))
+    return checks
+
+
+def source_candidate_signal_presence_checks(
+    source_candidate: SourceMechanismCandidate,
+    required_signals: list[str],
+) -> list[RelationshipCheckSpec]:
+    signals = list(required_signals)
+    for evidence in getattr(source_candidate, "required_log_evidence", []) or []:
+        signal = extract_signal_reference(evidence)
+        if signal:
+            signals.append(signal)
+    return [
+        RelationshipCheckSpec(
+            type="topic_field_present",
+            signal=signal,
+            supports=f"Required source signal is logged: {signal}.",
+            contradicts=f"Required source signal is not logged: {signal}.",
+        )
+        for signal in dedupe_keep_order(signals)
+    ]
 
 
 def source_candidate_required_signals(source_candidate: SourceMechanismCandidate) -> list[str]:
@@ -747,6 +792,42 @@ def signature_descriptions_with_signals(
         )
         pairs.append((description, signal))
     return pairs
+
+
+def parse_parameter_predicate(predicate: str, parameter: str) -> Optional[tuple[str, str, Any]]:
+    if not predicate:
+        return None
+    pattern = re.compile(
+        r"(?P<left>[A-Za-z_][A-Za-z0-9_.:]*\s*(?:\.\s*get\s*\(\s*\))?)\s*"
+        r"(?P<op>>=|<=|==|!=|>|<)\s*"
+        r"(?P<right>-?[A-Za-z_][A-Za-z0-9_:]*|-?\d+(?:\.\d+)?|true|false)"
+    )
+    for match in pattern.finditer(predicate):
+        left = match.group("left").replace(" ", "")
+        if parameter and parameter not in left and ".get()" not in left:
+            continue
+        return parameter, match.group("op"), parse_predicate_literal(match.group("right"))
+    return None
+
+
+def parse_predicate_literal(value: str) -> Any:
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    if number.is_integer() and "." not in value:
+        return int(number)
+    return number
+
+
+def extract_signal_reference(text: str) -> Optional[str]:
+    match = re.search(r"\b([a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\b", text)
+    return match.group(1) if match else None
 
 
 def empty_source_discovery_evidence(

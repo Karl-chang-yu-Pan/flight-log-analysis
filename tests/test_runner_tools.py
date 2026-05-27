@@ -849,6 +849,70 @@ def _sample_applicability(runner, candidate):
     )
 
 
+def test_applicability_checks_required_signal_fields(tmp_path):
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Missing field mechanism",
+        summary="Needs a specific logged field.",
+        source_refs=[],
+        required_signals=["vehicle_local_position.z", "vehicle_status.nav_state"],
+    )
+
+    result = runner.evaluate_candidate_applicability(
+        candidate,
+        {
+            "available_topics": ["vehicle_local_position", "vehicle_status"],
+            "topic_fields": {
+                "vehicle_local_position": ["x", "y"],
+                "vehicle_status": ["nav_state"],
+            },
+        },
+        [],
+        None,
+    )
+
+    assert result.available_required_signals == ["vehicle_status.nav_state"]
+    assert result.missing_required_signals == ["vehicle_local_position.z"]
+
+
+def test_source_mechanism_conversion_emits_executable_checks(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="RTL altitude source path",
+        source_mechanism="PX4 gates this path on VT_TYPE.",
+        controlling_parameters=[
+            runner.ParameterRequirement(
+                name="VT_TYPE",
+                role="branch_selector",
+                source_predicate="_param_vt_type.get() == 2",
+                actual_value=2,
+                gate_result="satisfied",
+                effect="VT_TYPE satisfies the VTOL RTL branch.",
+                source_file="src/modules/navigator/rtl.cpp",
+                source_line=10,
+            )
+        ],
+        relevant_fields=[
+            runner.SourceFieldRef(
+                topic="position_setpoint",
+                field="alt",
+                source_file="src/modules/navigator/rtl.cpp",
+                source_line=11,
+            )
+        ],
+        required_log_evidence=["Fetch time-series for position_setpoint.alt."],
+    )
+
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
+
+    assert candidate.exclusion_checks[0].type == "branch_parameter_satisfied"
+    assert candidate.exclusion_checks[0].parameter == "VT_TYPE"
+    assert candidate.exclusion_checks[0].op == "=="
+    assert candidate.exclusion_checks[0].value == 2
+    assert candidate.numeric_checks[0].type == "topic_field_present"
+    assert candidate.numeric_checks[0].signal == "position_setpoint.alt"
+
+
 def _sample_report(runner, candidate, applicability, plots=None):
     report_applicability = runner.ApplicabilityReport(
         applicable=applicability.applicable,
@@ -2044,6 +2108,66 @@ def test_evaluate_log_signature_supports_threshold_and_setpoint_tracking(tmp_pat
     ]
     assert result["contradictions"] == []
     assert result["check_results"][1]["value"]["max_abs_error"] == 2.0
+
+
+def test_evaluate_log_signature_supports_parameter_and_field_checks(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {
+                "VT_TYPE": 2,
+                "RTL_RETURN_ALT": 35.0,
+            }
+            self.data_list = [
+                SimpleNamespace(
+                    name="position_setpoint",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "alt": [35.0, 35.2, 34.9],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="RTL selected return altitude.",
+        expected_signature=[],
+        candidate_windows=[{"name": "rtl", "start_s": 1.0, "end_s": 3.0}],
+        required_signals=["position_setpoint.alt"],
+        exclusion_checks=[
+            {
+                "type": "branch_parameter_satisfied",
+                "parameter": "VT_TYPE",
+                "source_predicate": "_param_vt_type.get() == 2",
+                "supports": "VT_TYPE satisfied the source branch.",
+            }
+        ],
+        numeric_checks=[
+            {
+                "type": "topic_field_present",
+                "signal": "position_setpoint.alt",
+                "supports": "Position setpoint altitude was logged.",
+            },
+            {
+                "type": "tracks_parameter_value",
+                "signal": "position_setpoint.alt",
+                "parameter": "RTL_RETURN_ALT",
+                "window": "rtl",
+                "max_error": 0.25,
+                "supports": "Altitude setpoint tracked RTL_RETURN_ALT.",
+            },
+        ],
+    )
+
+    assert result["verdict"] == "supported"
+    assert result["missing_required_signals"] == []
+    assert result["evidence"] == [
+        "Position setpoint altitude was logged.",
+        "Altitude setpoint tracked RTL_RETURN_ALT.",
+        "VT_TYPE satisfied the source branch.",
+    ]
+    assert result["check_results"][1]["value"]["max_abs_error"] == 0.2
 
 
 def test_evaluate_log_signature_reports_contradictions_and_missing_signals(tmp_path, monkeypatch):
