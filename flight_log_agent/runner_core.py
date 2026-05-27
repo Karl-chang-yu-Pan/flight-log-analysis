@@ -96,6 +96,7 @@ from flight_log_agent.px4.source_mechanism_resolver import (
     SourceMechanismResolver,
     build_source_discovery_log_context,
 )
+from flight_log_agent.px4.msg_schema import resolve_topic_field, is_valid_topic_field
 
 from flight_log_agent.audit import (
     AgentRunAuditHooks,
@@ -170,7 +171,7 @@ def resolve_source_path(source_path: Optional[str | Path]) -> Optional[Path]:
 
 question_intent_agent = Agent(
     name="Question Intent Normalizer",
-    model="gpt-5.4-nano",
+    model="gpt-5.5",
     instructions="""
 Convert the user's natural-language PX4 flight-log question into a source-search intent.
 
@@ -721,6 +722,7 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
             ],
             required_parameters=required_parameters,
             required_signals=required_signals,
+            source_relevant_fields=source_candidate_relevant_field_signals(source_candidate),
             expected_logged_signature=[
                 ExpectedSignatureItem(
                     name=f"source_signature_{index + 1}",
@@ -805,9 +807,24 @@ def source_candidate_verification_checks(
 
 def source_candidate_required_signals(source_candidate: SourceMechanismCandidate) -> list[str]:
     signals = []
+    for source_check in getattr(source_candidate, "verification_checks", []) or []:
+        check = source_check.check
+        for signal in (check.signal, check.actual, check.setpoint, check.first, check.second):
+            if signal and is_valid_required_signal(str(signal)):
+                signals.append(str(signal))
+    for evidence in getattr(source_candidate, "required_log_evidence", []) or []:
+        signal = extract_signal_reference(evidence)
+        if signal and is_valid_required_signal(signal):
+            signals.append(signal)
+    return dedupe_keep_order(signals)
+
+
+def source_candidate_relevant_field_signals(source_candidate: SourceMechanismCandidate) -> list[str]:
+    signals = []
     for field in getattr(source_candidate, "relevant_fields", []) or []:
         if field.topic and field.field:
-            signals.append(f"{field.topic}.{field.field}")
+            resolved = resolve_topic_field(field.topic, field.field)
+            signals.append(resolved or f"{field.topic}.{field.field}")
     for topic_ref in (
         list(getattr(source_candidate, "published_topics", []) or [])
         + list(getattr(source_candidate, "subscribed_topics", []) or [])
@@ -815,6 +832,10 @@ def source_candidate_required_signals(source_candidate: SourceMechanismCandidate
         if topic_ref.topic and topic_ref.field:
             signals.append(f"{topic_ref.topic}.{topic_ref.field}")
     return dedupe_keep_order(signals)
+
+
+def is_valid_required_signal(signal: str) -> bool:
+    return is_logged_signal_reference(signal) and is_valid_topic_field(signal)
 
 
 def signature_descriptions_with_signals(
@@ -938,6 +959,7 @@ def compact_verified_mechanism_result(result: VerifiedMechanismResult) -> dict[s
             "source_refs": _safe_model_dump(candidate.source_refs),
             "required_parameters": list(candidate.required_parameters),
             "required_signals": list(candidate.required_signals),
+            "source_relevant_fields": list(candidate.source_relevant_fields),
             "expected_logged_signature": _safe_model_dump(candidate.expected_logged_signature),
             "exclusion_checks": _safe_model_dump(candidate.exclusion_checks),
             "numeric_checks": _safe_model_dump(candidate.numeric_checks),

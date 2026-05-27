@@ -316,6 +316,17 @@ class SourceMechanismResolver:
             for requirement in parameter_requirements
             if requirement.name and requirement.name != "unknown" and requirement.name not in discovered_parameter_names
         ])
+        requirement_parameter_names = {
+            requirement.name
+            for requirement in parameter_requirements
+            if requirement.name and requirement.name != "unknown"
+        }
+        published_topic_names = dedupe_keep_order([
+            ref.topic for ref in published_topics if ref.topic
+        ])
+        subscribed_topic_names = dedupe_keep_order([
+            ref.topic for ref in subscribed_topics if ref.topic
+        ])
         return SourceDiscoveryIterationPacket(
             user_question=user_question,
             depth=depth,
@@ -325,6 +336,8 @@ class SourceMechanismResolver:
             source_profile={
                 "related_files": compact_source_hits(hits, limit=8, max_matches_per_file=3),
                 "referenced_parameters": compact_refs(dedupe_parameter_refs(parameter_refs), limit=40),
+                "published_topic_names": published_topic_names[:40],
+                "subscribed_topic_names": subscribed_topic_names[:40],
                 "published_topics": compact_refs(dedupe_topic_refs(published_topics), limit=30),
                 "subscribed_topics": compact_refs(dedupe_topic_refs(subscribed_topics), limit=30),
                 "assigned_fields": compact_refs(dedupe_field_refs(assigned_fields), limit=60),
@@ -346,7 +359,7 @@ class SourceMechanismResolver:
                 "discovered_parameter_values": {
                     name: log_context.parameters.get(name)
                     for name in discovered_parameter_names
-                    if name in log_context.parameters
+                    if name in log_context.parameters and name not in requirement_parameter_names
                 },
                 "discovered_topic_fields": {
                     topic: log_context.topic_fields.get(topic, [])
@@ -596,11 +609,11 @@ class SourceMechanismResolver:
             controlling_parameters=parameter_requirements,
             published_topics=[
                 TopicFieldRef(topic=ref.topic, source_file=ref.file, source_line=ref.line)
-                for ref in published_topics
+                for ref in dedupe_topic_refs_by_topic(published_topics)
             ],
             subscribed_topics=[
                 TopicFieldRef(topic=ref.topic, source_file=ref.file, source_line=ref.line)
-                for ref in subscribed_topics
+                for ref in dedupe_topic_refs_by_topic(subscribed_topics)
             ],
             relevant_fields=relevant_fields,
             branch_conditions=[ref.condition for ref in branch_conditions],
@@ -976,6 +989,17 @@ def dedupe_topic_refs(refs: list[TopicRef]) -> list[TopicRef]:
         if key in seen:
             continue
         seen.add(key)
+        out.append(ref)
+    return out
+
+
+def dedupe_topic_refs_by_topic(refs: list[TopicRef]) -> list[TopicRef]:
+    seen = set()
+    out: list[TopicRef] = []
+    for ref in refs:
+        if ref.topic in seen:
+            continue
+        seen.add(ref.topic)
         out.append(ref)
     return out
 

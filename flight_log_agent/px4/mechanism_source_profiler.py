@@ -948,7 +948,11 @@ class MechanismSourceProfiler:
     def _file_path_boost(self, rel_file: str) -> float:
         boost = 0.0
         path_l = rel_file.lower()
-        if "/src/" in f"/{path_l}":
+        if path_l.startswith("src/lib/") or path_l.startswith("src/modules/"):
+            boost += 4.0
+        elif path_l.startswith("src/drivers/") or path_l.startswith("src/include/"):
+            boost += 2.0
+        elif path_l.startswith("src/"):
             boost += 1.0
         if "/test" in path_l or "_test" in path_l or "/unit" in path_l:
             boost -= 2.0

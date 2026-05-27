@@ -38,6 +38,7 @@ def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> 
     inventory["airframe"] = _extract_airframe(ulog, source_path, git_hash)
     inventory["duration_s"] = _extract_duration_s(ulog)
     inventory["parameters"] = _extract_parameters(ulog)
+    inventory["source_path"] = str(source_path or DEFAULT_PX4_SOURCE_PATH)
     inventory["available_topics"] = available_topics
     inventory["topic_fields"] = _extract_topic_fields(ulog)
     inventory["topic_instances"] = _extract_topic_instances(ulog)
@@ -58,6 +59,7 @@ def _empty_inventory() -> dict:
         "airframe": None,
         "duration_s": None,
         "parameters": {},
+        "source_path": str(DEFAULT_PX4_SOURCE_PATH),
         "available_topics": [],
         "topic_fields": {},
         "topic_instances": {},

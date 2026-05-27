@@ -274,6 +274,7 @@ def test_parse_ulog_inventory_extracts_inventory_from_pyulog(tmp_path, monkeypat
             "SYS_AUTOSTART": 4001,
             "UNRELATED_PARAM": 99,
         },
+        "source_path": str(source_path),
         "available_topics": [
             "debug_topic",
             "mission_result",
@@ -871,8 +872,70 @@ def test_applicability_checks_required_signal_fields(tmp_path):
         None,
     )
 
-    assert result.available_required_signals == ["vehicle_status.nav_state"]
-    assert result.missing_required_signals == ["vehicle_local_position.z"]
+    assert result.available_required_signals == ["vehicle_local_position.z", "vehicle_status.nav_state"]
+    assert result.missing_required_signals == []
+
+
+def test_applicability_uses_px4_schema_when_inventory_lacks_field(tmp_path):
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Nested field mechanism",
+        summary="Needs a nested PX4 message field.",
+        source_refs=[],
+        required_signals=["position_setpoint_triplet.current.alt"],
+    )
+
+    result = runner.evaluate_candidate_applicability(
+        candidate,
+        {
+            "available_topics": ["position_setpoint_triplet"],
+            "topic_fields": {"position_setpoint_triplet": ["timestamp"]},
+        },
+        [],
+        None,
+    )
+
+    assert result.available_required_signals == ["position_setpoint_triplet.current.alt"]
+    assert result.missing_required_signals == []
+
+
+def test_applicability_derives_fallback_windows_from_check_names(tmp_path):
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Windowed mechanism",
+        summary="Needs a dynamic check window.",
+        source_refs=[],
+        numeric_checks=[
+            runner.RelationshipCheckSpec(
+                type="threshold",
+                signal="vehicle_local_position.z",
+                window="source_window",
+                metric="mean",
+                op=">=",
+                value=0,
+            )
+        ],
+    )
+
+    result = runner.evaluate_candidate_applicability(
+        candidate,
+        {"topic_fields": {"vehicle_local_position": ["timestamp", "z"]}},
+        [
+            {"time_s": 2.0, "topic": "vehicle_status", "field": "nav_state", "value": 1},
+            {"time_s": 7.5, "topic": "vehicle_status", "field": "nav_state", "value": 2},
+        ],
+        None,
+    )
+
+    assert result.candidate_windows == [
+        runner.WindowSpec(
+            name="source_window",
+            start_s=2.0,
+            end_s=7.5,
+            reason="Fallback verification window from full timeline span for check window 'source_window'.",
+        )
+    ]
+    assert "No candidate verification window" not in " ".join(result.unresolved_conditions)
 
 
 def test_source_mechanism_conversion_emits_executable_checks(tmp_path):
@@ -922,10 +985,64 @@ def test_source_mechanism_conversion_emits_executable_checks(tmp_path):
     assert candidate.exclusion_checks[0].parameter == "VT_TYPE"
     assert candidate.exclusion_checks[0].op == "=="
     assert candidate.exclusion_checks[0].value == 2
+    assert candidate.required_signals == ["position_setpoint.alt"]
+    assert candidate.source_relevant_fields == ["position_setpoint.alt"]
     assert candidate.numeric_checks[0].type == "tracks_parameter_value"
     assert candidate.numeric_checks[0].parameter == "RTL_RETURN_ALT"
     assert candidate.numeric_checks[1].type == "topic_field_present"
     assert candidate.numeric_checks[1].signal == "position_setpoint.alt"
+
+
+def test_source_relevant_fields_are_not_hard_required_without_checks(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="Source-only field",
+        source_mechanism="Source touched a field that is not yet a required log signal.",
+        relevant_fields=[
+            runner.SourceFieldRef(
+                topic="vehicle_local_position_setpoint",
+                field="z",
+                source_file="src/modules/example.cpp",
+                source_line=20,
+            )
+        ],
+    )
+
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
+
+    assert candidate.required_signals == []
+    assert candidate.source_relevant_fields == ["vehicle_local_position_setpoint.z"]
+
+
+def test_source_relevant_fields_resolve_nested_px4_schema_fields(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="Nested source field",
+        source_mechanism="Source touched nested triplet fields.",
+        relevant_fields=[
+            runner.SourceFieldRef(
+                topic="position_setpoint_triplet",
+                field="current.alt",
+                source_file="src/modules/example.cpp",
+                source_line=20,
+            )
+        ],
+        verification_checks=[
+            runner.SourceBackedVerificationCheck(
+                check=runner.RelationshipCheckSpec(
+                    type="topic_field_present",
+                    signal="position_setpoint_triplet.current.alt",
+                ),
+                source_file="src/modules/example.cpp",
+                source_line=21,
+            )
+        ],
+    )
+
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
+
+    assert candidate.required_signals == ["position_setpoint_triplet.current.alt"]
+    assert candidate.source_relevant_fields == ["position_setpoint_triplet.current.alt"]
 
 
 def _sample_report(runner, candidate, applicability, plots=None):
@@ -1283,7 +1400,7 @@ def test_v3_agents_enforce_source_mechanism_context_boundaries(tmp_path):
     source_discovery_instructions = runner.source_discovery_agent.kwargs["instructions"]
     report_instructions = runner.final_report_agent.kwargs["instructions"]
 
-    assert runner.question_intent_agent.kwargs["model"] == "gpt-5.4-nano"
+    assert runner.question_intent_agent.kwargs["model"] == "gpt-5.5"
     assert runner.source_discovery_agent.kwargs["model"] == "gpt-5.5"
     assert runner.final_report_agent.kwargs["model"] == "gpt-5.4"
     assert "Do not use parameter values" in intent_instructions

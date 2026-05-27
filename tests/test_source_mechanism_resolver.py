@@ -243,16 +243,15 @@ class RtlTest {
     assert profile_packet.user_question == "Why did RTL use RTL_RETURN_ALT?"
     assert profile_packet.depth == 0
     assert profile_packet.new_files == ["src/modules/navigator/rtl.cpp"]
-    assert profile_packet.static_log_context["discovered_parameter_values"] == {
-        "RTL_RETURN_ALT": 20,
-        "VT_TYPE": 2,
-    }
+    assert profile_packet.static_log_context["discovered_parameter_values"] == {}
     assert "UNRELATED" not in profile_packet.static_log_context["discovered_parameter_values"]
     assert profile_packet.static_log_context["discovered_topic_fields"] == {
         "position_setpoint": ["alt"],
     }
     assert profile_packet.source_profile["source_snippets"][0]["file"] == "src/modules/navigator/rtl.cpp"
     assert "_param_vt_type.get() == 2" in profile_packet.source_profile["source_snippets"][0]["text"]
+    assert profile_packet.source_profile["published_topic_names"] == []
+    assert profile_packet.source_profile["subscribed_topic_names"] == []
     assert "unrelated_topic" not in profile_packet.static_log_context["discovered_topic_fields"]
     assert result.candidates[0].title == "LLM drafted RTL altitude mechanism"
     assert result.candidates[0].source_confidence == "medium"

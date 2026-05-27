@@ -189,6 +189,30 @@ class RtlTest {
     )
 
 
+def test_search_ranks_px4_source_tiers(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    files = [
+        source_path / "src" / "modules" / "navigator" / "rtl.cpp",
+        source_path / "src" / "lib" / "geo" / "geo.cpp",
+        source_path / "src" / "drivers" / "uavcan" / "driver.cpp",
+        source_path / "src" / "include" / "px4_platform_common" / "module.h",
+        source_path / "src" / "systemcmds" / "param" / "param.cpp",
+        source_path / "test" / "mavsdk_tests" / "catch2" / "catch.hpp",
+    ]
+    for index, file in enumerate(files):
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(f"// common_mechanism_token {index}\n", encoding="utf-8")
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    hits = profiler.search_related_source_files("common_mechanism_token", max_files=10)
+    ranked_files = [hit.file for hit in hits]
+
+    assert ranked_files.index("src/modules/navigator/rtl.cpp") < ranked_files.index("src/drivers/uavcan/driver.cpp")
+    assert ranked_files.index("src/lib/geo/geo.cpp") < ranked_files.index("src/include/px4_platform_common/module.h")
+    assert ranked_files.index("src/drivers/uavcan/driver.cpp") < ranked_files.index("src/systemcmds/param/param.cpp")
+    assert ranked_files.index("src/systemcmds/param/param.cpp") < ranked_files.index("test/mavsdk_tests/catch2/catch.hpp")
+
+
 def test_parameter_feasibility_gate_uses_only_discovered_parameters():
     context = build_source_discovery_log_context(
         {

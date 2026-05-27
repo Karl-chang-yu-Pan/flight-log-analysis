@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from flight_log_agent.models import ApplicabilityResult, MechanismCandidate, WindowSpec
+from flight_log_agent.px4.msg_schema import load_px4_msg_schema
 
 
 def evaluate_candidate_applicability(
@@ -17,6 +18,7 @@ def evaluate_candidate_applicability(
     """
     params = inventory.get("parameters") or {}
     topic_fields = inventory.get("topic_fields") or {}
+    schema_topic_fields = load_px4_msg_schema(inventory.get("source_path"))
     available_topics = set(inventory.get("available_topics") or topic_fields.keys())
 
     relevant_parameters = {
@@ -39,6 +41,7 @@ def evaluate_candidate_applicability(
         candidate.required_signals,
         available_topics,
         topic_fields,
+        schema_topic_fields,
     )
 
     if missing_required_signals:
@@ -77,13 +80,57 @@ def derive_candidate_windows(
                     reason=plot.purpose,
                 )
             )
+    if windows:
+        return windows
+
+    span = timeline_time_span(timeline)
+    if span is None:
+        return windows
+
+    start_s, end_s = span
+    for name in check_window_names(candidate):
+        windows.append(
+            WindowSpec(
+                name=name,
+                start_s=start_s,
+                end_s=end_s,
+                reason=f"Fallback verification window from full timeline span for check window '{name}'.",
+            )
+        )
     return windows
+
+
+def check_window_names(candidate: MechanismCandidate) -> list[str]:
+    names = []
+    for check in list(candidate.numeric_checks or []) + list(candidate.exclusion_checks or []):
+        window = getattr(check, "window", None)
+        if window and window not in names:
+            names.append(str(window))
+    return names
+
+
+def timeline_time_span(timeline: list[dict]) -> Optional[tuple[float, float]]:
+    times = []
+    for event in timeline or []:
+        time_s = event.get("time_s") if isinstance(event, dict) else None
+        if isinstance(time_s, (int, float)):
+            times.append(float(time_s))
+    if not times:
+        return None
+    start_s = min(times)
+    end_s = max(times)
+    if end_s < start_s:
+        return None
+    if end_s == start_s:
+        end_s = start_s + 0.001
+    return start_s, end_s
 
 
 def check_required_signals(
     required_signals: list[str],
     available_topics: set[str],
     topic_fields: dict[str, Any],
+    schema_topic_fields: Optional[dict[str, list[str]]] = None,
 ) -> tuple[list[str], list[str]]:
     available: list[str] = []
     missing: list[str] = []
@@ -98,7 +145,12 @@ def check_required_signals(
 
         topic, field = signal.split(".", 1)
         fields = topic_fields.get(topic)
-        field_known = topic not in topic_fields or field in (fields or [])
+        schema_fields = (schema_topic_fields or {}).get(topic)
+        field_known = (
+            topic not in topic_fields
+            or field in (fields or [])
+            or field in (schema_fields or [])
+        )
         if topic in available_topics and field_known:
             available.append(signal)
         else:

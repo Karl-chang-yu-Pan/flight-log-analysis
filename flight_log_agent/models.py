@@ -168,6 +168,7 @@ class MechanismCandidate(BaseModel):
 
     required_parameters: list[str] = Field(default_factory=list)
     required_signals: list[str] = Field(default_factory=list)
+    source_relevant_fields: list[str] = Field(default_factory=list)
     expected_logged_signature: list[ExpectedSignatureItem] = Field(default_factory=list)
     exclusion_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
     numeric_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
