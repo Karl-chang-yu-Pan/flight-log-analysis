@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.px4.source_mechanism_models import (
@@ -10,6 +11,32 @@ from flight_log_agent.px4.source_mechanism_resolver import (
     SourceMechanismResolver,
     build_source_discovery_log_context,
 )
+
+
+class LargeExtractionProfiler(MechanismSourceProfiler):
+    def extract_function_calls_from_source(self, files):
+        return [
+            SimpleNamespace(
+                name=f"call_{index}",
+                receiver=None,
+                file=str(files[0]),
+                line=index,
+                evidence="x" * 1000,
+            )
+            for index in range(200)
+        ]
+
+    def extract_branch_conditions_from_source(self, files):
+        return [
+            SimpleNamespace(
+                kind="if",
+                condition=f"condition_{index}",
+                file=str(files[0]),
+                line=index,
+                evidence="y" * 1000,
+            )
+            for index in range(200)
+        ]
 
 
 def test_source_mechanism_resolver_discovers_and_expands_source_path(tmp_path):
@@ -165,6 +192,13 @@ class RtlTest {
 
     async def decide(packet):
         packets.append(packet)
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision(
+                relevant_files=["src/modules/navigator/rtl.cpp"],
+                expansion_queries=[],
+                stop=False,
+                notes=["profile rtl.cpp"],
+            )
         return SourceDiscoveryDecision(
             relevant_files=["src/modules/navigator/rtl.cpp"],
             expansion_queries=[],
@@ -195,23 +229,144 @@ class RtlTest {
         )
     )
 
-    assert len(packets) == 1
-    packet = packets[0]
-    assert packet.user_question == "Why did RTL use RTL_RETURN_ALT?"
-    assert packet.depth == 0
-    assert packet.new_files == ["src/modules/navigator/rtl.cpp"]
-    assert packet.static_log_context["discovered_parameter_values"] == {
+    assert len(packets) == 2
+    search_packet = packets[0]
+    assert search_packet.source_profile["stage"] == "search_hits_only"
+    assert search_packet.new_files == []
+    assert list(search_packet.source_profile.keys()) == ["stage", "related_files"]
+    assert search_packet.static_log_context["discovered_parameter_values"] == {}
+
+    profile_packet = packets[1]
+    assert profile_packet.user_question == "Why did RTL use RTL_RETURN_ALT?"
+    assert profile_packet.depth == 0
+    assert profile_packet.new_files == ["src/modules/navigator/rtl.cpp"]
+    assert profile_packet.static_log_context["discovered_parameter_values"] == {
         "RTL_RETURN_ALT": 20,
         "VT_TYPE": 2,
     }
-    assert "UNRELATED" not in packet.static_log_context["discovered_parameter_values"]
-    assert packet.static_log_context["discovered_topic_fields"] == {
+    assert "UNRELATED" not in profile_packet.static_log_context["discovered_parameter_values"]
+    assert profile_packet.static_log_context["discovered_topic_fields"] == {
         "position_setpoint": ["alt"],
     }
-    assert "unrelated_topic" not in packet.static_log_context["discovered_topic_fields"]
+    assert "unrelated_topic" not in profile_packet.static_log_context["discovered_topic_fields"]
     assert result.candidates[0].title == "LLM drafted RTL altitude mechanism"
     assert result.candidates[0].source_confidence == "medium"
     assert any(
         "No time-series signal comparison" in note
         for note in result.candidates[0].resolver_notes
+    )
+
+
+def test_source_mechanism_resolver_caps_profiled_decision_packet(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "rtl.cpp").write_text(
+        """
+void update()
+{
+    navigateTo();
+}
+""",
+        encoding="utf-8",
+    )
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=LargeExtractionProfiler(source_path, rg_path="missing-rg"),
+    )
+    packets = []
+
+    async def decide(packet):
+        packets.append(packet)
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision(
+                relevant_files=["src/modules/navigator/rtl.cpp"],
+                stop=False,
+            )
+        return SourceDiscoveryDecision(stop=True)
+
+    asyncio.run(
+        resolver.discover(
+            "Why did it call navigateTo?",
+            build_source_discovery_log_context({}),
+            decide=decide,
+            max_depth=1,
+        )
+    )
+
+    profile_packet = packets[1]
+    assert len(profile_packet.source_profile["function_calls"]) == 80
+    assert len(profile_packet.source_profile["branch_conditions"]) == 80
+    assert all(
+        len(item["evidence"]) <= 240
+        for item in profile_packet.source_profile["function_calls"]
+    )
+    assert all(
+        len(item["evidence"]) <= 240
+        for item in profile_packet.source_profile["branch_conditions"]
+    )
+
+
+def test_source_mechanism_resolver_drops_drafts_with_contradicted_branch_parameters(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "rtl.cpp").write_text(
+        """
+class RtlTest {
+    ParamInt<px4::params::VT_TYPE> _param_vt_type;
+    void update()
+    {
+        if (_param_vt_type.get() == 2) {
+            navigateTo();
+        }
+    }
+};
+""",
+        encoding="utf-8",
+    )
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+    packets = []
+
+    async def decide(packet):
+        packets.append(packet)
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision(
+                relevant_files=["src/modules/navigator/rtl.cpp"],
+                stop=False,
+            )
+        return SourceDiscoveryDecision(
+            relevant_files=["src/modules/navigator/rtl.cpp"],
+            stop=True,
+            candidate_drafts=[
+                SourceDiscoveryCandidateDraft(
+                    title="Contradicted VTOL path",
+                    source_mechanism="This path requires VT_TYPE == 2.",
+                    source_files=["src/modules/navigator/rtl.cpp"],
+                    controlling_parameter_names=["VT_TYPE"],
+                    source_confidence="medium",
+                )
+            ],
+        )
+
+    result = asyncio.run(
+        resolver.discover(
+            "Why did it use the VTOL RTL branch?",
+            build_source_discovery_log_context({"parameters": {"VT_TYPE": 1}}),
+            decide=decide,
+            max_depth=1,
+        )
+    )
+
+    profile_packet = packets[1]
+    assert profile_packet.static_log_context["eliminated_parameter_paths"][0]["name"] == "VT_TYPE"
+    assert profile_packet.static_log_context["eliminated_parameter_paths"][0]["gate_result"] == "contradicted"
+    assert all(candidate.title != "Contradicted VTOL path" for candidate in result.candidates)
+    assert all(
+        requirement.name != "VT_TYPE"
+        for candidate in result.candidates
+        for requirement in candidate.controlling_parameters
     )

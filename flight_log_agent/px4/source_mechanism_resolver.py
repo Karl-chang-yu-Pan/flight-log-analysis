@@ -76,6 +76,7 @@ class SourceMechanismResolver:
         max_files_per_query: int = 8,
         max_total_files: int = 18,
         max_expansion_queries: int = 32,
+        max_profile_files_per_iteration: int = 3,
     ) -> SourceMechanismCandidateSet:
         active_queries = dedupe_keep_order(seed_queries or self._seed_queries(user_question))
         all_queries = list(active_queries)
@@ -101,14 +102,63 @@ class SourceMechanismResolver:
                 active_queries,
                 max_files=max_files_per_query,
             )
-            new_files = []
             for hit in hits:
                 existing = hits_by_file.get(hit.file)
                 if existing is None or hit.score > existing.score:
                     hits_by_file[hit.file] = hit
-                if hit.file not in visited_files and len(visited_files) < max_total_files:
-                    visited_files.append(hit.file)
-                    new_files.append(hit.file)
+
+            candidate_files = [
+                hit.file for hit in hits
+                if hit.file not in visited_files
+            ]
+            if not candidate_files:
+                break
+
+            selected_files = candidate_files[:max_profile_files_per_iteration]
+            if decide is not None:
+                search_decision = await decide(
+                    self._build_search_iteration_packet(
+                        user_question=user_question,
+                        depth=depth,
+                        active_queries=active_queries,
+                        visited_files=visited_files,
+                        candidate_hits=hits,
+                        log_context=log_context,
+                        prior_decision_notes=decision_notes,
+                    )
+                )
+                decision_notes.extend(search_decision.notes)
+                if search_decision.candidate_drafts:
+                    candidate_drafts.extend(
+                        self._filter_candidate_drafts_by_parameter_gate(
+                            search_decision.candidate_drafts,
+                            [],
+                        )
+                    )
+                requested_files = [
+                    path for path in search_decision.relevant_files
+                    if path in candidate_files
+                ]
+                if requested_files:
+                    selected_files = requested_files[:max_profile_files_per_iteration]
+                if search_decision.expansion_queries:
+                    active_queries = [
+                        query for query in search_decision.expansion_queries
+                        if query not in all_queries
+                    ]
+                    all_queries.extend(active_queries)
+                    if search_decision.stop:
+                        break
+                    if not selected_files:
+                        continue
+                if search_decision.stop and not selected_files:
+                    break
+
+            new_files = []
+            for file_path in selected_files:
+                if file_path not in visited_files and len(visited_files) < max_total_files:
+                    visited_files.append(file_path)
+                    new_files.append(file_path)
 
             if not new_files:
                 break
@@ -126,6 +176,7 @@ class SourceMechanismResolver:
                 dedupe_parameter_predicates(parameter_predicates),
                 log_context,
             )
+            eliminated_parameter_paths = eliminated_branch_selector_requirements(parameter_requirements)
 
             expansions = self._build_expansion_queries(
                 parameter_refs,
@@ -152,6 +203,7 @@ class SourceMechanismResolver:
                         branch_conditions=branch_conditions,
                         parameter_predicates=parameter_predicates,
                         parameter_requirements=parameter_requirements,
+                        eliminated_parameter_paths=eliminated_parameter_paths,
                         log_context=log_context,
                         prior_decision_notes=decision_notes,
                     )
@@ -160,7 +212,12 @@ class SourceMechanismResolver:
                     path for path in decision.relevant_files
                     if path in visited_files
                 ])
-                candidate_drafts.extend(decision.candidate_drafts)
+                candidate_drafts.extend(
+                    self._filter_candidate_drafts_by_parameter_gate(
+                        decision.candidate_drafts,
+                        parameter_requirements,
+                    )
+                )
                 decision_notes.extend(decision.notes)
                 expansions = dedupe_keep_order([
                     *decision.expansion_queries,
@@ -190,12 +247,16 @@ class SourceMechanismResolver:
             dedupe_parameter_predicates(parameter_predicates),
             log_context,
         )
+        surviving_parameter_requirements = [
+            requirement for requirement in parameter_requirements
+            if not is_contradicted_branch_selector(requirement)
+        ]
         selected_files = dedupe_keep_order(relevant_files) or visited_files
         candidates = self._build_candidates(
             user_question=user_question,
             source_files=selected_files,
             hits=list(hits_by_file.values()),
-            parameter_requirements=parameter_requirements,
+            parameter_requirements=surviving_parameter_requirements,
             published_topics=dedupe_topic_refs(published_topics),
             subscribed_topics=dedupe_topic_refs(subscribed_topics),
             fields=dedupe_field_refs(assigned_fields + read_fields),
@@ -228,6 +289,7 @@ class SourceMechanismResolver:
         branch_conditions: list[BranchConditionRef],
         parameter_predicates: list[ParameterPredicateRef],
         parameter_requirements: list[ParameterRequirement],
+        eliminated_parameter_paths: list[ParameterRequirement],
         log_context: SourceDiscoveryLogContext,
         prior_decision_notes: list[str],
     ) -> SourceDiscoveryIterationPacket:
@@ -256,16 +318,16 @@ class SourceMechanismResolver:
             visited_files=visited_files,
             new_files=new_files,
             source_profile={
-                "related_files": [_safe_model_dump(hit) for hit in hits],
-                "referenced_parameters": [_safe_model_dump(ref) for ref in dedupe_parameter_refs(parameter_refs)],
-                "published_topics": [_safe_model_dump(ref) for ref in dedupe_topic_refs(published_topics)],
-                "subscribed_topics": [_safe_model_dump(ref) for ref in dedupe_topic_refs(subscribed_topics)],
-                "assigned_fields": [_safe_model_dump(ref) for ref in dedupe_field_refs(assigned_fields)],
-                "read_fields": [_safe_model_dump(ref) for ref in dedupe_field_refs(read_fields)],
-                "function_calls": [_safe_model_dump(ref) for ref in dedupe_function_call_refs(function_calls)],
-                "branch_conditions": [_safe_model_dump(ref) for ref in dedupe_branch_conditions(branch_conditions)],
+                "related_files": compact_source_hits(hits, limit=8, max_matches_per_file=3),
+                "referenced_parameters": compact_refs(dedupe_parameter_refs(parameter_refs), limit=40),
+                "published_topics": compact_refs(dedupe_topic_refs(published_topics), limit=30),
+                "subscribed_topics": compact_refs(dedupe_topic_refs(subscribed_topics), limit=30),
+                "assigned_fields": compact_refs(dedupe_field_refs(assigned_fields), limit=60),
+                "read_fields": compact_refs(dedupe_field_refs(read_fields), limit=60),
+                "function_calls": compact_refs(dedupe_function_call_refs(function_calls), limit=80),
+                "branch_conditions": compact_refs(dedupe_branch_conditions(branch_conditions), limit=80),
                 "parameter_predicates": [
-                    _safe_model_dump(ref) for ref in dedupe_parameter_predicates(parameter_predicates)
+                    compact_ref(ref) for ref in dedupe_parameter_predicates(parameter_predicates)[:40]
                 ],
             },
             parameter_requirements=parameter_requirements,
@@ -286,6 +348,59 @@ class SourceMechanismResolver:
                     topic for topic in discovered_topics
                     if topic in log_context.available_topics
                 ],
+                "eliminated_parameter_paths": [
+                    _safe_model_dump(requirement)
+                    for requirement in eliminated_parameter_paths
+                ],
+            },
+            prior_decision_notes=prior_decision_notes,
+        )
+
+    def _filter_candidate_drafts_by_parameter_gate(
+        self,
+        drafts: list[SourceDiscoveryCandidateDraft],
+        parameter_requirements: list[ParameterRequirement],
+    ) -> list[SourceDiscoveryCandidateDraft]:
+        contradicted = {
+            requirement.name
+            for requirement in parameter_requirements
+            if is_contradicted_branch_selector(requirement)
+        }
+        if not contradicted:
+            return drafts
+        return [
+            draft for draft in drafts
+            if not any(name in contradicted for name in draft.controlling_parameter_names)
+        ]
+
+    def _build_search_iteration_packet(
+        self,
+        *,
+        user_question: str,
+        depth: int,
+        active_queries: list[str],
+        visited_files: list[str],
+        candidate_hits: list[SourceFileHit],
+        log_context: SourceDiscoveryLogContext,
+        prior_decision_notes: list[str],
+    ) -> SourceDiscoveryIterationPacket:
+        return SourceDiscoveryIterationPacket(
+            user_question=user_question,
+            depth=depth,
+            active_queries=active_queries,
+            visited_files=visited_files,
+            new_files=[],
+            source_profile={
+                "stage": "search_hits_only",
+                "related_files": compact_source_hits(candidate_hits, limit=12, max_matches_per_file=4),
+            },
+            parameter_requirements=[],
+            static_log_context={
+                "vehicle_type": log_context.vehicle_type,
+                "mode_state_constraints": compact_mode_state_constraints(log_context.mode_state_constraints),
+                "discovered_parameter_values": {},
+                "discovered_topic_fields": {},
+                "available_discovered_topics": [],
             },
             prior_decision_notes=prior_decision_notes,
         )
@@ -780,6 +895,82 @@ def dedupe_branch_conditions(refs: list[BranchConditionRef]) -> list[BranchCondi
         seen.add(key)
         out.append(ref)
     return out
+
+
+def is_contradicted_branch_selector(requirement: ParameterRequirement) -> bool:
+    return requirement.role == "branch_selector" and requirement.gate_result == "contradicted"
+
+
+def eliminated_branch_selector_requirements(
+    requirements: list[ParameterRequirement],
+) -> list[ParameterRequirement]:
+    return [
+        requirement for requirement in requirements
+        if is_contradicted_branch_selector(requirement)
+    ]
+
+
+def compact_source_hits(
+    hits: list[SourceFileHit],
+    *,
+    limit: int,
+    max_matches_per_file: int,
+) -> list[dict[str, Any]]:
+    compact = []
+    for hit in sorted(hits, key=lambda item: (-item.score, item.file))[:limit]:
+        compact.append({
+            "file": hit.file,
+            "score": round(hit.score, 3),
+            "matched_queries": list(hit.matched_queries)[:8],
+            "matches": [
+                {
+                    "file": match.file,
+                    "line": match.line,
+                    "query": match.query,
+                    "text": truncate_text(match.text, 240),
+                }
+                for match in hit.matches[:max_matches_per_file]
+            ],
+        })
+    return compact
+
+
+def compact_refs(refs: list[Any], *, limit: int) -> list[dict[str, Any]]:
+    return [compact_ref(ref) for ref in refs[:limit]]
+
+
+def compact_ref(ref: Any) -> dict[str, Any]:
+    data = _safe_model_dump(ref)
+    if not isinstance(data, dict) and hasattr(ref, "__dict__"):
+        data = dict(ref.__dict__)
+    if not isinstance(data, dict):
+        return {"value": truncate_text(str(data), 240)}
+    compact = {}
+    for key, value in data.items():
+        if value is None:
+            continue
+        if key == "evidence":
+            compact[key] = truncate_text(str(value), 240)
+        elif isinstance(value, str):
+            compact[key] = truncate_text(value, 240)
+        else:
+            compact[key] = value
+    return compact
+
+
+def compact_mode_state_constraints(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "observed_values": value.get("observed_values", {}),
+        "omitted_event_count": value.get("omitted_event_count", 0),
+    }
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
 
 
 def _safe_model_dump(value: Any) -> Any:
