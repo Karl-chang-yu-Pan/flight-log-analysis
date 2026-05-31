@@ -1,6 +1,8 @@
 from flight_log_agent.px4.msg_schema import (
     is_valid_topic_field,
+    load_px4_msg_enum_registry,
     load_px4_msg_schema,
+    normalize_px4_enum_value,
     resolve_topic_field,
 )
 
@@ -19,3 +21,70 @@ def test_px4_msg_schema_validates_and_resolves_nested_field_suffixes():
     assert is_valid_topic_field("position_setpoint_triplet.current.alt")
     assert resolve_topic_field("position_setpoint_triplet", "current.alt") == "position_setpoint_triplet.current.alt"
     assert resolve_topic_field("position_setpoint_triplet", "alt") is None
+
+
+def test_px4_msg_enum_registry_maps_constants_to_matching_fields(tmp_path):
+    msg_dir = tmp_path / "PX4-Autopilot" / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "VehicleStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 vehicle_type
+uint8 VEHICLE_TYPE_UNKNOWN = 0
+uint8 VEHICLE_TYPE_ROTARY_WING = 1
+uint8 VEHICLE_TYPE_FIXED_WING = 2
+""",
+        encoding="utf-8",
+    )
+    (msg_dir / "VtolVehicleStatus.msg").write_text(
+        """
+uint8 VEHICLE_VTOL_STATE_UNDEFINED = 0
+uint8 VEHICLE_VTOL_STATE_TRANSITION_TO_FW = 1
+uint8 VEHICLE_VTOL_STATE_TRANSITION_TO_MC = 2
+uint8 VEHICLE_VTOL_STATE_MC = 3
+uint8 VEHICLE_VTOL_STATE_FW = 4
+
+uint64 timestamp
+uint8 vehicle_vtol_state # current state of the vtol, see VEHICLE_VTOL_STATE
+""",
+        encoding="utf-8",
+    )
+
+    registry = load_px4_msg_enum_registry(tmp_path / "PX4-Autopilot")
+
+    vehicle_type = registry["vehicle_status.vehicle_type"]
+    assert vehicle_type["constants"]["VEHICLE_TYPE_ROTARY_WING"] == 1
+    assert vehicle_type["aliases"]["VEHICLE_TYPE_ROTARY_WING"] == 1
+    assert vehicle_type["aliases"]["ROTARY_WING"] == 1
+    assert normalize_px4_enum_value(
+        "vehicle_status.vehicle_type",
+        "rotary_wing",
+        tmp_path / "PX4-Autopilot",
+    ) == 1
+
+    vtol_state = registry["vtol_vehicle_status.vehicle_vtol_state"]
+    assert vtol_state["constants"]["VEHICLE_VTOL_STATE_FW"] == 4
+    assert vtol_state["aliases"]["VEHICLE_VTOL_STATE_FW"] == 4
+    assert vtol_state["aliases"]["FW"] == 4
+    assert vtol_state["aliases"]["TRANSITION_TO_FW"] == 1
+
+
+def test_px4_msg_enum_registry_keeps_ambiguous_short_aliases_out(tmp_path):
+    msg_dir = tmp_path / "PX4-Autopilot" / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "ModeStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 mode_state
+uint8 MODE_STATE_FOO_BAR = 1
+uint8 MODE_STATE_BAZ_BAR = 2
+""",
+        encoding="utf-8",
+    )
+
+    registry = load_px4_msg_enum_registry(tmp_path / "PX4-Autopilot")
+    aliases = registry["mode_status.mode_state"]["aliases"]
+
+    assert aliases["FOO_BAR"] == 1
+    assert aliases["BAZ_BAR"] == 2
+    assert "BAR" not in aliases

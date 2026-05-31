@@ -19,6 +19,7 @@ import flight_log_agent.ulog.signature_evaluator as ulog_signature_evaluator
 import flight_log_agent.px4.source as px4_source
 import flight_log_agent.mission.parser as mission_parser
 import flight_log_agent.ulog.plots as ulog_plots
+from flight_log_agent.px4 import msg_schema as px4_msg_schema
 
 
 class FakeLoggedMessage:
@@ -2156,6 +2157,102 @@ def test_evaluate_log_signature_supports_threshold_transition_and_divergence(tmp
     assert result["contradicting_evidence"] == []
     assert result["unresolved"] == []
     assert result["numeric_checks"][1]["value"]["max_relevant_error"] == 10.0
+
+
+def test_evaluate_log_signature_normalizes_px4_enum_labels(tmp_path, monkeypatch):
+    source_path = tmp_path / "PX4-Autopilot"
+    msg_dir = source_path / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "VehicleStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 vehicle_type
+uint8 VEHICLE_TYPE_UNKNOWN = 0
+uint8 VEHICLE_TYPE_ROTARY_WING = 1
+uint8 VEHICLE_TYPE_FIXED_WING = 2
+""",
+        encoding="utf-8",
+    )
+    (msg_dir / "VtolVehicleStatus.msg").write_text(
+        """
+uint8 VEHICLE_VTOL_STATE_UNDEFINED = 0
+uint8 VEHICLE_VTOL_STATE_TRANSITION_TO_FW = 1
+uint8 VEHICLE_VTOL_STATE_TRANSITION_TO_MC = 2
+uint8 VEHICLE_VTOL_STATE_MC = 3
+uint8 VEHICLE_VTOL_STATE_FW = 4
+
+uint64 timestamp
+uint8 vehicle_vtol_state # current state of the vtol, see VEHICLE_VTOL_STATE
+""",
+        encoding="utf-8",
+    )
+
+    class FakeULog:
+        def __init__(self, path):
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_status",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "vehicle_type": [1, 1],
+                    },
+                ),
+                SimpleNamespace(
+                    name="vtol_vehicle_status",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "vehicle_vtol_state": [3, 4],
+                    },
+                ),
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+    monkeypatch.setattr(
+        ulog_signature_evaluator,
+        "normalize_px4_enum_value",
+        lambda signal, value: px4_msg_schema.normalize_px4_enum_value(signal, value, source_path),
+    )
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="VTOL state checks use source enum labels.",
+        expected_signature=[],
+        candidate_windows=[{"name": "event", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=[
+            "vehicle_status.vehicle_type",
+            "vtol_vehicle_status.vehicle_vtol_state",
+        ],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "state_equals",
+                "signal": "vehicle_status.vehicle_type",
+                "window": "event",
+                "value": "ROTARY_WING",
+            },
+            {
+                "type": "transition_occurs",
+                "signal": "vtol_vehicle_status.vehicle_vtol_state",
+                "window": "event",
+                "from_value": "MC",
+                "to_value": "FW",
+            },
+            {
+                "type": "state_not_equals",
+                "signal": "vehicle_status.vehicle_type",
+                "window": "event",
+                "value": "VEHICLE_TYPE_FIXED_WING",
+            },
+        ],
+    )
+
+    assert result["numeric_checks"][0]["status"] == "passed"
+    assert result["numeric_checks"][0]["value"]["target"] == 1
+    assert result["numeric_checks"][1]["status"] == "passed"
+    assert result["numeric_checks"][1]["value"]["transitions"] == [
+        {"time_s": 2.0, "from": 3, "to": 4}
+    ]
+    assert result["numeric_checks"][2]["status"] == "passed"
 
 
 def test_evaluate_log_signature_reports_threshold_contradictions_and_missing_signals(tmp_path, monkeypatch):
