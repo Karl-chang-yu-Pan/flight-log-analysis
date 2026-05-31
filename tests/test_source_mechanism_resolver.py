@@ -13,6 +13,9 @@ from flight_log_agent.px4.source_mechanism_models import (
 from flight_log_agent.px4.source_mechanism_resolver import (
     SourceMechanismResolver,
     build_source_discovery_log_context,
+    helper_expression_verification_candidates,
+    lower_source_expression_for_evaluator,
+    source_output_binding_candidates,
 )
 
 
@@ -313,6 +316,180 @@ void run_vehicle_mode()
     verification_candidate = next(item for item in verification_candidates if item["name"] == "helper_altitude")
     assert verification_candidate["lowered_return_expression"] == "max((current_alt + return_alt), current_alt)"
     assert verification_candidate["output_binding_required"] is True
+
+
+def test_source_output_binding_candidates_bind_call_arguments_to_logged_output(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "mode.cpp").write_text(
+        """
+bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
+{
+    sp->lat = item.lat;
+    sp->alt = get_absolute_altitude_for_item(item);
+    return true;
+}
+
+void publish_setpoint()
+{
+    position_setpoint_triplet_s *pos_sp_triplet = owner->get_position_setpoint_triplet();
+    mission_item_s mission_item{};
+    mission_item.lat = destination.lat;
+    mission_item.altitude = selected_altitude;
+    convert_item(mission_item, &pos_sp_triplet->current);
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(["src/modules/navigator/mode.cpp"])
+    calls = profiler.extract_function_calls_from_source(["src/modules/navigator/mode.cpp"])
+
+    bindings = source_output_binding_candidates(assignments, calls)
+
+    assert any(
+        binding["target_symbol"] == "pos_sp_triplet.current.lat"
+        and binding["source_symbol"] == "mission_item.lat"
+        and binding["logged_signal"] == "position_setpoint_triplet.current.lat"
+        for binding in bindings
+    )
+    assert any(
+        binding["target_symbol"] == "pos_sp_triplet.current.alt"
+        and binding["source_symbol"] == "get_absolute_altitude_for_item(mission_item)"
+        and binding["logged_signal"] == "position_setpoint_triplet.current.alt"
+        for binding in bindings
+    )
+    assert any(
+        binding["target_symbol"] == "pos_sp_triplet.current.lat"
+        and binding["source_symbol"] == "destination.lat"
+        and binding["logged_signal"] == "position_setpoint_triplet.current.lat"
+        for binding in bindings
+    )
+
+
+def test_lower_source_expression_reuses_px4_enum_registry_for_bound_fields(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    msg_dir = source_path / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "VehicleStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 vehicle_type
+uint8 VEHICLE_TYPE_ROTARY_WING = 1
+uint8 VEHICLE_TYPE_FIXED_WING = 2
+""",
+        encoding="utf-8",
+    )
+
+    lowered = lower_source_expression_for_evaluator(
+        "_vstatus.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING",
+        {"_vstatus.vehicle_type": "vehicle_status.vehicle_type"},
+        source_path=source_path,
+    )
+
+    assert lowered["expression"] == "vehicle_status_vehicle_type != 1"
+    assert lowered["variables"] == {
+        "vehicle_status_vehicle_type": "vehicle_status.vehicle_type",
+    }
+    assert lowered["unresolved_symbols"] == []
+
+
+def test_helper_expression_candidates_generate_output_derived_check(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "mode.cpp").write_text(
+        """
+float compute_alt(float radius)
+{
+    return 2.0f * radius;
+}
+
+bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
+{
+    sp->alt = item.altitude;
+    return true;
+}
+
+void publish_setpoint()
+{
+    position_setpoint_triplet_s *pos_sp_triplet = owner->get_position_setpoint_triplet();
+    mission_item_s mission_item{};
+    mission_item.altitude = compute_alt(NAV_ACC_RAD);
+    convert_item(mission_item, &pos_sp_triplet->current);
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/mode.cpp"],
+        helper_names=["compute_alt"],
+    )
+    assignments = profiler.extract_source_assignments_from_source(["src/modules/navigator/mode.cpp"])
+    calls = profiler.extract_function_calls_from_source(["src/modules/navigator/mode.cpp"])
+
+    candidates = helper_expression_verification_candidates(
+        helpers,
+        source_assignments=assignments,
+        function_calls=calls,
+        source_path=source_path,
+        limit=20,
+    )
+    checks = [
+        check
+        for candidate in candidates
+        for check in candidate["derived_expression_checks"]
+        if check["source_output"] == "position_setpoint_triplet.current.alt"
+    ]
+
+    assert any(
+        check["expected_expression"] == "(2.0 * NAV_ACC_RAD)"
+        for check in checks
+    )
+
+
+def test_source_output_binding_candidates_bind_receiver_method_assignments(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "rtl.h").write_text(
+        """
+struct Destination {
+    float alt;
+    void set(const home_position_s &home_position)
+    {
+        alt = home_position.alt;
+    }
+};
+""",
+        encoding="utf-8",
+    )
+    (module_dir / "rtl.cpp").write_text(
+        """
+#include "rtl.h"
+
+void select_destination()
+{
+    Destination _destination{};
+    home_position_s home_position{};
+    _destination.set(home_position);
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(["src/modules/navigator/rtl.cpp"])
+    calls = profiler.extract_function_calls_from_source(["src/modules/navigator/rtl.cpp"])
+    bindings = source_output_binding_candidates(assignments, calls)
+
+    assert any(
+        binding["target_symbol"] == "_destination.alt"
+        and binding["source_symbol"] == "home_position.alt"
+        for binding in bindings
+    )
 
 
 def test_source_mechanism_resolver_prioritizes_requested_file_over_search_hits(tmp_path):

@@ -505,7 +505,7 @@ def _check_derived_expression(
         window,
         expected_expression=str(check.get("expected_expression") or "").strip(),
     )
-    if context["missing"]:
+    if context["missing"] and not context.get("defer_missing"):
         missing = ", ".join(context["missing"])
         return _check_result(
             check,
@@ -539,8 +539,9 @@ def _check_derived_expression(
             if len(expected_values) != len(results):
                 raise ExpressionEvaluationError("expected expression produced mismatched samples")
             op = op or "=="
+            tolerance = _safe_float(check.get("max_error"))
             comparisons = [
-                _compare_literal(actual, op, expected)
+                _compare_literal(actual, op, expected, tolerance=tolerance)
                 for (_, actual), expected in zip(results, expected_values)
             ]
         elif op:
@@ -694,6 +695,7 @@ def _expression_context(
     if expected_expression:
         names.extend(_expression_names(expected_expression))
     names = dedupe_keep_order(names)
+    defer_missing = _expression_has_conditional(expression) or _expression_has_conditional(expected_expression)
 
     scalars: dict[str, Any] = {}
     series: dict[str, list[tuple[float, Any]]] = {}
@@ -734,7 +736,18 @@ def _expression_context(
         "series": series,
         "times": times,
         "missing": missing,
+        "defer_missing": defer_missing,
     }
+
+
+def _expression_has_conditional(expression: str) -> bool:
+    if not expression:
+        return False
+    try:
+        tree = ast.parse(normalize_expression_function_names(expression), mode="eval")
+    except SyntaxError:
+        return False
+    return any(isinstance(node, ast.IfExp) for node in ast.walk(tree))
 
 
 def _signal_window_samples(topics: dict[str, Any], signal: str, window: dict[str, Any]) -> dict[str, Any]:

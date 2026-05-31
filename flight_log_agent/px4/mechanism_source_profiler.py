@@ -99,6 +99,20 @@ class FunctionCallRef(BaseModel):
     line: int
     evidence: str
     receiver: Optional[str] = None
+    args: List[str] = Field(default_factory=list)
+    argument_topics: Dict[str, str] = Field(default_factory=dict)
+
+
+class SourceAssignmentRef(BaseModel):
+    target: str
+    expression: str
+    file: str
+    line: int
+    evidence: str
+    function: Optional[str] = None
+    function_parameters: List[str] = Field(default_factory=list)
+    target_topic: Optional[str] = None
+    target_field: Optional[str] = None
 
 
 class HelperExpressionRef(BaseModel):
@@ -147,6 +161,7 @@ class MechanismSourceProfile(BaseModel):
     referenced_parameters: List[ParameterRef]
     assigned_fields: List[FieldRef]
     read_fields: List[FieldRef] = Field(default_factory=list)
+    source_assignments: List[SourceAssignmentRef] = Field(default_factory=list)
     function_calls: List[FunctionCallRef] = Field(default_factory=list)
     helper_expressions: List[HelperExpressionRef] = Field(default_factory=list)
     branch_conditions: List[BranchConditionRef] = Field(default_factory=list)
@@ -312,6 +327,10 @@ class MechanismSourceProfiler:
     )
     _FUNCTION_CALL_PATTERN = re.compile(
         r"(?<![#A-Za-z0-9_])(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)\s*\("
+    )
+    _SOURCE_ASSIGNMENT_PATTERN = re.compile(
+        r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+        r"\s*=\s*(?P<expr>[^;]+);"
     )
     _FUNCTION_SIGNATURE_PATTERN = re.compile(
         r"(?P<prefix>[A-Za-z_][A-Za-z0-9_:<>,~*&\s]*?)\s+"
@@ -706,6 +725,47 @@ class MechanismSourceProfiler:
 
         return self._dedupe_field_refs(refs)
 
+    def extract_source_assignments_from_source(
+        self,
+        files: Sequence[Union[str, Path]],
+    ) -> List[SourceAssignmentRef]:
+        refs: List[SourceAssignmentRef] = []
+        for path in self._expand_companion_files(files):
+            text = self._read_text(path)
+            if text is None:
+                continue
+
+            rel_file = self._rel(path)
+            var_to_struct = self._extract_struct_variables(text)
+            definitions = self._extract_function_definitions(text, rel_file)
+
+            for line_no, line in self._iter_code_lines(text):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("//"):
+                    continue
+                function_name = self._function_name_for_line(definitions, line_no)
+                for match in self._SOURCE_ASSIGNMENT_PATTERN.finditer(line):
+                    target = self._clean_field_path(match.group("target"))
+                    expression = self._normalize_source_expression(match.group("expr"))
+                    definition = self._function_definition_for_line(definitions, line_no)
+                    root, field = split_source_field(target)
+                    struct = var_to_struct.get(root)
+                    target_topic = self._topic_from_struct(struct) if struct else None
+                    refs.append(
+                        SourceAssignmentRef(
+                            target=target,
+                            expression=expression,
+                            target_topic=target_topic,
+                            target_field=field if target_topic else None,
+                            function=function_name,
+                            function_parameters=list(definition.get("params", [])) if definition else [],
+                            file=rel_file,
+                            line=line_no,
+                            evidence=stripped,
+                        )
+                    )
+        return self._dedupe_source_assignment_refs(refs)
+
     def extract_function_calls_from_source(
         self,
         files: Sequence[Union[str, Path]],
@@ -731,9 +791,12 @@ class MechanismSourceProfiler:
                 continue
 
             rel_file = self._rel(path)
+            var_to_struct = self._extract_struct_variables(text)
             for line_no, line in self._iter_code_lines(text):
                 stripped = line.strip()
                 if not stripped or stripped.startswith("//"):
+                    continue
+                if self._FUNCTION_SIGNATURE_PATTERN.search(" ".join(stripped.split())):
                     continue
 
                 for match in self._FUNCTION_CALL_PATTERN.finditer(line):
@@ -741,10 +804,14 @@ class MechanismSourceProfiler:
                     if name in ignored:
                         continue
                     receiver = self._call_receiver(line, match.start())
+                    args = self._call_args(line, match.end() - 1)
+                    argument_topics = self._argument_topics(args, var_to_struct)
                     refs.append(
                         FunctionCallRef(
                             name=name,
                             receiver=receiver,
+                            args=args,
+                            argument_topics=argument_topics,
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
@@ -760,8 +827,10 @@ class MechanismSourceProfiler:
     ) -> List[HelperExpressionRef]:
         helper_name_set = {name for name in (helper_names or []) if name}
         refs: List[HelperExpressionRef] = []
+        all_refs: List[HelperExpressionRef] = []
         expanded_files = self._expand_companion_files(files)
         member_to_param = self._collect_param_member_map(expanded_files)
+        member_to_struct = self._collect_struct_member_map(expanded_files)
 
         for path in expanded_files:
             text = self._read_text(path)
@@ -772,8 +841,6 @@ class MechanismSourceProfiler:
             for definition in self._extract_function_definitions(text, rel_file):
                 name = definition["name"]
                 short_name = name.split("::")[-1]
-                if helper_name_set and name not in helper_name_set and short_name not in helper_name_set:
-                    continue
                 translated = self._translate_helper_body(
                     name=name,
                     file=rel_file,
@@ -782,10 +849,13 @@ class MechanismSourceProfiler:
                     body=definition["body"],
                     evidence=definition["evidence"],
                     member_to_param=member_to_param,
+                    member_to_struct=member_to_struct,
                 )
-                refs.append(translated)
+                all_refs.append(translated)
+                if not helper_name_set or name in helper_name_set or short_name in helper_name_set:
+                    refs.append(translated)
 
-        return self._dedupe_helper_expression_refs(refs)
+        return self._dedupe_helper_expression_refs(self._compose_helper_expressions(refs, all_refs))
 
     def extract_branch_conditions_from_source(
         self,
@@ -918,6 +988,7 @@ class MechanismSourceProfiler:
         params = self.extract_params_from_source(files)
         fields = self.extract_assigned_fields_from_source(files)
         read_fields = self.extract_read_fields_from_source(files)
+        source_assignments = self.extract_source_assignments_from_source(files)
         function_calls = self.extract_function_calls_from_source(files)
         helper_expressions = self.extract_helper_expressions_from_source(
             files,
@@ -944,6 +1015,7 @@ class MechanismSourceProfiler:
             referenced_parameters=params,
             assigned_fields=fields,
             read_fields=read_fields,
+            source_assignments=source_assignments,
             function_calls=function_calls,
             helper_expressions=helper_expressions,
             branch_conditions=branch_conditions,
@@ -1201,7 +1273,7 @@ class MechanismSourceProfiler:
     def _iter_code_lines(self, text: str) -> Iterable[Tuple[int, str]]:
         # Strip block comments lightly. This is deliberately simple and avoids
         # pretending to be a full C++ parser.
-        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        text = self._strip_block_comments_preserve_lines(text)
         for idx, line in enumerate(text.splitlines(), start=1):
             yield idx, line
 
@@ -1229,6 +1301,15 @@ class MechanismSourceProfiler:
                         member_to_param[member] = name
                         member_to_param[member.lstrip("_ ")] = name
         return member_to_param
+
+    def _collect_struct_member_map(self, files: Sequence[Path]) -> Dict[str, str]:
+        member_to_struct: Dict[str, str] = {}
+        for path in files:
+            text = self._read_text(path)
+            if text is None:
+                continue
+            member_to_struct.update(self._extract_struct_variables(text))
+        return member_to_struct
 
     def _line_mentions_parameter(self, line: str, member_to_param: Dict[str, str]) -> bool:
         if self._PX4_PARAM_PATTERN.search(line) or self._PARAM_FIND_PATTERN.search(line):
@@ -1280,6 +1361,9 @@ class MechanismSourceProfiler:
                 {
                     "name": name,
                     "line": line_no,
+                    "end_line": text.count("\n", 0, close_brace) + 1,
+                    "start_index": match.start(),
+                    "end_index": close_brace,
                     "params": self._parse_function_parameters(match.group("params")),
                     "body": text[open_brace + 1:close_brace],
                     "evidence": f"{signature} {{",
@@ -1296,6 +1380,20 @@ class MechanismSourceProfiler:
             text,
             flags=re.DOTALL,
         )
+
+    @staticmethod
+    def _function_name_for_line(definitions: List[Dict[str, object]], line_no: int) -> Optional[str]:
+        definition = MechanismSourceProfiler._function_definition_for_line(definitions, line_no)
+        return str(definition.get("name") or "") if definition else None
+
+    @staticmethod
+    def _function_definition_for_line(definitions: List[Dict[str, object]], line_no: int) -> Optional[Dict[str, object]]:
+        for definition in definitions:
+            start_line = int(definition.get("line") or 0)
+            end_line = int(definition.get("end_line") or 0)
+            if start_line <= line_no <= end_line:
+                return definition
+        return None
 
     @staticmethod
     def _matching_brace(text: str, open_brace: int) -> Optional[int]:
@@ -1324,6 +1422,37 @@ class MechanismSourceProfiler:
                 parsed.append(match.group(1))
         return parsed
 
+    def _call_args(self, line: str, open_paren: int) -> List[str]:
+        close_paren = self._matching_delimiter(line, open_paren, "(", ")")
+        if close_paren is None:
+            return []
+        return [
+            self._normalize_call_arg(arg)
+            for arg in split_top_level_args(line[open_paren + 1:close_paren])
+            if arg.strip()
+        ]
+
+    @staticmethod
+    def _normalize_call_arg(arg: str) -> str:
+        arg = arg.strip().lstrip("&")
+        arg = MechanismSourceProfiler._clean_field_path(arg)
+        return MechanismSourceProfiler._normalize_source_expression(arg)
+
+    @staticmethod
+    def _argument_topics(args: List[str], var_to_struct: Dict[str, str]) -> Dict[str, str]:
+        topics: Dict[str, str] = {}
+        for arg in args:
+            root, _ = split_source_field(arg)
+            struct = var_to_struct.get(root)
+            if struct:
+                topics[arg] = MechanismSourceProfiler._topic_from_struct(struct) or ""
+        return {arg: topic for arg, topic in topics.items() if topic}
+
+    @staticmethod
+    def _normalize_source_expression(expr: str) -> str:
+        expr = MechanismSourceProfiler._clean_field_path(expr.strip())
+        return MechanismSourceProfiler._normalize_helper_expression(expr)
+
     def _translate_helper_body(
         self,
         *,
@@ -1334,6 +1463,7 @@ class MechanismSourceProfiler:
         body: str,
         evidence: str,
         member_to_param: Dict[str, str],
+        member_to_struct: Dict[str, str],
     ) -> HelperExpressionRef:
         cleaned_body = self._strip_line_comments(body)
         unresolved = self._unsupported_helper_body_reason(cleaned_body)
@@ -1343,7 +1473,7 @@ class MechanismSourceProfiler:
         return_expression = self._helper_return_expression(cleaned_body)
         lowered_return_expression = self._lower_helper_statements(statements) if unresolved is None else None
         helper_calls = self._helper_body_calls(cleaned_body)
-        symbol_bindings = self._helper_symbol_bindings(cleaned_body, member_to_param)
+        symbol_bindings = self._helper_symbol_bindings(cleaned_body, member_to_param, member_to_struct)
         call_resolutions = self._helper_call_resolutions(cleaned_body, member_to_param)
 
         if unresolved is None and not return_expression and not lowered_return_expression and not branches:
@@ -1526,7 +1656,7 @@ class MechanismSourceProfiler:
         statements: List[Dict[str, Any]],
         env: Dict[str, str],
     ) -> Optional[str]:
-        for statement in statements:
+        for index, statement in enumerate(statements):
             kind = statement.get("kind")
             if kind in {"declare", "assign"}:
                 target = str(statement.get("target") or "")
@@ -1549,6 +1679,20 @@ class MechanismSourceProfiler:
                 )
                 if then_return is not None and else_return is not None:
                     return f"({then_return} if {condition} else {else_return})"
+                if then_return is not None:
+                    continuation = self._lower_helper_statement_block(
+                        statements[index + 1:],
+                        else_env,
+                    )
+                    if continuation is not None:
+                        return f"({then_return} if {condition} else {continuation})"
+                if else_return is not None:
+                    continuation = self._lower_helper_statement_block(
+                        statements[index + 1:],
+                        then_env,
+                    )
+                    if continuation is not None:
+                        return f"({continuation} if {condition} else {else_return})"
                 for target in sorted(set(then_env) | set(else_env)):
                     before = env.get(target, target)
                     then_expr = then_env.get(target, before)
@@ -1556,6 +1700,144 @@ class MechanismSourceProfiler:
                     if then_expr != before or else_expr != before:
                         env[target] = f"({then_expr} if {condition} else {else_expr})"
         return None
+
+    def _compose_helper_expressions(
+        self,
+        refs: List[HelperExpressionRef],
+        all_refs: List[HelperExpressionRef],
+    ) -> List[HelperExpressionRef]:
+        helper_index = self._composable_helper_index(all_refs)
+        for ref in refs:
+            stack = {ref.name}
+            if ref.return_expression:
+                ref.return_expression = self._apply_parameter_symbol_bindings(
+                    ref.return_expression,
+                    ref.symbol_bindings,
+                )
+                ref.return_expression = self._compose_helper_expression(ref.return_expression, helper_index, stack)
+            if ref.lowered_return_expression:
+                ref.lowered_return_expression = self._apply_parameter_symbol_bindings(
+                    ref.lowered_return_expression,
+                    ref.symbol_bindings,
+                )
+                ref.lowered_return_expression = self._compose_helper_expression(
+                    ref.lowered_return_expression,
+                    helper_index,
+                    stack,
+                )
+            ref.call_resolutions = self._mark_composed_helper_calls(
+                ref.call_resolutions,
+                helper_index,
+                current_name=ref.name,
+            )
+        return refs
+
+    def _composable_helper_index(self, refs: List[HelperExpressionRef]) -> Dict[str, HelperExpressionRef]:
+        full_names: Dict[str, HelperExpressionRef] = {}
+        short_names: Dict[str, List[HelperExpressionRef]] = {}
+        for ref in refs:
+            if not self._helper_composable_expression(ref):
+                continue
+            full_names[ref.name] = ref
+            short_names.setdefault(ref.name.split("::")[-1], []).append(ref)
+
+        out = dict(full_names)
+        for short_name, matches in short_names.items():
+            if len(matches) == 1:
+                out[short_name] = matches[0]
+        return out
+
+    def _helper_composable_expression(self, ref: HelperExpressionRef) -> Optional[str]:
+        if ref.unresolved_reason:
+            return None
+        expression = ref.lowered_return_expression or ref.return_expression
+        if not expression:
+            return None
+        return self._apply_parameter_symbol_bindings(expression, ref.symbol_bindings)
+
+    def _compose_helper_expression(
+        self,
+        expression: str,
+        helper_index: Dict[str, HelperExpressionRef],
+        stack: set[str],
+    ) -> str:
+        out: List[str] = []
+        index = 0
+        for match in self._FUNCTION_CALL_PATTERN.finditer(expression):
+            name = match.group("name")
+            short_name = name.split("::")[-1]
+            if is_safe_math_function_name(name):
+                continue
+            callee = helper_index.get(name) or helper_index.get(short_name)
+            if callee is None or callee.name in stack:
+                continue
+            open_paren = match.end() - 1
+            close_paren = self._matching_delimiter(expression, open_paren, "(", ")")
+            if close_paren is None:
+                continue
+
+            callee_expression = self._helper_composable_expression(callee)
+            if not callee_expression:
+                continue
+            args = [
+                self._normalize_call_arg(arg)
+                for arg in split_top_level_args(expression[open_paren + 1:close_paren])
+            ]
+            inlined = substitute_expression_symbols(callee_expression, callee.parameters, args)
+            inlined = self._compose_helper_expression(inlined, helper_index, {*stack, callee.name})
+            replacement_start = self._helper_call_replacement_start(expression, index, match.start())
+            out.append(expression[index:replacement_start])
+            out.append(f"({inlined})")
+            index = close_paren + 1
+        out.append(expression[index:])
+        return "".join(out)
+
+    @staticmethod
+    def _helper_call_replacement_start(expression: str, start: int, call_start: int) -> int:
+        prefix = expression[start:call_start]
+        receiver = re.search(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.$", prefix)
+        if receiver:
+            return start + receiver.start()
+        return call_start
+
+    @staticmethod
+    def _apply_parameter_symbol_bindings(expression: str, bindings: Dict[str, str]) -> str:
+        parameter_bindings = {
+            source: target
+            for source, target in bindings.items()
+            if re.match(r"^[A-Z][A-Z0-9_]*$", target or "")
+        }
+        return substitute_expression_symbols(
+            expression,
+            list(parameter_bindings.keys()),
+            list(parameter_bindings.values()),
+        )
+
+    def _mark_composed_helper_calls(
+        self,
+        resolutions: List[Dict[str, Any]],
+        helper_index: Dict[str, HelperExpressionRef],
+        *,
+        current_name: str,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for resolution in resolutions:
+            call = str(resolution.get("call") or "")
+            name = call[:-2] if call.endswith("()") else call
+            short_name = re.split(r"::|\.", name)[-1]
+            callee = helper_index.get(name) or helper_index.get(short_name)
+            if resolution.get("kind") in {"source_helper_candidate", "unresolved_runtime_call"} and (
+                callee is not None and callee.name != current_name
+            ):
+                expression = self._helper_composable_expression(callee)
+                updated = dict(resolution)
+                updated["kind"] = "translated_pure_helper"
+                if expression:
+                    updated["expression"] = expression
+                out.append(updated)
+            else:
+                out.append(resolution)
+        return out
 
     @staticmethod
     def _substitute_helper_locals(expression: str, env: Dict[str, str]) -> str:
@@ -1573,8 +1855,11 @@ class MechanismSourceProfiler:
         unsupported_patterns = [
             (r"\b(for|while|switch|case|goto)\b", "helper body uses unsupported control flow"),
             (r"\breturn\s*;", "helper body returns void"),
-            (r"\*[A-Za-z_][A-Za-z0-9_]*\s*=", "helper body mutates pointer output"),
-            (r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.|->)[A-Za-z_][A-Za-z0-9_]*\s*=", "helper body mutates object state"),
+            (r"\*[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)", "helper body mutates pointer output"),
+            (
+                r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.|->)[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)",
+                "helper body mutates object state",
+            ),
             (r"\+\+|--", "helper body mutates state"),
         ]
         for pattern, reason in unsupported_patterns:
@@ -1634,7 +1919,12 @@ class MechanismSourceProfiler:
             names.append(name)
         return list(dict.fromkeys(names))
 
-    def _helper_symbol_bindings(self, body: str, member_to_param: Dict[str, str]) -> Dict[str, str]:
+    def _helper_symbol_bindings(
+        self,
+        body: str,
+        member_to_param: Dict[str, str],
+        member_to_struct: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
         bindings: Dict[str, str] = {}
         for match in self._PARAM_GET_MEMBER_PATTERN.finditer(body):
             member_expr = re.sub(r"\s+", "", match.group("member"))
@@ -1643,7 +1933,8 @@ class MechanismSourceProfiler:
             if param_name:
                 bindings[f"{member_expr}.get()"] = param_name
 
-        var_to_struct = self._extract_struct_variables(body)
+        var_to_struct = dict(member_to_struct or {})
+        var_to_struct.update(self._extract_struct_variables(body))
         for match in self._FIELD_ACCESS_PATTERN.finditer(body):
             var = match.group("var")
             field_name = self._clean_field_path(match.group("field"))
@@ -1698,7 +1989,7 @@ class MechanismSourceProfiler:
 
     @staticmethod
     def _normalize_helper_expression(expr: str) -> str:
-        expr = expr.strip()
+        expr = MechanismSourceProfiler._clean_field_path(expr.strip())
         cast_match = re.match(r"\bstatic_cast\s*<[^>]+>\s*\(", expr)
         if cast_match and expr.endswith(")"):
             expr = expr[cast_match.end():-1].strip()
@@ -1841,6 +2132,18 @@ class MechanismSourceProfiler:
         return out
 
     @staticmethod
+    def _dedupe_source_assignment_refs(refs: Sequence[SourceAssignmentRef]) -> List[SourceAssignmentRef]:
+        seen = set()
+        out: List[SourceAssignmentRef] = []
+        for ref in refs:
+            key = (ref.target, ref.expression, ref.function, ref.file, ref.line)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ref)
+        return out
+
+    @staticmethod
     def _dedupe_function_call_refs(refs: Sequence[FunctionCallRef]) -> List[FunctionCallRef]:
         seen = set()
         out: List[FunctionCallRef] = []
@@ -1887,6 +2190,43 @@ class MechanismSourceProfiler:
             seen.add(key)
             out.append(ref)
         return out
+
+
+def split_source_field(value: str) -> Tuple[str, str]:
+    cleaned = MechanismSourceProfiler._clean_field_path(value)
+    if "." not in cleaned:
+        return cleaned, ""
+    root, field = cleaned.split(".", 1)
+    return root, field
+
+
+def split_top_level_args(args: str) -> List[str]:
+    out: List[str] = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(args):
+        if char in "([{<":
+            depth += 1
+        elif char in ")]}>":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0:
+            out.append(args[start:index].strip())
+            start = index + 1
+    tail = args[start:].strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def substitute_expression_symbols(expression: str, names: Sequence[str], values: Sequence[str]) -> str:
+    substituted = expression
+    for name, value in sorted(zip(names, values), key=lambda item: len(item[0]), reverse=True):
+        substituted = re.sub(
+            rf"(?<![A-Za-z0-9_\.]){re.escape(name)}(?![A-Za-z0-9_])",
+            str(value),
+            substituted,
+        )
+    return substituted
 
 
 # ---------------------------------------------------------------------------

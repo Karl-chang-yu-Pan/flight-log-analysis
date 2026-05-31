@@ -2576,6 +2576,92 @@ def test_evaluate_log_signature_evaluates_lowered_conditional_expression(tmp_pat
     assert check["value"]["values"] == [8.0, 30.0]
 
 
+def test_evaluate_log_signature_defers_missing_inputs_in_unselected_conditional_branch(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {"NAV_ACC_RAD": 10.0}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_status",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "rotary_wing": [1, 1],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="Source expression with branch-collapsed pure wrapper.",
+        expected_signature=[],
+        candidate_windows=[{"name": "window", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "derived_expression",
+                "expression": "NAV_ACC_RAD if rotary_wing else controller_radius",
+                "variables": {
+                    "rotary_wing": "vehicle_status.rotary_wing",
+                },
+                "window": "window",
+                "op": "==",
+                "value": 10.0,
+                "mode": "all",
+            }
+        ],
+    )
+
+    check = result["numeric_checks"][0]
+    assert check["status"] == "passed"
+    assert check["value"]["values"] == [10.0, 10.0]
+
+
+def test_evaluate_log_signature_applies_max_error_to_expected_expression(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {}
+            self.data_list = [
+                SimpleNamespace(
+                    name="position_setpoint_triplet",
+                    data={
+                        "timestamp": [1_000_000],
+                        "current.alt": [120.02],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="Expected expression comparison uses numeric tolerance.",
+        expected_signature=[],
+        candidate_windows=[{"name": "window", "start_s": 1.0, "end_s": 1.0}],
+        required_signals=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "derived_expression",
+                "expression": "actual",
+                "expected_expression": "expected",
+                "variables": {
+                    "actual": "position_setpoint_triplet.current.alt",
+                    "expected": "120.0",
+                },
+                "window": "window",
+                "op": "==",
+                "max_error": 0.05,
+                "mode": "all",
+            }
+        ],
+    )
+
+    assert result["numeric_checks"][0]["status"] == "passed"
+
+
 def test_evaluate_log_signature_canonicalizes_safe_math_calls_by_rule(tmp_path, monkeypatch):
     class FakeULog:
         def __init__(self, path):

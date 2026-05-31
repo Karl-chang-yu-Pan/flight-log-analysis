@@ -388,6 +388,57 @@ float helper_value(float distance, float radius, float floor_value, float curren
     assert helper.unresolved_reason is None
 
 
+def test_helper_expression_translation_composes_pure_wrappers(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.h").write_text(
+        """
+class Example {
+    DEFINE_PARAMETERS(
+        (ParamFloat<px4::params::NAV_ACC_RAD>) _param_nav_acc_rad
+    )
+};
+""",
+        encoding="utf-8",
+    )
+    (module_dir / "helpers.cpp").write_text(
+        """
+#include "helpers.h"
+
+float get_default_acceptance_radius()
+{
+    return _param_nav_acc_rad.get();
+}
+
+float get_acceptance_radius(bool rotary_wing, Example *navigator, float controller_radius)
+{
+    if (rotary_wing) {
+        return navigator->get_default_acceptance_radius();
+    }
+
+    return controller_radius;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/example/helpers.cpp"],
+        helper_names=["get_acceptance_radius"],
+    )
+
+    helper = helpers[0]
+    assert helper.lowered_return_expression == "((NAV_ACC_RAD) if rotary_wing else controller_radius)"
+    assert {
+        "call": "navigator.get_default_acceptance_radius()",
+        "kind": "translated_pure_helper",
+        "expression": "NAV_ACC_RAD",
+    } in helper.call_resolutions
+    assert helper.unresolved_reason is None
+
+
 def test_helper_expression_translation_reports_generic_symbol_bindings(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
@@ -430,6 +481,43 @@ float helper_value(const vehicle_global_position_s &input)
         "kind": "parameter_accessor",
         "parameter": "NAV_ACC_RAD",
     } in helper.call_resolutions
+
+
+def test_helper_expression_translation_binds_class_member_struct_fields(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.h").write_text(
+        """
+class Example {
+    vehicle_status_s _vstatus{};
+};
+""",
+        encoding="utf-8",
+    )
+    (module_dir / "helpers.cpp").write_text(
+        """
+#include "helpers.h"
+
+float helper_radius(float fallback)
+{
+    if (_vstatus.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
+        return fallback;
+    }
+
+    return fallback * 2.0f;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helper = profiler.extract_helper_expressions_from_source(
+        ["src/modules/example/helpers.cpp"],
+        helper_names=["helper_radius"],
+    )[0]
+
+    assert helper.symbol_bindings["_vstatus.vehicle_type"] == "vehicle_status.vehicle_type"
 
 
 def test_helper_expression_translation_canonicalizes_safe_math_by_rule(tmp_path):
@@ -476,6 +564,32 @@ float helper_math(float x, float y)
         "kind": "math_function",
         "canonical_name": "min",
     } in helper.call_resolutions
+
+
+def test_source_assignment_extraction_preserves_rhs_and_function_parameters(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
+{
+    sp->lat = item.lat;
+    sp->alt = get_absolute_altitude_for_item(item);
+    return true;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(["src/modules/example/helpers.cpp"])
+    by_target = {assignment.target: assignment for assignment in assignments}
+
+    assert by_target["sp.lat"].expression == "item.lat"
+    assert by_target["sp.lat"].function == "convert_item"
+    assert by_target["sp.lat"].function_parameters == ["item", "sp"]
+    assert by_target["sp.alt"].expression == "get_absolute_altitude_for_item(item)"
 
 
 def test_helper_expression_translation_marks_complex_helpers_unresolved(tmp_path):

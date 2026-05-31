@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -13,9 +14,13 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     MechanismSourceProfiler,
     ParameterPredicateRef,
     ParameterRef,
+    SourceAssignmentRef,
     SourceFileHit,
     TopicRef,
+    split_top_level_args,
+    substitute_expression_symbols,
 )
+from flight_log_agent.px4.msg_schema import is_valid_topic_field, load_px4_msg_schema, normalize_px4_enum_value
 from flight_log_agent.px4.source_mechanism_models import (
     ParameterRequirement,
     SourceBackedParameterPredicate,
@@ -91,6 +96,7 @@ class SourceMechanismResolver:
         parameter_refs: list[ParameterRef] = []
         assigned_fields: list[FieldRef] = []
         read_fields: list[FieldRef] = []
+        source_assignments: list[SourceAssignmentRef] = []
         function_calls: list[FunctionCallRef] = []
         helper_expressions: list[HelperExpressionRef] = []
         branch_conditions: list[BranchConditionRef] = []
@@ -179,6 +185,7 @@ class SourceMechanismResolver:
             parameter_refs.extend(self.profiler.extract_params_from_source(new_files))
             assigned_fields.extend(self.profiler.extract_assigned_fields_from_source(new_files))
             read_fields.extend(self.profiler.extract_read_fields_from_source(new_files))
+            source_assignments.extend(self.profiler.extract_source_assignments_from_source(new_files))
             function_calls.extend(self.profiler.extract_function_calls_from_source(new_files))
             helper_expressions.extend(
                 self.profiler.extract_helper_expressions_from_source(
@@ -216,6 +223,7 @@ class SourceMechanismResolver:
                         subscribed_topics=subscribed_topics,
                         assigned_fields=assigned_fields,
                         read_fields=read_fields,
+                        source_assignments=source_assignments,
                         function_calls=function_calls,
                         helper_expressions=helper_expressions,
                         branch_conditions=branch_conditions,
@@ -304,6 +312,7 @@ class SourceMechanismResolver:
         subscribed_topics: list[TopicRef],
         assigned_fields: list[FieldRef],
         read_fields: list[FieldRef],
+        source_assignments: list[SourceAssignmentRef],
         function_calls: list[FunctionCallRef],
         helper_expressions: list[HelperExpressionRef],
         branch_conditions: list[BranchConditionRef],
@@ -357,10 +366,14 @@ class SourceMechanismResolver:
                 "subscribed_topics": compact_refs(dedupe_topic_refs(subscribed_topics), limit=30),
                 "assigned_fields": compact_refs(dedupe_field_refs(assigned_fields), limit=60),
                 "read_fields": compact_refs(dedupe_field_refs(read_fields), limit=60),
+                "source_assignments": compact_refs(dedupe_source_assignment_refs(source_assignments), limit=100),
                 "function_calls": compact_refs(dedupe_function_call_refs(function_calls), limit=80),
                 "helper_expressions": compact_refs(dedupe_helper_expression_refs(helper_expressions), limit=40),
                 "expression_verification_candidates": helper_expression_verification_candidates(
                     dedupe_helper_expression_refs(helper_expressions),
+                    source_assignments=dedupe_source_assignment_refs(source_assignments),
+                    function_calls=dedupe_function_call_refs(function_calls),
+                    source_path=self.source_path,
                     limit=40,
                 ),
                 "branch_conditions": compact_refs(dedupe_branch_conditions(branch_conditions), limit=80),
@@ -1257,6 +1270,18 @@ def dedupe_field_refs(refs: list[FieldRef]) -> list[FieldRef]:
     return out
 
 
+def dedupe_source_assignment_refs(refs: list[SourceAssignmentRef]) -> list[SourceAssignmentRef]:
+    seen = set()
+    out: list[SourceAssignmentRef] = []
+    for ref in refs:
+        key = (ref.target, ref.expression, ref.function, ref.file, ref.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
 def dedupe_function_call_refs(refs: list[FunctionCallRef]) -> list[FunctionCallRef]:
     seen = set()
     out: list[FunctionCallRef] = []
@@ -1284,8 +1309,25 @@ def dedupe_helper_expression_refs(refs: list[HelperExpressionRef]) -> list[Helpe
 def helper_expression_verification_candidates(
     refs: list[HelperExpressionRef],
     *,
+    source_assignments: list[SourceAssignmentRef] | None = None,
+    function_calls: list[FunctionCallRef] | None = None,
+    source_path: str | Path | None = None,
     limit: int,
 ) -> list[dict[str, Any]]:
+    source_assignments = source_assignments or []
+    function_calls = function_calls or []
+    output_bindings = source_output_binding_candidates(
+        source_assignments,
+        function_calls,
+    )
+    output_checks = source_output_derived_expression_candidates(
+        refs,
+        source_assignments,
+        function_calls,
+        source_path=source_path,
+        limit=limit,
+    )
+    helper_symbol_bindings = combined_helper_symbol_bindings(refs)
     candidates: list[dict[str, Any]] = []
     for ref in refs:
         if not ref.lowered_return_expression:
@@ -1295,20 +1337,568 @@ def helper_expression_verification_candidates(
             for call in ref.call_resolutions
             if call.get("kind") in {"source_helper_candidate", "unresolved_runtime_call"}
         ]
+        lowered = lower_source_expression_for_evaluator(
+            ref.lowered_return_expression,
+            {**helper_symbol_bindings, **ref.symbol_bindings},
+            source_path=source_path,
+            extra_signal_bindings={
+                **source_assignment_signal_bindings(source_assignments, source_path=source_path),
+                **output_signal_bindings(output_bindings),
+            },
+        )
         candidates.append(
             {
                 "name": ref.name,
                 "source_file": ref.file,
                 "source_line": ref.line,
                 "lowered_return_expression": ref.lowered_return_expression,
+                "evaluator_expression": lowered["expression"],
+                "evaluator_variables": lowered["variables"],
+                "unresolved_symbols": lowered["unresolved_symbols"],
                 "symbol_bindings": dict(ref.symbol_bindings),
                 "unresolved_calls": unresolved_calls,
+                "output_binding_candidates": [
+                    binding for binding in output_bindings
+                    if expression_mentions_symbol(ref.lowered_return_expression, binding.get("source_symbol", ""))
+                ],
+                "derived_expression_checks": [
+                    check for check in output_checks
+                    if check.get("source_helper") == ref.name
+                ],
                 "output_binding_required": True,
             }
         )
         if len(candidates) >= limit:
             break
     return candidates
+
+
+def source_output_derived_expression_candidates(
+    refs: list[HelperExpressionRef],
+    source_assignments: list[SourceAssignmentRef],
+    function_calls: list[FunctionCallRef],
+    *,
+    source_path: str | Path | None = None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    output_bindings = [
+        binding for binding in source_output_binding_candidates(source_assignments, function_calls)
+        if binding.get("logged_signal")
+    ]
+    target_to_sources = assignment_sources_by_target(source_assignments)
+    for edge in call_bound_assignment_edges(source_assignments, function_calls):
+        source = str(edge.get("source_symbol") or "")
+        target = str(edge.get("target_symbol") or "")
+        if source and target:
+            target_to_sources.setdefault(target, [])
+            if source not in target_to_sources[target]:
+                target_to_sources[target].append(source)
+    helper_index = composable_helper_expression_index(refs)
+    helper_symbol_bindings = combined_helper_symbol_bindings(refs)
+    extra_signal_bindings = {
+        **source_assignment_signal_bindings(source_assignments, source_path=source_path),
+        **output_signal_bindings(output_bindings),
+    }
+    output_bindings = sorted(
+        output_bindings,
+        key=lambda binding: output_binding_sort_key(binding, helper_index),
+    )
+
+    checks: list[dict[str, Any]] = []
+    seen = set()
+    for binding in output_bindings:
+        logged_signal = str(binding.get("logged_signal") or "")
+        source_expression = str(binding.get("source_symbol") or "")
+        if not logged_signal or not source_expression:
+            continue
+        for expression in expand_source_expression_variants(
+            source_expression,
+            target_to_sources=target_to_sources,
+            helper_index=helper_index,
+            max_depth=5,
+            max_variants=80,
+        ):
+            lowered = lower_source_expression_for_evaluator(
+                expression,
+                helper_symbol_bindings,
+                source_path=source_path,
+                extra_signal_bindings=extra_signal_bindings,
+            )
+            if lowered["unresolved_symbols"] and " if " not in lowered["expression"]:
+                continue
+            if not evaluator_expression_syntax_valid(lowered["expression"]):
+                continue
+            helper_name = source_helper_name_for_expression(source_expression, helper_index)
+            key = (logged_signal, lowered["expression"])
+            if key in seen:
+                continue
+            seen.add(key)
+            checks.append(
+                {
+                    "type": "derived_expression",
+                    "source_helper": helper_name,
+                    "source_expression": expression,
+                    "expression": "actual",
+                    "expected_expression": lowered["expression"],
+                    "variables": {"actual": logged_signal, **lowered["variables"]},
+                    "op": "==",
+                    "max_error": 1.0e-3,
+                    "mode": "all",
+                    "source_output": logged_signal,
+                    "assignment_path": binding.get("assignment_path") or [],
+                }
+            )
+            if len(checks) >= limit:
+                return checks
+    return checks
+
+
+def assignment_sources_by_target(source_assignments: list[SourceAssignmentRef]) -> dict[str, list[str]]:
+    by_target: dict[str, list[str]] = {}
+    for ref in source_assignments:
+        if ref.target and ref.expression and ref.expression != ref.target:
+            by_target.setdefault(ref.target, []).append(ref.expression)
+    return {target: dedupe_keep_order(sources) for target, sources in by_target.items()}
+
+
+def composable_helper_expression_index(refs: list[HelperExpressionRef]) -> dict[str, HelperExpressionRef]:
+    full_names: dict[str, HelperExpressionRef] = {}
+    short_names: dict[str, list[HelperExpressionRef]] = {}
+    for ref in refs:
+        if ref.unresolved_reason or not (ref.lowered_return_expression or ref.return_expression):
+            continue
+        full_names[ref.name] = ref
+        short_names.setdefault(ref.name.split("::")[-1], []).append(ref)
+    out = dict(full_names)
+    for short_name, matches in short_names.items():
+        if len(matches) == 1:
+            out[short_name] = matches[0]
+    return out
+
+
+def combined_helper_symbol_bindings(refs: list[HelperExpressionRef]) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for ref in refs:
+        bindings.update(ref.symbol_bindings)
+    return bindings
+
+
+def expand_source_expression_variants(
+    expression: str,
+    *,
+    target_to_sources: dict[str, list[str]],
+    helper_index: dict[str, HelperExpressionRef],
+    max_depth: int,
+    max_variants: int,
+) -> list[str]:
+    variants = dedupe_keep_order([inline_source_helper_calls(expression, helper_index)])
+    frontier = list(variants)
+    for _ in range(max_depth):
+        next_frontier: list[str] = []
+        for item in frontier:
+            for target in sorted(target_to_sources, key=len, reverse=True):
+                if not expression_mentions_symbol(item, target):
+                    continue
+                for source in target_to_sources[target][:4]:
+                    if source == target:
+                        continue
+                    expanded = replace_source_symbol(item, target, f"({source})")
+                    expanded = inline_source_helper_calls(expanded, helper_index)
+                    if expanded not in variants and expanded not in next_frontier:
+                        next_frontier.append(expanded)
+                        if len(variants) + len(next_frontier) >= max_variants:
+                            break
+                if len(variants) + len(next_frontier) >= max_variants:
+                    break
+            if len(variants) + len(next_frontier) >= max_variants:
+                break
+        if not next_frontier:
+            break
+        variants.extend(next_frontier)
+        frontier = next_frontier
+    return variants
+
+
+def inline_source_helper_calls(expression: str, helper_index: dict[str, HelperExpressionRef]) -> str:
+    changed = True
+    out = expression
+    depth = 0
+    while changed and depth < 4:
+        changed = False
+        depth += 1
+        pieces: list[str] = []
+        cursor = 0
+        for match in re.finditer(
+            r"(?<![#A-Za-z0-9_])(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+            out,
+        ):
+            name = match.group("name")
+            callee = helper_index.get(name) or helper_index.get(name.split("::")[-1])
+            if callee is None:
+                continue
+            close_paren = matching_delimiter(out, match.end() - 1, "(", ")")
+            if close_paren is None:
+                continue
+            callee_expression = callee.lowered_return_expression or callee.return_expression
+            if not callee_expression:
+                continue
+            args = split_top_level_args(out[match.end():close_paren])
+            inlined = substitute_expression_symbols(callee_expression, callee.parameters, args)
+            pieces.append(out[cursor:match.start()])
+            pieces.append(f"({inlined})")
+            cursor = close_paren + 1
+            changed = True
+        pieces.append(out[cursor:])
+        out = "".join(pieces)
+    return out
+
+
+def matching_delimiter(text: str, open_index: int, open_char: str, close_char: str) -> int | None:
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def output_signal_bindings(output_bindings: list[dict[str, Any]]) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for binding in sorted(output_bindings, key=lambda item: binding_evidence_score(item)):
+        source = str(binding.get("source_symbol") or "")
+        logged_signal = str(binding.get("logged_signal") or "")
+        if source and logged_signal and re.match(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$", source):
+            bindings.setdefault(source, logged_signal)
+    return bindings
+
+
+def source_assignment_signal_bindings(
+    source_assignments: list[SourceAssignmentRef],
+    *,
+    source_path: str | Path | None = None,
+) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    schema = load_px4_msg_schema(source_path)
+    for ref in source_assignments:
+        if not ref.target_topic or ref.target_field:
+            continue
+        for field in schema.get(ref.target_topic, []):
+            bindings[f"{ref.target}.{field}"] = f"{ref.target_topic}.{field}"
+    return bindings
+
+
+def output_binding_sort_key(
+    binding: dict[str, Any],
+    helper_index: dict[str, HelperExpressionRef],
+) -> tuple[bool, int, int, str]:
+    source_expression = str(binding.get("source_symbol") or "")
+    return (
+        source_helper_name_for_expression(source_expression, helper_index) is None,
+        binding_evidence_score(binding),
+        len(source_expression),
+        str(binding.get("logged_signal") or ""),
+    )
+
+
+def binding_evidence_score(binding: dict[str, Any]) -> int:
+    path = binding.get("assignment_path") or []
+    return len(path) if isinstance(path, list) else 0
+
+
+def source_helper_name_for_expression(
+    expression: str,
+    helper_index: dict[str, HelperExpressionRef],
+) -> str | None:
+    match = re.match(r"\s*(?P<name>[A-Za-z_][A-Za-z0-9_:]*)\s*\(", expression)
+    if not match:
+        return None
+    ref = helper_index.get(match.group("name")) or helper_index.get(match.group("name").split("::")[-1])
+    return ref.name if ref else match.group("name")
+
+
+def lower_source_expression_for_evaluator(
+    expression: str,
+    symbol_bindings: dict[str, str],
+    *,
+    source_path: str | Path | None = None,
+    extra_signal_bindings: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    bindings = dict(extra_signal_bindings or {})
+    bindings.update(symbol_bindings)
+    lowered = expression
+    lowered = re.sub(r"\btrue\b", "True", lowered)
+    lowered = re.sub(r"\bfalse\b", "False", lowered)
+    lowered = re.sub(r"\bPX4_ISFINITE\s*\(", "isfinite(", lowered)
+
+    for constant, value in numeric_source_constants(source_path).items():
+        lowered = re.sub(rf"(?<![A-Za-z0-9_:]){re.escape(constant)}(?![A-Za-z0-9_:])", str(value), lowered)
+
+    for token in sorted(set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*::[A-Z][A-Z0-9_]*\b", lowered)), key=len, reverse=True):
+        value = enum_constant_value_for_expression(token, bindings.values(), source_path)
+        if isinstance(value, int):
+            lowered = re.sub(rf"(?<![A-Za-z0-9_:]){re.escape(token)}(?![A-Za-z0-9_:])", str(value), lowered)
+
+    variables: dict[str, str] = {}
+    used_names: set[str] = set()
+    for source, signal in sorted(bindings.items(), key=lambda item: len(item[0]), reverse=True):
+        if source not in lowered:
+            continue
+        name = unique_expression_variable_name(signal, used_names)
+        lowered = replace_source_symbol(lowered, source, name)
+        variables[name] = signal
+
+    for token in sorted(set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*\b", lowered)), key=len, reverse=True):
+        if not is_valid_topic_field(token, source_path):
+            continue
+        name = unique_expression_variable_name(token, used_names)
+        lowered = replace_source_symbol(lowered, token, name)
+        variables[name] = token
+
+    unresolved_symbols = unresolved_source_symbols(lowered)
+    return {
+        "expression": lowered,
+        "variables": variables,
+        "unresolved_symbols": unresolved_symbols,
+    }
+
+
+def enum_constant_value_for_expression(
+    token: str,
+    signals: Any,
+    source_path: str | Path | None,
+) -> Any:
+    for signal in signals:
+        value = normalize_px4_enum_value(str(signal), token, source_path)
+        if isinstance(value, int):
+            return value
+    return token
+
+
+def numeric_source_constants(source_path: str | Path | None) -> dict[str, float | int]:
+    if source_path is None:
+        return {}
+    root = Path(source_path)
+    if not root.exists():
+        return {}
+    constants: dict[str, float | int] = {}
+    constant_re = re.compile(
+        r"\b(?:static\s+)?constexpr\s+(?:float|double|int|uint\d+_t|int\d+_t)\s+"
+        r"(?P<name>[A-Z][A-Z0-9_]*)\s*(?:=|\{)\s*(?P<value>-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)[fF]?"
+    )
+    define_re = re.compile(
+        r"^\s*#\s*define\s+(?P<name>[A-Z][A-Z0-9_]*)\s+"
+        r"(?P<value>-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)[fF]?\b"
+    )
+    for path in list(root.glob("src/lib/**/*.h")) + list(root.glob("src/lib/**/*.hpp")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in constant_re.finditer(text):
+            constants[match.group("name")] = parse_numeric_literal(match.group("value"))
+        for line in text.splitlines():
+            match = define_re.match(line)
+            if match:
+                constants[match.group("name")] = parse_numeric_literal(match.group("value"))
+    return constants
+
+
+def parse_numeric_literal(value: str) -> float | int:
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
+def replace_source_symbol(expression: str, symbol: str, replacement: str) -> str:
+    return re.sub(
+        rf"(?<![A-Za-z0-9_\.]){re.escape(symbol)}(?![A-Za-z0-9_\.])",
+        replacement,
+        expression,
+    )
+
+
+def unique_expression_variable_name(signal: str, used_names: set[str]) -> str:
+    base = re.sub(r"[^A-Za-z0-9_]", "_", signal).strip("_")
+    if not base:
+        base = "value"
+    if base[0].isdigit():
+        base = f"v_{base}"
+    name = base
+    index = 2
+    while name in used_names:
+        name = f"{base}_{index}"
+        index += 1
+    used_names.add(name)
+    return name
+
+
+def unresolved_source_symbols(expression: str) -> list[str]:
+    unresolved = []
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)?(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b", expression):
+        if token not in unresolved:
+            unresolved.append(token)
+    return unresolved
+
+
+def evaluator_expression_syntax_valid(expression: str) -> bool:
+    try:
+        ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return False
+    return True
+
+
+def source_output_binding_candidates(
+    source_assignments: list[SourceAssignmentRef],
+    function_calls: list[FunctionCallRef],
+) -> list[dict[str, Any]]:
+    direct_edges = [
+        assignment_edge(ref)
+        for ref in source_assignments
+        if ref.target and ref.expression
+    ]
+    bound_edges = call_bound_assignment_edges(source_assignments, function_calls)
+    return dedupe_binding_candidates([
+        *direct_edges,
+        *bound_edges,
+        *transitive_binding_edges([*direct_edges, *bound_edges]),
+    ])
+
+
+def assignment_edge(ref: SourceAssignmentRef) -> dict[str, Any]:
+    logged_signal = f"{ref.target_topic}.{ref.target_field}" if ref.target_topic and ref.target_field else None
+    return {
+        "source_symbol": ref.expression,
+        "target_symbol": ref.target,
+        "logged_signal": logged_signal,
+        "assignment_path": [
+            {
+                "file": ref.file,
+                "line": ref.line,
+                "function": ref.function,
+                "evidence": ref.evidence,
+            }
+        ],
+    }
+
+
+def call_bound_assignment_edges(
+    source_assignments: list[SourceAssignmentRef],
+    function_calls: list[FunctionCallRef],
+) -> list[dict[str, Any]]:
+    by_function: dict[str, list[SourceAssignmentRef]] = {}
+    for ref in source_assignments:
+        if ref.function:
+            by_function.setdefault(ref.function.split("::")[-1], []).append(ref)
+
+    out: list[dict[str, Any]] = []
+    for call in function_calls:
+        callee_assignments = by_function.get(call.name.split("::")[-1], [])
+        if not callee_assignments or not call.args:
+            continue
+        for assignment in callee_assignments:
+            target = substitute_call_args(assignment.target, assignment.function_parameters, call.args)
+            if call.receiver and "." not in target:
+                target = f"{call.receiver}.{target}"
+            expression = substitute_call_args(assignment.expression, assignment.function_parameters, call.args)
+            logged_signal = logged_signal_for_bound_target(target, call.argument_topics)
+            out.append(
+                {
+                    "source_symbol": expression,
+                    "target_symbol": target,
+                    "logged_signal": logged_signal,
+                    "assignment_path": [
+                        {
+                            "file": assignment.file,
+                            "line": assignment.line,
+                            "function": assignment.function,
+                            "evidence": assignment.evidence,
+                        },
+                        {
+                            "file": call.file,
+                            "line": call.line,
+                            "function": None,
+                            "evidence": call.evidence,
+                        },
+                    ],
+                }
+            )
+    return out
+
+
+def substitute_call_args(expression: str, params: list[str], args: list[str]) -> str:
+    if not params:
+        return expression
+    substituted = expression
+    for root, arg in zip(params, args):
+        substituted = re.sub(
+            rf"(?<![A-Za-z0-9_\.]){re.escape(root)}(?![A-Za-z0-9_])",
+            arg,
+            substituted,
+        )
+    return substituted
+
+
+def logged_signal_for_bound_target(target: str, argument_topics: dict[str, str]) -> str | None:
+    for arg, topic in sorted(argument_topics.items(), key=lambda item: len(item[0]), reverse=True):
+        arg_root, _, arg_field = arg.partition(".")
+        logged_prefix = f"{topic}.{arg_field}" if arg_field else topic
+        if target == arg:
+            return logged_prefix
+        if target.startswith(arg + "."):
+            return f"{logged_prefix}.{target[len(arg) + 1:]}"
+    return None
+
+
+def expression_mentions_symbol(expression: str, symbol: str) -> bool:
+    if not symbol:
+        return False
+    return symbol in expression or symbol.split(".")[-1] in expression
+
+
+def dedupe_binding_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    out: list[dict[str, Any]] = []
+    for candidate in candidates:
+        key = (candidate.get("source_symbol"), candidate.get("target_symbol"), candidate.get("logged_signal"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def transitive_binding_edges(edges: list[dict[str, Any]], *, max_depth: int = 4) -> list[dict[str, Any]]:
+    by_target: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges:
+        target = edge.get("target_symbol")
+        if isinstance(target, str) and target:
+            by_target.setdefault(target, []).append(edge)
+
+    expanded: list[dict[str, Any]] = []
+    frontier = list(edges)
+    for _ in range(max_depth):
+        next_frontier: list[dict[str, Any]] = []
+        for edge in frontier:
+            source = edge.get("source_symbol")
+            if not isinstance(source, str):
+                continue
+            for upstream in by_target.get(source, []):
+                candidate = {
+                    "source_symbol": upstream.get("source_symbol"),
+                    "target_symbol": edge.get("target_symbol"),
+                    "logged_signal": edge.get("logged_signal"),
+                    "assignment_path": [
+                        *(upstream.get("assignment_path") or []),
+                        *(edge.get("assignment_path") or []),
+                    ],
+                }
+                expanded.append(candidate)
+                next_frontier.append(candidate)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return expanded
 
 
 def dedupe_branch_conditions(refs: list[BranchConditionRef]) -> list[BranchConditionRef]:
