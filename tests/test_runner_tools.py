@@ -1049,6 +1049,41 @@ def test_source_mechanism_conversion_preserves_derived_expression_checks(tmp_pat
     ] == [{"name": "current_alt", "source": "vehicle_local_position.z"}]
 
 
+def test_source_mechanism_conversion_preserves_helper_dependencies(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="Helper expression source path",
+        source_mechanism="Source formula depends on a helper that still needs translation.",
+        verification_checks=[
+            runner.SourceBackedVerificationCheck(
+                check=runner.RelationshipCheckSpec(
+                    type="derived_expression",
+                    expression="helper_result",
+                    helper_dependencies=[
+                        {
+                            "name": "source_helper",
+                            "args": ["input_a", "input_b"],
+                            "source_file": "src/modules/example.cpp",
+                            "source_line": 42,
+                            "unresolved_reason": "helper body uses unsupported runtime state",
+                        }
+                    ],
+                ),
+                source_file="src/modules/example.cpp",
+                source_line=42,
+            )
+        ],
+    )
+
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
+    dependency = candidate.numeric_checks[0].helper_dependencies[0]
+
+    dumped = dependency.model_dump() if hasattr(dependency, "model_dump") else dependency
+    assert dumped["name"] == "source_helper"
+    assert dumped["args"] == ["input_a", "input_b"]
+    assert dumped["unresolved_reason"] == "helper body uses unsupported runtime state"
+
+
 def test_source_relevant_fields_are_not_hard_required_without_checks(tmp_path):
     runner = load_runner(tmp_path)
     source_candidate = runner.SourceMechanismCandidate(
@@ -1342,6 +1377,78 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     metadata = json.loads((run_dir / "metadata.json").read_text())
     assert metadata["runner_version"] == "v3_mechanism_first"
     assert metadata["report_path"] == str(output_dir / "report.json")
+
+
+def test_shape_report_evidence_moves_unresolved_items_out_of_contradictions(tmp_path):
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Cone helper mechanism",
+        summary="Source formula depends on helper translation.",
+        source_refs=[],
+    )
+    applicability = runner.ApplicabilityResult(
+        candidate_name=candidate.name,
+        applicable=True,
+    )
+    evaluation = runner.SignatureEvaluation(
+        candidate_name=candidate.name,
+        verdict="unresolved",
+        confidence_ceiling="unresolved",
+        evidence=["vehicle_status.vehicle_type matched rotary-wing condition."],
+        contradictions=[],
+        check_results=[
+            {
+                "type": "derived_expression",
+                "status": "unresolved",
+                "message": "cannot evaluate helper source_helper: helper body uses unsupported runtime state",
+            }
+        ],
+    )
+    report = runner.FlightLogReport(
+        airframe_summary="placeholder",
+        question_intent_summary="placeholder",
+        ranked_hypotheses=[
+            runner.HypothesisReportItem(
+                title="Cone helper mechanism",
+                known_px4_mechanism=candidate.name,
+                mechanism="Source helper path.",
+                source_refs=[],
+                expected_logged_signature=[],
+                applicability=runner.ApplicabilityReport(applicable=True),
+                evidence=[],
+                contradicting_evidence=[
+                    "Direct numeric verification was unresolved.",
+                    "The vehicle type contradicted the cone branch.",
+                ],
+                exclusion_checks=[],
+                numeric_checks=[],
+                confidence="low",
+            )
+        ],
+        excluded_mechanisms=[],
+        confirmed=[],
+        unconfirmed=[candidate.name],
+        final_summary="placeholder",
+    )
+
+    runner.shape_report_evidence(
+        report,
+        [
+            runner.VerifiedMechanismResult(
+                candidate=candidate,
+                applicability=applicability,
+                evaluation=evaluation,
+                final_confidence="unresolved",
+            )
+        ],
+    )
+
+    hypothesis = report.ranked_hypotheses[0]
+    assert hypothesis.contradicting_evidence == ["The vehicle type contradicted the cone branch."]
+    assert hypothesis.unresolved_evidence == [
+        "Direct numeric verification was unresolved.",
+        "cannot evaluate helper source_helper: helper body uses unsupported runtime state",
+    ]
 
 
 def test_generate_report_plots_updates_complete_v3_plot_specs(tmp_path):
@@ -2372,6 +2479,53 @@ def test_evaluate_log_signature_reports_missing_derived_expression_input(tmp_pat
         "missing input terrain_clearance"
     )
     assert check["value"]["missing_inputs"] == ["terrain_clearance"]
+
+
+def test_evaluate_log_signature_reports_untranslated_helper_dependency(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_global_position",
+                    data={
+                        "timestamp": [1_000_000],
+                        "lat": [47.0],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="Source expression depends on a helper.",
+        expected_signature=[],
+        candidate_windows=[{"name": "rtl", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "derived_expression",
+                "expression": "helper_result",
+                "helper_dependencies": [
+                    {
+                        "name": "source_helper",
+                        "args": ["vehicle_global_position.lat"],
+                        "unresolved_reason": "helper body uses unsupported runtime state",
+                    }
+                ],
+                "window": "rtl",
+            }
+        ],
+    )
+
+    check = result["numeric_checks"][0]
+    assert check["status"] == "unresolved"
+    assert check["message"] == (
+        "cannot evaluate helper source_helper: helper body uses unsupported runtime state"
+    )
+    assert check["value"]["helper_dependency"]["args"] == ["vehicle_global_position.lat"]
 
 
 def test_evaluate_log_signature_reports_threshold_contradictions_and_missing_signals(tmp_path, monkeypatch):

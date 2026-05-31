@@ -4,6 +4,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     BranchConditionRef,
     FieldRef,
     FunctionCallRef,
+    HelperExpressionRef,
     MechanismSourceProfile,
     ParameterPredicateRef,
     MechanismSourceProfiler,
@@ -88,6 +89,17 @@ def test_profiler_models_are_pydantic_serializable():
                 evidence="navigateTo(sp);",
             )
         ],
+        helper_expressions=[
+            HelperExpressionRef(
+                name="computeAltitude",
+                file="src/modules/navigator/rtl.cpp",
+                line=52,
+                evidence="float computeAltitude(float current_alt)",
+                parameters=["current_alt"],
+                assignments={"candidate": "current_alt + 10.0"},
+                return_expression="max(candidate, current_alt)",
+            )
+        ],
         branch_conditions=[
             BranchConditionRef(
                 kind="if",
@@ -119,6 +131,7 @@ def test_profiler_models_are_pydantic_serializable():
     assert dumped["assigned_fields"][0]["field"] == "alt"
     assert dumped["read_fields"][0]["field"] == "nav_state"
     assert dumped["function_calls"][0]["name"] == "navigateTo"
+    assert dumped["helper_expressions"][0]["return_expression"] == "max(candidate, current_alt)"
     assert dumped["branch_conditions"][0]["kind"] == "if"
     assert dumped["parameter_predicates"][0]["operator"] == ">"
 
@@ -254,6 +267,108 @@ def test_search_filters_broad_prompt_noise_and_downranks_vendor_paths(tmp_path):
     assert ranked_files[0] == "src/modules/navigator/mode.cpp"
     assert "test/mavsdk_tests/catch2/catch.hpp" not in ranked_files[:3]
     assert "src/drivers/uavcan/uavcan_drivers/stm32h7/driver/include/fdcan.h" not in ranked_files[:3]
+
+
+def test_helper_expression_translation_extracts_simple_returns(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float helper_altitude(float current_alt, float return_alt)
+{
+    const float candidate = current_alt + return_alt;
+    return max(candidate, current_alt);
+}
+
+float branch_altitude(float dist, float min_dist, float return_alt)
+{
+    if (dist <= min_dist) {
+        return min(dist / tanf(1.0f), return_alt);
+    } else {
+        return return_alt;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["helper_altitude", "branch_altitude"],
+    )
+    by_name = {helper.name: helper for helper in helpers}
+
+    assert by_name["helper_altitude"].parameters == ["current_alt", "return_alt"]
+    assert by_name["helper_altitude"].assignments == {"candidate": "current_alt + return_alt"}
+    assert by_name["helper_altitude"].return_expression == "max(candidate, current_alt)"
+    assert by_name["helper_altitude"].unresolved_reason is None
+    assert by_name["branch_altitude"].branches == [
+        {"condition": "dist <= min_dist", "expression": "min(dist / tan(1.0), return_alt)"},
+        {"condition": "!(dist <= min_dist)", "expression": "return_alt"},
+    ]
+
+
+def test_helper_expression_translation_handles_px4_style_multiline_math(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    lib_dir = source_path / "src" / "lib" / "geo"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "geo.cpp").write_text(
+        """
+float get_distance_to_next_waypoint(double lat_now, double lon_now, double lat_next, double lon_next)
+{
+    const double lat_now_rad = math::radians(lat_now);
+    const double lat_next_rad = math::radians(lat_next);
+    const double a = sin(lat_now_rad) * cos(
+        lat_next_rad);
+
+    return static_cast<float>(CONSTANTS_RADIUS_OF_EARTH * 2.0 * atan2(sqrt(a), sqrt(1.0 - a)));
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/lib/geo/geo.cpp"],
+        helper_names=["get_distance_to_next_waypoint"],
+    )
+
+    assert len(helpers) == 1
+    helper = helpers[0]
+    assert helper.name == "get_distance_to_next_waypoint"
+    assert helper.parameters == ["lat_now", "lon_now", "lat_next", "lon_next"]
+    assert helper.assignments["lat_now_rad"] == "radians(lat_now)"
+    assert helper.assignments["a"] == "sin(lat_now_rad) * cos(lat_next_rad)"
+    assert helper.return_expression == (
+        "CONSTANTS_RADIUS_OF_EARTH * 2.0 * atan2(sqrt(a), sqrt(1.0 - a))"
+    )
+    assert helper.unresolved_reason is None
+
+
+def test_helper_expression_translation_marks_complex_helpers_unresolved(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+void helper_with_output(float input, float *output)
+{
+    *output = input;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["helper_with_output"],
+    )
+
+    assert helpers[0].name == "helper_with_output"
+    assert helpers[0].unresolved_reason == "helper body mutates pointer output"
 
 
 def test_parameter_feasibility_gate_uses_only_discovered_parameters():

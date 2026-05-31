@@ -115,6 +115,14 @@ class ExpressionVariableRef(BaseModel):
     source: str
 
 
+class ExpressionHelperDependency(BaseModel):
+    name: str
+    args: list[str] = Field(default_factory=list)
+    source_file: Optional[str] = None
+    source_line: Optional[int] = None
+    unresolved_reason: Optional[str] = None
+
+
 class RelationshipCheckSpec(BaseModel):
     type: Literal[
         "threshold",
@@ -156,6 +164,7 @@ class RelationshipCheckSpec(BaseModel):
     expression: Optional[str] = None
     expected_expression: Optional[str] = None
     variables: list[ExpressionVariableRef] = Field(default_factory=list)
+    helper_dependencies: list[ExpressionHelperDependency] = Field(default_factory=list)
     supports: Optional[str] = None
     contradicts: Optional[str] = None
     description: Optional[str] = None
@@ -244,6 +253,7 @@ class HypothesisReportItem(BaseModel):
     applicability: ApplicabilityReport
     evidence: list[str]
     contradicting_evidence: list[str]
+    unresolved_evidence: list[str] = Field(default_factory=list)
     exclusion_checks: list[RelationshipCheckSpec]
     numeric_checks: list[RelationshipCheckSpec]
     confidence: Literal["high", "medium", "low", "unresolved"]

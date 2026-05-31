@@ -215,6 +215,11 @@ Rules:
   interpreted_parameter_predicates and executable later checks in
   verification_checks. Every interpreted predicate/check must include the exact
   source_file and source_line that supports it.
+- If a later verification check depends on a helper call or formula that cannot
+  be directly expressed yet, preserve it as a structured derived_expression
+  check with helper_dependencies and a precise unresolved_reason. Do not encode
+  source formulas or helper names as fake ULog signals or tracks_setpoint
+  setpoints.
 - Use required_log_evidence and expected_log_signature to request later
   MechanismVerifier checks; do not compute those checks yourself.
 - If the current source evidence is insufficient, return expansion_queries and
@@ -238,6 +243,9 @@ Rules:
 - Do not claim a mechanism happened unless applicability and log evaluation support it.
 - Separate source mechanism, applicability filtering, numeric log verification,
   contradictions, and confidence.
+- Put unresolved verification limitations in unresolved_evidence, not in
+  contradicting_evidence. Contradicting evidence is only for failed checks or
+  facts that actively refute the mechanism.
 - Confidence cannot exceed evaluation.confidence_ceiling.
 - If applicability is false, confidence must be low or unresolved.
 - If evaluation is unresolved or contradicted, confidence must be low or unresolved.
@@ -595,6 +603,7 @@ async def analyze_flight_log(
         )
 
         apply_deterministic_report_summaries(report, airframe_context, question_intent)
+        shape_report_evidence(report, verified_results)
         report = generate_report_plots(report, ctx, audit_logger)
         validation = validate_report(report)
         audit_logger.log_event("validation.finished", output=validation.model_dump())
@@ -974,6 +983,7 @@ def compact_verified_mechanism_result(result: VerifiedMechanismResult) -> dict[s
             "confidence_ceiling": evaluation.confidence_ceiling,
             "evidence": list(evaluation.evidence),
             "contradictions": list(evaluation.contradictions),
+            "unresolved": unresolved_messages_from_check_results(evaluation.check_results),
             "check_results": _safe_model_dump(evaluation.check_results),
             "warnings": list(evaluation.warnings),
         },
@@ -989,6 +999,61 @@ def apply_deterministic_report_summaries(
     report.airframe_summary = build_airframe_summary(airframe_context)
     report.question_intent_summary = build_question_intent_summary(question_intent)
     return report
+
+
+def shape_report_evidence(
+    report: FlightLogReport,
+    verified_results: list[VerifiedMechanismResult],
+) -> FlightLogReport:
+    unresolved_by_title = {
+        result.candidate.name: unresolved_messages_from_check_results(result.evaluation.check_results)
+        for result in verified_results
+    }
+    for hypothesis in report.ranked_hypotheses:
+        unresolved = list(getattr(hypothesis, "unresolved_evidence", []) or [])
+        expected_unresolved = unresolved_by_title.get(hypothesis.known_px4_mechanism) or unresolved_by_title.get(hypothesis.title) or []
+        contradictions = []
+        for item in hypothesis.contradicting_evidence:
+            text = str(item)
+            if is_unresolved_evidence_text(text):
+                unresolved.append(text)
+            else:
+                contradictions.append(text)
+        for item in expected_unresolved:
+            if item not in unresolved:
+                unresolved.append(item)
+        hypothesis.contradicting_evidence = contradictions
+        hypothesis.unresolved_evidence = dedupe_keep_order(unresolved)
+    return report
+
+
+def unresolved_messages_from_check_results(check_results: list[Any]) -> list[str]:
+    messages: list[str] = []
+    for result in check_results or []:
+        if not isinstance(result, dict):
+            continue
+        if result.get("status") == "unresolved" and result.get("message"):
+            messages.append(str(result["message"]))
+    return dedupe_keep_order(messages)
+
+
+def is_unresolved_evidence_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        token in lowered
+        for token in (
+            "unresolved",
+            "not directly evaluable",
+            "could not be evaluated",
+            "cannot evaluate",
+            "missing input",
+            "missing topic",
+            "missing field",
+            "unknown window",
+            "not numerically verified",
+            "remained unresolved",
+        )
+    )
 
 
 def build_airframe_summary(airframe_context: AirframeContext) -> str:

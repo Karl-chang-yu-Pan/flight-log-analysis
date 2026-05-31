@@ -9,6 +9,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     BranchConditionRef,
     FieldRef,
     FunctionCallRef,
+    HelperExpressionRef,
     MechanismSourceProfiler,
     ParameterPredicateRef,
     ParameterRef,
@@ -91,6 +92,7 @@ class SourceMechanismResolver:
         assigned_fields: list[FieldRef] = []
         read_fields: list[FieldRef] = []
         function_calls: list[FunctionCallRef] = []
+        helper_expressions: list[HelperExpressionRef] = []
         branch_conditions: list[BranchConditionRef] = []
         parameter_predicates: list[ParameterPredicateRef] = []
         decision_notes: list[str] = []
@@ -178,6 +180,12 @@ class SourceMechanismResolver:
             assigned_fields.extend(self.profiler.extract_assigned_fields_from_source(new_files))
             read_fields.extend(self.profiler.extract_read_fields_from_source(new_files))
             function_calls.extend(self.profiler.extract_function_calls_from_source(new_files))
+            helper_expressions.extend(
+                self.profiler.extract_helper_expressions_from_source(
+                    new_files,
+                    helper_names=[ref.name for ref in function_calls],
+                )
+            )
             branch_conditions.extend(self.profiler.extract_branch_conditions_from_source(new_files))
             parameter_predicates.extend(self.profiler.extract_parameter_predicates_from_source(new_files))
             parameter_requirements = self.parameter_gate.evaluate(
@@ -209,6 +217,7 @@ class SourceMechanismResolver:
                         assigned_fields=assigned_fields,
                         read_fields=read_fields,
                         function_calls=function_calls,
+                        helper_expressions=helper_expressions,
                         branch_conditions=branch_conditions,
                         parameter_predicates=parameter_predicates,
                         parameter_requirements=parameter_requirements,
@@ -296,6 +305,7 @@ class SourceMechanismResolver:
         assigned_fields: list[FieldRef],
         read_fields: list[FieldRef],
         function_calls: list[FunctionCallRef],
+        helper_expressions: list[HelperExpressionRef],
         branch_conditions: list[BranchConditionRef],
         parameter_predicates: list[ParameterPredicateRef],
         parameter_requirements: list[ParameterRequirement],
@@ -348,6 +358,7 @@ class SourceMechanismResolver:
                 "assigned_fields": compact_refs(dedupe_field_refs(assigned_fields), limit=60),
                 "read_fields": compact_refs(dedupe_field_refs(read_fields), limit=60),
                 "function_calls": compact_refs(dedupe_function_call_refs(function_calls), limit=80),
+                "helper_expressions": compact_refs(dedupe_helper_expression_refs(helper_expressions), limit=40),
                 "branch_conditions": compact_refs(dedupe_branch_conditions(branch_conditions), limit=80),
                 "parameter_predicates": [
                     compact_ref(ref) for ref in dedupe_parameter_predicates(parameter_predicates)[:40]
@@ -1247,6 +1258,18 @@ def dedupe_function_call_refs(refs: list[FunctionCallRef]) -> list[FunctionCallR
     out: list[FunctionCallRef] = []
     for ref in refs:
         key = (ref.name, ref.receiver, ref.file, ref.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
+def dedupe_helper_expression_refs(refs: list[HelperExpressionRef]) -> list[HelperExpressionRef]:
+    seen = set()
+    out: list[HelperExpressionRef] = []
+    for ref in refs:
+        key = (ref.name, ref.file, ref.line)
         if key in seen:
             continue
         seen.add(key)

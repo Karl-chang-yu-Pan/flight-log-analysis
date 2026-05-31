@@ -482,6 +482,20 @@ def _check_derived_expression(
     if window is None:
         return _check_result(check, status="unresolved", message=f"unknown window: {check.get('window')}")
 
+    helper_dependency = _first_unresolved_helper_dependency(check)
+    if helper_dependency is not None:
+        helper_name = helper_dependency["name"]
+        reason = helper_dependency.get("unresolved_reason") or "helper has not been translated into safe expression IR"
+        return _check_result(
+            check,
+            status="unresolved",
+            message=f"cannot evaluate helper {helper_name}: {reason}",
+            value={
+                "expression": expression,
+                "helper_dependency": helper_dependency,
+            },
+        )
+
     context = _expression_context(
         topics,
         parameters,
@@ -665,6 +679,12 @@ class ExpressionEvaluationError(ValueError):
 ALLOWED_EXPRESSION_FUNCTIONS = {
     "min": min,
     "max": max,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "sqrt": math.sqrt,
+    "atan2": math.atan2,
+    "radians": math.radians,
 }
 
 
@@ -760,6 +780,26 @@ def _expression_variables_map(raw_variables: Any) -> dict[str, str]:
         if name and source:
             variables[str(name)] = str(source)
     return variables
+
+
+def _first_unresolved_helper_dependency(check: dict) -> dict[str, Any] | None:
+    dependencies = check.get("helper_dependencies") or []
+    if not isinstance(dependencies, list):
+        return None
+    for item in dependencies:
+        if isinstance(item, dict):
+            dependency = item
+        else:
+            dependency = {
+                "name": getattr(item, "name", None),
+                "args": getattr(item, "args", []),
+                "source_file": getattr(item, "source_file", None),
+                "source_line": getattr(item, "source_line", None),
+                "unresolved_reason": getattr(item, "unresolved_reason", None),
+            }
+        if dependency.get("unresolved_reason"):
+            return {key: value for key, value in dependency.items() if value is not None}
+    return None
 
 
 def _evaluate_expression_over_context(expression: str, context: dict[str, Any]) -> list[tuple[float | None, Any]]:

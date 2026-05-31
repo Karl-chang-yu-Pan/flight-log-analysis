@@ -260,6 +260,56 @@ def test_source_mechanism_resolver_profiles_requested_file_line_snippets(tmp_pat
     assert "filler 30" not in deep_snippet["text"]
 
 
+def test_source_mechanism_resolver_includes_helper_expression_ir_in_packet(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "mode.cpp").write_text(
+        """
+float helper_altitude(float current_alt, float return_alt)
+{
+    const float candidate = current_alt + return_alt;
+    return max(candidate, current_alt);
+}
+
+void run_vehicle_mode()
+{
+    helper_altitude(10.0f, 20.0f);
+}
+""",
+        encoding="utf-8",
+    )
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+    packets = []
+
+    async def decide(packet):
+        packets.append(packet)
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision(relevant_files=["src/modules/navigator/mode.cpp"])
+        return SourceDiscoveryDecision(stop=True)
+
+    asyncio.run(
+        resolver.discover(
+            "Why did run_vehicle_mode use helper_altitude?",
+            build_source_discovery_log_context({}),
+            seed_queries=["run_vehicle_mode"],
+            decide=decide,
+            max_depth=1,
+        )
+    )
+
+    profile_packet = next(packet for packet in packets if packet.new_files)
+    helpers = profile_packet.source_profile["helper_expressions"]
+    helper = next(item for item in helpers if item["name"] == "helper_altitude")
+
+    assert helper["assignments"] == {"candidate": "current_alt + return_alt"}
+    assert helper["return_expression"] == "max(candidate, current_alt)"
+    assert helper["parameters"] == ["current_alt", "return_alt"]
+
+
 def test_source_mechanism_resolver_prioritizes_requested_file_over_search_hits(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"

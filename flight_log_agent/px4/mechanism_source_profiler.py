@@ -95,6 +95,19 @@ class FunctionCallRef(BaseModel):
     receiver: Optional[str] = None
 
 
+class HelperExpressionRef(BaseModel):
+    name: str
+    file: str
+    line: int
+    evidence: str
+    parameters: List[str] = Field(default_factory=list)
+    assignments: Dict[str, str] = Field(default_factory=dict)
+    return_expression: Optional[str] = None
+    branches: List[Dict[str, str]] = Field(default_factory=list)
+    helper_calls: List[str] = Field(default_factory=list)
+    unresolved_reason: Optional[str] = None
+
+
 class BranchConditionRef(BaseModel):
     kind: str
     condition: str
@@ -125,6 +138,7 @@ class MechanismSourceProfile(BaseModel):
     assigned_fields: List[FieldRef]
     read_fields: List[FieldRef] = Field(default_factory=list)
     function_calls: List[FunctionCallRef] = Field(default_factory=list)
+    helper_expressions: List[HelperExpressionRef] = Field(default_factory=list)
     branch_conditions: List[BranchConditionRef] = Field(default_factory=list)
     parameter_predicates: List[ParameterPredicateRef] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
@@ -286,6 +300,11 @@ class MechanismSourceProfiler:
     )
     _FUNCTION_CALL_PATTERN = re.compile(
         r"(?<![#A-Za-z0-9_])(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)\s*\("
+    )
+    _FUNCTION_SIGNATURE_PATTERN = re.compile(
+        r"(?P<prefix>[A-Za-z_][A-Za-z0-9_:<>,~*&\s]*?)\s+"
+        r"(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)"
+        r"\s*\((?P<params>[^()]*)\)\s*(?:const\s*)?$"
     )
     _BRANCH_CONDITION_PATTERN = re.compile(
         r"\b(?P<kind>if|else\s+if|while|switch)\s*\((?P<condition>[^;\n]*)\)"
@@ -719,6 +738,37 @@ class MechanismSourceProfiler:
 
         return self._dedupe_function_call_refs(refs)
 
+    def extract_helper_expressions_from_source(
+        self,
+        files: Sequence[Union[str, Path]],
+        helper_names: Optional[Sequence[str]] = None,
+    ) -> List[HelperExpressionRef]:
+        helper_name_set = {name for name in (helper_names or []) if name}
+        refs: List[HelperExpressionRef] = []
+
+        for path in self._expand_companion_files(files):
+            text = self._read_text(path)
+            if text is None:
+                continue
+
+            rel_file = self._rel(path)
+            for definition in self._extract_function_definitions(text, rel_file):
+                name = definition["name"]
+                short_name = name.split("::")[-1]
+                if helper_name_set and name not in helper_name_set and short_name not in helper_name_set:
+                    continue
+                translated = self._translate_helper_body(
+                    name=name,
+                    file=rel_file,
+                    line=definition["line"],
+                    params=definition["params"],
+                    body=definition["body"],
+                    evidence=definition["evidence"],
+                )
+                refs.append(translated)
+
+        return self._dedupe_helper_expression_refs(refs)
+
     def extract_branch_conditions_from_source(
         self,
         files: Sequence[Union[str, Path]],
@@ -851,6 +901,10 @@ class MechanismSourceProfiler:
         fields = self.extract_assigned_fields_from_source(files)
         read_fields = self.extract_read_fields_from_source(files)
         function_calls = self.extract_function_calls_from_source(files)
+        helper_expressions = self.extract_helper_expressions_from_source(
+            files,
+            helper_names=[ref.name for ref in function_calls],
+        )
         branch_conditions = self.extract_branch_conditions_from_source(files)
         parameter_predicates = self.extract_parameter_predicates_from_source(files)
 
@@ -873,6 +927,7 @@ class MechanismSourceProfiler:
             assigned_fields=fields,
             read_fields=read_fields,
             function_calls=function_calls,
+            helper_expressions=helper_expressions,
             branch_conditions=branch_conditions,
             parameter_predicates=parameter_predicates,
             notes=notes,
@@ -1180,6 +1235,208 @@ class MechanismSourceProfiler:
         member = operand.split(".")[-1]
         return member_to_param.get(operand) or member_to_param.get(member), operand if operand in member_to_param else None
 
+    def _extract_function_definitions(self, text: str, rel_file: str) -> List[Dict[str, object]]:
+        text = self._strip_block_comments_preserve_lines(text)
+        definitions: List[Dict[str, object]] = []
+        ignored = {"if", "for", "while", "switch", "catch"}
+        for open_brace in (match.start() for match in re.finditer(r"\{", text)):
+            signature_start = max(
+                text.rfind(";", 0, open_brace),
+                text.rfind("{", 0, open_brace),
+                text.rfind("}", 0, open_brace),
+            ) + 1
+            raw_signature = text[signature_start:open_brace].strip()
+            signature = " ".join(raw_signature.split())
+            match = self._FUNCTION_SIGNATURE_PATTERN.search(signature)
+            if not match:
+                continue
+            name = match.group("name")
+            if name in ignored:
+                continue
+            close_brace = self._matching_brace(text, open_brace)
+            if close_brace is None:
+                continue
+            line_start = signature_start + len(text[signature_start:open_brace]) - len(text[signature_start:open_brace].lstrip())
+            line_no = text.count("\n", 0, line_start) + 1
+            definitions.append(
+                {
+                    "name": name,
+                    "line": line_no,
+                    "params": self._parse_function_parameters(match.group("params")),
+                    "body": text[open_brace + 1:close_brace],
+                    "evidence": f"{signature} {{",
+                    "file": rel_file,
+                }
+            )
+        return definitions
+
+    @staticmethod
+    def _strip_block_comments_preserve_lines(text: str) -> str:
+        return re.sub(
+            r"/\*.*?\*/",
+            lambda match: "\n" * match.group(0).count("\n"),
+            text,
+            flags=re.DOTALL,
+        )
+
+    @staticmethod
+    def _matching_brace(text: str, open_brace: int) -> Optional[int]:
+        depth = 0
+        for index in range(open_brace, len(text)):
+            char = text[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return index
+        return None
+
+    @staticmethod
+    def _parse_function_parameters(params: str) -> List[str]:
+        parsed: List[str] = []
+        for raw_param in params.split(","):
+            param = raw_param.strip()
+            if not param or param == "void":
+                continue
+            param = param.split("=", 1)[0].strip()
+            param = re.sub(r"\[[^\]]*\]", "", param)
+            match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", param.replace("*", " ").replace("&", " "))
+            if match:
+                parsed.append(match.group(1))
+        return parsed
+
+    def _translate_helper_body(
+        self,
+        *,
+        name: str,
+        file: str,
+        line: int,
+        params: List[str],
+        body: str,
+        evidence: str,
+    ) -> HelperExpressionRef:
+        cleaned_body = self._strip_line_comments(body)
+        unresolved = self._unsupported_helper_body_reason(cleaned_body)
+        assignments = self._helper_assignments(cleaned_body)
+        branches = self._helper_return_branches(cleaned_body)
+        return_expression = self._helper_return_expression(cleaned_body)
+        helper_calls = self._helper_body_calls(cleaned_body)
+
+        if unresolved is None and not return_expression and not branches:
+            unresolved = "helper body has no simple return expression"
+        if unresolved is None and len(re.findall(r"\breturn\b", cleaned_body)) > 1 and not branches:
+            unresolved = "helper body has multiple returns without translatable branch structure"
+
+        return HelperExpressionRef(
+            name=name,
+            file=file,
+            line=line,
+            evidence=evidence,
+            parameters=params,
+            assignments=assignments if unresolved is None else {},
+            return_expression=return_expression if unresolved is None else None,
+            branches=branches if unresolved is None else [],
+            helper_calls=helper_calls,
+            unresolved_reason=unresolved,
+        )
+
+    @staticmethod
+    def _strip_line_comments(text: str) -> str:
+        return "\n".join(line.split("//", 1)[0] for line in text.splitlines())
+
+    @staticmethod
+    def _unsupported_helper_body_reason(body: str) -> Optional[str]:
+        unsupported_patterns = [
+            (r"\b(for|while|switch|case|goto)\b", "helper body uses unsupported control flow"),
+            (r"\breturn\s*;", "helper body returns void"),
+            (r"\*[A-Za-z_][A-Za-z0-9_]*\s*=", "helper body mutates pointer output"),
+            (r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.|->)[A-Za-z_][A-Za-z0-9_]*\s*=", "helper body mutates object state"),
+            (r"\+\+|--", "helper body mutates state"),
+        ]
+        for pattern, reason in unsupported_patterns:
+            if re.search(pattern, body):
+                return reason
+        return None
+
+    def _helper_assignments(self, body: str) -> Dict[str, str]:
+        assignments: Dict[str, str] = {}
+        pattern = re.compile(
+            r"(?:^|;|\n)\s*(?:const\s+)?(?:auto|float|double|int|bool|uint\d+_t|int\d+_t|[A-Za-z_][A-Za-z0-9_:<>]*)"
+            r"\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<expr>.*?);",
+            re.DOTALL,
+        )
+        for match in pattern.finditer(body):
+            assignments[match.group("name")] = self._normalize_helper_expression(match.group("expr"))
+        return assignments
+
+    def _helper_return_expression(self, body: str) -> Optional[str]:
+        matches = re.findall(r"\breturn\s+(?P<expr>.*?)\s*;", body, flags=re.DOTALL)
+        if len(matches) != 1:
+            return None
+        return self._normalize_helper_expression(matches[0])
+
+    def _helper_return_branches(self, body: str) -> List[Dict[str, str]]:
+        branches: List[Dict[str, str]] = []
+        pattern = re.compile(
+            r"\bif\s*\((?P<condition>[^{};]+)\)\s*\{\s*return\s+(?P<true_expr>[^;]+);\s*\}"
+            r"(?:\s*else\s*\{\s*return\s+(?P<false_expr>[^;]+);\s*\})?",
+            re.DOTALL,
+        )
+        for match in pattern.finditer(body):
+            branches.append(
+                {
+                    "condition": self._normalize_helper_expression(match.group("condition")),
+                    "expression": self._normalize_helper_expression(match.group("true_expr")),
+                }
+            )
+            false_expr = match.group("false_expr")
+            if false_expr:
+                branches.append(
+                    {
+                        "condition": f"!({self._normalize_helper_expression(match.group('condition'))})",
+                        "expression": self._normalize_helper_expression(false_expr),
+                    }
+                )
+        return branches
+
+    def _helper_body_calls(self, body: str) -> List[str]:
+        ignored = {"if", "return", "static_cast", "const_cast", "reinterpret_cast", "dynamic_cast"}
+        names: List[str] = []
+        for match in self._FUNCTION_CALL_PATTERN.finditer(body):
+            name = match.group("name")
+            short_name = name.split("::")[-1]
+            if short_name in ignored:
+                continue
+            names.append(name)
+        return list(dict.fromkeys(names))
+
+    @staticmethod
+    def _normalize_helper_expression(expr: str) -> str:
+        expr = expr.strip()
+        cast_match = re.match(r"\bstatic_cast\s*<[^>]+>\s*\(", expr)
+        if cast_match and expr.endswith(")"):
+            expr = expr[cast_match.end():-1].strip()
+        expr = re.sub(r"\bstatic_cast\s*<[^>]+>\s*\(([^()]+)\)", r"\1", expr)
+        expr = re.sub(r"\b([0-9]+(?:\.[0-9]+)?)f\b", r"\1", expr)
+        replacements = {
+            "math::radians": "radians",
+            "math::degrees": "degrees",
+            "tanf": "tan",
+            "sinf": "sin",
+            "cosf": "cos",
+            "sqrtf": "sqrt",
+            "atan2f": "atan2",
+            "fabsf": "fabs",
+            "CONSTANTS_RADIUS_OF_EARTH": "CONSTANTS_RADIUS_OF_EARTH",
+        }
+        for old, new in replacements.items():
+            expr = expr.replace(old, new)
+        expr = " ".join(expr.split())
+        expr = re.sub(r"\(\s+", "(", expr)
+        expr = re.sub(r"\s+\)", ")", expr)
+        return expr
+
     @staticmethod
     def _call_receiver(line: str, call_start: int) -> Optional[str]:
         prefix = line[:call_start].rstrip()
@@ -1309,6 +1566,18 @@ class MechanismSourceProfiler:
         out: List[FunctionCallRef] = []
         for ref in refs:
             key = (ref.name, ref.receiver, ref.file, ref.line)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ref)
+        return out
+
+    @staticmethod
+    def _dedupe_helper_expression_refs(refs: Sequence[HelperExpressionRef]) -> List[HelperExpressionRef]:
+        seen = set()
+        out: List[HelperExpressionRef] = []
+        for ref in refs:
+            key = (ref.name, ref.file, ref.line)
             if key in seen:
                 continue
             seen.add(key)
