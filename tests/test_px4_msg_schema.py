@@ -61,6 +61,11 @@ uint8 vehicle_vtol_state # current state of the vtol, see VEHICLE_VTOL_STATE
         "rotary_wing",
         tmp_path / "PX4-Autopilot",
     ) == 1
+    assert normalize_px4_enum_value(
+        "vehicle_status.vehicle_type",
+        "vehicle_status_s::VEHICLE_TYPE_ROTARY_WING",
+        tmp_path / "PX4-Autopilot",
+    ) == 1
 
     vtol_state = registry["vtol_vehicle_status.vehicle_vtol_state"]
     assert vtol_state["constants"]["VEHICLE_VTOL_STATE_FW"] == 4

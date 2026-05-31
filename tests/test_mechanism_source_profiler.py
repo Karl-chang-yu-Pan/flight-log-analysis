@@ -347,6 +347,137 @@ float get_distance_to_next_waypoint(double lat_now, double lon_now, double lat_n
     assert helper.unresolved_reason is None
 
 
+def test_helper_expression_translation_lowers_assignment_control_flow(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float helper_value(float distance, float radius, float floor_value, float current_value)
+{
+    float selected = floor_value;
+
+    if (distance <= radius) {
+        selected = distance * 2.0f;
+    } else {
+        selected = max(selected, radius * 2.0f);
+    }
+
+    return max(selected, current_value);
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/example/helpers.cpp"],
+        helper_names=["helper_value"],
+    )
+
+    helper = helpers[0]
+    assert helper.statements[1]["kind"] == "if"
+    assert helper.statements[1]["then"][0] == {
+        "kind": "assign",
+        "target": "selected",
+        "expression": "distance * 2.0",
+    }
+    assert helper.lowered_return_expression == (
+        "max(((distance * 2.0 if distance <= radius else max((floor_value), radius * 2.0))), current_value)"
+    )
+    assert helper.unresolved_reason is None
+
+
+def test_helper_expression_translation_reports_generic_symbol_bindings(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.h").write_text(
+        """
+class Example {
+    DEFINE_PARAMETERS(
+        (ParamFloat<px4::params::NAV_ACC_RAD>) _param_nav_acc_rad
+    )
+};
+""",
+        encoding="utf-8",
+    )
+    (module_dir / "helpers.cpp").write_text(
+        """
+#include "helpers.h"
+
+float helper_value(const vehicle_global_position_s &input)
+{
+    const vehicle_global_position_s &gpos = input;
+    const float selected = _param_nav_acc_rad.get() + gpos.alt;
+    return selected;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/example/helpers.cpp"],
+        helper_names=["helper_value"],
+    )
+
+    helper = helpers[0]
+    assert helper.symbol_bindings["_param_nav_acc_rad.get()"] == "NAV_ACC_RAD"
+    assert helper.symbol_bindings["gpos.alt"] == "vehicle_global_position.alt"
+    assert {
+        "call": "_param_nav_acc_rad.get()",
+        "kind": "parameter_accessor",
+        "parameter": "NAV_ACC_RAD",
+    } in helper.call_resolutions
+
+
+def test_helper_expression_translation_canonicalizes_safe_math_by_rule(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float helper_math(float x, float y)
+{
+    const float clamped = math::constrain(x, -1.0f, 1.0f);
+    return ceilf(std::sqrt(acosf(clamped))) + fminf(y, 5.0f);
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/example/helpers.cpp"],
+        helper_names=["helper_math"],
+    )
+
+    helper = helpers[0]
+    assert helper.assignments["clamped"] == "constrain(x, -1.0, 1.0)"
+    assert helper.return_expression == "ceil(sqrt(acos(clamped))) + min(y, 5.0)"
+    assert {
+        "call": "math::constrain()",
+        "kind": "math_function",
+        "canonical_name": "constrain",
+    } in helper.call_resolutions
+    assert {
+        "call": "acosf()",
+        "kind": "math_function",
+        "canonical_name": "acos",
+    } in helper.call_resolutions
+    assert {
+        "call": "std::sqrt()",
+        "kind": "math_function",
+        "canonical_name": "sqrt",
+    } in helper.call_resolutions
+    assert {
+        "call": "fminf()",
+        "kind": "math_function",
+        "canonical_name": "min",
+    } in helper.call_resolutions
+
+
 def test_helper_expression_translation_marks_complex_helpers_unresolved(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"

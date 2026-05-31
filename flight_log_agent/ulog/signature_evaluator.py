@@ -10,6 +10,7 @@ from typing import Any
 
 from pyulog import ULog
 
+from flight_log_agent.expression_math import SAFE_MATH_FUNCTIONS, normalize_expression_function_names
 from flight_log_agent.px4.msg_schema import field_or_flattened_prefix_present, normalize_px4_enum_value
 
 
@@ -676,16 +677,7 @@ class ExpressionEvaluationError(ValueError):
     pass
 
 
-ALLOWED_EXPRESSION_FUNCTIONS = {
-    "min": min,
-    "max": max,
-    "sin": math.sin,
-    "cos": math.cos,
-    "tan": math.tan,
-    "sqrt": math.sqrt,
-    "atan2": math.atan2,
-    "radians": math.radians,
-}
+ALLOWED_EXPRESSION_FUNCTIONS = SAFE_MATH_FUNCTIONS
 
 
 def _expression_context(
@@ -823,7 +815,7 @@ def _evaluate_expression_over_context(expression: str, context: dict[str, Any]) 
 
 def _parse_expression(expression: str) -> ast.Expression:
     try:
-        tree = ast.parse(expression, mode="eval")
+        tree = ast.parse(normalize_expression_function_names(expression), mode="eval")
     except SyntaxError as exc:
         raise ExpressionEvaluationError("invalid expression syntax") from exc
     return tree
@@ -831,7 +823,7 @@ def _parse_expression(expression: str) -> ast.Expression:
 
 def _expression_names(expression: str) -> list[str]:
     try:
-        tree = ast.parse(expression, mode="eval")
+        tree = ast.parse(normalize_expression_function_names(expression), mode="eval")
     except SyntaxError:
         return []
     return [
@@ -854,6 +846,15 @@ def _eval_expression_node(node: ast.AST, env: dict[str, Any]) -> Any:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
         operand = _numeric_expression_value(_eval_expression_node(node.operand, env))
         return operand if isinstance(node.op, ast.UAdd) else -operand
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not bool(_eval_expression_node(node.operand, env))
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+        return all(bool(_eval_expression_node(value, env)) for value in node.values)
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+        return any(bool(_eval_expression_node(value, env)) for value in node.values)
+    if isinstance(node, ast.IfExp):
+        branch = node.body if bool(_eval_expression_node(node.test, env)) else node.orelse
+        return _eval_expression_node(branch, env)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
         left = _numeric_expression_value(_eval_expression_node(node.left, env))
         right = _numeric_expression_value(_eval_expression_node(node.right, env))

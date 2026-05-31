@@ -2528,6 +2528,98 @@ def test_evaluate_log_signature_reports_untranslated_helper_dependency(tmp_path,
     assert check["value"]["helper_dependency"]["args"] == ["vehicle_global_position.lat"]
 
 
+def test_evaluate_log_signature_evaluates_lowered_conditional_expression(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {"radius": 10.0, "floor_value": 15.0}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_global_position",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "dist": [4.0, 20.0],
+                        "current_value": [5.0, 30.0],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="Source expression lowered from assignment control flow.",
+        expected_signature=[],
+        candidate_windows=[{"name": "window", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "derived_expression",
+                "expression": (
+                    "max((distance * 2 if distance <= radius else max(floor_value, radius * 2)), "
+                    "current_value)"
+                ),
+                "variables": {
+                    "distance": "vehicle_global_position.dist",
+                    "current_value": "vehicle_global_position.current_value",
+                },
+                "window": "window",
+                "op": ">=",
+                "value": 8.0,
+                "mode": "all",
+            }
+        ],
+    )
+
+    check = result["numeric_checks"][0]
+    assert check["status"] == "passed"
+    assert check["value"]["values"] == [8.0, 30.0]
+
+
+def test_evaluate_log_signature_canonicalizes_safe_math_calls_by_rule(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_global_position",
+                    data={
+                        "timestamp": [1_000_000],
+                        "x": [0.25],
+                        "y": [9.0],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="Source expression uses C++ math spellings.",
+        expected_signature=[],
+        candidate_windows=[{"name": "window", "start_s": 1.0, "end_s": 1.0}],
+        required_signals=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "derived_expression",
+                "expression": "ceilf(std::sqrt(acosf(math::constrain(x, -1.0, 1.0)))) + fminf(y, 5.0)",
+                "variables": {
+                    "x": "vehicle_global_position.x",
+                    "y": "vehicle_global_position.y",
+                },
+                "window": "window",
+                "op": ">=",
+                "value": 6.0,
+            }
+        ],
+    )
+
+    check = result["numeric_checks"][0]
+    assert check["status"] == "passed"
+    assert check["value"]["values"] == [7.0]
+
+
 def test_evaluate_log_signature_reports_threshold_contradictions_and_missing_signals(tmp_path, monkeypatch):
     class FakeULog:
         def __init__(self, path):

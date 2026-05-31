@@ -44,8 +44,13 @@ def normalize_px4_enum_value(signal: str, value: Any, source_path: Optional[str 
     entry = registry.get(signal)
     if not entry or not isinstance(value, str):
         return value
-    normalized = _normalize_enum_label(value)
-    return entry["aliases"].get(normalized, value)
+    normalized_values = [_normalize_enum_label(value)]
+    if "::" in value:
+        normalized_values.append(_normalize_enum_label(value.rsplit("::", 1)[-1]))
+    for normalized in dedupe_keep_order(normalized_values):
+        if normalized in entry["aliases"]:
+            return entry["aliases"][normalized]
+    return value
 
 
 def is_valid_topic_field(signal: str, source_path: Optional[str | Path] = None) -> bool:

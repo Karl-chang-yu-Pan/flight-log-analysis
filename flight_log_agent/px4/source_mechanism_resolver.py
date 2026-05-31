@@ -359,6 +359,10 @@ class SourceMechanismResolver:
                 "read_fields": compact_refs(dedupe_field_refs(read_fields), limit=60),
                 "function_calls": compact_refs(dedupe_function_call_refs(function_calls), limit=80),
                 "helper_expressions": compact_refs(dedupe_helper_expression_refs(helper_expressions), limit=40),
+                "expression_verification_candidates": helper_expression_verification_candidates(
+                    dedupe_helper_expression_refs(helper_expressions),
+                    limit=40,
+                ),
                 "branch_conditions": compact_refs(dedupe_branch_conditions(branch_conditions), limit=80),
                 "parameter_predicates": [
                     compact_ref(ref) for ref in dedupe_parameter_predicates(parameter_predicates)[:40]
@@ -1275,6 +1279,36 @@ def dedupe_helper_expression_refs(refs: list[HelperExpressionRef]) -> list[Helpe
         seen.add(key)
         out.append(ref)
     return out
+
+
+def helper_expression_verification_candidates(
+    refs: list[HelperExpressionRef],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for ref in refs:
+        if not ref.lowered_return_expression:
+            continue
+        unresolved_calls = [
+            call
+            for call in ref.call_resolutions
+            if call.get("kind") in {"source_helper_candidate", "unresolved_runtime_call"}
+        ]
+        candidates.append(
+            {
+                "name": ref.name,
+                "source_file": ref.file,
+                "source_line": ref.line,
+                "lowered_return_expression": ref.lowered_return_expression,
+                "symbol_bindings": dict(ref.symbol_bindings),
+                "unresolved_calls": unresolved_calls,
+                "output_binding_required": True,
+            }
+        )
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def dedupe_branch_conditions(refs: list[BranchConditionRef]) -> list[BranchConditionRef]:

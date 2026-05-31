@@ -307,7 +307,12 @@ void run_vehicle_mode()
 
     assert helper["assignments"] == {"candidate": "current_alt + return_alt"}
     assert helper["return_expression"] == "max(candidate, current_alt)"
+    assert helper["lowered_return_expression"] == "max((current_alt + return_alt), current_alt)"
     assert helper["parameters"] == ["current_alt", "return_alt"]
+    verification_candidates = profile_packet.source_profile["expression_verification_candidates"]
+    verification_candidate = next(item for item in verification_candidates if item["name"] == "helper_altitude")
+    assert verification_candidate["lowered_return_expression"] == "max((current_alt + return_alt), current_alt)"
+    assert verification_candidate["output_binding_required"] is True
 
 
 def test_source_mechanism_resolver_prioritizes_requested_file_over_search_hits(tmp_path):
