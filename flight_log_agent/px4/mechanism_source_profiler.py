@@ -165,6 +165,47 @@ class MechanismSourceProfiler:
         "Tools/simulation",
         "platforms/nuttx/NuttX",
     )
+    LOW_VALUE_QUERY_TOKENS = {
+        "about",
+        "above",
+        "active",
+        "around",
+        "branch",
+        "case",
+        "chain",
+        "class",
+        "complete",
+        "compute",
+        "covering",
+        "defines",
+        "definition",
+        "definitions",
+        "determine",
+        "determines",
+        "especially",
+        "extract",
+        "fallback",
+        "function",
+        "handling",
+        "including",
+        "logic",
+        "mechanism",
+        "metadata",
+        "method",
+        "minimum",
+        "parameter",
+        "parameters",
+        "profile",
+        "references",
+        "relative",
+        "return",
+        "selected",
+        "selection",
+        "source",
+        "values",
+        "whether",
+    }
+    MAX_SCORE_PER_FILE_QUERY = 12.0
 
     # PX4/uORB declaration patterns.
     _UORB_DECL_PATTERNS: Sequence[Tuple[str, str, re.Pattern]] = (
@@ -296,6 +337,7 @@ class MechanismSourceProfiler:
         """
         query_list = self._normalize_queries(queries)
         by_file: Dict[str, SourceFileHit] = {}
+        score_by_file_query: Dict[Tuple[str, str], float] = {}
 
         for query in query_list:
             matches = self._ripgrep_or_python_search(query)
@@ -310,7 +352,14 @@ class MechanismSourceProfiler:
                 if len(hit.matches) < max_matches_per_file:
                     hit.matches.append(match)
 
-                hit.score += self._score_match(match, query)
+                score = self._score_match(match, query)
+                score_key = (match.file, query)
+                current_score = score_by_file_query.get(score_key, 0.0)
+                remaining_score = max(self.MAX_SCORE_PER_FILE_QUERY - current_score, 0.0)
+                applied_score = min(score, remaining_score)
+                if applied_score > 0:
+                    hit.score += applied_score
+                    score_by_file_query[score_key] = current_score + applied_score
 
         # Prefer real flight-stack source over tests/examples when scores tie.
         for hit in by_file.values():
@@ -845,11 +894,12 @@ class MechanismSourceProfiler:
             query = str(query).strip()
             if not query:
                 continue
-            normalized.append(query)
+            if self._should_keep_query(query):
+                normalized.append(query)
 
             # Also search individual strong-looking tokens for recall.
             for token in re.findall(r"[A-Z][A-Z0-9_]{2,}|[A-Za-z_][A-Za-z0-9_]{5,}", query):
-                if token not in normalized:
+                if self._should_keep_query(token) and token not in normalized:
                     normalized.append(token)
 
         return normalized
@@ -949,16 +999,51 @@ class MechanismSourceProfiler:
         boost = 0.0
         path_l = rel_file.lower()
         if path_l.startswith("src/lib/") or path_l.startswith("src/modules/"):
-            boost += 4.0
+            boost += 30.0
         elif path_l.startswith("src/drivers/") or path_l.startswith("src/include/"):
-            boost += 2.0
+            boost += 15.0
         elif path_l.startswith("src/"):
-            boost += 1.0
-        if "/test" in path_l or "_test" in path_l or "/unit" in path_l:
-            boost -= 2.0
+            boost += 5.0
+        if (
+            path_l.startswith("test/")
+            or "/test" in path_l
+            or "_test" in path_l
+            or "/unit" in path_l
+        ):
+            boost -= 100.0
+        if any(
+            marker in path_l
+            for marker in (
+                "/catch2/",
+                "/cmsis",
+                "/libvnc/",
+                "/third_party/",
+                "/third-party/",
+                "/vendor/",
+                "/vendors/",
+                "/external/",
+                "/generated/",
+                "/uavcan_drivers/",
+            )
+        ):
+            boost -= 80.0
+        if "/examples/" in path_l or path_l.startswith("examples/"):
+            boost -= 40.0
         if "/build" in path_l or "/.git" in path_l:
             boost -= 5.0
         return boost
+
+    def _should_keep_query(self, query: str) -> bool:
+        query = query.strip()
+        if not query:
+            return False
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", query):
+            return True
+        if "/" in query or "\\" in query or "." in query:
+            return True
+        if " " in query:
+            return True
+        return query.lower() not in self.LOW_VALUE_QUERY_TOKENS
 
     # ------------------------------------------------------------------
     # Source reading/parsing helpers
@@ -992,7 +1077,9 @@ class MechanismSourceProfiler:
     def _expand_companion_files(self, files: Sequence[Union[str, Path]]) -> List[Path]:
         """
         Include same-stem .h/.hpp/.cpp companions to catch declarations in
-        headers and usage in implementation files.
+        headers and usage in implementation files. Also include one level of
+        local quoted includes, which commonly hold parameter declarations for
+        helper implementations.
         """
         expanded: Dict[str, Path] = {}
         for file_path in files:
@@ -1007,8 +1094,28 @@ class MechanismSourceProfiler:
             for candidate in candidates:
                 if candidate.exists() and candidate.is_file():
                     expanded[str(candidate.resolve())] = candidate.resolve()
+                    for include in self._local_include_files(candidate):
+                        expanded[str(include.resolve())] = include.resolve()
 
         return list(expanded.values())
+
+    def _local_include_files(self, path: Path) -> List[Path]:
+        text = self._read_text(path)
+        if text is None:
+            return []
+        includes: List[Path] = []
+        for line in text.splitlines():
+            match = re.match(r'\s*#\s*include\s+"(?P<include>[^"]+)"', line)
+            if not match:
+                continue
+            include_path = (path.parent / match.group("include")).resolve()
+            try:
+                include_path.relative_to(self.source_path)
+            except ValueError:
+                continue
+            if include_path.exists() and include_path.is_file():
+                includes.append(include_path)
+        return includes
 
     def _read_text(self, path: Path) -> Optional[str]:
         try:

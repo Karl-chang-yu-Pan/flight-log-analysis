@@ -111,9 +111,13 @@ class SourceMechanismResolver:
                     hits_by_file[hit.file] = hit
 
             candidate_files = [
-                hit.file for hit in hits
-                if hit.file not in visited_files
+                requested_file for requested_file in self._requested_source_files(active_queries)
+                if requested_file not in visited_files
             ]
+            candidate_files.extend([
+                hit.file for hit in hits
+                if hit.file not in visited_files and hit.file not in candidate_files
+            ])
             if not candidate_files:
                 break
 
@@ -187,6 +191,7 @@ class SourceMechanismResolver:
                 published_topics + subscribed_topics,
                 assigned_fields + read_fields,
                 function_calls,
+                branch_conditions,
                 max_queries=max_expansion_queries,
             )
             if decide is not None:
@@ -349,7 +354,11 @@ class SourceMechanismResolver:
                 ],
                 "source_snippets": [
                     _safe_model_dump(snippet)
-                    for snippet in self._source_snippets_for_files(new_files)
+                    for snippet in self._source_snippets_for_files(
+                        new_files,
+                        active_queries=active_queries,
+                        hits=hits,
+                    )
                 ],
             },
             parameter_requirements=parameter_requirements,
@@ -464,10 +473,18 @@ class SourceMechanismResolver:
         self,
         files: list[str],
         *,
-        max_lines_per_file: int = 220,
-        max_chars_per_file: int = 12_000,
+        active_queries: Optional[list[str]] = None,
+        hits: Optional[list[SourceFileHit]] = None,
+        default_lines_per_file: int = 220,
+        context_lines: int = 12,
+        max_lines_per_snippet: int = 180,
+        max_chars_per_snippet: int = 12_000,
+        max_snippets_per_file: int = 4,
     ) -> list[SourceSnippet]:
         snippets: list[SourceSnippet] = []
+        query_targets = self._snippet_targets_from_queries(active_queries or [])
+        hit_targets = self._snippet_targets_from_hits(hits or [])
+
         for file in files:
             path = (self.source_path / file).resolve()
             try:
@@ -480,19 +497,123 @@ class SourceMechanismResolver:
                 continue
 
             lines = text.splitlines()
-            selected = lines[:max_lines_per_file]
-            snippet_text = "\n".join(selected)
-            if len(snippet_text) > max_chars_per_file:
-                snippet_text = snippet_text[: max_chars_per_file - 3] + "..."
-            snippets.append(
-                SourceSnippet(
-                    file=file,
-                    start_line=1,
-                    end_line=min(len(lines), len(selected)),
-                    text=snippet_text,
-                )
+            targets = [
+                *query_targets.get(file, []),
+                *self._function_targets_for_file(file, lines, active_queries or []),
+                *hit_targets.get(file, []),
+            ]
+            ranges = self._snippet_ranges(
+                len(lines),
+                targets,
+                context_lines=context_lines,
+                max_lines_per_snippet=max_lines_per_snippet,
+                max_snippets=max_snippets_per_file,
             )
+            if not ranges:
+                ranges = [(1, min(len(lines), default_lines_per_file))]
+
+            for start_line, end_line in ranges:
+                selected = lines[start_line - 1:end_line]
+                snippet_text = "\n".join(selected)
+                if len(snippet_text) > max_chars_per_snippet:
+                    snippet_text = snippet_text[: max_chars_per_snippet - 3] + "..."
+                snippets.append(
+                    SourceSnippet(
+                        file=file,
+                        start_line=start_line,
+                        end_line=end_line,
+                        text=snippet_text,
+                    )
+                )
         return snippets
+
+    def _requested_source_files(self, queries: list[str]) -> list[str]:
+        files: list[str] = []
+        for query in queries:
+            for file in extract_source_file_paths(query):
+                path = (self.source_path / file).resolve()
+                try:
+                    path.relative_to(self.source_path.resolve())
+                except ValueError:
+                    continue
+                if path.exists() and path.is_file():
+                    files.append(file)
+        return dedupe_keep_order(files)
+
+    def _snippet_targets_from_queries(self, queries: list[str]) -> dict[str, list[tuple[int, int]]]:
+        targets: dict[str, list[tuple[int, int]]] = {}
+        for query in queries:
+            files = extract_source_file_paths(query)
+            if not files:
+                continue
+            ranges = extract_line_ranges(query)
+            if not ranges:
+                continue
+            for file in files:
+                targets.setdefault(file, []).extend(ranges)
+        return targets
+
+    def _snippet_targets_from_hits(self, hits: list[SourceFileHit]) -> dict[str, list[tuple[int, int]]]:
+        targets: dict[str, list[tuple[int, int]]] = {}
+        for hit in hits:
+            for match in hit.matches[:2]:
+                targets.setdefault(hit.file, []).append((match.line, match.line))
+        return targets
+
+    def _function_targets_for_file(
+        self,
+        file: str,
+        lines: list[str],
+        queries: list[str],
+    ) -> list[tuple[int, int]]:
+        function_names: list[str] = []
+        for query in queries:
+            files = extract_source_file_paths(query)
+            if files and file not in files:
+                continue
+            function_names.extend(extract_requested_function_names(query))
+
+        targets: list[tuple[int, int]] = []
+        for function_name in dedupe_keep_order(function_names):
+            short_name = function_name.split("::")[-1]
+            pattern = re.compile(
+                rf"(?:\b{re.escape(function_name)}\s*\(|\b{re.escape(short_name)}\s*\()"
+            )
+            for index, line in enumerate(lines, start=1):
+                if pattern.search(line):
+                    targets.append((index, min(index + 160, len(lines))))
+                    break
+        return targets
+
+    @staticmethod
+    def _snippet_ranges(
+        line_count: int,
+        targets: list[tuple[int, int]],
+        *,
+        context_lines: int,
+        max_lines_per_snippet: int,
+        max_snippets: int,
+    ) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        for start, end in targets:
+            if line_count <= 0:
+                continue
+            start = max(1, min(int(start), line_count))
+            end = max(start, min(int(end), line_count))
+            start = max(1, start - context_lines)
+            end = min(line_count, end + context_lines)
+            if end - start + 1 > max_lines_per_snippet:
+                end = start + max_lines_per_snippet - 1
+            ranges.append((start, end))
+
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(ranges):
+            if not merged or start > merged[-1][1] + 1:
+                merged.append((start, end))
+            else:
+                prev_start, prev_end = merged[-1]
+                merged[-1] = (prev_start, max(prev_end, end))
+        return merged[:max_snippets]
 
     def _seed_queries(self, user_question: str) -> list[str]:
         queries = [user_question.strip()]
@@ -508,15 +629,33 @@ class SourceMechanismResolver:
         topics: list[TopicRef],
         fields: list[FieldRef],
         function_calls: list[FunctionCallRef],
+        branch_conditions: list[BranchConditionRef],
         *,
         max_queries: int,
     ) -> list[str]:
         queries: list[str] = []
         queries.extend(ref.name for ref in parameters if ref.name)
+        queries.extend(self._helper_call_queries(function_calls, branch_conditions))
         queries.extend(ref.topic for ref in topics if ref.topic)
         queries.extend(ref.field for ref in fields if ref.field)
-        queries.extend(ref.name for ref in function_calls if self._is_relevant_function_name(ref.name))
         return dedupe_keep_order([query for query in queries if query])[:max_queries]
+
+    def _helper_call_queries(
+        self,
+        function_calls: list[FunctionCallRef],
+        branch_conditions: list[BranchConditionRef],
+    ) -> list[str]:
+        queries: list[str] = []
+        for ref in function_calls:
+            if self._is_relevant_function_name(ref.name):
+                queries.append(ref.name)
+        for ref in branch_conditions:
+            queries.extend(
+                name
+                for name in extract_call_names(ref.condition)
+                if self._is_relevant_function_name(name)
+            )
+        return dedupe_keep_order(queries)
 
     def _build_candidates(
         self,
@@ -779,7 +918,8 @@ class SourceMechanismResolver:
         lowered = name.lower()
         return not (
             lowered.startswith("orb_")
-            or lowered in {"get", "update", "publish", "copy", "min", "max", "abs"}
+            or lowered in {"get", "set", "update", "publish", "copy", "min", "max", "abs"}
+            or lowered in {"if", "for", "while", "switch", "return", "sizeof"}
         )
 
 
@@ -978,6 +1118,80 @@ def dedupe_keep_order(items: list[str]) -> list[str]:
             continue
         seen.add(item)
         out.append(item)
+    return out
+
+
+def extract_call_names(text: str) -> list[str]:
+    names = re.findall(
+        r"(?<![#A-Za-z0-9_])((?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        text or "",
+    )
+    ignored = {"if", "for", "while", "switch", "return", "sizeof"}
+    return [name for name in names if name not in ignored]
+
+
+def extract_source_file_paths(text: str) -> list[str]:
+    pattern = re.compile(
+        r"\b(?P<file>(?:src|platforms|boards|ROMFS|msg|test)/"
+        r"[A-Za-z0-9_./+\-]+"
+        r"\.(?:c|cc|cpp|cxx|h|hpp|hh|hxx|cuh|cu))\b"
+    )
+    return dedupe_keep_order([
+        match.group("file").rstrip(".,;:")
+        for match in pattern.finditer(text or "")
+    ])
+
+
+def extract_line_ranges(text: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for match in re.finditer(
+        r"\b(?:lines?|around(?:\s+lines?)?)\s+"
+        r"(?P<start>\d{1,6})\s*(?:-|to|:)\s*(?P<end>\d{1,6})\b",
+        text or "",
+        flags=re.IGNORECASE,
+    ):
+        start = int(match.group("start"))
+        end = int(match.group("end"))
+        ranges.append((min(start, end), max(start, end)))
+    for match in re.finditer(
+        r"\bline\s+(?P<line>\d{1,6})\b",
+        text or "",
+        flags=re.IGNORECASE,
+    ):
+        line = int(match.group("line"))
+        ranges.append((line, line))
+    return dedupe_line_ranges(ranges)
+
+
+def extract_requested_function_names(text: str) -> list[str]:
+    names = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_~]*(?:::[A-Za-z_][A-Za-z0-9_~]*)?)\s*\(\)",
+        text or "",
+    )
+    ignored = {
+        "around",
+        "profile",
+        "including",
+        "function",
+        "functions",
+        "helper",
+        "helpers",
+    }
+    return dedupe_keep_order([
+        name for name in names
+        if name.lower() not in ignored
+    ])
+
+
+def dedupe_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    seen: set[tuple[int, int]] = set()
+    out: list[tuple[int, int]] = []
+    for start, end in ranges:
+        key = (start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
     return out
 
 

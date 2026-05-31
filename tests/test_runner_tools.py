@@ -899,6 +899,29 @@ def test_applicability_uses_px4_schema_when_inventory_lacks_field(tmp_path):
     assert result.missing_required_signals == []
 
 
+def test_applicability_treats_flattened_struct_prefix_as_present(tmp_path):
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Nested prefix mechanism",
+        summary="Needs a nested PX4 message prefix.",
+        source_refs=[],
+        required_signals=["position_setpoint_triplet.current"],
+    )
+
+    result = runner.evaluate_candidate_applicability(
+        candidate,
+        {
+            "available_topics": ["position_setpoint_triplet"],
+            "topic_fields": {"position_setpoint_triplet": ["timestamp", "current.alt", "current.valid"]},
+        },
+        [],
+        None,
+    )
+
+    assert result.available_required_signals == ["position_setpoint_triplet.current"]
+    assert result.missing_required_signals == []
+
+
 def test_applicability_derives_fallback_windows_from_check_names(tmp_path):
     runner = load_runner(tmp_path)
     candidate = runner.MechanismCandidate(
@@ -927,13 +950,13 @@ def test_applicability_derives_fallback_windows_from_check_names(tmp_path):
         None,
     )
 
-    assert result.candidate_windows == [
-        runner.WindowSpec(
-            name="source_window",
-            start_s=2.0,
-            end_s=7.5,
-            reason="Fallback verification window from full timeline span for check window 'source_window'.",
-        )
+    assert [window.model_dump() for window in result.candidate_windows] == [
+        {
+            "name": "source_window",
+            "start_s": 2.0,
+            "end_s": 7.5,
+            "reason": "Fallback verification window from full timeline span for check window 'source_window'.",
+        }
     ]
     assert "No candidate verification window" not in " ".join(result.unresolved_conditions)
 
@@ -1043,6 +1066,17 @@ def test_source_relevant_fields_resolve_nested_px4_schema_fields(tmp_path):
 
     assert candidate.required_signals == ["position_setpoint_triplet.current.alt"]
     assert candidate.source_relevant_fields == ["position_setpoint_triplet.current.alt"]
+
+
+def test_extract_signal_reference_keeps_nested_scalar_field(tmp_path):
+    runner = load_runner(tmp_path)
+
+    assert (
+        runner.extract_signal_reference(
+            "Check whether position_setpoint_triplet.current.alt is logged before verification."
+        )
+        == "position_setpoint_triplet.current.alt"
+    )
 
 
 def _sample_report(runner, candidate, applicability, plots=None):
@@ -2300,6 +2334,54 @@ def test_evaluate_log_signature_supports_parameter_and_field_checks(tmp_path, mo
         "VT_TYPE satisfied the source branch.",
     ]
     assert result["check_results"][1]["value"]["max_abs_error"] == 0.2
+
+
+def test_evaluate_log_signature_treats_flattened_prefix_as_present_only(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.data_list = [
+                SimpleNamespace(
+                    name="position_setpoint_triplet",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "current.alt": [35.0, 35.2, 34.9],
+                        "current.valid": [True, True, True],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="RTL selected a current setpoint.",
+        expected_signature=[],
+        candidate_windows=[{"name": "rtl", "start_s": 1.0, "end_s": 3.0}],
+        required_signals=["position_setpoint_triplet.current"],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "topic_field_present",
+                "signal": "position_setpoint_triplet.current",
+                "supports": "Current position setpoint struct was logged.",
+            },
+            {
+                "type": "threshold",
+                "signal": "position_setpoint_triplet.current",
+                "window": "rtl",
+                "metric": "mean",
+                "op": ">=",
+                "value": 30.0,
+            },
+        ],
+    )
+
+    assert result["required_signals"]["present"] == ["position_setpoint_triplet.current"]
+    assert result["missing_required_signals"] == []
+    assert result["numeric_checks"][0]["status"] == "passed"
+    assert result["numeric_checks"][0]["value"]["field_present"] is True
+    assert result["numeric_checks"][1]["status"] == "unresolved"
+    assert result["numeric_checks"][1]["message"] == "missing field for signal: position_setpoint_triplet.current"
 
 
 def test_evaluate_log_signature_reports_contradictions_and_missing_signals(tmp_path, monkeypatch):

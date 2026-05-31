@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from flight_log_agent.models import ApplicabilityResult, MechanismCandidate, WindowSpec
-from flight_log_agent.px4.msg_schema import load_px4_msg_schema
+from flight_log_agent.px4.msg_schema import field_or_flattened_prefix_present, load_px4_msg_schema
 
 
 def evaluate_candidate_applicability(
@@ -148,8 +148,8 @@ def check_required_signals(
         schema_fields = (schema_topic_fields or {}).get(topic)
         field_known = (
             topic not in topic_fields
-            or field in (fields or [])
-            or field in (schema_fields or [])
+            or field_or_flattened_prefix_present(field, fields or [])
+            or field_or_flattened_prefix_present(field, schema_fields or [])
         )
         if topic in available_topics and field_known:
             available.append(signal)

@@ -888,7 +888,8 @@ def parse_predicate_literal(value: str) -> Any:
 
 
 def extract_signal_reference(text: str) -> Optional[str]:
-    match = re.search(r"\b([a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\b", text)
+    signal_part = r"[A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?"
+    match = re.search(rf"\b([a-z][a-z0-9_]*\.{signal_part}(?:\.{signal_part})*)\b", text)
     return match.group(1) if match else None
 
 

@@ -134,6 +134,179 @@ void navigateTo(position_setpoint_s sp)
     assert any("No time-series signal comparison" in note for note in candidate.resolver_notes)
 
 
+def test_source_mechanism_resolver_follows_generic_helper_call_to_parameter(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "mode.cpp").write_text(
+        """
+class ModeTest {
+    Navigator *_owner;
+
+    void run_vehicle_mode()
+    {
+        if (_owner->get_acceptance_radius() > 0.0f) {
+            do_work();
+        }
+    }
+};
+""",
+        encoding="utf-8",
+    )
+    (module_dir / "navigator.h").write_text(
+        """
+class Navigator {
+    ParamFloat<px4::params::NAV_ACC_RAD> _param_nav_acc_rad;
+    float get_acceptance_radius();
+    float get_default_acceptance_radius();
+};
+""",
+        encoding="utf-8",
+    )
+    (module_dir / "navigator_main.cpp").write_text(
+        """
+#include "navigator.h"
+
+float Navigator::get_default_acceptance_radius()
+{
+    return _param_nav_acc_rad.get();
+}
+
+float Navigator::get_acceptance_radius()
+{
+    return get_default_acceptance_radius();
+}
+""",
+        encoding="utf-8",
+    )
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+
+    result = asyncio.run(
+        resolver.discover(
+            "Why did the selected mode use the helper radius?",
+            build_source_discovery_log_context({"parameters": {"NAV_ACC_RAD": 12.5}}),
+            seed_queries=["run_vehicle_mode"],
+            max_depth=3,
+        )
+    )
+
+    candidate = result.candidates[0]
+    assert "get_acceptance_radius" in result.expansion_queries
+    assert "src/modules/navigator/mode.cpp" in candidate.source_files
+    assert "src/modules/navigator/navigator_main.cpp" in candidate.source_files
+    assert any(requirement.name == "NAV_ACC_RAD" for requirement in candidate.controlling_parameters)
+    nav_acc_rad = next(
+        requirement for requirement in candidate.controlling_parameters
+        if requirement.name == "NAV_ACC_RAD"
+    )
+    assert nav_acc_rad.actual_value == 12.5
+    assert nav_acc_rad.gate_result == "verification_required"
+
+
+def test_source_mechanism_resolver_profiles_requested_file_line_snippets(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "start.cpp").write_text(
+        "void start() { trigger_source_search(); }\n",
+        encoding="utf-8",
+    )
+    deep_lines = [f"// filler {index}" for index in range(1, 260)]
+    deep_lines[184] = "float requested_line_185 = helper_value();"
+    (module_dir / "deep.cpp").write_text("\n".join(deep_lines), encoding="utf-8")
+
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+    packets = []
+
+    async def decide(packet):
+        packets.append(packet)
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision()
+        if packet.new_files == ["src/modules/navigator/start.cpp"]:
+            return SourceDiscoveryDecision(
+                expansion_queries=[
+                    "Profile src/modules/navigator/deep.cpp around lines 180-190 for helper_value()."
+                ]
+            )
+        return SourceDiscoveryDecision(stop=True)
+
+    asyncio.run(
+        resolver.discover(
+            "Why did it call trigger_source_search?",
+            build_source_discovery_log_context({}),
+            seed_queries=["trigger_source_search"],
+            decide=decide,
+            max_depth=2,
+        )
+    )
+
+    deep_packet = next(
+        packet for packet in packets
+        if packet.new_files == ["src/modules/navigator/deep.cpp"]
+    )
+    deep_snippet = next(
+        snippet for snippet in deep_packet.source_profile["source_snippets"]
+        if snippet["file"] == "src/modules/navigator/deep.cpp"
+    )
+
+    assert deep_snippet["start_line"] <= 185 <= deep_snippet["end_line"]
+    assert "requested_line_185" in deep_snippet["text"]
+    assert "filler 30" not in deep_snippet["text"]
+
+
+def test_source_mechanism_resolver_prioritizes_requested_file_over_search_hits(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    for index in range(3):
+        (module_dir / f"noise_{index}.cpp").write_text(
+            "void noise() { shared_noise_token(); }\n",
+            encoding="utf-8",
+        )
+    (module_dir / "requested.cpp").write_text(
+        "\n".join(f"// requested filler {index}" for index in range(1, 80)),
+        encoding="utf-8",
+    )
+
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+    packets = []
+
+    async def decide(packet):
+        packets.append(packet)
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision()
+        return SourceDiscoveryDecision(stop=True)
+
+    asyncio.run(
+        resolver.discover(
+            "Profile src/modules/navigator/requested.cpp around lines 40-42 for shared_noise_token",
+            build_source_discovery_log_context({}),
+            decide=decide,
+            max_depth=1,
+            max_files_per_query=3,
+            max_profile_files_per_iteration=1,
+        )
+    )
+
+    profile_packet = next(packet for packet in packets if packet.new_files)
+    assert profile_packet.new_files == ["src/modules/navigator/requested.cpp"]
+    requested_snippets = [
+        snippet for snippet in profile_packet.source_profile["source_snippets"]
+        if snippet["file"] == "src/modules/navigator/requested.cpp"
+    ]
+    assert requested_snippets
+    assert any(snippet["start_line"] <= 40 <= snippet["end_line"] for snippet in requested_snippets)
+
+
 def test_source_mechanism_resolver_returns_unresolved_when_no_source_matches(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     source_path.mkdir()

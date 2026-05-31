@@ -213,6 +213,49 @@ def test_search_ranks_px4_source_tiers(tmp_path):
     assert ranked_files.index("src/systemcmds/param/param.cpp") < ranked_files.index("test/mavsdk_tests/catch2/catch.hpp")
 
 
+def test_search_filters_broad_prompt_noise_and_downranks_vendor_paths(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    relevant = source_path / "src" / "modules" / "navigator" / "mode.cpp"
+    catch_header = source_path / "test" / "mavsdk_tests" / "catch2" / "catch.hpp"
+    vendor_header = (
+        source_path
+        / "src"
+        / "drivers"
+        / "uavcan"
+        / "uavcan_drivers"
+        / "stm32h7"
+        / "driver"
+        / "include"
+        / "fdcan.h"
+    )
+    relevant.parent.mkdir(parents=True)
+    catch_header.parent.mkdir(parents=True)
+    vendor_header.parent.mkdir(parents=True)
+    relevant.write_text(
+        "void update_altitude_waypoint() { calculate_setpoint(); }\n",
+        encoding="utf-8",
+    )
+    catch_header.write_text(
+        "\n".join(["// around return source including parameter values"] * 200),
+        encoding="utf-8",
+    )
+    vendor_header.write_text(
+        "\n".join(["// around selection definitions including source handling"] * 200),
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    hits = profiler.search_related_source_files(
+        "Open src/modules/navigator/mode.cpp around return altitude source including parameter values",
+        max_files=10,
+    )
+    ranked_files = [hit.file for hit in hits]
+
+    assert ranked_files[0] == "src/modules/navigator/mode.cpp"
+    assert "test/mavsdk_tests/catch2/catch.hpp" not in ranked_files[:3]
+    assert "src/drivers/uavcan/uavcan_drivers/stm32h7/driver/include/fdcan.h" not in ranked_files[:3]
+
+
 def test_parameter_feasibility_gate_uses_only_discovered_parameters():
     context = build_source_discovery_log_context(
         {

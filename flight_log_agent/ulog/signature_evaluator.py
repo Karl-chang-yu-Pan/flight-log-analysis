@@ -9,6 +9,8 @@ from typing import Any
 
 from pyulog import ULog
 
+from flight_log_agent.px4.msg_schema import field_or_flattened_prefix_present
+
 
 NUMERIC_METRICS = {"min", "max", "mean", "median", "std", "start", "end", "delta", "count"}
 
@@ -470,13 +472,14 @@ def _check_topic_field_present(topics: dict[str, Any], windows: dict[str, dict],
     topic_name, field_name = parsed
     topic = topics.get(topic_name)
     data = getattr(topic, "data", {}) or {} if topic is not None else {}
-    passed = topic is not None and field_name in data and "timestamp" in data
+    field_present = field_or_flattened_prefix_present(field_name, data)
+    passed = topic is not None and field_present and "timestamp" in data
     message = _message(check, passed, f"{signal} is logged" if passed else f"{signal} is not logged")
     return _check_result(
         check,
         status="passed" if passed else "failed",
         message=message,
-        value={"signal": signal, "topic_present": topic is not None, "field_present": field_name in data},
+        value={"signal": signal, "topic_present": topic is not None, "field_present": field_present},
     )
 
 
@@ -582,7 +585,7 @@ def _required_signal_status(topics: dict[str, Any], required_signals: list[str])
         topic_name, field_name = parsed
         topic = topics.get(topic_name)
         data = getattr(topic, "data", {}) or {} if topic is not None else {}
-        if topic is not None and field_name in data and "timestamp" in data:
+        if topic is not None and field_or_flattened_prefix_present(field_name, data) and "timestamp" in data:
             present.append(signal)
         else:
             missing.append(signal)

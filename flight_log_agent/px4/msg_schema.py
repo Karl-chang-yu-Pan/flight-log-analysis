@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 
 DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parents[2] / "ref" / "PX4-Autopilot"
@@ -56,6 +56,13 @@ def resolve_topic_field(
     if len(matches) == 1:
         return f"{topic}.{matches[0]}"
     return None
+
+
+def field_or_flattened_prefix_present(field: str, fields: Iterable[str]) -> bool:
+    if not field:
+        return False
+    known_fields = set(fields)
+    return field in known_fields or any(item.startswith(f"{field}.") for item in known_fields)
 
 
 @lru_cache(maxsize=8)
