@@ -1017,6 +1017,38 @@ def test_source_mechanism_conversion_emits_executable_checks(tmp_path):
     assert candidate.numeric_checks[1].signal == "position_setpoint.alt"
 
 
+def test_source_mechanism_conversion_preserves_derived_expression_checks(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="RTL altitude expression source path",
+        source_mechanism="PX4 computes a return altitude from logged altitude and RTL_RETURN_ALT.",
+        verification_checks=[
+            runner.SourceBackedVerificationCheck(
+                check=runner.RelationshipCheckSpec(
+                    type="derived_expression",
+                    expression="current_alt + RTL_RETURN_ALT",
+                    variables=[{"name": "current_alt", "source": "vehicle_local_position.z"}],
+                    window="rtl",
+                    op=">=",
+                    value=100,
+                ),
+                source_file="src/modules/navigator/rtl.cpp",
+                source_line=42,
+            )
+        ],
+    )
+
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
+
+    assert candidate.required_signals == []
+    assert candidate.numeric_checks[0].type == "derived_expression"
+    assert candidate.numeric_checks[0].expression == "current_alt + RTL_RETURN_ALT"
+    assert [
+        variable.model_dump() if hasattr(variable, "model_dump") else variable
+        for variable in candidate.numeric_checks[0].variables
+    ] == [{"name": "current_alt", "source": "vehicle_local_position.z"}]
+
+
 def test_source_relevant_fields_are_not_hard_required_without_checks(tmp_path):
     runner = load_runner(tmp_path)
     source_candidate = runner.SourceMechanismCandidate(
@@ -2253,6 +2285,93 @@ uint8 vehicle_vtol_state # current state of the vtol, see VEHICLE_VTOL_STATE
         {"time_s": 2.0, "from": 3, "to": 4}
     ]
     assert result["numeric_checks"][2]["status"] == "passed"
+
+
+def test_evaluate_log_signature_evaluates_derived_expression(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {"RTL_RETURN_ALT": 20.0}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_local_position",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "z": [90.0, 95.0],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="RTL derived return altitude should stay above threshold.",
+        expected_signature=[],
+        candidate_windows=[{"name": "rtl", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "derived_expression",
+                "expression": "max(current_alt + RTL_RETURN_ALT, 100)",
+                "variables": {"current_alt": "vehicle_local_position.z"},
+                "window": "rtl",
+                "op": ">=",
+                "value": 110.0,
+                "mode": "all",
+                "supports": "Derived RTL altitude expression stayed above the expected threshold.",
+            }
+        ],
+    )
+
+    check = result["numeric_checks"][0]
+    assert check["status"] == "passed"
+    assert check["value"]["values"] == [110.0, 115.0]
+    assert result["evidence"] == ["Derived RTL altitude expression stayed above the expected threshold."]
+
+
+def test_evaluate_log_signature_reports_missing_derived_expression_input(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {"RTL_RETURN_ALT": 20.0}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_local_position",
+                    data={
+                        "timestamp": [1_000_000],
+                        "z": [90.0],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="RTL derived return altitude references unresolved runtime state.",
+        expected_signature=[],
+        candidate_windows=[{"name": "rtl", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=[],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "derived_expression",
+                "expression": "current_alt + terrain_clearance + RTL_RETURN_ALT",
+                "variables": {"current_alt": "vehicle_local_position.z"},
+                "window": "rtl",
+                "op": ">=",
+                "value": 110.0,
+            }
+        ],
+    )
+
+    check = result["numeric_checks"][0]
+    assert check["status"] == "unresolved"
+    assert check["message"] == (
+        "cannot evaluate expression 'current_alt + terrain_clearance + RTL_RETURN_ALT': "
+        "missing input terrain_clearance"
+    )
+    assert check["value"]["missing_inputs"] == ["terrain_clearance"]
 
 
 def test_evaluate_log_signature_reports_threshold_contradictions_and_missing_signals(tmp_path, monkeypatch):

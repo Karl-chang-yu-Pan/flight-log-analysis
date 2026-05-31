@@ -110,6 +110,11 @@ class WindowSpec(BaseModel):
     reason: Optional[str] = None
 
 
+class ExpressionVariableRef(BaseModel):
+    name: str
+    source: str
+
+
 class RelationshipCheckSpec(BaseModel):
     type: Literal[
         "threshold",
@@ -125,6 +130,7 @@ class RelationshipCheckSpec(BaseModel):
         "branch_parameter_satisfied",
         "tracks_parameter_value",
         "topic_field_present",
+        "derived_expression",
         "custom",
     ]
     window: Optional[str] = None
@@ -147,6 +153,9 @@ class RelationshipCheckSpec(BaseModel):
     max_error: Optional[float] = None
     min_error: Optional[float] = None
     min_delta: Optional[float] = None
+    expression: Optional[str] = None
+    expected_expression: Optional[str] = None
+    variables: list[ExpressionVariableRef] = Field(default_factory=list)
     supports: Optional[str] = None
     contradicts: Optional[str] = None
     description: Optional[str] = None

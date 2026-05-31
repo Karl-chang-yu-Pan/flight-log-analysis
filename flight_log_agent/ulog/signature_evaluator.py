@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import math
 import re
 from collections import Counter
@@ -115,6 +116,7 @@ def _run_check(
         "branch_parameter_satisfied": _check_branch_parameter_satisfied,
         "tracks_parameter_value": _check_tracks_parameter_value,
         "topic_field_present": _check_topic_field_present,
+        "derived_expression": _check_derived_expression,
     }
     handler = handlers.get(check_type)
     if handler is None:
@@ -466,6 +468,106 @@ def _check_tracks_parameter_value(
     )
 
 
+def _check_derived_expression(
+    topics: dict[str, Any],
+    windows: dict[str, dict],
+    parameters: dict[str, Any],
+    check: dict,
+) -> dict:
+    expression = str(check.get("expression") or "").strip()
+    if not expression:
+        return _check_result(check, status="unresolved", message="derived expression is missing")
+
+    window = _window_for_check(windows, check)
+    if window is None:
+        return _check_result(check, status="unresolved", message=f"unknown window: {check.get('window')}")
+
+    context = _expression_context(
+        topics,
+        parameters,
+        check,
+        expression,
+        window,
+        expected_expression=str(check.get("expected_expression") or "").strip(),
+    )
+    if context["missing"]:
+        missing = ", ".join(context["missing"])
+        return _check_result(
+            check,
+            status="unresolved",
+            message=f"cannot evaluate expression '{expression}': missing input {missing}",
+            value={"expression": expression, "missing_inputs": context["missing"]},
+        )
+
+    try:
+        results = _evaluate_expression_over_context(expression, context)
+    except ExpressionEvaluationError as exc:
+        return _check_result(
+            check,
+            status="unresolved",
+            message=f"cannot evaluate expression '{expression}': {exc}",
+            value={"expression": expression},
+        )
+
+    if not results:
+        return _check_result(check, status="unresolved", message=f"no expression samples for {expression}")
+
+    op = str(check.get("op") or "").strip()
+    expected_expression = str(check.get("expected_expression") or "").strip()
+    expected_literal = check.get("value")
+    comparisons: list[bool] = []
+    expected_values: list[Any] = []
+    try:
+        if expected_expression:
+            expected_results = _evaluate_expression_over_context(expected_expression, context)
+            expected_values = [value for _, value in expected_results]
+            if len(expected_values) != len(results):
+                raise ExpressionEvaluationError("expected expression produced mismatched samples")
+            op = op or "=="
+            comparisons = [
+                _compare_literal(actual, op, expected)
+                for (_, actual), expected in zip(results, expected_values)
+            ]
+        elif op:
+            comparisons = [
+                _compare_literal(actual, op, expected_literal)
+                for _, actual in results
+            ]
+            expected_values = [expected_literal]
+        else:
+            comparisons = [bool(actual) for _, actual in results]
+    except (ExpressionEvaluationError, ValueError, TypeError) as exc:
+        return _check_result(
+            check,
+            status="unresolved",
+            message=f"cannot evaluate expression '{expression}': {exc}",
+            value={"expression": expression},
+        )
+
+    mode = str(check.get("mode") or "any")
+    passed = all(comparisons) if mode == "all" else any(comparisons)
+    values = [_expression_display_value(value) for _, value in results]
+    message = _message(
+        check,
+        passed,
+        f"{expression} values include {dict(Counter(values))}",
+    )
+    value: dict[str, Any] = {
+        "expression": expression,
+        "mode": mode,
+        "values": values[:20],
+    }
+    if op:
+        value["op"] = op
+        value["expected"] = expected_expression or expected_literal
+    return _check_result(
+        check,
+        status="passed" if passed else "failed",
+        message=message,
+        value=value,
+    )
+
+
 def _check_topic_field_present(topics: dict[str, Any], windows: dict[str, dict], parameters: dict[str, Any], check: dict) -> dict:
     signal = str(check.get("signal") or "")
     parsed = _parse_signal(signal)
@@ -554,6 +656,254 @@ def _check_samples(
         return {"result": _check_result(check, status="unresolved", message=f"no samples for {signal} in window {window['name']}")}
 
     return {"samples": samples, "window": window}
+
+
+class ExpressionEvaluationError(ValueError):
+    pass
+
+
+ALLOWED_EXPRESSION_FUNCTIONS = {
+    "min": min,
+    "max": max,
+}
+
+
+def _expression_context(
+    topics: dict[str, Any],
+    parameters: dict[str, Any],
+    check: dict,
+    expression: str,
+    window: dict[str, Any],
+    *,
+    expected_expression: str = "",
+) -> dict[str, Any]:
+    variables = _expression_variables_map(check.get("variables") or {})
+    names = _expression_names(expression)
+    if expected_expression:
+        names.extend(_expression_names(expected_expression))
+    names = dedupe_keep_order(names)
+
+    scalars: dict[str, Any] = {}
+    series: dict[str, list[tuple[float, Any]]] = {}
+    missing: list[str] = []
+
+    for name in names:
+        if name in ALLOWED_EXPRESSION_FUNCTIONS:
+            continue
+        source = variables.get(name)
+        if source is None and name in parameters:
+            scalars[name] = _json_safe_value(parameters[name])
+            continue
+        if source is None:
+            missing.append(name)
+            continue
+
+        source_text = str(source)
+        if source_text in parameters:
+            scalars[name] = _json_safe_value(parameters[source_text])
+            continue
+        literal = _number(source_text)
+        if literal is not None:
+            scalars[name] = literal
+            continue
+        signal_samples = _signal_window_samples(topics, source_text, window)
+        if "missing" in signal_samples:
+            missing.append(f"{name} ({signal_samples['missing']})")
+            continue
+        series[name] = signal_samples["samples"]
+
+    times: list[float] = []
+    if series:
+        first_series = next(iter(series.values()))
+        times = [time_s for time_s, _ in first_series]
+
+    return {
+        "scalars": scalars,
+        "series": series,
+        "times": times,
+        "missing": missing,
+    }
+
+
+def _signal_window_samples(topics: dict[str, Any], signal: str, window: dict[str, Any]) -> dict[str, Any]:
+    parsed = _parse_signal(signal)
+    if parsed is None:
+        return {"missing": signal}
+    topic_name, field_name = parsed
+    topic = topics.get(topic_name)
+    if topic is None:
+        return {"missing": signal}
+    data = getattr(topic, "data", {}) or {}
+    timestamps = data.get("timestamp")
+    values = data.get(field_name)
+    if timestamps is None or values is None:
+        return {"missing": signal}
+    samples = _window_samples(timestamps, values, window["start_s"], window["end_s"])
+    if not samples:
+        return {"missing": signal}
+    return {"samples": samples}
+
+
+def _expression_variables_map(raw_variables: Any) -> dict[str, str]:
+    if isinstance(raw_variables, dict):
+        return {str(name): str(source) for name, source in raw_variables.items()}
+    if not isinstance(raw_variables, list):
+        return {}
+    variables: dict[str, str] = {}
+    for item in raw_variables:
+        if isinstance(item, dict):
+            name = item.get("name")
+            source = item.get("source")
+        else:
+            name = getattr(item, "name", None)
+            source = getattr(item, "source", None)
+        if name and source:
+            variables[str(name)] = str(source)
+    return variables
+
+
+def _evaluate_expression_over_context(expression: str, context: dict[str, Any]) -> list[tuple[float | None, Any]]:
+    tree = _parse_expression(expression)
+    series = context["series"]
+    scalars = context["scalars"]
+    if not series:
+        return [(None, _eval_expression_node(tree, scalars))]
+
+    results: list[tuple[float | None, Any]] = []
+    for time_s in context["times"]:
+        env = dict(scalars)
+        for name, samples in series.items():
+            value = _series_value_at(samples, time_s)
+            if value is None:
+                raise ExpressionEvaluationError(f"missing sample for {name} at {time_s}")
+            env[name] = value
+        results.append((time_s, _eval_expression_node(tree, env)))
+    return results
+
+
+def _parse_expression(expression: str) -> ast.Expression:
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise ExpressionEvaluationError("invalid expression syntax") from exc
+    return tree
+
+
+def _expression_names(expression: str) -> list[str]:
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return []
+    return [
+        node.id for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+    ]
+
+
+def _eval_expression_node(node: ast.AST, env: dict[str, Any]) -> Any:
+    if isinstance(node, ast.Expression):
+        return _eval_expression_node(node.body, env)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float, bool)):
+            return node.value
+        raise ExpressionEvaluationError("string literals are not supported")
+    if isinstance(node, ast.Name):
+        if node.id not in env:
+            raise ExpressionEvaluationError(f"missing runtime variable {node.id}")
+        return env[node.id]
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        operand = _numeric_expression_value(_eval_expression_node(node.operand, env))
+        return operand if isinstance(node.op, ast.UAdd) else -operand
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+        left = _numeric_expression_value(_eval_expression_node(node.left, env))
+        right = _numeric_expression_value(_eval_expression_node(node.right, env))
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if right == 0:
+            raise ExpressionEvaluationError("division by zero")
+        return left / right
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in ALLOWED_EXPRESSION_FUNCTIONS:
+            raise ExpressionEvaluationError("unsupported function")
+        if node.keywords:
+            raise ExpressionEvaluationError("keyword arguments are not supported")
+        args = [_numeric_expression_value(_eval_expression_node(arg, env)) for arg in node.args]
+        if not args:
+            raise ExpressionEvaluationError("function requires at least one argument")
+        return ALLOWED_EXPRESSION_FUNCTIONS[node.func.id](*args)
+    if isinstance(node, ast.Compare):
+        left = _eval_expression_node(node.left, env)
+        for operator, comparator in zip(node.ops, node.comparators):
+            right = _eval_expression_node(comparator, env)
+            op = _comparison_operator(operator)
+            if not _compare_literal(left, op, right):
+                return False
+            left = right
+        return True
+    raise ExpressionEvaluationError("unsupported expression syntax")
+
+
+def _comparison_operator(operator: ast.cmpop) -> str:
+    if isinstance(operator, ast.Gt):
+        return ">"
+    if isinstance(operator, ast.GtE):
+        return ">="
+    if isinstance(operator, ast.Lt):
+        return "<"
+    if isinstance(operator, ast.LtE):
+        return "<="
+    if isinstance(operator, ast.Eq):
+        return "=="
+    if isinstance(operator, ast.NotEq):
+        return "!="
+    raise ExpressionEvaluationError("unsupported comparison operator")
+
+
+def _numeric_expression_value(value: Any) -> float:
+    number = _number(value)
+    if number is None:
+        raise ExpressionEvaluationError(f"non-numeric expression value: {value}")
+    return number
+
+
+def _series_value_at(samples: list[tuple[float, Any]], target_time: float) -> Any:
+    numeric_samples = [
+        (time_s, number)
+        for time_s, value in samples
+        if (number := _number(value)) is not None
+    ]
+    if len(numeric_samples) == len(samples):
+        return _interpolated_value(
+            [time_s for time_s, _ in numeric_samples],
+            [value for _, value in numeric_samples],
+            target_time,
+        )
+    for time_s, value in samples:
+        if abs(time_s - target_time) < 1e-9:
+            return value
+    return None
+
+
+def _expression_display_value(value: Any) -> Any:
+    number = _number(value)
+    if number is not None:
+        return _round_float(number)
+    return _json_safe_value(value)
+
+
+def dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 def _topics_by_name(ulog: Any) -> dict[str, Any]:

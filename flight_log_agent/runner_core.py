@@ -706,6 +706,7 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
             "same_direction_change",
             "tracks_parameter_value",
             "topic_field_present",
+            "derived_expression",
         },
     )
     return sanitize_mechanism_candidate_contract(
