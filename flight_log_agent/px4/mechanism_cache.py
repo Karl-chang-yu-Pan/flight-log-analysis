@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 
 MECHANISM_CACHE_SCHEMA_VERSION = 1
+MIN_MECHANISM_RELEVANCE_SCORE = 6
 
 SourceValidationStatus = Literal[
     "exact_git_match",
@@ -145,8 +146,11 @@ class MechanismRetriever:
                 result.rejected_files.append(str(path))
                 continue
 
-            score = self._score(record, context)
-            if score <= 0:
+            if not self._eligible(record, context):
+                result.rejected_files.append(str(path))
+                continue
+            score = self._intent_relevance_score(record, context)
+            if score < MIN_MECHANISM_RELEVANCE_SCORE:
                 result.rejected_files.append(str(path))
                 continue
             scored.append((score, path, record))
@@ -158,7 +162,31 @@ class MechanismRetriever:
 
         return result
 
-    def _score(self, record: MechanismRecord, context: dict[str, Any]) -> int:
+    def _eligible(self, record: MechanismRecord, context: dict[str, Any]) -> bool:
+        """
+        Compatibility gate only.
+
+        Source identity and airframe/domain compatibility decide whether a
+        cache entry is safe to consider. They must not make an unrelated
+        mechanism relevant to the current question.
+        """
+        candidate = _to_plain_dict(record.candidate_payload)
+        airframe = context.get("airframe") or {}
+        vehicle_type = str(airframe.get("vehicle_type") or "").lower()
+        if not vehicle_type:
+            return True
+
+        gates = [
+            str(gate).lower()
+            for gate in candidate.get("vehicle_type_gates", []) or []
+            if gate
+        ]
+        if not gates:
+            return True
+
+        return any(_vehicle_gate_matches(gate, vehicle_type) for gate in gates)
+
+    def _intent_relevance_score(self, record: MechanismRecord, context: dict[str, Any]) -> int:
         airframe = context.get("airframe") or {}
         intent = context.get("question_intent") or {}
 
@@ -167,12 +195,15 @@ class MechanismRetriever:
             intent.get("problem_domain"),
             intent.get("concise_intent"),
             " ".join(intent.get("source_queries") or []),
-            " ".join(intent.get("likely_modules") or []),
             " ".join(intent.get("likely_source_files") or []),
         ]
         query_text = " ".join(str(x) for x in query_text_parts if x)
-        query_tokens = set(_tokenize(query_text))
+        query_terms = _structured_relevance_terms(query_text)
+        query_params = _parameter_like_terms(query_text)
+        query_files = _source_file_terms(intent.get("likely_source_files") or [])
+        query_phrases = _specific_source_phrases(intent.get("source_queries") or [])
 
+        candidate = _to_plain_dict(record.candidate_payload)
         record_text_parts = [
             record.mechanism_id,
             record.name,
@@ -181,40 +212,70 @@ class MechanismRetriever:
             " ".join(record.question_intents),
             " ".join(record.source_queries),
             " ".join(record.search_terms),
+            " ".join(str(x) for x in candidate.get("required_parameters", []) or []),
+            " ".join(str(x) for x in candidate.get("required_signals", []) or []),
             " ".join(ref.file for ref in record.source_refs),
             " ".join(ref.function or "" for ref in record.source_refs),
         ]
         record_text = " ".join(str(x) for x in record_text_parts if x)
-        record_tokens = set(_tokenize(record_text))
+        record_terms = _structured_relevance_terms(record_text)
+        record_params = _parameter_like_terms(record_text)
+        record_files = _source_file_terms([ref.file for ref in record.source_refs])
+        record_functions = {
+            _normalize_identifier(ref.function)
+            for ref in record.source_refs
+            if ref.function
+        }
+        query_functions = {
+            term for term in query_terms
+            if "::" in term or re.search(r"[a-z][A-Z]", term)
+        }
 
         score = 0
-        overlap = query_tokens & record_tokens
-        score += min(len(overlap), 20)
+        strong_score = 0
 
-        vehicle_type = str(airframe.get("vehicle_type") or "").lower()
-        problem_domain = str(intent.get("problem_domain") or "").lower()
-        domain = record.vehicle_control_domain.lower()
-        if vehicle_type and vehicle_type in domain:
-            score += 8
-        if problem_domain and (problem_domain in domain or domain in problem_domain):
-            score += 8
+        parameter_overlap = query_params & (record_params | record_terms)
+        if parameter_overlap:
+            parameter_score = min(len(parameter_overlap) * 8, 24)
+            score += parameter_score
+            strong_score += parameter_score
 
-        current_git = str(airframe.get("px4_git_hash") or "")
-        cached_git = str(record.source_identity.px4_git_hash or "")
-        if current_git and cached_git and current_git == cached_git:
-            score += 10
+        function_overlap = {
+            term for term in query_functions
+            if term in record_functions or term in record_terms
+        }
+        if function_overlap:
+            function_score = min(len(function_overlap) * 6, 18)
+            score += function_score
+            strong_score += function_score
 
-        likely_files = {str(x) for x in intent.get("likely_source_files") or []}
-        if likely_files:
-            for ref in record.source_refs:
-                if ref.file in likely_files or any(ref.file.endswith(f) or f.endswith(ref.file) for f in likely_files):
-                    score += 5
+        symbol_overlap = query_terms & record_terms
+        if symbol_overlap:
+            symbol_score = min(len(symbol_overlap) * 2, 8)
+            score += symbol_score
+            if symbol_score >= 4:
+                strong_score += symbol_score
 
-        # Phrase matches are useful for PX4 symbols that tokenization splits poorly.
+        # Specific source-query phrases are useful for PX4 symbols and source
+        # concepts that tokenization splits poorly. Generic free-text overlap is
+        # intentionally not scored.
         lowered_query = query_text.lower()
-        for term in record.search_terms:
-            if term and term.lower() in lowered_query:
-                score += 4
+        lowered_record = record_text.lower()
+        phrase_matches = [
+            phrase for phrase in query_phrases
+            if phrase in lowered_record or phrase in lowered_query and phrase in lowered_record
+        ]
+        if phrase_matches:
+            phrase_score = min(len(phrase_matches) * 6, 18)
+            score += phrase_score
+            strong_score += phrase_score
+
+        file_overlap = query_files & record_files
+        if file_overlap:
+            score += min(len(file_overlap) * 2, 8)
+
+        if strong_score <= 0:
+            return 0
 
         return score
 
@@ -537,6 +598,87 @@ def _derive_search_terms(candidate: dict[str, Any], intent: dict[str, Any], sour
     return _dedupe_keep_order([t.strip() for t in terms if t and t.strip()])[:80]
 
 
+def _vehicle_gate_matches(gate: str, vehicle_type: str) -> bool:
+    normalized_gate = gate.replace("-", "_").replace(" ", "_")
+    normalized_vehicle = vehicle_type.replace("-", "_").replace(" ", "_")
+    return (
+        normalized_gate in normalized_vehicle
+        or normalized_vehicle in normalized_gate
+        or any(part and part in normalized_vehicle for part in normalized_gate.split("_"))
+    )
+
+
+def _structured_relevance_terms(text: str) -> set[str]:
+    terms = set(_parameter_like_terms(text))
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_:./-]*\b", text):
+        if _looks_like_version_token(token):
+            continue
+        if _looks_like_source_path(token):
+            continue
+        if _looks_like_structured_symbol(token):
+            terms.add(_normalize_identifier(token))
+    return {term for term in terms if term}
+
+
+def _parameter_like_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for token in re.findall(r"\b_?param_[A-Za-z0-9_]+\b|\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+\b", text):
+        terms.add(_normalize_identifier(token))
+    return terms
+
+
+def _source_file_terms(paths: Any) -> set[str]:
+    terms: set[str] = set()
+    for raw_path in paths or []:
+        path = str(raw_path).strip()
+        if not path:
+            continue
+        normalized = path.lower().replace("\\", "/")
+        terms.add(normalized)
+        leaf = normalized.rsplit("/", 1)[-1]
+        if leaf:
+            terms.add(leaf)
+    return terms
+
+
+def _specific_source_phrases(phrases: Any) -> list[str]:
+    out: list[str] = []
+    for phrase in phrases or []:
+        text = str(phrase).strip()
+        if not text:
+            continue
+        if _parameter_like_terms(text) or any(_looks_like_structured_symbol(token) for token in text.split()):
+            out.append(text.lower())
+    return _dedupe_keep_order(out)
+
+
+def _looks_like_source_path(token: str) -> bool:
+    lowered = token.lower()
+    return "/" in lowered and (lowered.endswith((".cpp", ".hpp", ".h", ".c", ".cc")) or lowered.startswith("src/"))
+
+
+def _looks_like_version_token(token: str) -> bool:
+    return bool(re.fullmatch(r"v?\d+(?:\.\d+)+(?:[._-]?\w+)?", token.lower()))
+
+
+def _looks_like_structured_symbol(token: str) -> bool:
+    if len(token) < 4:
+        return False
+    if "::" in token:
+        return True
+    if "_" in token:
+        return True
+    if "." in token and "/" not in token:
+        return True
+    return bool(re.search(r"[a-z][A-Z]", token))
+
+
+def _normalize_identifier(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", "", str(value)).strip().lower()
+
+
 def _slugify(value: str) -> str:
     value = value.strip().lower()
     value = re.sub(r"[^a-z0-9_.-]+", "_", value)
@@ -684,4 +826,3 @@ def _maybe_int(value: Any) -> Optional[int]:
         return int(float(value))
     except (TypeError, ValueError):
         return None
-
