@@ -91,6 +91,7 @@ from flight_log_agent.px4.source_mechanism_models import (
     SourceFieldRef,
     SourceMechanismCandidate,
     SourceMechanismCandidateSet,
+    SourceOutputBindingRecord,
 )
 from flight_log_agent.px4.source_mechanism_resolver import (
     SourceMechanismResolver,
@@ -461,6 +462,7 @@ async def analyze_flight_log(
             for candidate in mechanism_records_to_candidates(cached_records, max_candidates)
         ]
         mechanism_cache_summary["cache_hit_candidate_names"] = [c.name for c in cached_candidates]
+        source_output_bindings: list[SourceOutputBindingRecord] = []
 
         if cached_candidates:
             source_evidence = empty_source_discovery_evidence(source_search_context)
@@ -507,6 +509,7 @@ async def analyze_flight_log(
                 max_candidates,
                 decide_source_discovery,
             )
+            source_output_bindings = list(source_candidate_set.output_bindings)
             candidate_set = source_mechanisms_to_candidates(source_candidate_set)
             source_evidence = empty_source_discovery_evidence(
                 source_search_context,
@@ -587,6 +590,12 @@ async def analyze_flight_log(
                     applicability=applicability,
                     evaluation=evaluation,
                     final_confidence=derive_confidence(applicability, evaluation),
+                    source_binding_provenance=source_binding_provenance_for_result(
+                        candidate,
+                        applicability,
+                        evaluation,
+                        source_output_bindings,
+                    ),
                 )
             )
 
@@ -822,6 +831,10 @@ def source_candidate_required_signals(source_candidate: SourceMechanismCandidate
         for signal in (check.signal, check.actual, check.setpoint, check.first, check.second):
             if signal and is_valid_required_signal(str(signal)):
                 signals.append(str(signal))
+        for variable in check.variables:
+            source = getattr(variable, "source", None)
+            if source and is_valid_required_signal(str(source)):
+                signals.append(str(source))
     for evidence in getattr(source_candidate, "required_log_evidence", []) or []:
         signal = extract_signal_reference(evidence)
         if signal and is_valid_required_signal(signal):
@@ -960,10 +973,114 @@ def build_final_report_input(
     }
 
 
+def source_binding_provenance_for_result(
+    candidate: MechanismCandidate,
+    applicability: ApplicabilityResult,
+    evaluation: SignatureEvaluation,
+    output_bindings: list[SourceOutputBindingRecord],
+    *,
+    max_bindings: int = 12,
+) -> list[dict[str, Any]]:
+    if not applicability.applicable or evaluation.verdict == "contradicted":
+        return []
+
+    relevant_signals = set(candidate_binding_signal_references(candidate))
+    if not relevant_signals:
+        return []
+
+    provenance: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for binding in output_bindings:
+        logged_signal = binding.logged_signal
+        if not logged_signal or logged_signal not in relevant_signals:
+            continue
+        if binding.binding_id in seen:
+            continue
+        seen.add(binding.binding_id)
+        provenance.append(compact_source_output_binding(binding))
+        if len(provenance) >= max_bindings:
+            break
+    return provenance
+
+
+def candidate_binding_signal_references(candidate: MechanismCandidate) -> list[str]:
+    signals: list[str] = []
+    signals.extend(candidate.required_signals)
+    signals.extend(candidate.source_relevant_fields)
+    for check in list(candidate.numeric_checks or []) + list(candidate.exclusion_checks or []):
+        for value in (check.signal, check.actual, check.setpoint, check.first, check.second):
+            if value and is_logged_signal_reference(str(value)):
+                signals.append(str(value))
+        for variable in check.variables:
+            source = getattr(variable, "source", None)
+            if source and is_logged_signal_reference(str(source)):
+                signals.append(str(source))
+    for item in candidate.expected_logged_signature:
+        if item.signal and is_logged_signal_reference(str(item.signal)):
+            signals.append(str(item.signal))
+    return dedupe_keep_order(signals)
+
+
+def compact_source_output_binding(
+    binding: SourceOutputBindingRecord,
+    *,
+    max_path_steps: int = 6,
+    max_evidence_chars: int = 220,
+) -> dict[str, Any]:
+    path = [
+        compact_assignment_path_step(step, max_evidence_chars=max_evidence_chars)
+        for step in binding.assignment_path[:max_path_steps]
+    ]
+    return {
+        "binding_id": binding.binding_id,
+        "source_symbol": binding.source_symbol,
+        "target_symbol": binding.target_symbol,
+        "logged_signal": binding.logged_signal,
+        "assignment_path": path,
+        "source_refs": compact_assignment_source_refs(path),
+    }
+
+
+def compact_assignment_path_step(step: dict[str, Any], *, max_evidence_chars: int) -> dict[str, Any]:
+    compact = {
+        "file": step.get("file"),
+        "line": step.get("line"),
+        "function": step.get("function"),
+    }
+    evidence = str(step.get("evidence") or "")
+    if evidence:
+        compact["evidence"] = evidence[:max_evidence_chars]
+    return {
+        key: value
+        for key, value in compact.items()
+        if value is not None and value != ""
+    }
+
+
+def compact_assignment_source_refs(path: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen = set()
+    for step in path:
+        key = (step.get("file"), step.get("line"), step.get("function"))
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        refs.append({
+            key_name: value
+            for key_name, value in {
+                "file": step.get("file"),
+                "line": step.get("line"),
+                "function": step.get("function"),
+            }.items()
+            if value is not None and value != ""
+        })
+    return refs
+
+
 def compact_verified_mechanism_result(result: VerifiedMechanismResult) -> dict[str, Any]:
     candidate = result.candidate
     evaluation = result.evaluation
-    return {
+    compact = {
         "candidate": {
             "name": candidate.name,
             "summary": candidate.summary,
@@ -989,6 +1106,9 @@ def compact_verified_mechanism_result(result: VerifiedMechanismResult) -> dict[s
         },
         "final_confidence": result.final_confidence,
     }
+    if result.source_binding_provenance:
+        compact["source_binding_provenance"] = list(result.source_binding_provenance)
+    return compact
 
 
 def apply_deterministic_report_summaries(

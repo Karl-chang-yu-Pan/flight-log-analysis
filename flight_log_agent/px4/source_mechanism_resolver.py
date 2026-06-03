@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from flight_log_agent.models import AirframeContext, CodeRef
+from flight_log_agent.models import AirframeContext, CodeRef, RelationshipCheckSpec
 from flight_log_agent.px4.mechanism_source_profiler import (
     BranchConditionRef,
     FieldRef,
@@ -32,6 +33,7 @@ from flight_log_agent.px4.source_mechanism_models import (
     SourceFieldRef,
     SourceMechanismCandidate,
     SourceMechanismCandidateSet,
+    SourceOutputBindingRecord,
     SourceSnippet,
     TopicFieldRef,
 )
@@ -279,6 +281,10 @@ class SourceMechanismResolver:
             if not is_contradicted_branch_selector(requirement)
         ]
         selected_files = dedupe_keep_order(relevant_files) or visited_files
+        output_bindings = source_output_binding_records(
+            dedupe_source_assignment_refs(source_assignments),
+            dedupe_function_call_refs(function_calls),
+        )
         candidates = self._build_candidates(
             user_question=user_question,
             source_files=selected_files,
@@ -291,11 +297,15 @@ class SourceMechanismResolver:
             log_context=log_context,
             candidate_drafts=candidate_drafts,
             decision_notes=decision_notes,
+            helper_expressions=dedupe_helper_expression_refs(helper_expressions),
+            source_assignments=dedupe_source_assignment_refs(source_assignments),
+            function_calls=dedupe_function_call_refs(function_calls),
         )
         return SourceMechanismCandidateSet(
             candidates=candidates,
             expansion_queries=all_queries,
             unresolved_questions=[],
+            output_bindings=output_bindings,
         )
 
     def _build_iteration_packet(
@@ -369,7 +379,7 @@ class SourceMechanismResolver:
                 "source_assignments": compact_refs(dedupe_source_assignment_refs(source_assignments), limit=100),
                 "function_calls": compact_refs(dedupe_function_call_refs(function_calls), limit=80),
                 "helper_expressions": compact_refs(dedupe_helper_expression_refs(helper_expressions), limit=40),
-                "expression_verification_candidates": helper_expression_verification_candidates(
+                "expression_verification_candidates": source_discovery_expression_verification_candidates(
                     dedupe_helper_expression_refs(helper_expressions),
                     source_assignments=dedupe_source_assignment_refs(source_assignments),
                     function_calls=dedupe_function_call_refs(function_calls),
@@ -699,7 +709,17 @@ class SourceMechanismResolver:
         log_context: SourceDiscoveryLogContext,
         candidate_drafts: list[SourceDiscoveryCandidateDraft],
         decision_notes: list[str],
+        helper_expressions: list[HelperExpressionRef],
+        source_assignments: list[SourceAssignmentRef],
+        function_calls: list[FunctionCallRef],
     ) -> list[SourceMechanismCandidate]:
+        deterministic_checks = source_backed_derived_expression_checks(
+            helper_expressions,
+            source_assignments=source_assignments,
+            function_calls=function_calls,
+            source_path=self.source_path,
+            limit=40,
+        )
         if candidate_drafts:
             return [
                 self._build_candidate_from_draft(
@@ -714,6 +734,7 @@ class SourceMechanismResolver:
                     branch_conditions=branch_conditions,
                     log_context=log_context,
                     decision_notes=decision_notes,
+                    deterministic_checks=deterministic_checks,
                 )
                 for draft in candidate_drafts
             ]
@@ -729,6 +750,7 @@ class SourceMechanismResolver:
                 branch_conditions=branch_conditions,
                 log_context=log_context,
                 decision_notes=decision_notes,
+                deterministic_checks=deterministic_checks,
             )
         ]
 
@@ -745,6 +767,7 @@ class SourceMechanismResolver:
         branch_conditions: list[BranchConditionRef],
         log_context: SourceDiscoveryLogContext,
         decision_notes: list[str],
+        deterministic_checks: list[SourceBackedVerificationCheck],
     ) -> SourceMechanismCandidate:
         source_chain = self._source_chain_from_hits(hits)
         relevant_fields = [
@@ -786,6 +809,7 @@ class SourceMechanismResolver:
             branch_conditions=[ref.condition for ref in branch_conditions],
             expected_log_signature=expected_log_signature,
             required_log_evidence=required_log_evidence,
+            verification_checks=deterministic_checks,
             contradiction_checks=contradiction_checks,
             source_confidence=self._source_confidence(source_files, source_chain, parameter_requirements),
             resolver_notes=[
@@ -809,6 +833,7 @@ class SourceMechanismResolver:
         branch_conditions: list[BranchConditionRef],
         log_context: SourceDiscoveryLogContext,
         decision_notes: list[str],
+        deterministic_checks: list[SourceBackedVerificationCheck],
     ) -> SourceMechanismCandidate:
         source_files = draft.source_files or fallback_source_files
         required_parameters = set(draft.controlling_parameter_names)
@@ -846,7 +871,12 @@ class SourceMechanismResolver:
             branch_conditions=branch_conditions,
             log_context=log_context,
             decision_notes=decision_notes,
+            deterministic_checks=deterministic_checks,
         )
+        verification_checks = dedupe_source_backed_verification_checks([
+            *draft.verification_checks,
+            *deterministic_checks,
+        ])
         return SourceMechanismCandidate(
             title=draft.title or fallback.title,
             source_mechanism=draft.source_mechanism or fallback.source_mechanism,
@@ -860,7 +890,7 @@ class SourceMechanismResolver:
             expected_log_signature=draft.expected_log_signature or fallback.expected_log_signature,
             required_log_evidence=draft.required_log_evidence or fallback.required_log_evidence,
             interpreted_parameter_predicates=draft.interpreted_parameter_predicates,
-            verification_checks=draft.verification_checks,
+            verification_checks=verification_checks,
             contradiction_checks=draft.contradiction_checks or fallback.contradiction_checks,
             source_confidence=draft.source_confidence,
             resolver_notes=[
@@ -1373,6 +1403,133 @@ def helper_expression_verification_candidates(
     return candidates
 
 
+def source_discovery_expression_verification_candidates(
+    refs: list[HelperExpressionRef],
+    *,
+    source_assignments: list[SourceAssignmentRef] | None = None,
+    function_calls: list[FunctionCallRef] | None = None,
+    source_path: str | Path | None = None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    return [
+        source_discovery_expression_candidate(candidate)
+        for candidate in helper_expression_verification_candidates(
+            refs,
+            source_assignments=source_assignments,
+            function_calls=function_calls,
+            source_path=source_path,
+            limit=limit,
+        )
+    ]
+
+
+def source_discovery_expression_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(candidate)
+    sanitized.pop("output_binding_candidates", None)
+    sanitized.pop("derived_expression_checks", None)
+    sanitized.pop("output_binding_required", None)
+    return sanitized
+
+
+def source_backed_derived_expression_checks(
+    refs: list[HelperExpressionRef],
+    *,
+    source_assignments: list[SourceAssignmentRef] | None = None,
+    function_calls: list[FunctionCallRef] | None = None,
+    source_path: str | Path | None = None,
+    limit: int,
+) -> list[SourceBackedVerificationCheck]:
+    source_assignments = source_assignments or []
+    function_calls = function_calls or []
+    helper_refs = {
+        ref.name: ref
+        for ref in refs
+        if ref.name
+    }
+    checks: list[SourceBackedVerificationCheck] = []
+    for raw_check in source_output_derived_expression_candidates(
+        refs,
+        source_assignments,
+        function_calls,
+        source_path=source_path,
+        limit=limit,
+    ):
+        source_check = source_backed_derived_expression_check(raw_check, helper_refs)
+        if source_check is not None:
+            checks.append(source_check)
+    return dedupe_source_backed_verification_checks(checks)
+
+
+def source_backed_derived_expression_check(
+    raw_check: dict[str, Any],
+    helper_refs: dict[str, HelperExpressionRef],
+) -> SourceBackedVerificationCheck | None:
+    source_file = None
+    source_line = None
+    helper_name = str(raw_check.get("source_helper") or "")
+    helper_ref = helper_refs.get(helper_name)
+    if helper_ref is not None:
+        source_file = helper_ref.file
+        source_line = helper_ref.line
+    if source_file is None:
+        for step in raw_check.get("assignment_path") or []:
+            if step.get("file"):
+                source_file = step.get("file")
+                source_line = step.get("line")
+                break
+    if source_file is None or source_line is None:
+        return None
+
+    variables = [
+        {"name": str(name), "source": str(source)}
+        for name, source in (raw_check.get("variables") or {}).items()
+        if name and source is not None
+    ]
+    check = RelationshipCheckSpec(
+        type="derived_expression",
+        expression=raw_check.get("expression"),
+        expected_expression=raw_check.get("expected_expression"),
+        variables=variables,
+        op=raw_check.get("op"),
+        max_error=raw_check.get("max_error"),
+        mode=raw_check.get("mode"),
+        supports=(
+            f"Source-derived expression for {raw_check.get('source_output')} "
+            f"matches {raw_check.get('expected_expression')}."
+        ),
+        contradicts=(
+            f"Source-derived expression for {raw_check.get('source_output')} "
+            "does not match the logged output."
+        ),
+        description=f"Check source-derived expression for {raw_check.get('source_output')}.",
+    )
+    return SourceBackedVerificationCheck(
+        check=check,
+        source_file=str(source_file),
+        source_line=int(source_line),
+        rationale="Deterministically derived from source helper expression and output binding.",
+    )
+
+
+def dedupe_source_backed_verification_checks(
+    checks: list[SourceBackedVerificationCheck],
+) -> list[SourceBackedVerificationCheck]:
+    seen = set()
+    out: list[SourceBackedVerificationCheck] = []
+    for source_check in checks:
+        dumped = source_check.check.model_dump(mode="json")
+        key = (
+            source_check.source_file,
+            source_check.source_line,
+            repr(sorted(dumped.items())),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(source_check)
+    return out
+
+
 def source_output_derived_expression_candidates(
     refs: list[HelperExpressionRef],
     source_assignments: list[SourceAssignmentRef],
@@ -1763,6 +1920,31 @@ def source_output_binding_candidates(
         *bound_edges,
         *transitive_binding_edges([*direct_edges, *bound_edges]),
     ])
+
+
+def source_output_binding_records(
+    source_assignments: list[SourceAssignmentRef],
+    function_calls: list[FunctionCallRef],
+) -> list[SourceOutputBindingRecord]:
+    return [
+        SourceOutputBindingRecord(
+            binding_id=source_output_binding_id(binding),
+            source_symbol=str(binding.get("source_symbol") or ""),
+            target_symbol=str(binding.get("target_symbol") or ""),
+            logged_signal=binding.get("logged_signal"),
+            assignment_path=list(binding.get("assignment_path") or []),
+        )
+        for binding in source_output_binding_candidates(source_assignments, function_calls)
+    ]
+
+
+def source_output_binding_id(binding: dict[str, Any]) -> str:
+    text = "|".join([
+        str(binding.get("source_symbol") or ""),
+        str(binding.get("target_symbol") or ""),
+        str(binding.get("logged_signal") or ""),
+    ])
+    return f"bind_{hashlib.sha1(text.encode('utf-8')).hexdigest()[:12]}"
 
 
 def assignment_edge(ref: SourceAssignmentRef) -> dict[str, Any]:

@@ -72,6 +72,14 @@ class SourceBackedVerificationCheck(BaseModel):
     rationale: str = ""
 
 
+class SourceOutputBindingRecord(BaseModel):
+    binding_id: str
+    source_symbol: str
+    target_symbol: str
+    logged_signal: Optional[str] = None
+    assignment_path: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class SourceMechanismCandidate(BaseModel):
     title: str
     source_mechanism: str
@@ -95,6 +103,7 @@ class SourceMechanismCandidateSet(BaseModel):
     candidates: list[SourceMechanismCandidate] = Field(default_factory=list)
     expansion_queries: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
+    output_bindings: list[SourceOutputBindingRecord] = Field(default_factory=list)
 
 
 class SourceDiscoveryCandidateDraft(BaseModel):

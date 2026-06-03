@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -315,7 +316,9 @@ void run_vehicle_mode()
     verification_candidates = profile_packet.source_profile["expression_verification_candidates"]
     verification_candidate = next(item for item in verification_candidates if item["name"] == "helper_altitude")
     assert verification_candidate["lowered_return_expression"] == "max((current_alt + return_alt), current_alt)"
-    assert verification_candidate["output_binding_required"] is True
+    assert "output_binding_candidates" not in verification_candidate
+    assert "derived_expression_checks" not in verification_candidate
+    assert "output_binding_required" not in verification_candidate
 
 
 def test_source_output_binding_candidates_bind_call_arguments_to_logged_output(tmp_path):
@@ -447,6 +450,72 @@ void publish_setpoint()
     assert any(
         check["expected_expression"] == "(2.0 * NAV_ACC_RAD)"
         for check in checks
+    )
+
+
+def test_source_discovery_packet_excludes_output_bindings_but_result_keeps_table(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "mode.cpp").write_text(
+        """
+float compute_alt(float radius)
+{
+    return 2.0f * radius;
+}
+
+bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
+{
+    sp->alt = item.altitude;
+    return true;
+}
+
+void publish_setpoint()
+{
+    position_setpoint_triplet_s *pos_sp_triplet = owner->get_position_setpoint_triplet();
+    mission_item_s mission_item{};
+    mission_item.altitude = compute_alt(NAV_ACC_RAD);
+    convert_item(mission_item, &pos_sp_triplet->current);
+}
+""",
+        encoding="utf-8",
+    )
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+    packets = []
+
+    async def decide(packet):
+        packets.append(packet)
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision(relevant_files=["src/modules/navigator/mode.cpp"])
+        return SourceDiscoveryDecision(stop=True)
+
+    result = asyncio.run(
+        resolver.discover(
+            "Why did it compute altitude from NAV_ACC_RAD?",
+            build_source_discovery_log_context({}),
+            seed_queries=["compute_alt"],
+            decide=decide,
+            max_depth=1,
+        )
+    )
+
+    profile_packet = next(packet for packet in packets if packet.new_files)
+    packet_json = json.dumps(profile_packet.model_dump(), default=str)
+    assert "output_binding_candidates" not in packet_json
+    assert "assignment_path" not in packet_json
+    assert result.output_bindings
+    binding = next(
+        item for item in result.output_bindings
+        if item.logged_signal == "position_setpoint_triplet.current.alt"
+    )
+    assert binding.binding_id.startswith("bind_")
+    assert binding.assignment_path
+    assert any(
+        check.check.type == "derived_expression"
+        for check in result.candidates[0].verification_checks
     )
 
 

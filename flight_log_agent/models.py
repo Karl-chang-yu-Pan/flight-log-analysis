@@ -227,6 +227,7 @@ class VerifiedMechanismResult(BaseModel):
     applicability: ApplicabilityResult
     evaluation: SignatureEvaluation
     final_confidence: Literal["high", "medium", "low", "unresolved"]
+    source_binding_provenance: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ParameterValue(BaseModel):

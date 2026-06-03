@@ -1040,7 +1040,7 @@ def test_source_mechanism_conversion_preserves_derived_expression_checks(tmp_pat
 
     candidate = runner.source_mechanism_to_candidate(source_candidate)
 
-    assert candidate.required_signals == []
+    assert candidate.required_signals == ["vehicle_local_position.z"]
     assert candidate.numeric_checks[0].type == "derived_expression"
     assert candidate.numeric_checks[0].expression == "current_alt + RTL_RETURN_ALT"
     assert [
@@ -1639,11 +1639,46 @@ def test_final_report_input_is_compact_and_summaries_are_deterministic(tmp_path)
         warnings=[],
         raw={"large": "debug payload"},
     )
+    provenance = runner.source_binding_provenance_for_result(
+        candidate,
+        applicability,
+        evaluation,
+        [
+            runner.SourceOutputBindingRecord(
+                binding_id="bind_test",
+                source_symbol="tecs_altitude_setpoint",
+                target_symbol="vehicle_local_position.z",
+                logged_signal="vehicle_local_position.z",
+                assignment_path=[
+                    {
+                        "file": "src/modules/fw_pos_control_l1/FixedwingPositionControl.cpp",
+                        "line": 123,
+                        "function": "control_position",
+                        "evidence": "vehicle_local_position.z = tecs_altitude_setpoint;",
+                    }
+                ],
+            ),
+            runner.SourceOutputBindingRecord(
+                binding_id="bind_unrelated",
+                source_symbol="unrelated",
+                target_symbol="vehicle_status.nav_state",
+                logged_signal="vehicle_status.nav_state",
+                assignment_path=[
+                    {
+                        "file": "src/modules/example.cpp",
+                        "line": 1,
+                        "evidence": "unrelated assignment",
+                    }
+                ],
+            ),
+        ],
+    )
     verified = runner.VerifiedMechanismResult(
         candidate=candidate,
         applicability=applicability,
         evaluation=evaluation,
         final_confidence="medium",
+        source_binding_provenance=provenance,
     )
 
     payload = runner.build_final_report_input([verified])
@@ -1652,6 +1687,8 @@ def test_final_report_input_is_compact_and_summaries_are_deterministic(tmp_path)
     compact = payload["verified_mechanism_results"][0]
     assert compact["candidate"]["name"] == candidate.name
     assert compact["evaluation"]["evidence"] == ["numeric support"]
+    assert [item["binding_id"] for item in compact["source_binding_provenance"]] == ["bind_test"]
+    assert compact["source_binding_provenance"][0]["assignment_path"][0]["line"] == 123
     assert "raw" not in compact["evaluation"]
 
     airframe_context = runner.AirframeContext(
