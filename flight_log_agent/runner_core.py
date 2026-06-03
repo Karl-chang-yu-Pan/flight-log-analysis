@@ -464,13 +464,13 @@ async def analyze_flight_log(
         mechanism_cache_summary["cache_hit_candidate_names"] = [c.name for c in cached_candidates]
         source_output_bindings: list[SourceOutputBindingRecord] = []
 
-        if cached_candidates:
+        if cached_candidates and source_path_obj is None:
             source_evidence = empty_source_discovery_evidence(source_search_context)
             candidate_set = MechanismCandidateSet(
                 candidates=cached_candidates,
                 rejected_source_paths=[],
                 unresolved_questions=[
-                    f"Used {len(cached_candidates)} source-validated mechanism cache hit(s); source resolver agent was skipped."
+                    f"Used {len(cached_candidates)} source-validated mechanism cache hit(s); source resolver agent was skipped because PX4 source is unavailable."
                 ],
             )
         else:
@@ -502,12 +502,14 @@ async def analyze_flight_log(
                     "question_intent": question_intent.model_dump(),
                     "static_log_context": source_discovery_log_context.model_dump(),
                     "max_candidates": max_candidates,
+                    "cached_seed_candidate_names": [candidate.name for candidate in cached_candidates],
                 },
                 source_path_obj,
                 question_intent,
                 source_discovery_log_context,
                 max_candidates,
                 decide_source_discovery,
+                cached_candidates,
             )
             source_output_bindings = list(source_candidate_set.output_bindings)
             candidate_set = source_mechanisms_to_candidates(source_candidate_set)
@@ -660,6 +662,7 @@ async def discover_source_mechanisms(
     log_context: SourceDiscoveryLogContext,
     max_candidates: int,
     decide,
+    cached_candidates: Optional[list[MechanismCandidate]] = None,
 ) -> SourceMechanismCandidateSet:
     if source_path is None:
         return SourceMechanismCandidateSet(
@@ -679,6 +682,10 @@ async def discover_source_mechanisms(
             *question_intent.source_queries,
             *question_intent.likely_modules,
             *question_intent.likely_source_files,
+        ],
+        cached_mechanism_seeds=[
+            candidate.model_dump()
+            for candidate in (cached_candidates or [])
         ],
         decide=decide,
         max_total_files=max(max_candidates * 8, 8),

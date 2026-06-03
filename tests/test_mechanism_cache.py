@@ -43,6 +43,45 @@ def test_mechanism_cache_rejects_unrelated_record_despite_git_and_airframe_match
     assert result.rejected_files
 
 
+def test_mechanism_cache_rejects_phrase_only_match_from_polluted_record(tmp_path):
+    cache_root = tmp_path / "mechanisms"
+    record = _rtl_record()
+    record.search_terms.append("position_setpoint_triplet.current.cruising_speed")
+    record.candidate_payload["required_signals"] = [
+        *record.candidate_payload["required_signals"],
+        "position_setpoint_triplet.current.cruising_speed",
+    ]
+    _write_record(cache_root, record)
+
+    result = MechanismRetriever(MechanismCacheConfig(cache_root=cache_root)).retrieve(
+        {
+            "airframe": {
+                "vehicle_type": "vtol_standard",
+                "px4_git_hash": "1dacb4cdef2d7145754fc788fa8dc482eed74b40",
+            },
+            "question_intent": {
+                "original_question": "Why is airspeed setpoint sometimes different from FW_AIRSPD_TRIM?",
+                "problem_domain": "PX4 fixed-wing/standard VTOL airspeed setpoint generation and mode-specific overrides",
+                "concise_intent": "Trace FW_AIRSPD_TRIM to the final fixed-wing airspeed setpoint.",
+                "source_queries": [
+                    "FW_AIRSPD_TRIM",
+                    "airspeed_sp",
+                    "cruising_speed",
+                ],
+                "likely_modules": ["fw_pos_control_l1", "navigator"],
+                "likely_source_files": [
+                    "src/modules/fw_pos_control_l1/FixedwingPositionControl.cpp",
+                    "src/modules/navigator/mission_block.cpp",
+                ],
+            },
+        },
+        max_records=5,
+    )
+
+    assert result.records == []
+    assert result.rejected_files
+
+
 def test_mechanism_cache_accepts_record_with_structured_intent_overlap(tmp_path):
     cache_root = tmp_path / "mechanisms"
     _write_record(cache_root, _rtl_record())

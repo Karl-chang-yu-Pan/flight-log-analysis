@@ -16,6 +16,7 @@ from flight_log_agent.px4.source_mechanism_resolver import (
     build_source_discovery_log_context,
     helper_expression_verification_candidates,
     lower_source_expression_for_evaluator,
+    scope_deterministic_checks_to_candidate,
     source_output_binding_candidates,
 )
 
@@ -517,6 +518,47 @@ void publish_setpoint()
         check.check.type == "derived_expression"
         for check in result.candidates[0].verification_checks
     )
+
+
+def test_deterministic_checks_scope_to_candidate_relevant_signals():
+    altitude_check = SourceBackedVerificationCheck(
+        check=RelationshipCheckSpec(
+            type="derived_expression",
+            expression="actual",
+            expected_expression="RTL_RETURN_ALT",
+            variables=[
+                {
+                    "name": "actual",
+                    "source": "position_setpoint_triplet.current.alt",
+                }
+            ],
+        ),
+        source_file="src/modules/navigator/rtl.cpp",
+        source_line=10,
+    )
+    airspeed_check = SourceBackedVerificationCheck(
+        check=RelationshipCheckSpec(
+            type="derived_expression",
+            expression="actual",
+            expected_expression="FW_AIRSPD_TRIM",
+            variables=[
+                {
+                    "name": "actual",
+                    "source": "position_setpoint_triplet.current.cruising_speed",
+                }
+            ],
+        ),
+        source_file="src/modules/navigator/mission_block.cpp",
+        source_line=20,
+    )
+
+    scoped = scope_deterministic_checks_to_candidate(
+        [altitude_check, airspeed_check],
+        source_files=["src/modules/navigator/rtl.cpp"],
+        relevant_signals=["position_setpoint_triplet.current.alt"],
+    )
+
+    assert scoped == [altitude_check]
 
 
 def test_source_output_binding_candidates_bind_receiver_method_assignments(tmp_path):

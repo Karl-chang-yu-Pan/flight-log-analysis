@@ -1362,6 +1362,7 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
         "vehicle_local_position",
         "vehicle_local_position_setpoint",
     ]
+    assert discovery_args[5] == []
     assert list(captured[1]["input"].keys()) == ["verified_mechanism_results"]
     assert captured[1]["input"]["verified_mechanism_results"][0]["final_confidence"] == "medium"
     assert "raw" not in captured[1]["input"]["verified_mechanism_results"][0]["evaluation"]
@@ -1377,6 +1378,172 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     metadata = json.loads((run_dir / "metadata.json").read_text())
     assert metadata["runner_version"] == "v3_mechanism_first"
     assert metadata["report_path"] == str(output_dir / "report.json")
+
+
+def test_analyze_flight_log_passes_valid_cache_hits_as_source_discovery_seeds(tmp_path):
+    runner = load_runner(tmp_path)
+    log_path = tmp_path / "flight.ulg"
+    source_path = tmp_path / "PX4-Autopilot"
+    source_path.mkdir()
+    output_dir = tmp_path / "outputs"
+    dev_log_root = tmp_path / "dev_logs"
+
+    question_intent = runner.QuestionIntent(
+        original_question="Why is the airspeed setpoint different from FW_AIRSPD_TRIM?",
+        problem_domain="fixed_wing_airspeed",
+        concise_intent="trace fixed-wing airspeed setpoint generation",
+        source_queries=["FW_AIRSPD_TRIM", "cruising_speed"],
+    )
+    cached_candidate = runner.MechanismCandidate(
+        name="Cached airspeed mechanism",
+        summary="Cached source path mentions the fixed-wing cruising speed setpoint.",
+        source_refs=[
+            runner.CodeRef(
+                file="src/modules/fw_pos_control_l1/FixedwingPositionControl.cpp",
+                function="control_position",
+                start_line=100,
+                explanation="Cached source ref.",
+            )
+        ],
+        required_parameters=["FW_AIRSPD_TRIM"],
+        required_signals=["position_setpoint_triplet.current.cruising_speed"],
+    )
+    cache_record = runner.MechanismRecord(
+        mechanism_id="cached-airspeed",
+        name=cached_candidate.name,
+        summary=cached_candidate.summary,
+        vehicle_control_domain="fixed_wing_airspeed",
+        source_identity={"px4_git_hash": None, "px4_version": None, "px4_tag": None},
+        candidate_payload=cached_candidate.model_dump(),
+        source_queries=["FW_AIRSPD_TRIM"],
+        search_terms=["cruising_speed"],
+    )
+    source_candidate = runner.SourceMechanismCandidate(
+        title="Resolved airspeed mechanism",
+        source_mechanism="PX4 source selects cruising_speed from fixed-wing airspeed parameters.",
+        source_chain=[
+            runner.CodeRef(
+                file="src/modules/fw_pos_control_l1/FixedwingPositionControl.cpp",
+                start_line=100,
+                explanation="Resolver checked source path.",
+            )
+        ],
+        source_files=["src/modules/fw_pos_control_l1/FixedwingPositionControl.cpp"],
+        controlling_parameters=[],
+        published_topics=[],
+        subscribed_topics=[],
+        relevant_fields=[
+            runner.SourceFieldRef(
+                topic="position_setpoint_triplet",
+                field="current.cruising_speed",
+                source_file="src/modules/fw_pos_control_l1/FixedwingPositionControl.cpp",
+                source_line=100,
+            )
+        ],
+        expected_log_signature=[
+            "Verify later whether position_setpoint_triplet.current.cruising_speed follows the source-selected value."
+        ],
+        required_log_evidence=[
+            "Fetch time-series for position_setpoint_triplet.current.cruising_speed."
+        ],
+        contradiction_checks=[],
+        source_confidence="medium",
+    )
+    source_candidate_set = runner.SourceMechanismCandidateSet(candidates=[source_candidate])
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
+    applicability = _sample_applicability(runner, candidate)
+    evaluation = runner.SignatureEvaluation(
+        candidate_name=candidate.name,
+        verdict="supported",
+        confidence_ceiling="medium",
+        evidence=["Airspeed setpoint followed source-selected cruising_speed."],
+        contradictions=[],
+        check_results=[],
+        warnings=[],
+        raw={},
+    )
+    final_report = _sample_report(runner, candidate, applicability)
+
+    async def fake_run(agent, input, context, max_turns, hooks=None):
+        if agent is runner.question_intent_agent:
+            return SimpleNamespace(final_output=question_intent, new_items=[])
+        if agent is runner.final_report_agent:
+            return SimpleNamespace(final_output=final_report, new_items=[])
+        raise AssertionError(f"unexpected agent: {agent}")
+
+    runner.Runner.run = fake_run
+
+    with patch.object(
+        runner,
+        "parse_ulog_inventory",
+        return_value={
+            "available_topics": ["position_setpoint_triplet"],
+            "parameters": {"FW_AIRSPD_TRIM": 18.0},
+        },
+    ), patch.object(
+        runner,
+        "build_basic_timeline",
+        return_value=[],
+    ), patch.object(
+        runner,
+        "infer_control_surface",
+        return_value={"vehicle_type": "fixed_wing"},
+    ), patch.object(
+        runner,
+        "parse_mission_file",
+        return_value={"mission_file": None, "items": []},
+    ), patch.object(
+        runner,
+        "retrieve_cached_mechanisms",
+        return_value=runner.MechanismRetrievalResult(records=[cache_record]),
+    ) as retrieve_cache, patch.object(
+        runner,
+        "validate_cached_mechanism_source",
+        return_value=runner.MechanismSourceValidation(
+            mechanism_id=cache_record.mechanism_id,
+            status="exact_git_match",
+            usable=True,
+            reason="test cache source is valid",
+        ),
+    ) as validate_cache, patch.object(
+        runner,
+        "discover_source_mechanisms",
+        return_value=source_candidate_set,
+    ) as source_discovery, patch.object(
+        runner,
+        "write_resolved_mechanisms_to_cache",
+        return_value=[],
+    ), patch.object(
+        runner,
+        "evaluate_candidate_applicability",
+        return_value=applicability,
+    ), patch.object(
+        runner,
+        "evaluate_candidate_log_signature",
+        return_value=evaluation,
+    ):
+        result = asyncio.run(
+            runner.analyze_flight_log(
+                log_path=str(log_path),
+                mission_path=None,
+                source_path=str(source_path),
+                output_dir=str(output_dir),
+                dev_log_root=str(dev_log_root),
+                dev_run_id="web_run_cached_seed",
+                user_question="Why is the airspeed setpoint different from FW_AIRSPD_TRIM?",
+                max_candidates=2,
+                mechanism_cache_dir=str(tmp_path / "mechanism_cache"),
+                force_mechanism_refresh=False,
+            )
+        )
+
+    assert result is final_report
+    retrieve_cache.assert_called_once()
+    validate_cache.assert_called_once()
+    source_discovery.assert_called_once()
+    discovery_args = source_discovery.call_args.args
+    assert discovery_args[0] == source_path
+    assert [candidate.name for candidate in discovery_args[5]] == [cached_candidate.name]
 
 
 def test_shape_report_evidence_moves_unresolved_items_out_of_contradictions(tmp_path):

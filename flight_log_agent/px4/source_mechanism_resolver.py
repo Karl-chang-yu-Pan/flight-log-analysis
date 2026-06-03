@@ -82,6 +82,7 @@ class SourceMechanismResolver:
         log_context: SourceDiscoveryLogContext,
         *,
         seed_queries: Optional[list[str]] = None,
+        cached_mechanism_seeds: Optional[list[dict[str, Any]]] = None,
         decide: Optional[Callable[[SourceDiscoveryIterationPacket], Awaitable[SourceDiscoveryDecision]]] = None,
         max_depth: int = 2,
         max_files_per_query: int = 8,
@@ -89,7 +90,11 @@ class SourceMechanismResolver:
         max_expansion_queries: int = 32,
         max_profile_files_per_iteration: int = 3,
     ) -> SourceMechanismCandidateSet:
-        active_queries = dedupe_keep_order(seed_queries or self._seed_queries(user_question))
+        compact_seed_candidates = compact_cached_mechanism_seeds(cached_mechanism_seeds or [])
+        active_queries = dedupe_keep_order([
+            *(seed_queries or self._seed_queries(user_question)),
+            *cached_mechanism_seed_queries(compact_seed_candidates),
+        ])
         all_queries = list(active_queries)
         visited_files: list[str] = []
         hits_by_file: dict[str, SourceFileHit] = {}
@@ -142,6 +147,7 @@ class SourceMechanismResolver:
                         candidate_hits=hits,
                         log_context=log_context,
                         prior_decision_notes=decision_notes,
+                        cached_mechanism_seeds=compact_seed_candidates,
                     )
                 )
                 decision_notes.extend(search_decision.notes)
@@ -234,6 +240,7 @@ class SourceMechanismResolver:
                         eliminated_parameter_paths=eliminated_parameter_paths,
                         log_context=log_context,
                         prior_decision_notes=decision_notes,
+                        cached_mechanism_seeds=compact_seed_candidates,
                     )
                 )
                 relevant_files.extend([
@@ -331,6 +338,7 @@ class SourceMechanismResolver:
         eliminated_parameter_paths: list[ParameterRequirement],
         log_context: SourceDiscoveryLogContext,
         prior_decision_notes: list[str],
+        cached_mechanism_seeds: list[dict[str, Any]],
     ) -> SourceDiscoveryIterationPacket:
         discovered_topics = dedupe_keep_order([
             ref.topic
@@ -361,44 +369,48 @@ class SourceMechanismResolver:
         subscribed_topic_names = dedupe_keep_order([
             ref.topic for ref in subscribed_topics if ref.topic
         ])
+        source_profile = {
+            "related_files": compact_source_hits(hits, limit=8, max_matches_per_file=3),
+            "referenced_parameters": compact_refs(dedupe_parameter_refs(parameter_refs), limit=40),
+            "published_topic_names": published_topic_names[:40],
+            "subscribed_topic_names": subscribed_topic_names[:40],
+            "published_topics": compact_refs(dedupe_topic_refs(published_topics), limit=30),
+            "subscribed_topics": compact_refs(dedupe_topic_refs(subscribed_topics), limit=30),
+            "assigned_fields": compact_refs(dedupe_field_refs(assigned_fields), limit=60),
+            "read_fields": compact_refs(dedupe_field_refs(read_fields), limit=60),
+            "source_assignments": compact_refs(dedupe_source_assignment_refs(source_assignments), limit=100),
+            "function_calls": compact_refs(dedupe_function_call_refs(function_calls), limit=80),
+            "helper_expressions": compact_refs(dedupe_helper_expression_refs(helper_expressions), limit=40),
+            "expression_verification_candidates": source_discovery_expression_verification_candidates(
+                dedupe_helper_expression_refs(helper_expressions),
+                source_assignments=dedupe_source_assignment_refs(source_assignments),
+                function_calls=dedupe_function_call_refs(function_calls),
+                source_path=self.source_path,
+                limit=40,
+            ),
+            "branch_conditions": compact_refs(dedupe_branch_conditions(branch_conditions), limit=80),
+            "parameter_predicates": [
+                compact_ref(ref) for ref in dedupe_parameter_predicates(parameter_predicates)[:40]
+            ],
+            "source_snippets": [
+                _safe_model_dump(snippet)
+                for snippet in self._source_snippets_for_files(
+                    new_files,
+                    active_queries=active_queries,
+                    hits=hits,
+                )
+            ],
+        }
+        if cached_mechanism_seeds:
+            source_profile["cached_mechanism_seeds"] = cached_mechanism_seeds
+
         return SourceDiscoveryIterationPacket(
             user_question=user_question,
             depth=depth,
             active_queries=active_queries,
             visited_files=visited_files,
             new_files=new_files,
-            source_profile={
-                "related_files": compact_source_hits(hits, limit=8, max_matches_per_file=3),
-                "referenced_parameters": compact_refs(dedupe_parameter_refs(parameter_refs), limit=40),
-                "published_topic_names": published_topic_names[:40],
-                "subscribed_topic_names": subscribed_topic_names[:40],
-                "published_topics": compact_refs(dedupe_topic_refs(published_topics), limit=30),
-                "subscribed_topics": compact_refs(dedupe_topic_refs(subscribed_topics), limit=30),
-                "assigned_fields": compact_refs(dedupe_field_refs(assigned_fields), limit=60),
-                "read_fields": compact_refs(dedupe_field_refs(read_fields), limit=60),
-                "source_assignments": compact_refs(dedupe_source_assignment_refs(source_assignments), limit=100),
-                "function_calls": compact_refs(dedupe_function_call_refs(function_calls), limit=80),
-                "helper_expressions": compact_refs(dedupe_helper_expression_refs(helper_expressions), limit=40),
-                "expression_verification_candidates": source_discovery_expression_verification_candidates(
-                    dedupe_helper_expression_refs(helper_expressions),
-                    source_assignments=dedupe_source_assignment_refs(source_assignments),
-                    function_calls=dedupe_function_call_refs(function_calls),
-                    source_path=self.source_path,
-                    limit=40,
-                ),
-                "branch_conditions": compact_refs(dedupe_branch_conditions(branch_conditions), limit=80),
-                "parameter_predicates": [
-                    compact_ref(ref) for ref in dedupe_parameter_predicates(parameter_predicates)[:40]
-                ],
-                "source_snippets": [
-                    _safe_model_dump(snippet)
-                    for snippet in self._source_snippets_for_files(
-                        new_files,
-                        active_queries=active_queries,
-                        hits=hits,
-                    )
-                ],
-            },
+            source_profile=source_profile,
             parameter_requirements=parameter_requirements,
             static_log_context={
                 "vehicle_type": log_context.vehicle_type,
@@ -485,17 +497,21 @@ class SourceMechanismResolver:
         candidate_hits: list[SourceFileHit],
         log_context: SourceDiscoveryLogContext,
         prior_decision_notes: list[str],
+        cached_mechanism_seeds: list[dict[str, Any]],
     ) -> SourceDiscoveryIterationPacket:
+        source_profile = {
+            "stage": "search_hits_only",
+            "related_files": compact_source_hits(candidate_hits, limit=12, max_matches_per_file=4),
+        }
+        if cached_mechanism_seeds:
+            source_profile["cached_mechanism_seeds"] = cached_mechanism_seeds
         return SourceDiscoveryIterationPacket(
             user_question=user_question,
             depth=depth,
             active_queries=active_queries,
             visited_files=visited_files,
             new_files=[],
-            source_profile={
-                "stage": "search_hits_only",
-                "related_files": compact_source_hits(candidate_hits, limit=12, max_matches_per_file=4),
-            },
+            source_profile=source_profile,
             parameter_requirements=[],
             static_log_context={
                 "vehicle_type": log_context.vehicle_type,
@@ -787,6 +803,15 @@ class SourceMechanismResolver:
             for requirement in parameter_requirements
             if requirement.gate_result == "contradicted"
         ]
+        scoped_deterministic_checks = scope_deterministic_checks_to_candidate(
+            deterministic_checks,
+            source_files=source_files,
+            relevant_signals=[
+                f"{field.topic}.{field.field}"
+                for field in relevant_fields
+                if field.topic and field.field
+            ],
+        )
         title = self._candidate_title(user_question, source_files)
         return SourceMechanismCandidate(
             title=title,
@@ -809,7 +834,7 @@ class SourceMechanismResolver:
             branch_conditions=[ref.condition for ref in branch_conditions],
             expected_log_signature=expected_log_signature,
             required_log_evidence=required_log_evidence,
-            verification_checks=deterministic_checks,
+            verification_checks=scoped_deterministic_checks,
             contradiction_checks=contradiction_checks,
             source_confidence=self._source_confidence(source_files, source_chain, parameter_requirements),
             resolver_notes=[
@@ -873,9 +898,14 @@ class SourceMechanismResolver:
             decision_notes=decision_notes,
             deterministic_checks=deterministic_checks,
         )
+        scoped_deterministic_checks = scope_deterministic_checks_to_candidate(
+            deterministic_checks,
+            source_files=source_files,
+            relevant_signals=draft.relevant_signals,
+        )
         verification_checks = dedupe_source_backed_verification_checks([
             *draft.verification_checks,
-            *deterministic_checks,
+            *scoped_deterministic_checks,
         ])
         return SourceMechanismCandidate(
             title=draft.title or fallback.title,
@@ -1528,6 +1558,90 @@ def dedupe_source_backed_verification_checks(
         seen.add(key)
         out.append(source_check)
     return out
+
+
+def compact_cached_mechanism_seeds(seeds: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for seed in seeds[:limit]:
+        compact.append({
+            "name": seed.get("name"),
+            "summary": seed.get("summary"),
+            "source_refs": [
+                {
+                    "file": ref.get("file"),
+                    "function": ref.get("function"),
+                    "start_line": ref.get("start_line"),
+                    "explanation": ref.get("explanation"),
+                }
+                for ref in seed.get("source_refs", [])[:8]
+                if isinstance(ref, dict)
+            ],
+            "required_parameters": list(seed.get("required_parameters") or [])[:12],
+            "required_signals": list(seed.get("required_signals") or [])[:12],
+            "source_relevant_fields": list(seed.get("source_relevant_fields") or [])[:12],
+            "numeric_check_count": len(seed.get("numeric_checks") or []),
+            "exclusion_check_count": len(seed.get("exclusion_checks") or []),
+        })
+    return [
+        {
+            key: value
+            for key, value in item.items()
+            if value not in (None, "", [], {})
+        }
+        for item in compact
+    ]
+
+
+def cached_mechanism_seed_queries(seeds: list[dict[str, Any]]) -> list[str]:
+    queries: list[str] = []
+    for seed in seeds:
+        if seed.get("name"):
+            queries.append(str(seed["name"]))
+        for ref in seed.get("source_refs", [])[:4]:
+            file = ref.get("file")
+            function = ref.get("function")
+            if file:
+                queries.append(str(file))
+            if function:
+                queries.append(str(function))
+        queries.extend(str(param) for param in seed.get("required_parameters", [])[:6])
+    return dedupe_keep_order(queries)
+
+
+def scope_deterministic_checks_to_candidate(
+    checks: list[SourceBackedVerificationCheck],
+    *,
+    source_files: list[str],
+    relevant_signals: list[str],
+) -> list[SourceBackedVerificationCheck]:
+    normalized_files = {str(file) for file in source_files if file}
+    normalized_signals = {str(signal) for signal in relevant_signals if signal}
+    scoped: list[SourceBackedVerificationCheck] = []
+    for source_check in checks:
+        check_signals = set(relationship_check_signal_references(source_check.check))
+        if normalized_signals:
+            if check_signals & normalized_signals:
+                scoped.append(source_check)
+            continue
+        if source_check.source_file and str(source_check.source_file) in normalized_files:
+            scoped.append(source_check)
+    return dedupe_source_backed_verification_checks(scoped)
+
+
+def relationship_check_signal_references(check: RelationshipCheckSpec) -> list[str]:
+    signals: list[str] = []
+    for value in (check.signal, check.actual, check.setpoint, check.first, check.second):
+        if value and looks_like_logged_signal(str(value)):
+            signals.append(str(value))
+    for variable in check.variables:
+        source = getattr(variable, "source", None)
+        if source and looks_like_logged_signal(str(source)):
+            signals.append(str(source))
+    return dedupe_keep_order(signals)
+
+
+def looks_like_logged_signal(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*(?:[.\[][^ ]*)*", value))
 
 
 def source_output_derived_expression_candidates(

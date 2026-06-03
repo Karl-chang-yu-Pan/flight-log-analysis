@@ -268,7 +268,6 @@ class MechanismRetriever:
         if phrase_matches:
             phrase_score = min(len(phrase_matches) * 6, 18)
             score += phrase_score
-            strong_score += phrase_score
 
         file_overlap = query_files & record_files
         if file_overlap:
