@@ -31,6 +31,7 @@ from flight_log_agent.px4.source_mechanism_models import (
     SourceDiscoveryIterationPacket,
     SourceDiscoveryLogContext,
     SourceFieldRef,
+    SourceMechanismBranchGroup,
     SourceMechanismCandidate,
     SourceMechanismCandidateSet,
     SourceOutputBindingRecord,
@@ -462,13 +463,77 @@ class SourceMechanismResolver:
         if not contradicted:
             return cited_drafts
         return [
-            draft for draft in cited_drafts
-            if not any(name in contradicted for name in draft.controlling_parameter_names)
+            self._prune_contradicted_branch_facts(draft, contradicted)
+            for draft in cited_drafts
+        ]
+
+    def _prune_contradicted_branch_facts(
+        self,
+        draft: SourceDiscoveryCandidateDraft,
+        contradicted: set[str],
+    ) -> SourceDiscoveryCandidateDraft:
+        pruned_names = [
+            name for name in draft.controlling_parameter_names
+            if name in contradicted
+        ]
+        kept_predicates = [
+            predicate for predicate in draft.interpreted_parameter_predicates
+            if predicate.name not in contradicted
+        ]
+        kept_checks = [
+            check for check in draft.verification_checks
+            if (check.check.parameter or "") not in contradicted
+        ]
+        kept_groups = [
+            self._prune_contradicted_branch_group(group, contradicted)
+            for group in draft.branch_groups
+            if not any(name in contradicted for name in group.controlling_parameter_names)
             and not any(
                 predicate.name in contradicted
-                for predicate in draft.interpreted_parameter_predicates
+                for predicate in group.interpreted_parameter_predicates
             )
         ]
+        notes = list(draft.resolver_notes)
+        if pruned_names or len(kept_predicates) != len(draft.interpreted_parameter_predicates):
+            notes.append(
+                "Resolver pruned contradicted branch-selector facts without discarding the full mechanism: "
+                + ", ".join(sorted(set(pruned_names) | {
+                    predicate.name
+                    for predicate in draft.interpreted_parameter_predicates
+                    if predicate.name in contradicted
+                }))
+                + "."
+            )
+        return draft.model_copy(
+            update={
+                "controlling_parameter_names": [
+                    name for name in draft.controlling_parameter_names
+                    if name not in contradicted
+                ],
+                "interpreted_parameter_predicates": kept_predicates,
+                "verification_checks": kept_checks,
+                "branch_groups": kept_groups,
+                "resolver_notes": notes,
+            }
+        )
+
+    @staticmethod
+    def _prune_contradicted_branch_group(
+        group: SourceMechanismBranchGroup,
+        contradicted: set[str],
+    ) -> SourceMechanismBranchGroup:
+        return group.model_copy(
+            update={
+                "interpreted_parameter_predicates": [
+                    predicate for predicate in group.interpreted_parameter_predicates
+                    if predicate.name not in contradicted
+                ],
+                "verification_checks": [
+                    check for check in group.verification_checks
+                    if (check.check.parameter or "") not in contradicted
+                ],
+            }
+        )
 
     def _drop_uncited_agent_facts(
         self,
@@ -864,7 +929,8 @@ class SourceMechanismResolver:
         required_parameters = set(draft.controlling_parameter_names)
         controlling_parameters = [
             requirement for requirement in parameter_requirements
-            if not required_parameters or requirement.name in required_parameters
+            if (not required_parameters or requirement.name in required_parameters)
+            and not is_contradicted_branch_selector(requirement)
         ]
         controlling_parameters = dedupe_parameter_requirements([
             *controlling_parameters,
@@ -899,7 +965,7 @@ class SourceMechanismResolver:
             deterministic_checks=deterministic_checks,
         )
         scoped_deterministic_checks = scope_deterministic_checks_to_candidate(
-            deterministic_checks,
+            deterministic_checks if draft.relevant_signals else [],
             source_files=source_files,
             relevant_signals=draft.relevant_signals,
         )
@@ -907,6 +973,13 @@ class SourceMechanismResolver:
             *draft.verification_checks,
             *scoped_deterministic_checks,
         ])
+        branch_groups = [
+            self._build_source_candidate_branch_group(
+                group,
+                deterministic_checks=deterministic_checks,
+            )
+            for group in draft.branch_groups
+        ]
         return SourceMechanismCandidate(
             title=draft.title or fallback.title,
             source_mechanism=draft.source_mechanism or fallback.source_mechanism,
@@ -922,6 +995,7 @@ class SourceMechanismResolver:
             interpreted_parameter_predicates=draft.interpreted_parameter_predicates,
             verification_checks=verification_checks,
             contradiction_checks=draft.contradiction_checks or fallback.contradiction_checks,
+            branch_groups=branch_groups,
             source_confidence=draft.source_confidence,
             resolver_notes=[
                 "Source candidate was drafted by the source-discovery decision agent.",
@@ -929,6 +1003,26 @@ class SourceMechanismResolver:
                 *draft.resolver_notes,
                 *decision_notes,
             ],
+        )
+
+    def _build_source_candidate_branch_group(
+        self,
+        group: SourceMechanismBranchGroup,
+        *,
+        deterministic_checks: list[SourceBackedVerificationCheck],
+    ) -> SourceMechanismBranchGroup:
+        scoped_deterministic_checks = scope_deterministic_checks_to_candidate(
+            deterministic_checks if group.relevant_signals else [],
+            source_files=group.source_files,
+            relevant_signals=group.relevant_signals,
+        )
+        return group.model_copy(
+            update={
+                "verification_checks": dedupe_source_backed_verification_checks([
+                    *group.verification_checks,
+                    *scoped_deterministic_checks,
+                ])
+            }
         )
 
     def _source_chain_from_hits(self, hits: list[SourceFileHit]) -> list[CodeRef]:

@@ -61,6 +61,7 @@ from flight_log_agent.models import (
     ExpectedSignatureItem,
     FlightLogReport,
     HypothesisReportItem,
+    MechanismBranchGroup,
     MechanismCandidate,
     MechanismCandidateSet,
     ParameterValue,
@@ -512,7 +513,10 @@ async def analyze_flight_log(
                 cached_candidates,
             )
             source_output_bindings = list(source_candidate_set.output_bindings)
-            candidate_set = source_mechanisms_to_candidates(source_candidate_set)
+            candidate_set = source_mechanisms_to_candidates(
+                source_candidate_set,
+                output_bindings=source_output_bindings,
+            )
             source_evidence = empty_source_discovery_evidence(
                 source_search_context,
                 warnings=[
@@ -694,10 +698,11 @@ async def discover_source_mechanisms(
 
 def source_mechanisms_to_candidates(
     source_candidate_set: SourceMechanismCandidateSet,
+    output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
 ) -> MechanismCandidateSet:
     return MechanismCandidateSet(
         candidates=[
-            source_mechanism_to_candidate(candidate)
+            source_mechanism_to_candidate(candidate, output_bindings=output_bindings)
             for candidate in source_candidate_set.candidates
         ],
         rejected_source_paths=[],
@@ -705,13 +710,17 @@ def source_mechanisms_to_candidates(
     )
 
 
-def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) -> MechanismCandidate:
+def source_mechanism_to_candidate(
+    source_candidate: SourceMechanismCandidate,
+    output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
+) -> MechanismCandidate:
+    canonicalizer = SignalCanonicalizer(output_bindings or [])
     required_parameters = dedupe_keep_order([
         requirement.name
         for requirement in getattr(source_candidate, "controlling_parameters", []) or []
         if requirement.name and requirement.name != "unknown"
     ])
-    required_signals = source_candidate_required_signals(source_candidate)
+    required_signals = source_candidate_required_signals(source_candidate, canonicalizer=canonicalizer)
     parameter_checks = source_candidate_parameter_checks(source_candidate)
     explicit_exclusion_checks = source_candidate_verification_checks(
         source_candidate,
@@ -735,7 +744,8 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
         },
     )
     return sanitize_mechanism_candidate_contract(
-        MechanismCandidate(
+        canonicalize_mechanism_candidate_signals(
+            MechanismCandidate(
             name=source_candidate.title,
             summary=source_candidate.source_mechanism,
             source_refs=list(source_candidate.source_chain),
@@ -748,7 +758,10 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
             ],
             required_parameters=required_parameters,
             required_signals=required_signals,
-            source_relevant_fields=source_candidate_relevant_field_signals(source_candidate),
+            source_relevant_fields=source_candidate_relevant_field_signals(
+                source_candidate,
+                canonicalizer=canonicalizer,
+            ),
             expected_logged_signature=[
                 ExpectedSignatureItem(
                     name=f"source_signature_{index + 1}",
@@ -772,9 +785,206 @@ def source_mechanism_to_candidate(source_candidate: SourceMechanismCandidate) ->
                 *explicit_numeric_checks,
                 *source_candidate_signal_presence_checks(source_candidate, required_signals),
             ],
+            branch_groups=source_candidate_branch_groups(source_candidate, canonicalizer=canonicalizer),
             plot_requests=[],
+            ),
+            canonicalizer,
         )
     )
+
+
+class SignalCanonicalizer:
+    def __init__(self, output_bindings: list[SourceOutputBindingRecord]) -> None:
+        aliases: dict[str, set[str]] = {}
+        for binding in output_bindings:
+            logged_signal = str(binding.logged_signal or "")
+            if not logged_signal:
+                continue
+            for alias in self._binding_aliases(binding, logged_signal):
+                aliases.setdefault(alias, set()).add(logged_signal)
+        self._aliases = {
+            alias: next(iter(targets))
+            for alias, targets in aliases.items()
+            if len(targets) == 1
+        }
+
+    def canonicalize(self, signal: Optional[str]) -> Optional[str]:
+        if not signal:
+            return signal
+        cleaned = self._normalize_symbol(signal)
+        if cleaned in self._aliases:
+            return self._aliases[cleaned]
+        if "." in cleaned:
+            suffix = cleaned.split(".", 1)[1]
+            if suffix in self._aliases:
+                return self._aliases[suffix]
+        return signal
+
+    @classmethod
+    def _binding_aliases(cls, binding: SourceOutputBindingRecord, logged_signal: str) -> set[str]:
+        aliases = {logged_signal}
+        for value in (binding.source_symbol, binding.target_symbol, logged_signal):
+            normalized = cls._normalize_symbol(value)
+            if not normalized:
+                continue
+            aliases.add(normalized)
+            parts = normalized.split(".")
+            for index in range(1, len(parts)):
+                aliases.add(".".join(parts[index:]))
+        return aliases
+
+    @staticmethod
+    def _normalize_symbol(value: str) -> str:
+        normalized = str(value or "").strip()
+        normalized = normalized.replace("->", ".")
+        normalized = normalized.replace("::", ".")
+        normalized = normalized.replace(" ", "")
+        normalized = normalized.strip("&*")
+        normalized = re.sub(r"\[[^\]]+\]", "", normalized)
+        return normalized
+
+
+def canonicalize_mechanism_candidate_signals(
+    candidate: MechanismCandidate,
+    canonicalizer: SignalCanonicalizer,
+) -> MechanismCandidate:
+    return candidate.model_copy(
+        update={
+            "required_signals": dedupe_keep_order([
+                signal for signal in (
+                    canonicalizer.canonicalize(signal)
+                    for signal in candidate.required_signals
+                )
+                if signal
+            ]),
+            "source_relevant_fields": dedupe_keep_order([
+                signal for signal in (
+                    canonicalizer.canonicalize(signal)
+                    for signal in candidate.source_relevant_fields
+                )
+                if signal
+            ]),
+            "numeric_checks": [
+                canonicalize_relationship_check_signals(check, canonicalizer)
+                for check in candidate.numeric_checks
+            ],
+            "exclusion_checks": [
+                canonicalize_relationship_check_signals(check, canonicalizer)
+                for check in candidate.exclusion_checks
+            ],
+            "expected_logged_signature": [
+                item.model_copy(update={"signal": canonicalizer.canonicalize(item.signal)})
+                if item.signal else item
+                for item in candidate.expected_logged_signature
+            ],
+            "branch_groups": [
+                canonicalize_branch_group_signals(group, canonicalizer)
+                for group in candidate.branch_groups
+            ],
+        }
+    )
+
+
+def canonicalize_branch_group_signals(
+    group: MechanismBranchGroup,
+    canonicalizer: SignalCanonicalizer,
+) -> MechanismBranchGroup:
+    return group.model_copy(
+        update={
+            "required_signals": dedupe_keep_order([
+                signal for signal in (
+                    canonicalizer.canonicalize(signal)
+                    for signal in group.required_signals
+                )
+                if signal
+            ]),
+            "numeric_checks": [
+                canonicalize_relationship_check_signals(check, canonicalizer)
+                for check in group.numeric_checks
+            ],
+            "exclusion_checks": [
+                canonicalize_relationship_check_signals(check, canonicalizer)
+                for check in group.exclusion_checks
+            ],
+        }
+    )
+
+
+def canonicalize_relationship_check_signals(
+    check: RelationshipCheckSpec,
+    canonicalizer: SignalCanonicalizer,
+) -> RelationshipCheckSpec:
+    update: dict[str, Any] = {}
+    for field in ("signal", "first", "second", "actual", "setpoint"):
+        value = getattr(check, field, None)
+        if value and is_logged_signal_reference(str(value)):
+            update[field] = canonicalizer.canonicalize(str(value))
+    if check.variables:
+        update["variables"] = [
+            variable.model_copy(update={"source": canonicalizer.canonicalize(variable.source) or variable.source})
+            if variable.source and is_logged_signal_reference(str(variable.source))
+            else variable
+            for variable in check.variables
+        ]
+    return check.model_copy(update=update) if update else check
+
+
+def source_candidate_branch_groups(
+    source_candidate: SourceMechanismCandidate,
+    *,
+    canonicalizer: SignalCanonicalizer,
+) -> list[MechanismBranchGroup]:
+    groups: list[MechanismBranchGroup] = []
+    for group in getattr(source_candidate, "branch_groups", []) or []:
+        checks = [
+            check.check
+            for check in group.verification_checks
+            if check.source_file and check.source_line is not None
+        ]
+        numeric_checks = [
+            check for check in checks
+            if check.type not in {"parameter_equals", "branch_parameter_satisfied"}
+        ]
+        exclusion_checks = [
+            check for check in checks
+            if check.type in {"parameter_equals", "branch_parameter_satisfied"}
+        ]
+        required_signals = dedupe_keep_order([
+            signal for signal in (
+                canonicalizer.canonicalize(signal)
+                for signal in [
+                    *group.relevant_signals,
+                    *relationship_checks_signal_refs(checks),
+                ]
+            )
+            if signal and is_logged_signal_reference(signal)
+        ])
+        groups.append(
+            MechanismBranchGroup(
+                name=group.name,
+                source_refs=list(group.source_chain),
+                source_predicates=list(group.branch_conditions),
+                parameter_gates=list(group.controlling_parameter_names),
+                required_parameters=list(group.controlling_parameter_names),
+                required_signals=required_signals,
+                numeric_checks=numeric_checks,
+                exclusion_checks=exclusion_checks,
+                notes=list(group.notes),
+            )
+        )
+    return groups
+
+
+def relationship_checks_signal_refs(checks: list[RelationshipCheckSpec]) -> list[str]:
+    signals: list[str] = []
+    for check in checks:
+        for value in (check.signal, check.actual, check.setpoint, check.first, check.second):
+            if value and is_logged_signal_reference(str(value)):
+                signals.append(str(value))
+        for variable in check.variables:
+            if variable.source and is_logged_signal_reference(str(variable.source)):
+                signals.append(str(variable.source))
+    return signals
 
 
 def source_candidate_parameter_checks(source_candidate: SourceMechanismCandidate) -> list[RelationshipCheckSpec]:
@@ -831,36 +1041,52 @@ def source_candidate_verification_checks(
     return checks
 
 
-def source_candidate_required_signals(source_candidate: SourceMechanismCandidate) -> list[str]:
+def source_candidate_required_signals(
+    source_candidate: SourceMechanismCandidate,
+    *,
+    canonicalizer: SignalCanonicalizer,
+) -> list[str]:
     signals = []
     for source_check in getattr(source_candidate, "verification_checks", []) or []:
         check = source_check.check
         for signal in (check.signal, check.actual, check.setpoint, check.first, check.second):
-            if signal and is_valid_required_signal(str(signal)):
-                signals.append(str(signal))
+            if signal and is_logged_signal_reference(str(signal)):
+                canonical_signal = canonicalizer.canonicalize(str(signal)) or str(signal)
+                if is_valid_required_signal(canonical_signal):
+                    signals.append(canonical_signal)
         for variable in check.variables:
             source = getattr(variable, "source", None)
-            if source and is_valid_required_signal(str(source)):
-                signals.append(str(source))
+            if source and is_logged_signal_reference(str(source)):
+                canonical_signal = canonicalizer.canonicalize(str(source)) or str(source)
+                if is_valid_required_signal(canonical_signal):
+                    signals.append(canonical_signal)
     for evidence in getattr(source_candidate, "required_log_evidence", []) or []:
         signal = extract_signal_reference(evidence)
-        if signal and is_valid_required_signal(signal):
-            signals.append(signal)
+        if signal:
+            canonical_signal = canonicalizer.canonicalize(signal) or signal
+            if is_valid_required_signal(canonical_signal):
+                signals.append(canonical_signal)
     return dedupe_keep_order(signals)
 
 
-def source_candidate_relevant_field_signals(source_candidate: SourceMechanismCandidate) -> list[str]:
+def source_candidate_relevant_field_signals(
+    source_candidate: SourceMechanismCandidate,
+    *,
+    canonicalizer: SignalCanonicalizer,
+) -> list[str]:
     signals = []
     for field in getattr(source_candidate, "relevant_fields", []) or []:
         if field.topic and field.field:
             resolved = resolve_topic_field(field.topic, field.field)
-            signals.append(resolved or f"{field.topic}.{field.field}")
+            signal = resolved or f"{field.topic}.{field.field}"
+            signals.append(canonicalizer.canonicalize(signal) or signal)
     for topic_ref in (
         list(getattr(source_candidate, "published_topics", []) or [])
         + list(getattr(source_candidate, "subscribed_topics", []) or [])
     ):
         if topic_ref.topic and topic_ref.field:
-            signals.append(f"{topic_ref.topic}.{topic_ref.field}")
+            signal = f"{topic_ref.topic}.{topic_ref.field}"
+            signals.append(canonicalizer.canonicalize(signal) or signal)
     return dedupe_keep_order(signals)
 
 

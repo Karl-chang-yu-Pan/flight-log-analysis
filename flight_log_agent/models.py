@@ -168,6 +168,19 @@ class RelationshipCheckSpec(BaseModel):
     supports: Optional[str] = None
     contradicts: Optional[str] = None
     description: Optional[str] = None
+    branch_group: Optional[str] = None
+
+
+class MechanismBranchGroup(BaseModel):
+    name: str
+    source_refs: list[CodeRef] = Field(default_factory=list)
+    source_predicates: list[str] = Field(default_factory=list)
+    parameter_gates: list[str] = Field(default_factory=list)
+    required_parameters: list[str] = Field(default_factory=list)
+    required_signals: list[str] = Field(default_factory=list)
+    numeric_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
+    exclusion_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class MechanismCandidate(BaseModel):
@@ -190,6 +203,7 @@ class MechanismCandidate(BaseModel):
     expected_logged_signature: list[ExpectedSignatureItem] = Field(default_factory=list)
     exclusion_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
     numeric_checks: list[RelationshipCheckSpec] = Field(default_factory=list)
+    branch_groups: list[MechanismBranchGroup] = Field(default_factory=list)
     plot_requests: list[PlotRef] = Field(default_factory=list)
 
 

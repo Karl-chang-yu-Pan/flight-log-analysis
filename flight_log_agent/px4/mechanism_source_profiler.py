@@ -113,6 +113,7 @@ class SourceAssignmentRef(BaseModel):
     function_parameters: List[str] = Field(default_factory=list)
     target_topic: Optional[str] = None
     target_field: Optional[str] = None
+    assignment_operator: Optional[str] = None
 
 
 class HelperExpressionRef(BaseModel):
@@ -331,6 +332,10 @@ class MechanismSourceProfiler:
     _SOURCE_ASSIGNMENT_PATTERN = re.compile(
         r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
         r"\s*=\s*(?P<expr>[^;]+);"
+    )
+    _SOURCE_COMPOUND_ASSIGNMENT_PATTERN = re.compile(
+        r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+        r"\s*(?P<op>\+=|-=|\*=|/=|%=|\|=|&=|\^=)\s*(?P<expr>[^;]+);"
     )
     _FUNCTION_SIGNATURE_PATTERN = re.compile(
         r"(?P<prefix>[A-Za-z_][A-Za-z0-9_:<>,~*&\s]*?)\s+"
@@ -759,12 +764,46 @@ class MechanismSourceProfiler:
                             target_field=field if target_topic else None,
                             function=function_name,
                             function_parameters=list(definition.get("params", [])) if definition else [],
+                            assignment_operator="=",
+                            file=rel_file,
+                            line=line_no,
+                            evidence=stripped,
+                        )
+                    )
+                for match in self._SOURCE_COMPOUND_ASSIGNMENT_PATTERN.finditer(line):
+                    target = self._clean_field_path(match.group("target"))
+                    operator = match.group("op")
+                    expression = self._compound_assignment_expression(
+                        target,
+                        operator,
+                        self._normalize_source_expression(match.group("expr")),
+                    )
+                    definition = self._function_definition_for_line(definitions, line_no)
+                    root, field = split_source_field(target)
+                    struct = var_to_struct.get(root)
+                    target_topic = self._topic_from_struct(struct) if struct else None
+                    refs.append(
+                        SourceAssignmentRef(
+                            target=target,
+                            expression=expression,
+                            target_topic=target_topic,
+                            target_field=field if target_topic else None,
+                            function=function_name,
+                            function_parameters=list(definition.get("params", [])) if definition else [],
+                            assignment_operator=operator,
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
                         )
                     )
         return self._dedupe_source_assignment_refs(refs)
+
+    @staticmethod
+    def _compound_assignment_expression(target: str, operator: str, expression: str) -> str:
+        binary_operator = operator[:-1]
+        if binary_operator:
+            return f"{target} {binary_operator} ({expression})"
+        return expression
 
     def extract_function_calls_from_source(
         self,
@@ -1584,6 +1623,25 @@ class MechanismSourceProfiler:
                 "kind": "declare",
                 "target": declaration_match.group("name"),
                 "expression": MechanismSourceProfiler._normalize_helper_expression(declaration_match.group("expr")),
+            }
+        compound_assignment_match = re.match(
+            r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+            r"\s*(?P<op>\+=|-=|\*=|/=|%=|\|=|&=|\^=)\s*(?P<expr>.+)$",
+            statement,
+            flags=re.DOTALL,
+        )
+        if compound_assignment_match:
+            target = MechanismSourceProfiler._clean_field_path(compound_assignment_match.group("target"))
+            expression = MechanismSourceProfiler._compound_assignment_expression(
+                target,
+                compound_assignment_match.group("op"),
+                MechanismSourceProfiler._normalize_helper_expression(compound_assignment_match.group("expr")),
+            )
+            return {
+                "kind": "assign",
+                "target": target,
+                "expression": expression,
+                "operator": compound_assignment_match.group("op"),
             }
         assignment_match = re.match(
             r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"

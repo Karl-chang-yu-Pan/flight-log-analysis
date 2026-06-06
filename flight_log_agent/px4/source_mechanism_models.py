@@ -80,6 +80,19 @@ class SourceOutputBindingRecord(BaseModel):
     assignment_path: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class SourceMechanismBranchGroup(BaseModel):
+    name: str
+    source_files: list[str] = Field(default_factory=list)
+    source_chain: list[CodeRef] = Field(default_factory=list)
+    controlling_parameter_names: list[str] = Field(default_factory=list)
+    relevant_signals: list[str] = Field(default_factory=list)
+    branch_conditions: list[str] = Field(default_factory=list)
+    interpreted_parameter_predicates: list[SourceBackedParameterPredicate] = Field(default_factory=list)
+    verification_checks: list[SourceBackedVerificationCheck] = Field(default_factory=list)
+    contradiction_checks: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class SourceMechanismCandidate(BaseModel):
     title: str
     source_mechanism: str
@@ -95,6 +108,7 @@ class SourceMechanismCandidate(BaseModel):
     interpreted_parameter_predicates: list[SourceBackedParameterPredicate] = Field(default_factory=list)
     verification_checks: list[SourceBackedVerificationCheck] = Field(default_factory=list)
     contradiction_checks: list[str] = Field(default_factory=list)
+    branch_groups: list[SourceMechanismBranchGroup] = Field(default_factory=list)
     source_confidence: Literal["low", "medium", "high"] = "low"
     resolver_notes: list[str] = Field(default_factory=list)
 
@@ -119,6 +133,7 @@ class SourceDiscoveryCandidateDraft(BaseModel):
     interpreted_parameter_predicates: list[SourceBackedParameterPredicate] = Field(default_factory=list)
     verification_checks: list[SourceBackedVerificationCheck] = Field(default_factory=list)
     contradiction_checks: list[str] = Field(default_factory=list)
+    branch_groups: list[SourceMechanismBranchGroup] = Field(default_factory=list)
     source_confidence: Literal["low", "medium", "high"] = "low"
     resolver_notes: list[str] = Field(default_factory=list)
 

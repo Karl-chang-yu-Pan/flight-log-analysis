@@ -6,10 +6,12 @@ from types import SimpleNamespace
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.models import RelationshipCheckSpec
 from flight_log_agent.px4.source_mechanism_models import (
+    ParameterRequirement,
     SourceBackedParameterPredicate,
     SourceBackedVerificationCheck,
     SourceDiscoveryCandidateDraft,
     SourceDiscoveryDecision,
+    SourceMechanismBranchGroup,
 )
 from flight_log_agent.px4.source_mechanism_resolver import (
     SourceMechanismResolver,
@@ -827,7 +829,7 @@ void update()
     )
 
 
-def test_source_mechanism_resolver_drops_drafts_with_contradicted_branch_parameters(tmp_path):
+def test_source_mechanism_resolver_prunes_drafts_with_contradicted_branch_parameters(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -884,7 +886,9 @@ class RtlTest {
     profile_packet = packets[1]
     assert profile_packet.static_log_context["eliminated_parameter_paths"][0]["name"] == "VT_TYPE"
     assert profile_packet.static_log_context["eliminated_parameter_paths"][0]["gate_result"] == "contradicted"
-    assert all(candidate.title != "Contradicted VTOL path" for candidate in result.candidates)
+    candidate = next(candidate for candidate in result.candidates if candidate.title == "Contradicted VTOL path")
+    assert "pruned contradicted branch-selector facts" in " ".join(candidate.resolver_notes)
+    assert candidate.controlling_parameters == []
     assert all(
         requirement.name != "VT_TYPE"
         for candidate in result.candidates
@@ -966,6 +970,51 @@ void update()
     assert candidate.controlling_parameters[0].name == "VT_TYPE"
     assert candidate.controlling_parameters[0].gate_result == "satisfied"
     assert candidate.verification_checks[0].check.type == "branch_parameter_satisfied"
+
+
+def test_source_mechanism_resolver_prunes_contradicted_branch_groups(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    source_path.mkdir()
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+    draft = SourceDiscoveryCandidateDraft(
+        title="Mixed source mechanism",
+        source_mechanism="One branch is contradicted but another remains possible.",
+        branch_groups=[
+            SourceMechanismBranchGroup(
+                name="manual",
+                controlling_parameter_names=["FW_ARSP_MODE"],
+                branch_conditions=["_param_fw_arsp_mode.get() == 1"],
+            ),
+            SourceMechanismBranchGroup(
+                name="auto",
+                controlling_parameter_names=["FW_AIRSPD_TRIM"],
+                branch_conditions=["position_setpoint_triplet.current.valid"],
+            ),
+        ],
+    )
+
+    filtered = resolver._filter_candidate_drafts_by_parameter_gate(
+        [draft],
+        [
+            ParameterRequirement(
+                name="FW_ARSP_MODE",
+                role="branch_selector",
+                source_predicate="_param_fw_arsp_mode.get() == 1",
+                actual_value=0,
+                gate_result="contradicted",
+                effect="Manual airspeed branch is disabled.",
+                source_file="src/modules/fw_pos_control/FixedwingPositionControl.cpp",
+                source_line=10,
+            )
+        ],
+        build_source_discovery_log_context({"parameters": {"FW_ARSP_MODE": 0}}),
+    )
+
+    assert [group.name for group in filtered[0].branch_groups] == ["auto"]
+    assert filtered[0].title == "Mixed source mechanism"
 
 
 def test_source_mechanism_resolver_discards_uncited_agent_facts(tmp_path):

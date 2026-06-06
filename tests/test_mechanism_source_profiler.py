@@ -592,6 +592,35 @@ bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
     assert by_target["sp.alt"].expression == "get_absolute_altitude_for_item(item)"
 
 
+def test_source_assignment_extraction_lowers_compound_updates(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "fw_pos_control"
+    module_dir.mkdir(parents=True)
+    (module_dir / "FixedwingPositionControl.cpp").write_text(
+        """
+float adapt_airspeed_setpoint(float calibrated_min_airspeed, float weight_ratio)
+{
+    float load_factor_from_bank_angle = 1.0f;
+    load_factor_from_bank_angle = 1.0f / cosf(_att_sp.roll_body);
+    calibrated_min_airspeed *= sqrtf(load_factor_from_bank_angle * weight_ratio);
+    return calibrated_min_airspeed;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/fw_pos_control/FixedwingPositionControl.cpp"]
+    )
+    by_line = {assignment.line: assignment for assignment in assignments}
+
+    assert by_line[6].target == "calibrated_min_airspeed"
+    assert by_line[6].assignment_operator == "*="
+    assert by_line[6].expression == "calibrated_min_airspeed * (sqrt(load_factor_from_bank_angle * weight_ratio))"
+    assert by_line[6].function == "adapt_airspeed_setpoint"
+
+
 def test_helper_expression_translation_marks_complex_helpers_unresolved(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"

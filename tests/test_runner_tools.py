@@ -962,6 +962,88 @@ def test_applicability_derives_fallback_windows_from_check_names(tmp_path):
     assert "No candidate verification window" not in " ".join(result.unresolved_conditions)
 
 
+def test_applicability_derives_windows_from_logged_source_predicates(tmp_path):
+    runner = load_runner(tmp_path)
+    source_path = tmp_path / "PX4-Autopilot"
+    msg_dir = source_path / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "VehicleStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 vehicle_type
+uint8 VEHICLE_TYPE_FIXED_WING = 2
+uint8 nav_state
+uint8 NAV_STATE_AUTO_MISSION = 3
+uint8 NAV_STATE_POSCTL = 4
+""",
+        encoding="utf-8",
+    )
+    candidate = runner.MechanismCandidate(
+        name="Automatic fixed-wing source path",
+        summary="Only applies in automatic fixed-wing mission windows.",
+        source_refs=[],
+        mode_state_gates=[
+            "vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING",
+            "vehicle_status.nav_state == vehicle_status_s::NAV_STATE_AUTO_MISSION",
+        ],
+        numeric_checks=[
+            runner.RelationshipCheckSpec(
+                type="threshold",
+                signal="airspeed_validated.true_airspeed_m_s",
+                window="source_predicate_window_1",
+                metric="mean",
+                op=">=",
+                value=0,
+            )
+        ],
+    )
+
+    result = runner.evaluate_candidate_applicability(
+        candidate,
+        {
+            "source_path": source_path,
+            "available_topics": ["airspeed_validated", "vehicle_status"],
+            "topic_fields": {
+                "airspeed_validated": ["true_airspeed_m_s"],
+                "vehicle_status": ["vehicle_type", "nav_state"],
+            },
+        },
+        [
+            {"time_s": 1.0, "topic": "vehicle_status", "field": "vehicle_type", "value": 2},
+            {"time_s": 1.0, "topic": "vehicle_status", "field": "nav_state", "value": 3},
+            {"time_s": 9.0, "topic": "vehicle_status", "field": "nav_state", "value": 4},
+        ],
+        None,
+    )
+
+    assert result.applicable is True
+    assert [(window.name, window.start_s, window.end_s) for window in result.candidate_windows] == [
+        ("source_predicate_window_1", 1.0, 9.0)
+    ]
+
+    excluded = runner.evaluate_candidate_applicability(
+        candidate,
+        {
+            "source_path": source_path,
+            "available_topics": ["airspeed_validated", "vehicle_status"],
+            "topic_fields": {
+                "airspeed_validated": ["true_airspeed_m_s"],
+                "vehicle_status": ["vehicle_type", "nav_state"],
+            },
+        },
+        [
+            {"time_s": 1.0, "topic": "vehicle_status", "field": "vehicle_type", "value": 2},
+            {"time_s": 1.0, "topic": "vehicle_status", "field": "nav_state", "value": 4},
+            {"time_s": 9.0, "topic": "vehicle_status", "field": "nav_state", "value": 4},
+        ],
+        None,
+    )
+
+    assert excluded.applicable is False
+    assert excluded.candidate_windows == []
+    assert "No timeline window satisfied" in " ".join(excluded.excluded_by)
+
+
 def test_source_mechanism_conversion_emits_executable_checks(tmp_path):
     runner = load_runner(tmp_path)
     source_candidate = runner.SourceMechanismCandidate(
@@ -1047,6 +1129,43 @@ def test_source_mechanism_conversion_preserves_derived_expression_checks(tmp_pat
         variable.model_dump() if hasattr(variable, "model_dump") else variable
         for variable in candidate.numeric_checks[0].variables
     ] == [{"name": "current_alt", "source": "vehicle_local_position.z"}]
+
+
+def test_source_mechanism_conversion_canonicalizes_signal_refs_from_output_bindings(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="Cruising speed source path",
+        source_mechanism="Source compares the requested cruising speed.",
+        required_log_evidence=["Check position_setpoint.cruising_speed in the log."],
+        verification_checks=[
+            runner.SourceBackedVerificationCheck(
+                check=runner.RelationshipCheckSpec(
+                    type="tracks_setpoint",
+                    actual="airspeed_validated.true_airspeed_m_s",
+                    setpoint="position_setpoint.cruising_speed",
+                    window="fixed_wing",
+                ),
+                source_file="src/modules/fw_pos_control/FixedwingPositionControl.cpp",
+                source_line=455,
+            )
+        ],
+    )
+    output_bindings = [
+        runner.SourceOutputBindingRecord(
+            binding_id="binding_1",
+            source_symbol="sp.cruising_speed",
+            target_symbol="pos_sp_triplet.current.cruising_speed",
+            logged_signal="position_setpoint_triplet.current.cruising_speed",
+        )
+    ]
+
+    candidate = runner.source_mechanism_to_candidate(
+        source_candidate,
+        output_bindings=output_bindings,
+    )
+
+    assert "position_setpoint_triplet.current.cruising_speed" in candidate.required_signals
+    assert candidate.numeric_checks[0].setpoint == "position_setpoint_triplet.current.cruising_speed"
 
 
 def test_source_mechanism_conversion_preserves_helper_dependencies(tmp_path):
