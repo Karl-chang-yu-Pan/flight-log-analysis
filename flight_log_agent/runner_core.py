@@ -223,6 +223,11 @@ Rules:
   interpreted_parameter_predicates and executable later checks in
   verification_checks. Every interpreted predicate/check must include the exact
   source_file and source_line that supports it.
+- Verification checks must encode generic claim polarity. Use supports for a
+  check result that supports the candidate, and contradicts for a check result
+  that rules out the candidate. This applies even when the check itself is
+  expected to pass, such as command-absent, sentinel-value, alternative-formula,
+  or branch-not-active facts.
 - If a later verification check depends on a helper call or formula that cannot
   be directly expressed yet, preserve it as a structured derived_expression
   check with helper_dependencies and a precise unresolved_reason. Do not encode
@@ -1085,8 +1090,36 @@ def source_candidate_verification_checks(
     for source_check in getattr(source_candidate, "verification_checks", []) or []:
         check = source_check.check
         if check.type in check_types and source_check.source_file and source_check.source_line is not None:
-            checks.append(check)
+            checks.append(source_check_with_default_claim_messages(check))
     return checks
+
+
+def source_check_with_default_claim_messages(check: RelationshipCheckSpec) -> RelationshipCheckSpec:
+    if check.supports and check.contradicts:
+        return check
+    description = check.description or relationship_check_summary(check)
+    updates: dict[str, Any] = {}
+    if not check.supports:
+        updates["supports"] = description
+    if not check.contradicts:
+        updates["contradicts"] = f"Log evidence contradicted: {description}"
+    data = check.model_dump() if hasattr(check, "model_dump") else dict(check.__dict__)
+    data.update(updates)
+    return RelationshipCheckSpec(**data)
+
+
+def relationship_check_summary(check: RelationshipCheckSpec) -> str:
+    if check.type == "derived_expression":
+        expression = check.expected_expression or check.expression or "source expression"
+        target = check.signal or check.actual or "logged output"
+        return f"{expression} matches {target}."
+    if check.type in {"state_equals", "state_not_equals", "threshold"} and check.signal:
+        return f"{check.signal} satisfies {check.type} check."
+    if check.type in {"parameter_equals", "branch_parameter_satisfied"} and check.parameter:
+        return f"{check.parameter} satisfies {check.type} check."
+    if check.type == "topic_field_present" and check.signal:
+        return f"{check.signal} is logged."
+    return f"{check.type} check is satisfied."
 
 
 def source_candidate_required_signals(

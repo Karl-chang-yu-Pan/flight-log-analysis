@@ -1131,6 +1131,65 @@ def test_source_mechanism_conversion_preserves_derived_expression_checks(tmp_pat
     ] == [{"name": "current_alt", "source": "vehicle_local_position.z"}]
 
 
+def test_source_mechanism_conversion_adds_default_claim_messages(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="Generic source check",
+        source_mechanism="PX4 source has an executable check.",
+        verification_checks=[
+            runner.SourceBackedVerificationCheck(
+                check=runner.RelationshipCheckSpec(
+                    type="derived_expression",
+                    expression="actual",
+                    expected_expression="source_value",
+                    variables=[
+                        {"name": "actual", "source": "position_setpoint_triplet.current.alt"},
+                        {"name": "source_value", "source": "rtl_reference.alt"},
+                    ],
+                    op="==",
+                    max_error=0.001,
+                ),
+                source_file="src/modules/navigator/rtl.cpp",
+                source_line=42,
+            )
+        ],
+    )
+
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
+
+    check = candidate.numeric_checks[0]
+    assert check.supports == "source_value matches logged output."
+    assert check.contradicts == "Log evidence contradicted: source_value matches logged output."
+
+
+def test_source_mechanism_conversion_preserves_contradicting_claim_checks(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="Command-driven source path",
+        source_mechanism="This path needs a command that may be absent in the log.",
+        verification_checks=[
+            runner.SourceBackedVerificationCheck(
+                check=runner.RelationshipCheckSpec(
+                    type="state_not_equals",
+                    signal="vehicle_command.command",
+                    value=178,
+                    mode="all",
+                    contradicts="No DO_CHANGE_SPEED command was observed.",
+                ),
+                source_file="src/modules/navigator/mission.cpp",
+                source_line=178,
+            )
+        ],
+    )
+
+    candidate = runner.source_mechanism_to_candidate(source_candidate)
+
+    assert candidate.numeric_checks[0].type == "state_not_equals"
+    assert candidate.numeric_checks[0].signal == "vehicle_command.command"
+    assert candidate.numeric_checks[0].contradicts == "No DO_CHANGE_SPEED command was observed."
+    assert candidate.numeric_checks[0].supports == "vehicle_command.command satisfies state_not_equals check."
+
+
 def test_source_mechanism_conversion_canonicalizes_signal_refs_from_output_bindings(tmp_path):
     runner = load_runner(tmp_path)
     source_candidate = runner.SourceMechanismCandidate(
