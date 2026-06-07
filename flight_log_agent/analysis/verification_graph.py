@@ -8,6 +8,8 @@ from typing import Any, Iterable, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from flight_log_agent.analysis.control_predicate import lower_control_predicates
+from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.models import CodeRef, MechanismCandidate, RelationshipCheckSpec
 
 
@@ -43,6 +45,8 @@ CHECK_SIGNAL_FIELDS = ("signal", "first", "second", "actual", "setpoint")
 NON_SYMBOL_NAMES = {
     "True",
     "False",
+    "F",
+    "and",
     "abs",
     "constrain",
     "cos",
@@ -52,20 +56,25 @@ NON_SYMBOL_NAMES = {
     "isfinite",
     "max",
     "min",
+    "not",
+    "or",
     "round",
     "sin",
     "sqrt",
     "tan",
+    "f",
 }
 
 
 def compile_verification_graphs(
     candidate: MechanismCandidate,
     output_bindings: Iterable[Any] = (),
+    *,
+    source_path: Optional[str] = None,
 ) -> list[VerificationGraph]:
     bindings = [_binding_dict(binding) for binding in output_bindings]
     return [
-        compile_verification_graph(candidate, terminal, bindings)
+        compile_verification_graph(candidate, terminal, bindings, source_path=source_path)
         for terminal in terminal_outputs(candidate, bindings)
     ]
 
@@ -91,9 +100,12 @@ def compile_verification_graph(
     candidate: MechanismCandidate,
     terminal_output: str,
     output_bindings: Iterable[Any] = (),
+    *,
+    source_path: Optional[str] = None,
 ) -> VerificationGraph:
     terminal = normalize_symbol(terminal_output)
     bindings = [_binding_dict(binding) for binding in output_bindings]
+    signal_bindings = source_signal_bindings(bindings)
     relevant_bindings = backward_binding_slice(terminal, bindings)
     reachable_symbols = binding_slice_symbols(terminal, relevant_bindings)
     owned_checks = [
@@ -120,6 +132,7 @@ def compile_verification_graph(
         label=f"expected source output: {terminal}",
         symbol=terminal,
         logged_signal=terminal,
+        metadata={"actual_input_id": actual_id, "producer_controls": {}},
     )
     comparison_id = add_node(
         nodes,
@@ -134,20 +147,22 @@ def compile_verification_graph(
     if not relevant_bindings:
         unresolved.append(f"No primary source binding reaches terminal output {terminal}.")
 
-    binding_operations: dict[tuple[str, str, str], str] = {}
+    binding_operations: dict[tuple[str, ...], str] = {}
     operations_by_target: dict[str, list[str]] = defaultdict(list)
     for binding in relevant_bindings:
-        source_symbol = normalize_symbol(str(binding.get("source_symbol") or ""))
+        source_expression = str(binding.get("source_symbol") or "").strip()
+        source_symbol = normalize_symbol(source_expression)
         target_symbol = normalize_symbol(str(binding.get("target_symbol") or ""))
         operation_id = add_node(
             nodes,
             kind="operation",
-            label=f"{target_symbol} = {source_symbol}",
+            label=f"{target_symbol} = {source_expression}",
             symbol=target_symbol,
             binding_id=str(binding.get("binding_id") or "") or None,
             source_refs=assignment_path_source_refs(binding.get("assignment_path") or []),
             metadata={
                 "operation": "source_assignment",
+                "source_expression": source_expression,
                 "source_symbol": source_symbol,
                 "target_symbol": target_symbol,
             },
@@ -156,11 +171,53 @@ def compile_verification_graph(
         operations_by_target[target_symbol].append(operation_id)
         if normalize_symbol(str(binding.get("logged_signal") or "")) == terminal:
             add_edge(edges, operation_id, output_id, "data")
+            predicates = [str(item) for item in binding.get("control_predicates") or [] if item]
+            control_id = None
+            if predicates:
+                lowered_predicates = lower_control_predicates(
+                    predicates,
+                    signal_bindings,
+                    source_path=source_path,
+                )
+                control_id = add_node(
+                    nodes,
+                    kind="branch",
+                    label=f"producer control: {target_symbol} = {source_expression}",
+                    symbol=str(binding.get("binding_id") or "") or target_symbol,
+                    metadata={
+                        "source_predicates": predicates,
+                        "lowered_predicates": [item.model_dump() for item in lowered_predicates],
+                        "producer_id": operation_id,
+                    },
+                )
+                add_edge(edges, control_id, output_id, "control")
+                lowered_dependencies = []
+                lowered_dependency_signals: dict[str, str] = {}
+                for lowered in lowered_predicates:
+                    if lowered.status != "log_verifiable" or not lowered.expression:
+                        continue
+                    lowered_dependencies.extend(expression_symbols(lowered.expression))
+                    lowered_dependency_signals.update(lowered.variables)
+                for dependency in dedupe(lowered_dependencies):
+                    evidence_id = add_node(
+                        nodes,
+                        kind="evidence",
+                        label=f"producer control dependency: {dependency}",
+                        symbol=dependency,
+                        logged_signal=(
+                            lowered_dependency_signals.get(dependency)
+                            or (dependency if looks_like_logged_signal(dependency) else None)
+                        ),
+                        metadata={"evidence_kind": "producer_control"},
+                    )
+                    add_edge(edges, evidence_id, control_id, "data")
+            nodes[output_id].metadata["producer_controls"][operation_id] = control_id
+    add_edge(edges, actual_id, output_id, "control")
 
     for binding in relevant_bindings:
-        source_symbol = normalize_symbol(str(binding.get("source_symbol") or ""))
+        source_expression = str(binding.get("source_symbol") or "").strip()
         operation_id = binding_operations[binding_key(binding)]
-        for dependency in expression_symbols(source_symbol):
+        for dependency in expression_symbols(source_expression):
             producers = operations_by_target.get(dependency, [])
             if producers:
                 for producer_id in producers:
@@ -200,12 +257,31 @@ def compile_verification_graph(
             )
             add_edge(edges, evidence_id, check_id, "data")
         if branch_name:
+            source_predicates = next(
+                (
+                    group.source_predicates
+                    for group in candidate.branch_groups
+                    if group.name == branch_name
+                ),
+                [],
+            )
             branch_id = add_node(
                 nodes,
                 kind="branch",
                 label=f"branch: {branch_name}",
                 symbol=branch_name,
+                metadata={"source_predicates": source_predicates},
             )
+            for dependency in expression_symbols(" and ".join(source_predicates)):
+                evidence_id = add_node(
+                    nodes,
+                    kind="evidence",
+                    label=f"branch dependency: {dependency}",
+                    symbol=dependency,
+                    logged_signal=dependency if looks_like_logged_signal(dependency) else None,
+                    metadata={"evidence_kind": "branch_input"},
+                )
+                add_edge(edges, evidence_id, branch_id, "data")
             add_edge(edges, branch_id, check_id, "control")
 
     graph = VerificationGraph(
@@ -242,8 +318,8 @@ def backward_binding_slice(terminal_output: str, bindings: list[dict[str, Any]])
             continue
         seen.add(key)
         selected.append(binding)
-        source = normalize_symbol(str(binding.get("source_symbol") or ""))
-        for symbol in expression_symbols(source):
+        source_expression = str(binding.get("source_symbol") or "")
+        for symbol in expression_symbols(source_expression):
             frontier.extend(by_target.get(symbol, []))
     return selected
 
@@ -255,6 +331,32 @@ def binding_slice_symbols(terminal_output: str, bindings: list[dict[str, Any]]) 
         symbols.add(normalize_symbol(str(binding.get("target_symbol") or "")))
         symbols.update(expression_symbols(str(binding.get("source_symbol") or "")))
     return {symbol for symbol in symbols if symbol}
+
+
+def source_signal_bindings(bindings: list[dict[str, Any]]) -> dict[str, str]:
+    signal_bindings: dict[str, str] = common_source_signal_bindings()
+    for binding in bindings:
+        logged_signal = normalize_symbol(str(binding.get("logged_signal") or ""))
+        if not logged_signal:
+            continue
+        for symbol in (
+            str(binding.get("target_symbol") or ""),
+            normalize_symbol(str(binding.get("target_symbol") or "")),
+        ):
+            if symbol:
+                signal_bindings[symbol] = logged_signal
+    return signal_bindings
+
+
+def common_source_signal_bindings() -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    for prefix in ("cmd", "vehicle_command"):
+        for field in ("command", "param1", "param2", "param3", "param4", "param5", "param6", "param7"):
+            bindings[f"{prefix}.{field}"] = f"vehicle_command.{field}"
+    for prefix in ("status", "vstatus", "_vstatus", "vehicle_status"):
+        for field in ("arming_state", "nav_state", "vehicle_type"):
+            bindings[f"{prefix}.{field}"] = f"vehicle_status.{field}"
+    return bindings
 
 
 def check_owned_by_terminal(
@@ -360,6 +462,9 @@ def reverse_reachable_node_ids(target_id: str, edges: list[VerificationGraphEdge
 
 
 def expression_symbols(expression: str) -> list[str]:
+    parsed_names = source_expression_names(expression)
+    if parsed_names:
+        return dedupe(normalize_symbol(name) for name in parsed_names)
     symbols = []
     for token in re.findall(
         r"\b_?[A-Za-z][A-Za-z0-9_]*(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*)*\b",
@@ -456,11 +561,13 @@ def looks_like_source_symbol(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", value))
 
 
-def binding_key(binding: dict[str, Any]) -> tuple[str, str, str]:
+def binding_key(binding: dict[str, Any]) -> tuple[str, ...]:
     return (
         normalize_symbol(str(binding.get("source_symbol") or "")),
         normalize_symbol(str(binding.get("target_symbol") or "")),
         normalize_symbol(str(binding.get("logged_signal") or "")),
+        str(binding.get("binding_id") or ""),
+        *[str(item) for item in binding.get("control_predicates") or []],
     )
 
 

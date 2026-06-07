@@ -78,6 +78,7 @@ class SourceOutputBindingRecord(BaseModel):
     target_symbol: str
     logged_signal: Optional[str] = None
     assignment_path: list[dict[str, Any]] = Field(default_factory=list)
+    control_predicates: list[str] = Field(default_factory=list)
 
 
 class SourceMechanismBranchGroup(BaseModel):

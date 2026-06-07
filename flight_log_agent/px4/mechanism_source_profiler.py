@@ -101,6 +101,7 @@ class FunctionCallRef(BaseModel):
     receiver: Optional[str] = None
     args: List[str] = Field(default_factory=list)
     argument_topics: Dict[str, str] = Field(default_factory=dict)
+    control_predicates: List[str] = Field(default_factory=list)
 
 
 class SourceAssignmentRef(BaseModel):
@@ -114,6 +115,7 @@ class SourceAssignmentRef(BaseModel):
     target_topic: Optional[str] = None
     target_field: Optional[str] = None
     assignment_operator: Optional[str] = None
+    control_predicates: List[str] = Field(default_factory=list)
 
 
 class HelperExpressionRef(BaseModel):
@@ -743,6 +745,7 @@ class MechanismSourceProfiler:
             rel_file = self._rel(path)
             var_to_struct = self._extract_struct_variables(text)
             definitions = self._extract_function_definitions(text, rel_file)
+            control_predicates = self._control_predicates_by_line(text)
 
             for line_no, line in self._iter_code_lines(text):
                 stripped = line.strip()
@@ -768,6 +771,7 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
+                            control_predicates=control_predicates.get(line_no, []),
                         )
                     )
                 for match in self._SOURCE_COMPOUND_ASSIGNMENT_PATTERN.finditer(line):
@@ -794,9 +798,33 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
+                            control_predicates=control_predicates.get(line_no, []),
                         )
                     )
         return self._dedupe_source_assignment_refs(refs)
+
+    def _control_predicates_by_line(self, text: str) -> Dict[int, List[str]]:
+        predicates_by_line: Dict[int, List[str]] = {}
+        active: List[Tuple[int, str]] = []
+        brace_depth = 0
+        for line_no, line in self._iter_code_lines(text):
+            stripped = line.strip()
+            leading_closes = len(stripped) - len(stripped.lstrip("}"))
+            if leading_closes:
+                brace_depth = max(brace_depth - leading_closes, 0)
+                active = [(depth, predicate) for depth, predicate in active if depth < brace_depth]
+
+            match = self._BRANCH_CONDITION_PATTERN.search(line)
+            branch_kind = " ".join(match.group("kind").split()) if match else ""
+            if match and branch_kind in {"if", "else if"} and "{" in line[match.end():]:
+                predicate = match.group("condition").strip()
+                active.append((brace_depth, predicate))
+
+            predicates_by_line[line_no] = [predicate for _, predicate in active]
+            remainder = stripped[leading_closes:]
+            brace_depth += remainder.count("{") - remainder.count("}")
+            active = [(depth, predicate) for depth, predicate in active if depth < brace_depth]
+        return predicates_by_line
 
     @staticmethod
     def _compound_assignment_expression(target: str, operator: str, expression: str) -> str:
@@ -831,6 +859,7 @@ class MechanismSourceProfiler:
 
             rel_file = self._rel(path)
             var_to_struct = self._extract_struct_variables(text)
+            control_predicates = self._control_predicates_by_line(text)
             for line_no, line in self._iter_code_lines(text):
                 stripped = line.strip()
                 if not stripped or stripped.startswith("//"):
@@ -854,6 +883,7 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
+                            control_predicates=control_predicates.get(line_no, []),
                         )
                     )
 
@@ -2206,7 +2236,7 @@ class MechanismSourceProfiler:
         seen = set()
         out: List[FunctionCallRef] = []
         for ref in refs:
-            key = (ref.name, ref.receiver, ref.file, ref.line)
+            key = (ref.name, ref.receiver, ref.file, ref.line, tuple(ref.control_predicates))
             if key in seen:
                 continue
             seen.add(key)

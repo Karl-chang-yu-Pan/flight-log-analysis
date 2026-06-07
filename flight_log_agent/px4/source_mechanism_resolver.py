@@ -2151,6 +2151,7 @@ def source_output_binding_records(
             target_symbol=str(binding.get("target_symbol") or ""),
             logged_signal=binding.get("logged_signal"),
             assignment_path=list(binding.get("assignment_path") or []),
+            control_predicates=list(binding.get("control_predicates") or []),
         )
         for binding in source_output_binding_candidates(source_assignments, function_calls)
     ]
@@ -2161,6 +2162,7 @@ def source_output_binding_id(binding: dict[str, Any]) -> str:
         str(binding.get("source_symbol") or ""),
         str(binding.get("target_symbol") or ""),
         str(binding.get("logged_signal") or ""),
+        *[str(item) for item in binding.get("control_predicates") or []],
     ])
     return f"bind_{hashlib.sha1(text.encode('utf-8')).hexdigest()[:12]}"
 
@@ -2206,6 +2208,7 @@ def assignment_edge(ref: SourceAssignmentRef) -> dict[str, Any]:
         "source_symbol": ref.expression,
         "target_symbol": ref.target,
         "logged_signal": logged_signal,
+        "control_predicates": list(ref.control_predicates),
         "assignment_path": [
             {
                 "file": ref.file,
@@ -2236,12 +2239,20 @@ def call_bound_assignment_edges(
             if call.receiver and "." not in target:
                 target = f"{call.receiver}.{target}"
             expression = substitute_call_args(assignment.expression, assignment.function_parameters, call.args)
+            control_predicates = [
+                substitute_call_args(predicate, assignment.function_parameters, call.args)
+                for predicate in assignment.control_predicates
+            ]
             logged_signal = logged_signal_for_bound_target(target, call.argument_topics)
             out.append(
                 {
                     "source_symbol": expression,
                     "target_symbol": target,
                     "logged_signal": logged_signal,
+                    "control_predicates": dedupe_keep_order([
+                        *call.control_predicates,
+                        *control_predicates,
+                    ]),
                     "assignment_path": [
                         {
                             "file": assignment.file,
@@ -2295,7 +2306,12 @@ def dedupe_binding_candidates(candidates: list[dict[str, Any]]) -> list[dict[str
     seen = set()
     out: list[dict[str, Any]] = []
     for candidate in candidates:
-        key = (candidate.get("source_symbol"), candidate.get("target_symbol"), candidate.get("logged_signal"))
+        key = (
+            candidate.get("source_symbol"),
+            candidate.get("target_symbol"),
+            candidate.get("logged_signal"),
+            tuple(candidate.get("control_predicates") or []),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -2323,6 +2339,10 @@ def transitive_binding_edges(edges: list[dict[str, Any]], *, max_depth: int = 4)
                     "source_symbol": upstream.get("source_symbol"),
                     "target_symbol": edge.get("target_symbol"),
                     "logged_signal": edge.get("logged_signal"),
+                    "control_predicates": dedupe_keep_order([
+                        *(upstream.get("control_predicates") or []),
+                        *(edge.get("control_predicates") or []),
+                    ]),
                     "assignment_path": [
                         *(upstream.get("assignment_path") or []),
                         *(edge.get("assignment_path") or []),

@@ -374,6 +374,68 @@ void publish_setpoint()
     )
 
 
+def test_source_output_bindings_preserve_assignment_control_predicates(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "mode.cpp").write_text(
+        """
+void publish(position_setpoint_triplet_s &triplet, const vehicle_status_s &status)
+{
+    while (!should_exit()) {
+        if (status.nav_state == 1) {
+            if (status.arming_state == 2) {
+                triplet.current.alt = 42.f;
+            }
+        }
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(["src/modules/navigator/mode.cpp"])
+
+    bindings = source_output_binding_candidates(assignments, [])
+
+    binding = next(item for item in bindings if item["logged_signal"] == "position_setpoint_triplet.current.alt")
+    assert binding["control_predicates"] == [
+        "status.nav_state == 1",
+        "status.arming_state == 2",
+    ]
+
+
+def test_source_output_bindings_propagate_control_predicates_through_assignments(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "mode.cpp").write_text(
+        """
+void publish(position_setpoint_triplet_s &triplet, const vehicle_status_s &status)
+{
+    float selected_altitude = 0.f;
+    if (status.nav_state == 1) {
+        selected_altitude = 42.f;
+    }
+    triplet.current.alt = selected_altitude;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(["src/modules/navigator/mode.cpp"])
+
+    bindings = source_output_binding_candidates(assignments, [])
+
+    binding = next(
+        item
+        for item in bindings
+        if item["source_symbol"] == "42.f"
+        and item["logged_signal"] == "position_setpoint_triplet.current.alt"
+    )
+    assert binding["control_predicates"] == ["status.nav_state == 1"]
+
+
 def test_lower_source_expression_reuses_px4_enum_registry_for_bound_fields(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     msg_dir = source_path / "msg"

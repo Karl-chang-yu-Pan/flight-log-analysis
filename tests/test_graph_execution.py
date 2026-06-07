@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from flight_log_agent.analysis.graph_execution import execute_verification_graph
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.verification_graph import compile_verification_graphs
-from flight_log_agent.models import MechanismCandidate
+from flight_log_agent.models import MechanismBranchGroup, MechanismCandidate, RelationshipCheckSpec
 from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
 
 
@@ -23,22 +23,56 @@ def build_graph():
     return compile_verification_graphs(candidate, [binding])[0]
 
 
-def build_index(actual_values):
+def build_index(
+    actual_values,
+    *,
+    parameters=None,
+    source_timestamps=None,
+    actual_timestamps=None,
+    mode_values=None,
+):
+    data_list = [
+        SimpleNamespace(
+            name="vehicle_global_position",
+            multi_id=0,
+            data={"timestamp": source_timestamps or [1_000_000, 2_000_000], "alt": [10.0, 11.0]},
+        ),
+        SimpleNamespace(
+            name="position_setpoint_triplet",
+            multi_id=0,
+            data={
+                "timestamp": actual_timestamps or [1_000_000, 2_000_000],
+                "current.alt": actual_values,
+            },
+        ),
+    ]
+    if mode_values is not None:
+        data_list.append(
+            SimpleNamespace(
+                name="vehicle_status",
+                multi_id=0,
+                data={"timestamp": [1_000_000, 2_000_000], "nav_state": mode_values},
+            )
+        )
+    else:
+        data_list.append(
+            SimpleNamespace(
+                name="vehicle_status",
+                multi_id=0,
+                data={"timestamp": [1_000_000, 2_000_000], "nav_state": [5, 4], "arming_state": [2, 2]},
+            )
+        )
+    data_list.append(
+        SimpleNamespace(
+            name="vehicle_command",
+            multi_id=0,
+            data={"timestamp": [1_000_000, 2_000_000], "command": [178, 16], "param1": [0.0, 1.0]},
+        )
+    )
     return ULogEvidenceIndex(
         SimpleNamespace(
-            initial_parameters={},
-            data_list=[
-                SimpleNamespace(
-                    name="vehicle_global_position",
-                    multi_id=0,
-                    data={"timestamp": [1_000_000, 2_000_000], "alt": [10.0, 11.0]},
-                ),
-                SimpleNamespace(
-                    name="position_setpoint_triplet",
-                    multi_id=0,
-                    data={"timestamp": [1_000_000, 2_000_000], "current.alt": actual_values},
-                ),
-            ],
+            initial_parameters=parameters or {},
+            data_list=data_list,
         )
     )
 
@@ -60,7 +94,7 @@ def test_graph_execution_contradicts_when_terminal_log_comparison_mismatches():
     assert comparison.value["max_error"] == 1.0
 
 
-def test_graph_execution_keeps_complex_source_expression_pending():
+def test_graph_execution_reconstructs_stateless_source_expression():
     candidate = MechanismCandidate(
         name="Complex altitude publication",
         summary="Requires arithmetic expression execution.",
@@ -75,8 +109,259 @@ def test_graph_execution_keeps_complex_source_expression_pending():
     )
     graph = compile_verification_graphs(candidate, [binding])[0]
 
-    result = execute_verification_graph(graph, build_index([20.0, 21.0]))
+    result = execute_verification_graph(
+        graph,
+        build_index([20.0, 21.0], parameters={"RTL_RETURN_ALT": 10.0}),
+    )
+
+    assert result.verdict == "supported"
+
+
+def test_graph_execution_aligns_reconstruction_to_actual_output_by_prior_sample():
+    result = execute_verification_graph(
+        build_graph(),
+        build_index(
+            [10.0, 11.0],
+            source_timestamps=[1_000_000, 2_000_000],
+            actual_timestamps=[1_500_000, 2_500_000],
+        ),
+    )
+
+    assert result.verdict == "supported"
+
+
+def test_graph_execution_compares_constant_source_expression_to_logged_series():
+    candidate = MechanismCandidate(
+        name="Default cruising speed",
+        summary="Publishes the default unset cruising speed.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    binding = SourceOutputBindingRecord(
+        binding_id="constant",
+        source_symbol="-1.f",
+        target_symbol="triplet.current.alt",
+        logged_signal="position_setpoint_triplet.current.alt",
+    )
+    graph = compile_verification_graphs(candidate, [binding])[0]
+
+    result = execute_verification_graph(graph, build_index([-1.0, -1.0]))
+
+    assert result.verdict == "supported"
+
+
+def test_graph_execution_evaluates_branch_predicate_without_using_it_as_terminal_proof():
+    candidate = MechanismCandidate(
+        name="Bitmask branch",
+        summary="Publishes altitude while a source branch is active.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+        branch_groups=[
+            MechanismBranchGroup(
+                name="enabled",
+                source_predicates=["MODE & 2 != 0"],
+                numeric_checks=[
+                    RelationshipCheckSpec(
+                        type="derived_expression",
+                        actual="position_setpoint_triplet.current.alt",
+                        expected_expression="vehicle_global_position.alt",
+                    )
+                ],
+            )
+        ],
+    )
+    graph = compile_verification_graphs(
+        candidate,
+        [
+            SourceOutputBindingRecord(
+                binding_id="altitude",
+                source_symbol="vehicle_global_position.alt",
+                target_symbol="triplet.current.alt",
+                logged_signal="position_setpoint_triplet.current.alt",
+            )
+        ],
+    )[0]
+
+    result = execute_verification_graph(graph, build_index([10.0, 11.0], parameters={"MODE": 2}))
+
+    assert result.verdict == "supported"
+    assert any(item.status == "applicable" for item in result.node_results)
+
+
+def test_graph_execution_selects_exactly_one_controlled_producer_per_actual_timestamp():
+    candidate = MechanismCandidate(
+        name="Controlled altitude producers",
+        summary="Different source branches publish the same terminal.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="mode-one",
+            source_symbol="10.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["vehicle_status.nav_state == 1"],
+        ),
+        SourceOutputBindingRecord(
+            binding_id="mode-two",
+            source_symbol="20.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["vehicle_status.nav_state == 2"],
+        ),
+    ]
+    graph = compile_verification_graphs(candidate, bindings)[0]
+
+    result = execute_verification_graph(graph, build_index([10.0, 20.0], mode_values=[1, 2]))
+
+    assert result.verdict == "supported"
+    comparison = next(item for item in result.node_results if item.status == "supported")
+    assert comparison.value["sample_count"] == 2
+
+
+def test_graph_execution_keeps_overlapping_controlled_producers_unresolved():
+    candidate = MechanismCandidate(
+        name="Overlapping altitude producers",
+        summary="More than one source branch can appear active.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="positive",
+            source_symbol="10.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["vehicle_status.nav_state > 0"],
+        ),
+        SourceOutputBindingRecord(
+            binding_id="one",
+            source_symbol="10.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["vehicle_status.nav_state == 1"],
+        ),
+    ]
+    graph = compile_verification_graphs(candidate, bindings)[0]
+
+    result = execute_verification_graph(graph, build_index([10.0, 10.0], mode_values=[1, 1]))
 
     assert result.verdict == "unresolved"
-    assert any("parameter is not present" in item for item in result.unresolved_dependencies)
-    assert any("requires expression execution" in item for item in result.unresolved_dependencies)
+    assert any("2 active producers" in reason for reason in result.unresolved_dependencies)
+
+
+def test_graph_execution_keeps_competing_uncontrolled_producer_unresolved():
+    candidate = MechanismCandidate(
+        name="Incomplete producer controls",
+        summary="One competing source assignment has no recoverable control context.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="controlled",
+            source_symbol="10.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["vehicle_status.nav_state == 1"],
+        ),
+        SourceOutputBindingRecord(
+            binding_id="uncontrolled",
+            source_symbol="20.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+        ),
+    ]
+    graph = compile_verification_graphs(candidate, bindings)[0]
+
+    result = execute_verification_graph(graph, build_index([10.0, 10.0], mode_values=[1, 1]))
+
+    assert result.verdict == "unresolved"
+    assert any("without control predicates" in reason for reason in result.unresolved_dependencies)
+
+
+def test_graph_execution_uses_lowered_control_predicate_aliases_for_log_evidence(tmp_path):
+    msg_dir = tmp_path / "msg"
+    msg_dir.mkdir()
+    (msg_dir / "VehicleCommand.msg").write_text(
+        """
+uint64 timestamp
+uint16 command
+uint16 VEHICLE_CMD_DO_CHANGE_SPEED = 178
+""",
+        encoding="utf-8",
+    )
+    candidate = MechanismCandidate(
+        name="Command-controlled altitude",
+        summary="A source branch is selected by a logged command enum.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="command-field",
+            source_symbol="cmd.command",
+            target_symbol="cmd.command",
+            logged_signal="vehicle_command.command",
+        ),
+        SourceOutputBindingRecord(
+            binding_id="change-speed",
+            source_symbol="10.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["cmd.command == vehicle_command_s::VEHICLE_CMD_DO_CHANGE_SPEED"],
+        ),
+        SourceOutputBindingRecord(
+            binding_id="other",
+            source_symbol="20.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["cmd.command != vehicle_command_s::VEHICLE_CMD_DO_CHANGE_SPEED"],
+        ),
+    ]
+    graph = compile_verification_graphs(candidate, bindings, source_path=str(tmp_path))[0]
+
+    result = execute_verification_graph(graph, build_index([10.0, 20.0]))
+
+    assert result.verdict == "supported"
+
+
+def test_graph_execution_uses_common_status_alias_for_control_predicate(tmp_path):
+    msg_dir = tmp_path / "msg"
+    msg_dir.mkdir()
+    (msg_dir / "VehicleStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 nav_state
+uint8 NAVIGATION_STATE_AUTO_RTL = 5
+""",
+        encoding="utf-8",
+    )
+    candidate = MechanismCandidate(
+        name="Status-controlled altitude",
+        summary="A source branch is selected by logged vehicle status.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="rtl",
+            source_symbol="10.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["_vstatus.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_RTL"],
+        ),
+        SourceOutputBindingRecord(
+            binding_id="not-rtl",
+            source_symbol="20.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["_vstatus.nav_state != vehicle_status_s::NAVIGATION_STATE_AUTO_RTL"],
+        ),
+    ]
+    graph = compile_verification_graphs(candidate, bindings, source_path=str(tmp_path))[0]
+
+    result = execute_verification_graph(graph, build_index([10.0, 20.0]))
+
+    assert result.verdict == "supported"
