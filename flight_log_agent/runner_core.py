@@ -215,6 +215,10 @@ Rules:
 - Decide which source files are mechanism-relevant, what expansion queries to
   run next, and whether the source chain is complete enough.
 - Candidate drafts must be source-level mechanisms plus verification plans.
+- Candidate drafts must identify primary_output_signals: the specific terminal
+  logged outputs produced by the cited source mechanism. Do not list nearby or
+  merely relevant outputs. The resolver will reject outputs whose exact
+  source-to-log assignment path is not cited by the candidate source chain.
 - Put semantically interpreted C++ parameter predicates in
   interpreted_parameter_predicates and executable later checks in
   verification_checks. Every interpreted predicate/check must include the exact
@@ -776,6 +780,13 @@ def source_mechanism_to_candidate(
                 source_candidate,
                 canonicalizer=canonicalizer,
             ),
+            primary_output_signals=dedupe_keep_order([
+                signal for signal in (
+                    canonicalizer.canonicalize(signal)
+                    for signal in source_candidate.primary_output_signals
+                )
+                if signal
+            ]),
             expected_logged_signature=[
                 ExpectedSignatureItem(
                     name=f"source_signature_{index + 1}",
@@ -876,6 +887,13 @@ def canonicalize_mechanism_candidate_signals(
                 signal for signal in (
                     canonicalizer.canonicalize(signal)
                     for signal in candidate.source_relevant_fields
+                )
+                if signal
+            ]),
+            "primary_output_signals": dedupe_keep_order([
+                signal for signal in (
+                    canonicalizer.canonicalize(signal)
+                    for signal in candidate.primary_output_signals
                 )
                 if signal
             ]),

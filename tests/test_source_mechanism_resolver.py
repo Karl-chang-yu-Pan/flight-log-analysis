@@ -1069,6 +1069,40 @@ def test_deterministic_checks_belong_to_branch_groups_when_groups_exist(tmp_path
     assert candidate.branch_groups[0].verification_checks == [check]
 
 
+def test_primary_output_signals_require_cited_exact_binding_path():
+    from flight_log_agent.models import CodeRef
+    from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+    from flight_log_agent.px4.source_mechanism_resolver import source_backed_primary_output_signals
+
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="altitude",
+            source_symbol="selected_altitude",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            assignment_path=[{"file": "src/modules/navigator/mode.cpp", "line": 42}],
+        ),
+        SourceOutputBindingRecord(
+            binding_id="cruising_speed",
+            source_symbol="selected_speed",
+            target_symbol="triplet.current.cruising_speed",
+            logged_signal="position_setpoint_triplet.current.cruising_speed",
+            assignment_path=[{"file": "src/modules/navigator/mode.cpp", "line": 50}],
+        ),
+    ]
+
+    outputs = source_backed_primary_output_signals(
+        [
+            "position_setpoint_triplet.current.alt",
+            "position_setpoint_triplet.current.cruising_speed",
+        ],
+        bindings,
+        [CodeRef(file="src/modules/navigator/mode.cpp", start_line=40, end_line=45)],
+    )
+
+    assert outputs == ["position_setpoint_triplet.current.alt"]
+
+
 def test_source_mechanism_resolver_discards_uncited_agent_facts(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"

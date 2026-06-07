@@ -308,6 +308,7 @@ class SourceMechanismResolver:
             helper_expressions=dedupe_helper_expression_refs(helper_expressions),
             source_assignments=dedupe_source_assignment_refs(source_assignments),
             function_calls=dedupe_function_call_refs(function_calls),
+            output_bindings=output_bindings,
         )
         return SourceMechanismCandidateSet(
             candidates=candidates,
@@ -793,6 +794,7 @@ class SourceMechanismResolver:
         helper_expressions: list[HelperExpressionRef],
         source_assignments: list[SourceAssignmentRef],
         function_calls: list[FunctionCallRef],
+        output_bindings: list[SourceOutputBindingRecord],
     ) -> list[SourceMechanismCandidate]:
         deterministic_checks = source_backed_derived_expression_checks(
             helper_expressions,
@@ -816,6 +818,7 @@ class SourceMechanismResolver:
                     log_context=log_context,
                     decision_notes=decision_notes,
                     deterministic_checks=deterministic_checks,
+                    output_bindings=output_bindings,
                 )
                 for draft in candidate_drafts
             ]
@@ -924,6 +927,7 @@ class SourceMechanismResolver:
         log_context: SourceDiscoveryLogContext,
         decision_notes: list[str],
         deterministic_checks: list[SourceBackedVerificationCheck],
+        output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
     ) -> SourceMechanismCandidate:
         source_files = draft.source_files or fallback_source_files
         required_parameters = set(draft.controlling_parameter_names)
@@ -980,15 +984,21 @@ class SourceMechanismResolver:
             )
             for group in draft.branch_groups
         ]
+        source_chain = draft.source_chain or fallback.source_chain
         return SourceMechanismCandidate(
             title=draft.title or fallback.title,
             source_mechanism=draft.source_mechanism or fallback.source_mechanism,
-            source_chain=draft.source_chain or fallback.source_chain,
+            source_chain=source_chain,
             source_files=source_files,
             controlling_parameters=controlling_parameters,
             published_topics=fallback.published_topics,
             subscribed_topics=fallback.subscribed_topics,
             relevant_fields=relevant_fields or fallback.relevant_fields,
+            primary_output_signals=source_backed_primary_output_signals(
+                draft.primary_output_signals,
+                output_bindings or [],
+                source_chain,
+            ),
             branch_conditions=draft.branch_conditions or fallback.branch_conditions,
             expected_log_signature=draft.expected_log_signature or fallback.expected_log_signature,
             required_log_evidence=draft.required_log_evidence or fallback.required_log_evidence,
@@ -2153,6 +2163,41 @@ def source_output_binding_id(binding: dict[str, Any]) -> str:
         str(binding.get("logged_signal") or ""),
     ])
     return f"bind_{hashlib.sha1(text.encode('utf-8')).hexdigest()[:12]}"
+
+
+def source_backed_primary_output_signals(
+    requested_signals: list[str],
+    output_bindings: list[SourceOutputBindingRecord],
+    source_chain: list[CodeRef],
+) -> list[str]:
+    supported = []
+    for signal in requested_signals:
+        matching_bindings = [
+            binding
+            for binding in output_bindings
+            if binding.logged_signal == signal
+            and assignment_path_is_cited(binding.assignment_path, source_chain)
+        ]
+        if matching_bindings:
+            supported.append(signal)
+    return dedupe_keep_order(supported)
+
+
+def assignment_path_is_cited(path: list[dict[str, Any]], source_chain: list[CodeRef]) -> bool:
+    for step in path:
+        file = str(step.get("file") or "")
+        line = step.get("line")
+        function = str(step.get("function") or "")
+        for ref in source_chain:
+            if not file or ref.file != file:
+                continue
+            if line is not None and ref.start_line is not None and ref.end_line is not None:
+                if int(ref.start_line) <= int(line) <= int(ref.end_line):
+                    return True
+                continue
+            if function and ref.function and function == ref.function:
+                return True
+    return False
 
 
 def assignment_edge(ref: SourceAssignmentRef) -> dict[str, Any]:
