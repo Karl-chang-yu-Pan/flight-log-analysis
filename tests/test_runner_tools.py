@@ -3147,6 +3147,137 @@ def test_evaluate_log_signature_supports_threshold_and_setpoint_tracking(tmp_pat
     assert result["check_results"][1]["value"]["max_abs_error"] == 2.0
 
 
+def test_evaluate_log_signature_uses_passed_facts_as_contradicting_claims(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_command",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "command": [16, 84, 20],
+                    },
+                ),
+                SimpleNamespace(
+                    name="position_setpoint_triplet",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "current.cruising_speed": [-1.0, -1.0, -1.0],
+                    },
+                ),
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="A positive command or mission cruising speed set the airspeed.",
+        expected_signature=[],
+        candidate_windows=[{"name": "event", "start_s": 1.0, "end_s": 3.0}],
+        required_signals=[
+            "vehicle_command.command",
+            "position_setpoint_triplet.current.cruising_speed",
+        ],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "state_not_equals",
+                "signal": "vehicle_command.command",
+                "window": "event",
+                "value": 178,
+                "contradicts": "No DO_CHANGE_SPEED command was observed.",
+            },
+            {
+                "type": "state_equals",
+                "signal": "position_setpoint_triplet.current.cruising_speed",
+                "window": "event",
+                "value": -1,
+                "mode": "all",
+                "contradicts": "Logged current.cruising_speed is unset for all samples.",
+            },
+        ],
+    )
+
+    assert result["verdict"] == "contradicted"
+    assert result["evidence"] == []
+    assert result["contradictions"] == [
+        "No DO_CHANGE_SPEED command was observed.",
+        "Logged current.cruising_speed is unset for all samples.",
+    ]
+    assert result["check_results"][0]["status"] == "passed"
+    assert result["check_results"][0]["claim_effect"] == "contradicts"
+
+
+def test_evaluate_log_signature_compares_generic_expression_claims(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {"NAV_ACC_RAD": 10.0}
+            self.data_list = [
+                SimpleNamespace(
+                    name="rtl_reference",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "destination_alt": [83.93811798095703, 83.93811798095703],
+                        "current_alt": [87.254013, 87.254013],
+                    },
+                ),
+                SimpleNamespace(
+                    name="position_setpoint_triplet",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "current.alt": [103.93811798095703, 103.93811798095703],
+                    },
+                ),
+            ]
+
+    monkeypatch.setattr(ulog_signature_evaluator, "ULog", FakeULog)
+
+    result = ulog_signature_evaluator.evaluate_log_signature(
+        tmp_path / "flight.ulg",
+        mechanism="RTL altitude source selection.",
+        expected_signature=[],
+        candidate_windows=[{"name": "rtl", "start_s": 1.0, "end_s": 2.0}],
+        required_signals=["position_setpoint_triplet.current.alt"],
+        exclusion_checks=[],
+        numeric_checks=[
+            {
+                "type": "derived_expression",
+                "expression": "destination_alt + 2 * NAV_ACC_RAD",
+                "expected_expression": "setpoint_alt",
+                "window": "rtl",
+                "op": "==",
+                "max_error": 0.001,
+                "variables": [
+                    {"name": "destination_alt", "source": "rtl_reference.destination_alt"},
+                    {"name": "setpoint_alt", "source": "position_setpoint_triplet.current.alt"},
+                ],
+                "supports": "Cone lower bound reconstructs the logged RTL setpoint.",
+            },
+            {
+                "type": "derived_expression",
+                "expression": "current_alt",
+                "expected_expression": "setpoint_alt",
+                "window": "rtl",
+                "op": "==",
+                "max_error": 0.001,
+                "variables": [
+                    {"name": "current_alt", "source": "rtl_reference.current_alt"},
+                    {"name": "setpoint_alt", "source": "position_setpoint_triplet.current.alt"},
+                ],
+                "contradicts": "Current altitude does not reconstruct the logged RTL setpoint.",
+            },
+        ],
+    )
+
+    assert result["verdict"] == "mixed"
+    assert result["evidence"] == ["Cone lower bound reconstructs the logged RTL setpoint."]
+    assert result["contradictions"] == [
+        "Current altitude does not reconstruct the logged RTL setpoint.",
+    ]
+    assert result["check_results"][0]["status"] == "passed"
+    assert result["check_results"][1]["status"] == "failed"
+
+
 def test_evaluate_log_signature_supports_parameter_and_field_checks(tmp_path, monkeypatch):
     class FakeULog:
         def __init__(self, path):

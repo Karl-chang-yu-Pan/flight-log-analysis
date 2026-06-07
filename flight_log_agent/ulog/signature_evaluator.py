@@ -70,9 +70,15 @@ def evaluate_log_signature(
     unresolved = []
     for result in [*numeric_results, *exclusion_results]:
         if result["status"] == "passed":
-            evidence.append(result["message"])
+            if result.get("claim_effect") == "contradicts":
+                contradictions.append(result["message"])
+            else:
+                evidence.append(result["message"])
         elif result["status"] == "failed":
-            contradictions.append(result["message"])
+            if result.get("claim_effect") == "supports":
+                evidence.append(result["message"])
+            else:
+                contradictions.append(result["message"])
         else:
             unresolved.append(result["message"])
 
@@ -136,6 +142,9 @@ def _run_check(
             message=f"{check_type} check could not be evaluated: {exc}",
         )
     result["category"] = category
+    claim_effect = _claim_effect(check, str(result.get("status") or ""))
+    if claim_effect is not None:
+        result["claim_effect"] = claim_effect
     return result
 
 
@@ -1151,8 +1160,29 @@ def _parse_literal(value: str) -> Any:
 
 
 def _message(check: dict, passed: bool, fallback: str) -> str:
+    effect = _claim_effect(check, "passed" if passed else "failed")
+    if effect == "supports" and check.get("supports"):
+        return str(check.get("supports"))
+    if effect == "contradicts" and check.get("contradicts"):
+        return str(check.get("contradicts"))
     key = "supports" if passed else "contradicts"
     return str(check.get(key) or check.get("description") or fallback)
+
+
+def _claim_effect(check: dict, status: str) -> str | None:
+    if status == "unresolved":
+        return None
+    if status == "passed":
+        if check.get("supports"):
+            return "supports"
+        if check.get("contradicts"):
+            return "contradicts"
+        return "supports"
+    if status == "failed":
+        if check.get("contradicts"):
+            return "contradicts"
+        return "contradicts"
+    return None
 
 
 def _check_result(
