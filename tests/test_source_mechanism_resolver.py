@@ -509,6 +509,9 @@ void publish_setpoint()
     packet_json = json.dumps(profile_packet.model_dump(), default=str)
     assert "output_binding_candidates" not in packet_json
     assert "assignment_path" not in packet_json
+    assert "verification_plan" not in packet_json
+    assert "branch_results" not in packet_json
+    assert "resolved_windows" not in packet_json
     assert result.output_bindings
     binding = next(
         item for item in result.output_bindings
@@ -1015,6 +1018,55 @@ def test_source_mechanism_resolver_prunes_contradicted_branch_groups(tmp_path):
 
     assert [group.name for group in filtered[0].branch_groups] == ["auto"]
     assert filtered[0].title == "Mixed source mechanism"
+
+
+def test_deterministic_checks_belong_to_branch_groups_when_groups_exist(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    source_path.mkdir()
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+    check = SourceBackedVerificationCheck(
+        check=RelationshipCheckSpec(
+            type="derived_expression",
+            expression="actual",
+            variables=[{"name": "actual", "source": "position_setpoint_triplet.current.alt"}],
+        ),
+        source_file="src/modules/navigator/rtl.cpp",
+        source_line=42,
+    )
+    draft = SourceDiscoveryCandidateDraft(
+        title="Grouped mechanism",
+        source_mechanism="The deterministic check belongs to the altitude branch.",
+        source_files=["src/modules/navigator/rtl.cpp"],
+        relevant_signals=["position_setpoint_triplet.current.alt"],
+        branch_groups=[
+            SourceMechanismBranchGroup(
+                name="altitude",
+                source_files=["src/modules/navigator/rtl.cpp"],
+                relevant_signals=["position_setpoint_triplet.current.alt"],
+            )
+        ],
+    )
+
+    candidate = resolver._build_candidate_from_draft(
+        draft,
+        fallback_user_question="Why did altitude change?",
+        fallback_source_files=[],
+        fallback_hits=[],
+        parameter_requirements=[],
+        published_topics=[],
+        subscribed_topics=[],
+        fields=[],
+        branch_conditions=[],
+        log_context=build_source_discovery_log_context({}),
+        decision_notes=[],
+        deterministic_checks=[check],
+    )
+
+    assert candidate.verification_checks == []
+    assert candidate.branch_groups[0].verification_checks == [check]
 
 
 def test_source_mechanism_resolver_discards_uncited_agent_facts(tmp_path):

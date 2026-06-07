@@ -965,7 +965,7 @@ class SourceMechanismResolver:
             deterministic_checks=deterministic_checks,
         )
         scoped_deterministic_checks = scope_deterministic_checks_to_candidate(
-            deterministic_checks if draft.relevant_signals else [],
+            deterministic_checks if draft.relevant_signals and not draft.branch_groups else [],
             source_files=source_files,
             relevant_signals=draft.relevant_signals,
         )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from flight_log_agent.models import ApplicabilityResult, MechanismCandidate, WindowSpec
+from flight_log_agent.models import ApplicabilityResult, MechanismCandidate, VerificationPlan, WindowSpec
 from flight_log_agent.px4.msg_schema import (
     field_or_flattened_prefix_present,
     load_px4_msg_schema,
@@ -16,11 +16,17 @@ def evaluate_candidate_applicability(
     inventory: dict,
     timeline: list[dict],
     mission: Optional[dict],
+    verification_plan: Optional[VerificationPlan] = None,
 ) -> ApplicabilityResult:
     """
     Use actual parameters/timeline/mission/topic availability to eliminate mechanisms.
     This is where parameters and topics enter the workflow.
     """
+    if verification_plan is not None:
+        from flight_log_agent.analysis.verification_plan import applicability_from_verification_plan
+
+        return applicability_from_verification_plan(candidate, verification_plan, inventory)
+
     params = inventory.get("parameters") or {}
     topic_fields = inventory.get("topic_fields") or {}
     schema_topic_fields = load_px4_msg_schema(inventory.get("source_path"))

@@ -868,7 +868,7 @@ def _eval_expression_node(node: ast.AST, env: dict[str, Any]) -> Any:
     if isinstance(node, ast.IfExp):
         branch = node.body if bool(_eval_expression_node(node.test, env)) else node.orelse
         return _eval_expression_node(branch, env)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod)):
         left = _numeric_expression_value(_eval_expression_node(node.left, env))
         right = _numeric_expression_value(_eval_expression_node(node.right, env))
         if isinstance(node.op, ast.Add):
@@ -879,6 +879,8 @@ def _eval_expression_node(node: ast.AST, env: dict[str, Any]) -> Any:
             return left * right
         if right == 0:
             raise ExpressionEvaluationError("division by zero")
+        if isinstance(node.op, ast.Mod):
+            return left % right
         return left / right
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name) or node.func.id not in ALLOWED_EXPRESSION_FUNCTIONS:
@@ -1166,6 +1168,9 @@ def _check_result(
         "status": status,
         "message": message,
     }
+    for key in ("check_id", "branch_id", "role"):
+        if check.get(key) is not None:
+            result[key] = check.get(key)
     if value is not None:
         result["value"] = value
     return result

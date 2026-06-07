@@ -74,10 +74,12 @@ from flight_log_agent.models import (
     SourceSearchContext,
     ValidationResult,
     VerifiedMechanismResult,
+    VerificationPlan,
     WindowSpec,
 )
 from flight_log_agent.analysis.signature_verification import derive_confidence
 from flight_log_agent.analysis.signature_verification import evaluate_candidate_log_signature as evaluate_candidate_log_signature_impl
+from flight_log_agent.analysis.verification_plan import compile_verification_plan
 from flight_log_agent.ulog.control_surface import infer_control_surface as infer_control_surface_impl
 from flight_log_agent.ulog.inventory import parse_ulog_inventory as parse_ulog_inventory_impl
 from flight_log_agent.ulog.plots import generate_signal_plot as generate_signal_plot_impl
@@ -554,16 +556,27 @@ async def analyze_flight_log(
         # ------------------------------------------------------------
         verified_results: list[VerifiedMechanismResult] = []
         for candidate in candidates:
+            verification_plan = compile_verification_plan(
+                candidate,
+                inventory,
+                timeline,
+                mission,
+                source_output_bindings,
+            )
             applicability = _audit_sync_call(
                 audit_logger,
                 "applicability",
                 f"evaluate_applicability:{candidate.name}",
                 evaluate_candidate_applicability,
-                {"candidate": candidate.model_dump()},
+                {
+                    "candidate": candidate.model_dump(),
+                    "verification_plan": verification_plan.model_dump(),
+                },
                 candidate,
                 inventory,
                 timeline,
                 mission,
+                verification_plan,
             )
 
             if not applicability.applicable:
@@ -588,6 +601,7 @@ async def analyze_flight_log(
                     ctx,
                     candidate,
                     applicability,
+                    verification_plan,
                 )
 
             verified_results.append(
@@ -848,7 +862,8 @@ def canonicalize_mechanism_candidate_signals(
     candidate: MechanismCandidate,
     canonicalizer: SignalCanonicalizer,
 ) -> MechanismCandidate:
-    return candidate.model_copy(
+    return copy_model(
+        candidate,
         update={
             "required_signals": dedupe_keep_order([
                 signal for signal in (
@@ -873,7 +888,7 @@ def canonicalize_mechanism_candidate_signals(
                 for check in candidate.exclusion_checks
             ],
             "expected_logged_signature": [
-                item.model_copy(update={"signal": canonicalizer.canonicalize(item.signal)})
+                copy_model(item, update={"signal": canonicalizer.canonicalize(item.signal)})
                 if item.signal else item
                 for item in candidate.expected_logged_signature
             ],
@@ -889,7 +904,8 @@ def canonicalize_branch_group_signals(
     group: MechanismBranchGroup,
     canonicalizer: SignalCanonicalizer,
 ) -> MechanismBranchGroup:
-    return group.model_copy(
+    return copy_model(
+        group,
         update={
             "required_signals": dedupe_keep_order([
                 signal for signal in (
@@ -920,13 +936,26 @@ def canonicalize_relationship_check_signals(
         if value and is_logged_signal_reference(str(value)):
             update[field] = canonicalizer.canonicalize(str(value))
     if check.variables:
-        update["variables"] = [
-            variable.model_copy(update={"source": canonicalizer.canonicalize(variable.source) or variable.source})
-            if variable.source and is_logged_signal_reference(str(variable.source))
-            else variable
-            for variable in check.variables
-        ]
-    return check.model_copy(update=update) if update else check
+        update["variables"] = []
+        for variable in check.variables:
+            source = variable.get("source") if isinstance(variable, dict) else getattr(variable, "source", None)
+            if source and is_logged_signal_reference(str(source)):
+                resolved = canonicalizer.canonicalize(str(source)) or str(source)
+                if isinstance(variable, dict):
+                    update["variables"].append({**variable, "source": resolved})
+                else:
+                    update["variables"].append(copy_model(variable, update={"source": resolved}))
+            else:
+                update["variables"].append(variable)
+    return copy_model(check, update=update) if update else check
+
+
+def copy_model(value: Any, *, update: dict[str, Any]) -> Any:
+    if hasattr(value, "model_copy"):
+        return value.model_copy(update=update)
+    data = value.model_dump() if hasattr(value, "model_dump") else dict(vars(value))
+    data.update(update)
+    return value.__class__(**data)
 
 
 def source_candidate_branch_groups(
@@ -982,8 +1011,9 @@ def relationship_checks_signal_refs(checks: list[RelationshipCheckSpec]) -> list
             if value and is_logged_signal_reference(str(value)):
                 signals.append(str(value))
         for variable in check.variables:
-            if variable.source and is_logged_signal_reference(str(variable.source)):
-                signals.append(str(variable.source))
+            source = variable.get("source") if isinstance(variable, dict) else getattr(variable, "source", None)
+            if source and is_logged_signal_reference(str(source)):
+                signals.append(str(source))
     return signals
 
 
@@ -1055,7 +1085,7 @@ def source_candidate_required_signals(
                 if is_valid_required_signal(canonical_signal):
                     signals.append(canonical_signal)
         for variable in check.variables:
-            source = getattr(variable, "source", None)
+            source = variable.get("source") if isinstance(variable, dict) else getattr(variable, "source", None)
             if source and is_logged_signal_reference(str(source)):
                 canonical_signal = canonicalizer.canonicalize(str(source)) or str(source)
                 if is_valid_required_signal(canonical_signal):
@@ -1510,7 +1540,11 @@ def mechanism_records_to_candidates(
     candidates: list[MechanismCandidate] = []
     for record in records[:max_candidates]:
         try:
-            candidate = MechanismCandidate.model_validate(record.candidate_payload)
+            candidate = (
+                MechanismCandidate.model_validate(record.candidate_payload)
+                if hasattr(MechanismCandidate, "model_validate")
+                else MechanismCandidate(**record.candidate_payload)
+            )
         except Exception:
             continue
         candidates.append(candidate)
@@ -1549,8 +1583,9 @@ def evaluate_candidate_log_signature(
     ctx: FlightLogContext,
     candidate: MechanismCandidate,
     applicability: ApplicabilityResult,
+    verification_plan: Optional[VerificationPlan] = None,
 ) -> SignatureEvaluation:
-    return evaluate_candidate_log_signature_impl(ctx.log_path, candidate, applicability)
+    return evaluate_candidate_log_signature_impl(ctx.log_path, candidate, applicability, verification_plan)
 
 
 def generate_report_plots(

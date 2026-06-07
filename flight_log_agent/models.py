@@ -183,6 +183,46 @@ class MechanismBranchGroup(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class VerificationSignalResolution(BaseModel):
+    original: str
+    status: Literal["resolved", "ambiguous", "unresolved"]
+    resolved: Optional[str] = None
+    candidates: list[str] = Field(default_factory=list)
+    reason: Optional[str] = None
+
+
+class VerificationCheckPlan(BaseModel):
+    check_id: str
+    branch_id: str
+    role: Literal["mechanism_defining", "branch_applicability", "evidence_availability"]
+    category: Literal["numeric", "exclusion"]
+    check: RelationshipCheckSpec
+    executable: bool = True
+    unresolved_dependencies: list[str] = Field(default_factory=list)
+
+
+class VerificationBranchPlan(BaseModel):
+    branch_id: str
+    name: str
+    source_refs: list[CodeRef] = Field(default_factory=list)
+    source_predicates: list[str] = Field(default_factory=list)
+    resolved_predicates: list[str] = Field(default_factory=list)
+    required_parameters: list[str] = Field(default_factory=list)
+    required_signals: list[str] = Field(default_factory=list)
+    signal_resolutions: list[VerificationSignalResolution] = Field(default_factory=list)
+    windows: list[WindowSpec] = Field(default_factory=list)
+    checks: list[VerificationCheckPlan] = Field(default_factory=list)
+    applicable: bool = True
+    excluded_by: list[str] = Field(default_factory=list)
+    unresolved_dependencies: list[str] = Field(default_factory=list)
+
+
+class VerificationPlan(BaseModel):
+    mechanism_id: str
+    candidate_name: str
+    branches: list[VerificationBranchPlan] = Field(default_factory=list)
+
+
 class MechanismCandidate(BaseModel):
     """
     Candidate produced from PX4 source. This is still only a possible mechanism.
