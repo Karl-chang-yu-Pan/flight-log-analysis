@@ -6,8 +6,10 @@
 - Keep changes focused on the requested scope.
 - Prefer simple, runnable code over abstract architecture.
 - When creating commits, use the format `type(scope): description` and include a list-format body describing the changes.
+- Before creating commits, carefully read the diff and understand the changes being committed.
 - Before editing a file or creating a new file, explain to the user what you're about to change and ask for approval.
 - Do not edit or create files until the user approves the proposed change.
+- Ask for explicit user approval before using user-provided API keys, calling paid APIs, or running commands that can spend tokens or usage credits.
 - AGENTS.md is for Codex build/edit instructions; runtime flight-log agent behavior belongs in code prompts or agent instructions.
 - Run Python scripts and install Python packages only inside the user-created virtual environment. If no virtual environment exists, ask the user to create one before proceeding.
 - Run pytest through the virtual environment's Python module invocation, for example `.venv/bin/python -m pytest`, so repository-local imports and pytest.ini are honored.
