@@ -403,6 +403,11 @@ void publish(position_setpoint_triplet_s &triplet, const vehicle_status_s &statu
         "status.nav_state == 1",
         "status.arming_state == 2",
     ]
+    assert binding["symbol_bindings"] == {
+        "status.nav_state": "vehicle_status.nav_state",
+        "status.arming_state": "vehicle_status.arming_state",
+        "triplet.current.alt": "position_setpoint_triplet.current.alt",
+    }
 
 
 def test_source_output_bindings_propagate_control_predicates_through_assignments(tmp_path):
@@ -434,6 +439,7 @@ void publish(position_setpoint_triplet_s &triplet, const vehicle_status_s &statu
         and item["logged_signal"] == "position_setpoint_triplet.current.alt"
     )
     assert binding["control_predicates"] == ["status.nav_state == 1"]
+    assert binding["symbol_bindings"]["status.nav_state"] == "vehicle_status.nav_state"
 
 
 def test_lower_source_expression_reuses_px4_enum_registry_for_bound_fields(tmp_path):

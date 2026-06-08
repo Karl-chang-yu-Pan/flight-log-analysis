@@ -157,8 +157,11 @@ def infer_control_surface(log_path: Path, source_path: Optional[Path]) -> dict:
     return infer_control_surface_impl(log_path, source_path)
 
 
-def parse_mission_file(mission_path: Optional[Path]) -> Optional[dict]:
-    return parse_mission_file_impl(mission_path)
+def parse_mission_file(
+    mission_path: Optional[Path],
+    source_path: Optional[Path] = None,
+) -> Optional[dict]:
+    return parse_mission_file_impl(mission_path, source_path=source_path)
 
 
 def resolve_source_path(source_path: Optional[str | Path]) -> Optional[Path]:
@@ -379,8 +382,12 @@ async def analyze_flight_log(
             "prepass",
             "parse_mission_file",
             parse_mission_file,
-            {"mission_path": str(mission_path_obj) if mission_path_obj else None},
+            {
+                "mission_path": str(mission_path_obj) if mission_path_obj else None,
+                "source_path": str(source_path_obj) if source_path_obj else None,
+            },
             mission_path_obj,
+            source_path_obj,
         )
 
         # Only this compact object may enter mechanism discovery.

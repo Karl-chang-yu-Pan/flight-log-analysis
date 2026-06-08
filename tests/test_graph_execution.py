@@ -311,6 +311,7 @@ uint16 VEHICLE_CMD_DO_CHANGE_SPEED = 178
             target_symbol="triplet.current.alt",
             logged_signal="position_setpoint_triplet.current.alt",
             control_predicates=["cmd.command == vehicle_command_s::VEHICLE_CMD_DO_CHANGE_SPEED"],
+            symbol_bindings={"cmd.command": "vehicle_command.command"},
         ),
         SourceOutputBindingRecord(
             binding_id="other",
@@ -318,6 +319,7 @@ uint16 VEHICLE_CMD_DO_CHANGE_SPEED = 178
             target_symbol="triplet.current.alt",
             logged_signal="position_setpoint_triplet.current.alt",
             control_predicates=["cmd.command != vehicle_command_s::VEHICLE_CMD_DO_CHANGE_SPEED"],
+            symbol_bindings={"cmd.command": "vehicle_command.command"},
         ),
     ]
     graph = compile_verification_graphs(candidate, bindings, source_path=str(tmp_path))[0]
@@ -327,7 +329,7 @@ uint16 VEHICLE_CMD_DO_CHANGE_SPEED = 178
     assert result.verdict == "supported"
 
 
-def test_graph_execution_uses_common_status_alias_for_control_predicate(tmp_path):
+def test_graph_execution_does_not_invent_common_control_predicate_aliases(tmp_path):
     msg_dir = tmp_path / "msg"
     msg_dir.mkdir()
     (msg_dir / "VehicleStatus.msg").write_text(
@@ -358,6 +360,49 @@ uint8 NAVIGATION_STATE_AUTO_RTL = 5
             target_symbol="triplet.current.alt",
             logged_signal="position_setpoint_triplet.current.alt",
             control_predicates=["_vstatus.nav_state != vehicle_status_s::NAVIGATION_STATE_AUTO_RTL"],
+        ),
+    ]
+    graph = compile_verification_graphs(candidate, bindings, source_path=str(tmp_path))[0]
+
+    result = execute_verification_graph(graph, build_index([10.0, 20.0]))
+
+    assert result.verdict == "unresolved"
+    assert any("_vstatus.nav_state" in reason for reason in result.unresolved_dependencies)
+
+
+def test_graph_execution_uses_source_derived_status_alias_for_control_predicate(tmp_path):
+    msg_dir = tmp_path / "msg"
+    msg_dir.mkdir()
+    (msg_dir / "VehicleStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 nav_state
+uint8 NAVIGATION_STATE_AUTO_RTL = 5
+""",
+        encoding="utf-8",
+    )
+    candidate = MechanismCandidate(
+        name="Status-controlled altitude",
+        summary="A source branch is selected by logged vehicle status.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="rtl",
+            source_symbol="10.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["_vstatus.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_RTL"],
+            symbol_bindings={"_vstatus.nav_state": "vehicle_status.nav_state"},
+        ),
+        SourceOutputBindingRecord(
+            binding_id="not-rtl",
+            source_symbol="20.f",
+            target_symbol="triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+            control_predicates=["_vstatus.nav_state != vehicle_status_s::NAVIGATION_STATE_AUTO_RTL"],
+            symbol_bindings={"_vstatus.nav_state": "vehicle_status.nav_state"},
         ),
     ]
     graph = compile_verification_graphs(candidate, bindings, source_path=str(tmp_path))[0]

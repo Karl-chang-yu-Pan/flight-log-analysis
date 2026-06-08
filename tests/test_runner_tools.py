@@ -642,8 +642,29 @@ def test_parse_mission_file_returns_none_without_path():
     assert mission_parser.parse_mission_file(None) is None
 
 
+def write_mavlink_common_xml(source_path):
+    xml_path = source_path / "mavlink" / "message_definitions" / "v1.0" / "common.xml"
+    xml_path.parent.mkdir(parents=True)
+    xml_path.write_text(
+        """
+<mavlink>
+  <enums>
+    <enum name="MAV_CMD">
+      <entry value="16" name="MAV_CMD_NAV_WAYPOINT" />
+      <entry value="22" name="MAV_CMD_NAV_TAKEOFF" />
+      <entry value="178" name="MAV_CMD_DO_CHANGE_SPEED" />
+    </enum>
+  </enums>
+</mavlink>
+""",
+        encoding="utf-8",
+    )
+
+
 def test_parse_mission_file_extracts_qgroundcontrol_plan_items(tmp_path):
     mission_path = tmp_path / "mission.plan"
+    source_path = tmp_path / "PX4-Autopilot"
+    write_mavlink_common_xml(source_path)
     mission_path.write_text(
         json.dumps({
             "groundStation": "QGroundControl",
@@ -680,7 +701,7 @@ def test_parse_mission_file_extracts_qgroundcontrol_plan_items(tmp_path):
         })
     )
 
-    result = mission_parser.parse_mission_file(mission_path)
+    result = mission_parser.parse_mission_file(mission_path, source_path=source_path)
 
     assert result == {
         "mission_file": str(mission_path),
@@ -726,13 +747,15 @@ def test_parse_mission_file_extracts_qgroundcontrol_plan_items(tmp_path):
 
 def test_parse_mission_file_extracts_qgc_wpl_items(tmp_path):
     mission_path = tmp_path / "mission.waypoints"
+    source_path = tmp_path / "PX4-Autopilot"
+    write_mavlink_common_xml(source_path)
     mission_path.write_text(
         "QGC WPL 110\n"
         "0\t1\t3\t22\t15\t0\t0\t0\t47.397742\t8.545594\t50\t1\n"
         "1\t0\t3\t16\t0\t10\t0\t0\t47.398\t8.546\t65\t1\n"
     )
 
-    result = mission_parser.parse_mission_file(mission_path)
+    result = mission_parser.parse_mission_file(mission_path, source_path=source_path)
 
     assert result["format"] == "qgc_wpl"
     assert result["version"] == "110"
@@ -769,6 +792,18 @@ def test_parse_mission_file_extracts_qgc_wpl_items(tmp_path):
     assert result["warnings"] == []
 
 
+def test_parse_mission_file_falls_back_to_numeric_command_name_without_source(tmp_path):
+    mission_path = tmp_path / "mission.waypoints"
+    mission_path.write_text(
+        "QGC WPL 110\n"
+        "0\t1\t3\t178\t0\t0\t0\t0\t47.397742\t8.545594\t50\t1\n"
+    )
+
+    result = mission_parser.parse_mission_file(mission_path)
+
+    assert result["items"][0]["command_name"] == "MAV_CMD_178"
+
+
 def test_parse_mission_file_reports_missing_file(tmp_path):
     mission_path = tmp_path / "missing.plan"
 
@@ -790,7 +825,7 @@ def test_runner_parse_mission_file_delegates_to_mission_parser(tmp_path):
     ) as parse_impl:
         result = runner.parse_mission_file(mission_path)
 
-    parse_impl.assert_called_once_with(mission_path)
+    parse_impl.assert_called_once_with(mission_path, source_path=None)
     assert result == {"mission_file": str(mission_path), "items": []}
 
 
@@ -1521,7 +1556,7 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     parse_inventory.assert_called_once_with(log_path)
     build_timeline.assert_called_once_with(log_path)
     infer_surface.assert_called_once_with(log_path, source_path)
-    parse_mission.assert_called_once_with(mission_path)
+    parse_mission.assert_called_once_with(mission_path, source_path)
 
     assert result is final_report
     assert [item["agent"] for item in captured] == [

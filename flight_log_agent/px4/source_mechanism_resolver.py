@@ -2163,6 +2163,7 @@ def source_output_binding_records(
             logged_signal=binding.get("logged_signal"),
             assignment_path=list(binding.get("assignment_path") or []),
             control_predicates=list(binding.get("control_predicates") or []),
+            symbol_bindings=dict(binding.get("symbol_bindings") or {}),
         )
         for binding in source_output_binding_candidates(source_assignments, function_calls)
     ]
@@ -2220,6 +2221,7 @@ def assignment_edge(ref: SourceAssignmentRef) -> dict[str, Any]:
         "target_symbol": ref.target,
         "logged_signal": logged_signal,
         "control_predicates": list(ref.control_predicates),
+        "symbol_bindings": dict(ref.symbol_bindings),
         "assignment_path": [
             {
                 "file": ref.file,
@@ -2254,6 +2256,11 @@ def call_bound_assignment_edges(
                 substitute_call_args(predicate, assignment.function_parameters, call.args)
                 for predicate in assignment.control_predicates
             ]
+            symbol_bindings = {
+                substitute_call_args(source, assignment.function_parameters, call.args): signal
+                for source, signal in assignment.symbol_bindings.items()
+            }
+            symbol_bindings.update(call.symbol_bindings)
             logged_signal = logged_signal_for_bound_target(target, call.argument_topics)
             out.append(
                 {
@@ -2264,6 +2271,7 @@ def call_bound_assignment_edges(
                         *call.control_predicates,
                         *control_predicates,
                     ]),
+                    "symbol_bindings": symbol_bindings,
                     "assignment_path": [
                         {
                             "file": assignment.file,
@@ -2354,6 +2362,10 @@ def transitive_binding_edges(edges: list[dict[str, Any]], *, max_depth: int = 4)
                         *(upstream.get("control_predicates") or []),
                         *(edge.get("control_predicates") or []),
                     ]),
+                    "symbol_bindings": {
+                        **dict(upstream.get("symbol_bindings") or {}),
+                        **dict(edge.get("symbol_bindings") or {}),
+                    },
                     "assignment_path": [
                         *(upstream.get("assignment_path") or []),
                         *(edge.get("assignment_path") or []),

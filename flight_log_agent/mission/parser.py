@@ -1,25 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Optional
 
-
-COMMAND_NAMES = {
-    16: "MAV_CMD_NAV_WAYPOINT",
-    17: "MAV_CMD_NAV_LOITER_UNLIM",
-    18: "MAV_CMD_NAV_LOITER_TURNS",
-    19: "MAV_CMD_NAV_LOITER_TIME",
-    20: "MAV_CMD_NAV_RETURN_TO_LAUNCH",
-    21: "MAV_CMD_NAV_LAND",
-    22: "MAV_CMD_NAV_TAKEOFF",
-    84: "MAV_CMD_NAV_VTOL_TAKEOFF",
-    85: "MAV_CMD_NAV_VTOL_LAND",
-    177: "MAV_CMD_DO_JUMP",
-    178: "MAV_CMD_DO_CHANGE_SPEED",
-    181: "MAV_CMD_DO_SET_RELAY",
-    183: "MAV_CMD_DO_SET_SERVO",
-}
 
 FRAME_NAMES = {
     0: "MAV_FRAME_GLOBAL",
@@ -30,11 +16,15 @@ FRAME_NAMES = {
 }
 
 
-def parse_mission_file(mission_path: Optional[Path]) -> Optional[dict]:
+def parse_mission_file(
+    mission_path: Optional[Path],
+    source_path: Optional[Path] = None,
+) -> Optional[dict]:
     if mission_path is None:
         return None
 
     summary = _empty_summary(mission_path)
+    command_names = load_mavlink_command_names(source_path)
 
     if not mission_path.exists():
         summary["warnings"].append(f"mission file does not exist: {mission_path}")
@@ -52,10 +42,10 @@ def parse_mission_file(mission_path: Optional[Path]) -> Optional[dict]:
         return summary
 
     if stripped.startswith("{"):
-        return _parse_plan_json(mission_path, text)
+        return _parse_plan_json(mission_path, text, command_names)
 
     if stripped.startswith("QGC WPL"):
-        return _parse_qgc_wpl(mission_path, text)
+        return _parse_qgc_wpl(mission_path, text, command_names)
 
     summary["warnings"].append("unsupported mission file format")
     return summary
@@ -77,7 +67,7 @@ def _empty_summary(mission_path: Path) -> dict:
     }
 
 
-def _parse_plan_json(mission_path: Path, text: str) -> dict:
+def _parse_plan_json(mission_path: Path, text: str, command_names: dict[int, str]) -> dict:
     summary = _empty_summary(mission_path)
     summary["format"] = "qgroundcontrol_plan"
 
@@ -112,12 +102,12 @@ def _parse_plan_json(mission_path: Path, text: str) -> dict:
             summary["warnings"].append(f"skipped non-object mission item at index {index}")
             continue
 
-        summary["items"].append(_parse_plan_item(index, item))
+        summary["items"].append(_parse_plan_item(index, item, command_names))
 
     return summary
 
 
-def _parse_plan_item(index: int, item: dict) -> dict:
+def _parse_plan_item(index: int, item: dict, command_names: dict[int, str]) -> dict:
     item_type = item.get("type")
     if item_type == "ComplexItem":
         return {
@@ -143,7 +133,7 @@ def _parse_plan_item(index: int, item: dict) -> dict:
         "sequence": _json_safe_value(item.get("doJumpId", index)),
         "type": _json_safe_value(item_type),
         "command": command,
-        "command_name": _command_name(command),
+        "command_name": _command_name(command, command_names),
         "frame": frame,
         "frame_name": _frame_name(frame),
         "auto_continue": _json_safe_value(item.get("autoContinue")),
@@ -154,7 +144,7 @@ def _parse_plan_item(index: int, item: dict) -> dict:
     }
 
 
-def _parse_qgc_wpl(mission_path: Path, text: str) -> dict:
+def _parse_qgc_wpl(mission_path: Path, text: str, command_names: dict[int, str]) -> dict:
     summary = _empty_summary(mission_path)
     summary["format"] = "qgc_wpl"
 
@@ -188,7 +178,7 @@ def _parse_qgc_wpl(mission_path: Path, text: str) -> dict:
             "current": current,
             "type": "SimpleItem",
             "command": command,
-            "command_name": _command_name(command),
+            "command_name": _command_name(command, command_names),
             "frame": frame,
             "frame_name": _frame_name(frame),
             "auto_continue": auto_continue,
@@ -215,11 +205,91 @@ def _param(params: list[Any], index: int, fallback: Any = None) -> Any:
     return _json_safe_value(fallback)
 
 
-def _command_name(command: Optional[int]) -> Optional[str]:
+def _command_name(command: Optional[int], command_names: dict[int, str]) -> Optional[str]:
     if command is None:
         return None
 
-    return COMMAND_NAMES.get(command, f"MAV_CMD_{command}")
+    return command_names.get(command, f"MAV_CMD_{command}")
+
+
+def load_mavlink_command_names(source_path: Optional[Path]) -> dict[int, str]:
+    if source_path is None:
+        return {}
+
+    root = Path(source_path)
+    if not root.exists():
+        return {}
+
+    for path in _candidate_mavlink_xml_paths(root):
+        names = _load_mavlink_command_names_from_xml(path)
+        if names:
+            return names
+
+    for path in _candidate_mavlink_header_paths(root):
+        names = _load_mavlink_command_names_from_header(path)
+        if names:
+            return names
+
+    return {}
+
+
+def _candidate_mavlink_xml_paths(root: Path) -> list[Path]:
+    candidates = [
+        root / "mavlink" / "message_definitions" / "v1.0" / "common.xml",
+        root / "src" / "modules" / "mavlink" / "mavlink" / "message_definitions" / "v1.0" / "common.xml",
+        root / "src" / "modules" / "mavlink" / "mavlink" / "message_definitions" / "v1.0" / "minimal.xml",
+    ]
+    existing = [path for path in candidates if path.exists()]
+    if existing:
+        return existing
+    return list(root.glob("**/message_definitions/v1.0/common.xml"))[:8]
+
+
+def _candidate_mavlink_header_paths(root: Path) -> list[Path]:
+    candidates = [
+        root / "build" / "px4_sitl_default" / "mavlink" / "common" / "mavlink.h",
+        root / "mavlink" / "include" / "mavlink" / "v2.0" / "common" / "mavlink.h",
+    ]
+    existing = [path for path in candidates if path.exists()]
+    if existing:
+        return existing
+    return list(root.glob("**/mavlink/v*/common/mavlink.h"))[:8]
+
+
+def _load_mavlink_command_names_from_xml(path: Path) -> dict[int, str]:
+    try:
+        tree = ET.parse(path)
+    except Exception:
+        return {}
+
+    names: dict[int, str] = {}
+    for enum in tree.findall(".//enum"):
+        if enum.attrib.get("name") != "MAV_CMD":
+            continue
+        for entry in enum.findall("entry"):
+            value = _safe_int(entry.attrib.get("value"))
+            name = entry.attrib.get("name")
+            if value is not None and name:
+                names[value] = name
+    return names
+
+
+def _load_mavlink_command_names_from_header(path: Path) -> dict[int, str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+
+    match = re.search(r"typedef\s+enum\s+MAV_CMD\s*\{(?P<body>.*?)\}\s*MAV_CMD\s*;", text, re.S)
+    if not match:
+        return {}
+
+    names: dict[int, str] = {}
+    for item in match.group("body").split(","):
+        entry = re.search(r"\b(?P<name>MAV_CMD_[A-Z0-9_]+)\s*=\s*(?P<value>\d+)\b", item)
+        if entry:
+            names[int(entry.group("value"))] = entry.group("name")
+    return names
 
 
 def _frame_name(frame: Optional[int]) -> Optional[str]:

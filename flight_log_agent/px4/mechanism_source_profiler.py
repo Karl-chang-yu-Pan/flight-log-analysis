@@ -102,6 +102,7 @@ class FunctionCallRef(BaseModel):
     args: List[str] = Field(default_factory=list)
     argument_topics: Dict[str, str] = Field(default_factory=dict)
     control_predicates: List[str] = Field(default_factory=list)
+    symbol_bindings: Dict[str, str] = Field(default_factory=dict)
 
 
 class SourceAssignmentRef(BaseModel):
@@ -116,6 +117,7 @@ class SourceAssignmentRef(BaseModel):
     target_field: Optional[str] = None
     assignment_operator: Optional[str] = None
     control_predicates: List[str] = Field(default_factory=list)
+    symbol_bindings: Dict[str, str] = Field(default_factory=dict)
 
 
 class HelperExpressionRef(BaseModel):
@@ -768,6 +770,7 @@ class MechanismSourceProfiler:
                     root, field = split_source_field(target)
                     struct = var_to_struct.get(root)
                     target_topic = self._topic_from_struct(struct) if struct else None
+                    predicates = control_predicates.get(line_no, [])
                     refs.append(
                         SourceAssignmentRef(
                             target=target,
@@ -780,7 +783,11 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
-                            control_predicates=control_predicates.get(line_no, []),
+                            control_predicates=predicates,
+                            symbol_bindings=self._source_symbol_bindings(
+                                " ".join([target, expression, *predicates]),
+                                var_to_struct,
+                            ),
                         )
                     )
                 for match in self._SOURCE_COMPOUND_ASSIGNMENT_PATTERN.finditer(line):
@@ -795,6 +802,7 @@ class MechanismSourceProfiler:
                     root, field = split_source_field(target)
                     struct = var_to_struct.get(root)
                     target_topic = self._topic_from_struct(struct) if struct else None
+                    predicates = control_predicates.get(line_no, [])
                     refs.append(
                         SourceAssignmentRef(
                             target=target,
@@ -807,7 +815,11 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
-                            control_predicates=control_predicates.get(line_no, []),
+                            control_predicates=predicates,
+                            symbol_bindings=self._source_symbol_bindings(
+                                " ".join([target, expression, *predicates]),
+                                var_to_struct,
+                            ),
                         )
                     )
         return self._dedupe_source_assignment_refs(refs)
@@ -883,6 +895,7 @@ class MechanismSourceProfiler:
                     receiver = self._call_receiver(line, match.start())
                     args = self._call_args(line, match.end() - 1)
                     argument_topics = self._argument_topics(args, var_to_struct)
+                    predicates = control_predicates.get(line_no, [])
                     refs.append(
                         FunctionCallRef(
                             name=name,
@@ -892,7 +905,11 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
-                            control_predicates=control_predicates.get(line_no, []),
+                            control_predicates=predicates,
+                            symbol_bindings=self._source_symbol_bindings(
+                                " ".join([stripped, *predicates]),
+                                var_to_struct,
+                            ),
                         )
                     )
 
@@ -2033,6 +2050,21 @@ class MechanismSourceProfiler:
         var_to_struct = dict(member_to_struct or {})
         var_to_struct.update(self._extract_struct_variables(body))
         for match in self._FIELD_ACCESS_PATTERN.finditer(body):
+            var = match.group("var")
+            field_name = self._clean_field_path(match.group("field"))
+            struct = var_to_struct.get(var)
+            topic = self._topic_from_struct(struct) if struct else None
+            if topic:
+                bindings[f"{var}.{field_name}"] = f"{topic}.{field_name}"
+        return bindings
+
+    def _source_symbol_bindings(
+        self,
+        expression: str,
+        var_to_struct: Dict[str, str],
+    ) -> Dict[str, str]:
+        bindings: Dict[str, str] = {}
+        for match in self._FIELD_ACCESS_PATTERN.finditer(expression):
             var = match.group("var")
             field_name = self._clean_field_path(match.group("field"))
             struct = var_to_struct.get(var)

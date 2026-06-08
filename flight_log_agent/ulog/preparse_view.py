@@ -30,7 +30,7 @@ def build_preparse_payload(
     inventory = parse_ulog_inventory(log_path_obj, source_path_obj)
     timeline = build_basic_timeline(log_path_obj)
     assumptions = infer_control_surface(log_path_obj, source_path_obj)
-    mission = parse_mission_file(mission_path_obj)
+    mission = parse_mission_file(mission_path_obj, source_path=source_path_obj)
     parameter_metadata = load_parameter_metadata(parameters_xml_path_obj)
     parameter_payload = build_parameter_payload(log_path_obj, parameter_metadata)
 

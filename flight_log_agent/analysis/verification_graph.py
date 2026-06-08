@@ -334,8 +334,16 @@ def binding_slice_symbols(terminal_output: str, bindings: list[dict[str, Any]]) 
 
 
 def source_signal_bindings(bindings: list[dict[str, Any]]) -> dict[str, str]:
-    signal_bindings: dict[str, str] = common_source_signal_bindings()
+    signal_bindings: dict[str, str] = {}
     for binding in bindings:
+        for source, signal in dict(binding.get("symbol_bindings") or {}).items():
+            raw_source_symbol = str(source or "").strip()
+            source_symbol = normalize_symbol(raw_source_symbol)
+            logged = normalize_symbol(str(signal or ""))
+            if raw_source_symbol and logged:
+                signal_bindings[raw_source_symbol] = logged
+            if source_symbol and logged:
+                signal_bindings[source_symbol] = logged
         logged_signal = normalize_symbol(str(binding.get("logged_signal") or ""))
         if not logged_signal:
             continue
@@ -346,17 +354,6 @@ def source_signal_bindings(bindings: list[dict[str, Any]]) -> dict[str, str]:
             if symbol:
                 signal_bindings[symbol] = logged_signal
     return signal_bindings
-
-
-def common_source_signal_bindings() -> dict[str, str]:
-    bindings: dict[str, str] = {}
-    for prefix in ("cmd", "vehicle_command"):
-        for field in ("command", "param1", "param2", "param3", "param4", "param5", "param6", "param7"):
-            bindings[f"{prefix}.{field}"] = f"vehicle_command.{field}"
-    for prefix in ("status", "vstatus", "_vstatus", "vehicle_status"):
-        for field in ("arming_state", "nav_state", "vehicle_type"):
-            bindings[f"{prefix}.{field}"] = f"vehicle_status.{field}"
-    return bindings
 
 
 def check_owned_by_terminal(
