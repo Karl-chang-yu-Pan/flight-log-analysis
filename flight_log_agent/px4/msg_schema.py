@@ -5,8 +5,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from flight_log_agent.source_path import resolve_source_path
 
-DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parents[2] / "ref" / "PX4-Autopilot"
 PRIMITIVE_TYPES = {
     "bool",
     "byte",
@@ -30,12 +30,16 @@ CONSTANT_RE = re.compile(
 
 
 def load_px4_msg_schema(source_path: Optional[str | Path] = None) -> dict[str, list[str]]:
-    source_root = Path(source_path) if source_path else DEFAULT_PX4_SOURCE_PATH
+    source_root = resolve_source_path(source_path)
+    if source_root is None:
+        return {}
     return _load_px4_msg_schema_cached(str(source_root.resolve()))
 
 
 def load_px4_msg_enum_registry(source_path: Optional[str | Path] = None) -> dict[str, dict[str, dict[str, int]]]:
-    source_root = Path(source_path) if source_path else DEFAULT_PX4_SOURCE_PATH
+    source_root = resolve_source_path(source_path)
+    if source_root is None:
+        return {}
     return _load_px4_msg_enum_registry_cached(str(source_root.resolve()))
 
 

@@ -38,6 +38,7 @@ from flight_log_agent.px4.source_mechanism_models import (
     SourceSnippet,
     TopicFieldRef,
 )
+from flight_log_agent.source_path import resolve_source_path
 
 
 def build_source_discovery_log_context(
@@ -2065,6 +2066,7 @@ def enum_constant_value_for_expression(
 
 
 def numeric_source_constants(source_path: str | Path | None) -> dict[str, float | int]:
+    source_path = resolve_source_path(source_path)
     if source_path is None:
         return {}
     root = Path(source_path)

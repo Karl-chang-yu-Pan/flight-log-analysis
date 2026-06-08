@@ -6,6 +6,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Optional
 
+from flight_log_agent.source_path import resolve_source_path
+
 
 def parse_mission_file(
     mission_path: Optional[Path],
@@ -235,6 +237,7 @@ def load_mavlink_enum_names(
     enum_name: str,
     fallback_prefix: str,
 ) -> dict[int, str]:
+    source_path = resolve_source_path(source_path)
     if source_path is None:
         return {}
 

@@ -13,6 +13,7 @@ from flight_log_agent.analysis.source_expression import (
     source_expression_names,
 )
 from flight_log_agent.px4.msg_schema import is_valid_topic_field, normalize_px4_enum_value
+from flight_log_agent.source_path import resolve_source_path
 
 
 class LoweredControlPredicate(BaseModel):
@@ -134,6 +135,7 @@ def enum_value(token: str, signals: Any, source_path: str | Path | None) -> Any:
 
 
 def global_constant_value(token: str, source_path: str | Path | None) -> Any:
+    source_path = resolve_source_path(source_path)
     if source_path is None:
         return token
     root = Path(source_path)

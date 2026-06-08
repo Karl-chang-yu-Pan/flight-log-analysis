@@ -7,6 +7,8 @@ from typing import Any, Optional
 from pyulog import ULog
 from pyulog.px4_events import PX4Events
 
+from flight_log_agent.source_path import resolve_source_path
+
 
 EXPECTED_TIMELINE_TOPICS = [
     "vehicle_status",
@@ -15,11 +17,9 @@ EXPECTED_TIMELINE_TOPICS = [
     "mission_result",
 ]
 
-DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parents[2] / "ref" / "PX4-Autopilot"
-
-
 def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> dict:
     inventory = _empty_inventory()
+    source_path = resolve_source_path(source_path)
 
     try:
         ulog = ULog(str(log_path), None, disable_str_exceptions=True)
@@ -38,7 +38,7 @@ def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> 
     inventory["airframe"] = _extract_airframe(ulog, source_path, git_hash)
     inventory["duration_s"] = _extract_duration_s(ulog)
     inventory["parameters"] = _extract_parameters(ulog)
-    inventory["source_path"] = str(source_path or DEFAULT_PX4_SOURCE_PATH)
+    inventory["source_path"] = str(source_path) if source_path else None
     inventory["available_topics"] = available_topics
     inventory["topic_fields"] = _extract_topic_fields(ulog)
     inventory["topic_instances"] = _extract_topic_instances(ulog)
@@ -59,7 +59,7 @@ def _empty_inventory() -> dict:
         "airframe": None,
         "duration_s": None,
         "parameters": {},
-        "source_path": str(DEFAULT_PX4_SOURCE_PATH),
+        "source_path": None,
         "available_topics": [],
         "topic_fields": {},
         "topic_instances": {},
@@ -361,8 +361,8 @@ def _resolve_airframe_metadata(
     source_path: Optional[Path],
     git_hash: Any,
 ) -> Optional[dict[str, Any]]:
-    px4_source_path = Path(source_path) if source_path else DEFAULT_PX4_SOURCE_PATH
-    if not px4_source_path.exists():
+    px4_source_path = resolve_source_path(source_path)
+    if px4_source_path is None:
         return None
 
     git_hash_str = _clean_string(git_hash)

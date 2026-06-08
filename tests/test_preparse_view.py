@@ -160,3 +160,72 @@ def test_build_preparse_payload_uses_default_source_path_when_empty(tmp_path):
     infer_control.assert_called_once_with(log_path, default_source)
     parse_mission.assert_called_once_with(mission_path, source_path=default_source)
     assert result["inputs"]["source_path"] == str(default_source)
+
+
+def test_build_preparse_payload_checks_out_logged_revision_before_source_reads(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    source_path.mkdir()
+    log_path = tmp_path / "flight.ulg"
+    mission_path = tmp_path / "mission.plan"
+    events = []
+
+    def fake_inventory(*args):
+        events.append("inventory")
+        return {
+            "available_topics": [],
+            "topic_fields": {},
+            "git_hash": "abcdef1234567890",
+        }
+
+    def fake_checkout(*args):
+        events.append("checkout")
+        return {"checkout_performed": True}
+
+    def fake_control(*args):
+        events.append("control_surface")
+        return {}
+
+    def fake_mission(*args, **kwargs):
+        events.append("mission")
+        return {"items": []}
+
+    with patch.object(
+        preparse_view,
+        "parse_ulog_inventory",
+        side_effect=fake_inventory,
+    ) as parse_inventory, patch.object(
+        preparse_view,
+        "checkout_px4_source_revision",
+        side_effect=fake_checkout,
+    ) as checkout_source, patch.object(
+        preparse_view,
+        "build_basic_timeline",
+        return_value=[],
+    ), patch.object(
+        preparse_view,
+        "infer_control_surface",
+        side_effect=fake_control,
+    ) as infer_control, patch.object(
+        preparse_view,
+        "parse_mission_file",
+        side_effect=fake_mission,
+    ) as parse_mission, patch.object(
+        preparse_view,
+        "load_parameter_metadata",
+        return_value={},
+    ), patch.object(
+        preparse_view,
+        "build_parameter_payload",
+        return_value={},
+    ):
+        preparse_view.build_preparse_payload(
+            log_path,
+            mission_path=mission_path,
+            source_path=source_path,
+        )
+
+    parse_inventory.assert_called_once_with(log_path, source_path)
+    checkout_source.assert_called_once_with(source_path, "abcdef1234567890")
+    infer_control.assert_called_once_with(log_path, source_path)
+    parse_mission.assert_called_once_with(mission_path, source_path=source_path)
+    assert events == ["inventory", "checkout", "control_surface", "mission"]

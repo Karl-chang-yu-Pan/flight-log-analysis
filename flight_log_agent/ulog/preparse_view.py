@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from pyulog import ULog
 
+from flight_log_agent.px4.source import checkout_px4_source_revision
 from flight_log_agent.ulog.control_surface import infer_control_surface
 from flight_log_agent.ulog.inventory import parse_ulog_inventory
 from flight_log_agent.ulog.timeline import build_basic_timeline
@@ -32,6 +33,14 @@ def build_preparse_payload(
     parameters_xml_path_obj = Path(parameters_xml_path) if parameters_xml_path else None
 
     inventory = parse_ulog_inventory(log_path_obj, source_path_obj)
+    logged_px4_git_hash = (
+        inventory.get("git_hash")
+        or inventory.get("px4_git_hash")
+        or inventory.get("firmware_git_hash")
+    )
+    if source_path_obj is not None and logged_px4_git_hash:
+        checkout_px4_source_revision(source_path_obj, logged_px4_git_hash)
+
     timeline = build_basic_timeline(log_path_obj)
     assumptions = infer_control_surface(log_path_obj, source_path_obj)
     mission = parse_mission_file(mission_path_obj, source_path=source_path_obj)

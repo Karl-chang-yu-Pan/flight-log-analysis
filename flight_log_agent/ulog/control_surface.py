@@ -16,6 +16,7 @@ CONTROL_SURFACE_TYPE_RE = re.compile(r"^CA_SV_CS(?P<index>\d+)_TYPE$")
 
 
 def infer_control_surface(log_path: Path, source_path: Optional[Path] = None) -> dict:
+    source_path = resolve_source_path(source_path)
     result = _empty_result()
 
     try:
@@ -297,6 +298,7 @@ def _safe_int(value: Any) -> Optional[int]:
 
 
 def control_surface_type_labels(source_path: Optional[Path]) -> dict[int, str]:
+    source_path = resolve_source_path(source_path)
     if source_path is None:
         return {}
     root = Path(source_path)
@@ -317,6 +319,7 @@ def _control_surface_type_labels_cached(source_root: str) -> dict[int, str]:
 
 def output_function_definitions(source_path: Optional[Path]) -> dict[str, Any]:
     empty = {"exact": {}, "ranges": []}
+    source_path = resolve_source_path(source_path)
     if source_path is None:
         return empty
     root = Path(source_path)

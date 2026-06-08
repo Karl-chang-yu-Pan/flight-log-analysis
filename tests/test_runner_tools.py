@@ -20,6 +20,8 @@ import flight_log_agent.px4.source as px4_source
 import flight_log_agent.mission.parser as mission_parser
 import flight_log_agent.ulog.plots as ulog_plots
 from flight_log_agent.px4 import msg_schema as px4_msg_schema
+from flight_log_agent.analysis import control_predicate
+from flight_log_agent.px4 import source_mechanism_resolver
 
 
 class FakeLoggedMessage:
@@ -662,6 +664,48 @@ def test_resolve_source_path_uses_repo_default_when_available(tmp_path):
     assert runner.resolve_source_path(None) is None
 
 
+def test_inventory_and_schema_use_shared_source_path_resolver(tmp_path, monkeypatch):
+    default_source = tmp_path / "ref" / "PX4-Autopilot"
+    msg_dir = default_source / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "VehicleStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 nav_state
+""",
+        encoding="utf-8",
+    )
+
+    class FakeULog:
+        def __init__(self, path, *args, **kwargs):
+            self.msg_info_dict = {}
+            self.initial_parameters = {}
+            self.data_list = []
+            self.logged_messages = []
+            self.dropouts = []
+
+    monkeypatch.setattr(ulog_inventory, "ULog", FakeULog)
+    monkeypatch.setattr(
+        ulog_inventory,
+        "resolve_source_path",
+        lambda source_path: default_source if not source_path else Path(source_path),
+    )
+    monkeypatch.setattr(
+        px4_msg_schema,
+        "resolve_source_path",
+        lambda source_path: default_source if not source_path else Path(source_path),
+    )
+    px4_msg_schema._load_px4_msg_schema_cached.cache_clear()
+
+    inventory = ulog_inventory.parse_ulog_inventory(tmp_path / "flight.ulg")
+
+    assert inventory["source_path"] == str(default_source)
+    assert px4_msg_schema.load_px4_msg_schema(None)["vehicle_status"] == [
+        "nav_state",
+        "timestamp",
+    ]
+
+
 def test_runner_build_basic_timeline_delegates_to_timeline_module(tmp_path):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"
@@ -738,6 +782,45 @@ functions:
 """,
         encoding="utf-8",
     )
+
+
+def test_source_derived_helpers_resolve_default_source_path(tmp_path, monkeypatch):
+    default_source = tmp_path / "ref" / "PX4-Autopilot"
+    write_mavlink_common_xml(default_source)
+    write_control_surface_source_metadata(default_source)
+
+    msg_dir = default_source / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "TestStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 TEST_CONSTANT = 7
+""",
+        encoding="utf-8",
+    )
+    constants_header = default_source / "src" / "lib" / "example" / "constants.h"
+    constants_header.parent.mkdir(parents=True)
+    constants_header.write_text(
+        "static constexpr float TEST_SOURCE_CONSTANT = 12.5f;\n",
+        encoding="utf-8",
+    )
+
+    def fake_resolve(source_path):
+        return default_source if not source_path else Path(source_path)
+
+    monkeypatch.setattr(mission_parser, "resolve_source_path", fake_resolve)
+    monkeypatch.setattr(ulog_control_surface, "resolve_source_path", fake_resolve)
+    monkeypatch.setattr(control_predicate, "resolve_source_path", fake_resolve)
+    monkeypatch.setattr(source_mechanism_resolver, "resolve_source_path", fake_resolve)
+
+    ulog_control_surface._control_surface_type_labels_cached.cache_clear()
+    ulog_control_surface._output_function_definitions_cached.cache_clear()
+
+    assert mission_parser.load_mavlink_command_names(None)[178] == "MAV_CMD_DO_CHANGE_SPEED"
+    assert ulog_control_surface.control_surface_type_labels(None)[5] == "left_elevon"
+    assert ulog_control_surface.output_function_definitions(None)["ranges"][0]["function"] == "motor"
+    assert control_predicate.global_constant_value("TEST_CONSTANT", None) == 7
+    assert source_mechanism_resolver.numeric_source_constants(None)["TEST_SOURCE_CONSTANT"] == 12.5
 
 
 def test_parse_mission_file_extracts_qgroundcontrol_plan_items(tmp_path):
@@ -1611,6 +1694,7 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
         raw={},
     )
     final_report = _sample_report(runner, candidate, applicability)
+    source_prepass_events = []
 
     async def fake_run(agent, input, context, max_turns, hooks=None):
         captured.append(
@@ -1630,28 +1714,49 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
 
     runner.Runner.run = fake_run
 
-    with patch.object(
-        runner,
-        "parse_ulog_inventory",
-        return_value={
+    def fake_parse_inventory(*args):
+        source_prepass_events.append("inventory")
+        return {
             "available_topics": [
                 "vehicle_local_position",
                 "vehicle_local_position_setpoint",
             ],
+            "git_hash": "abcdef1234567890",
             "parameters": {"SYS_AUTOSTART": 4001},
-        },
+        }
+
+    def fake_checkout(*args):
+        source_prepass_events.append("checkout")
+        return {"checkout_performed": True}
+
+    def fake_infer_control_surface(*args):
+        source_prepass_events.append("control_surface")
+        return {"vehicle_type": "fixed_wing"}
+
+    def fake_parse_mission(*args, **kwargs):
+        source_prepass_events.append("mission")
+        return {"mission_file": str(mission_path), "items": []}
+
+    with patch.object(
+        runner,
+        "parse_ulog_inventory",
+        side_effect=fake_parse_inventory,
     ) as parse_inventory, patch.object(
+        runner,
+        "checkout_px4_source_revision",
+        side_effect=fake_checkout,
+    ) as checkout_source, patch.object(
         runner,
         "build_basic_timeline",
         return_value=[{"event": "initial_value"}],
     ) as build_timeline, patch.object(
         runner,
         "infer_control_surface",
-        return_value={"vehicle_type": "fixed_wing"},
+        side_effect=fake_infer_control_surface,
     ) as infer_surface, patch.object(
         runner,
         "parse_mission_file",
-        return_value={"mission_file": str(mission_path), "items": []},
+        side_effect=fake_parse_mission,
     ) as parse_mission, patch.object(
         runner,
         "discover_source_mechanisms",
@@ -1688,10 +1793,12 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     write_cache.assert_called_once()
     evaluate_applicability.assert_called_once()
     evaluate_signature.assert_called_once()
-    parse_inventory.assert_called_once_with(log_path)
+    parse_inventory.assert_called_once_with(log_path, source_path)
+    checkout_source.assert_called_once_with(source_path, "abcdef1234567890")
     build_timeline.assert_called_once_with(log_path)
     infer_surface.assert_called_once_with(log_path, source_path)
     parse_mission.assert_called_once_with(mission_path, source_path)
+    assert source_prepass_events == ["inventory", "checkout", "control_surface", "mission"]
 
     assert result is final_report
     assert [item["agent"] for item in captured] == [
@@ -1717,7 +1824,7 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     assert "airframe_context" not in captured[1]["input"]
     assert "question_intent" not in captured[1]["input"]
     assert "mechanism_cache" not in captured[1]["input"]
-    assert final_report.airframe_summary == "vehicle_type=fixed_wing; SYS_AUTOSTART=4001"
+    assert final_report.airframe_summary == "git abcdef123456; vehicle_type=fixed_wing; SYS_AUTOSTART=4001"
     assert final_report.question_intent_summary == "fixed_wing_altitude: explain altitude drop"
     run_dir = dev_log_root / "web_run_001"
     assert output_dir.is_dir()
@@ -2466,6 +2573,7 @@ def test_infer_control_surface_does_not_invent_labels_without_source(tmp_path, m
             ]
 
     monkeypatch.setattr(ulog_control_surface, "ULog", FakeULog)
+    monkeypatch.setattr(ulog_control_surface, "resolve_source_path", lambda source_path: None)
 
     result = ulog_control_surface.infer_control_surface(log_path)
 

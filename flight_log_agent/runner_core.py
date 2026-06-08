@@ -361,9 +361,28 @@ async def analyze_flight_log(
             "prepass",
             "parse_ulog_inventory",
             parse_ulog_inventory,
-            {"log_path": str(log_path_obj)},
+            {"log_path": str(log_path_obj), "source_path": str(source_path_obj) if source_path_obj else None},
             log_path_obj,
+            source_path_obj,
         )
+
+        logged_px4_git_hash = (
+            inventory.get("git_hash")
+            or inventory.get("px4_git_hash")
+            or inventory.get("firmware_git_hash")
+        )
+        # Align before source-derived prepass steps read version-sensitive PX4 files.
+        if source_path_obj is not None and logged_px4_git_hash:
+            _audit_sync_call(
+                audit_logger,
+                "source",
+                "checkout_px4_source_revision",
+                checkout_px4_source_revision,
+                {"revision": logged_px4_git_hash},
+                source_path_obj,
+                logged_px4_git_hash,
+            )
+
         timeline = _audit_sync_call(
             audit_logger,
             "prepass",
@@ -396,18 +415,6 @@ async def analyze_flight_log(
 
         # Only this compact object may enter mechanism discovery.
         airframe_context = build_airframe_context(inventory, control_surface)
-
-        # Optional: checkout exact PX4 revision before source search.
-        if source_path_obj is not None and airframe_context.px4_git_hash:
-            _audit_sync_call(
-                audit_logger,
-                "source",
-                "checkout_px4_source_revision",
-                checkout_px4_source_revision,
-                {"revision": airframe_context.px4_git_hash},
-                source_path_obj,
-                airframe_context.px4_git_hash,
-            )
 
         # ------------------------------------------------------------
         # Stage 2: normalize question into source-search intent
@@ -712,6 +719,7 @@ async def discover_source_mechanisms(
     decide,
     cached_candidates: Optional[list[MechanismCandidate]] = None,
 ) -> SourceMechanismCandidateSet:
+    source_path = resolve_source_path(source_path)
     if source_path is None:
         return SourceMechanismCandidateSet(
             candidates=[],

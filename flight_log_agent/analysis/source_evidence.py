@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from flight_log_agent.px4.source import read_source_file, search_source
 from flight_log_agent.models import CodeRef, SourceEvidenceBundle, SourceHit, SourceSearchContext
+from flight_log_agent.source_path import resolve_source_path
 
 
 def bounded_source_search(
@@ -15,6 +16,7 @@ def bounded_source_search(
     max_hits_per_query: int = 8,
     max_snippet_chars: int = 1600,
 ) -> SourceEvidenceBundle:
+    source_path = resolve_source_path(source_path)
     if source_path is None:
         return SourceEvidenceBundle(
             search_context=search_context,

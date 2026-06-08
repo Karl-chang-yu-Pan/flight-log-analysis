@@ -22,6 +22,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from flight_log_agent.source_path import resolve_source_path
+
 
 MECHANISM_CACHE_SCHEMA_VERSION = 1
 MIN_MECHANISM_RELEVANCE_SCORE = 6
@@ -283,7 +285,8 @@ class MechanismSourceValidator:
     """Validates whether cached mechanism source refs still match a PX4 checkout."""
 
     def __init__(self, source_path: Optional[str | Path], current_git_hash: Optional[str] = None):
-        self.source_path = Path(source_path) if source_path else None
+        resolved_source_path = resolve_source_path(source_path)
+        self.source_path = Path(resolved_source_path) if resolved_source_path else None
         self.current_git_hash = current_git_hash
 
     def validate_record(self, record: MechanismRecord) -> MechanismSourceValidation:
@@ -456,8 +459,9 @@ class MechanismCacheWriter:
             px4_tag=airframe.get("px4_tag"),
         )
 
+        resolved_source_path = resolve_source_path(source_path)
         source_refs = [
-            self._fingerprint_source_ref(ref, source_path)
+            self._fingerprint_source_ref(ref, resolved_source_path)
             for ref in candidate.get("source_refs", [])
         ]
 
@@ -517,6 +521,7 @@ class MechanismCacheWriter:
         )
 
     def _fingerprint_source_ref(self, ref_payload: Any, source_path: Optional[str | Path]) -> MechanismSourceRef:
+        source_path = resolve_source_path(source_path)
         ref = _to_plain_dict(ref_payload)
         source_ref = MechanismSourceRef(
             file=str(ref.get("file") or ""),
