@@ -226,7 +226,7 @@ Rules:
 - Verification checks must encode generic claim polarity. Use supports for a
   check result that supports the candidate, and contradicts for a check result
   that rules out the candidate. This applies even when the check itself is
-  expected to pass, such as command-absent, sentinel-value, alternative-formula,
+  expected to pass, such as event-absent, sentinel-value, alternative-formula,
   or branch-not-active facts.
 - If a later verification check depends on a helper call or formula that cannot
   be directly expressed yet, preserve it as a structured derived_expression
@@ -1809,7 +1809,7 @@ if __name__ == "__main__":
             mission_path="missions/test.plan",
             source_path="PX4-Autopilot",
             output_dir="outputs/test_case_001",
-            user_question="Why did RTL climb higher than expected? Do not provide suggestions.",
+            user_question="Why did the logged output differ from the expected source behavior?",
         )
     )
     print(report.model_dump_json(indent=2))

@@ -654,8 +654,48 @@ def write_mavlink_common_xml(source_path):
       <entry value="22" name="MAV_CMD_NAV_TAKEOFF" />
       <entry value="178" name="MAV_CMD_DO_CHANGE_SPEED" />
     </enum>
+    <enum name="MAV_FRAME">
+      <entry value="3" name="MAV_FRAME_GLOBAL_RELATIVE_ALT" />
+    </enum>
   </enums>
 </mavlink>
+""",
+        encoding="utf-8",
+    )
+
+
+def write_control_surface_source_metadata(source_path):
+    module_yaml = source_path / "src" / "modules" / "control_allocator" / "module.yaml"
+    module_yaml.parent.mkdir(parents=True)
+    module_yaml.write_text(
+        """
+parameters:
+    - group: Geometry
+      definitions:
+        CA_SV_CS${i}_TYPE:
+            description:
+                short: Control Surface ${i} type
+            type: enum
+            values:
+                4: Rudder
+                5: Left Elevon
+                6: Right Elevon
+""",
+        encoding="utf-8",
+    )
+    output_yaml = source_path / "src" / "lib" / "mixer_module" / "output_functions.yaml"
+    output_yaml.parent.mkdir(parents=True)
+    output_yaml.write_text(
+        """
+functions:
+  common:
+    Disabled: 0
+    Motor:
+      start: 101
+      count: 12
+    Servo:
+      start: 201
+      count: 8
 """,
         encoding="utf-8",
     )
@@ -802,6 +842,7 @@ def test_parse_mission_file_falls_back_to_numeric_command_name_without_source(tm
     result = mission_parser.parse_mission_file(mission_path)
 
     assert result["items"][0]["command_name"] == "MAV_CMD_178"
+    assert result["items"][0]["frame_name"] == "MAV_FRAME_3"
 
 
 def test_parse_mission_file_does_not_recursively_discover_mavlink_xml(tmp_path):
@@ -2232,6 +2273,8 @@ def test_runner_imports_with_real_sdk_function_tool_schema():
 
 def test_infer_control_surface_maps_ca_servo_types_to_pwm_outputs(tmp_path, monkeypatch):
     log_path = tmp_path / "flight.ulg"
+    source_path = tmp_path / "PX4-Autopilot"
+    write_control_surface_source_metadata(source_path)
 
     class FakeULog:
         def __init__(self, path):
@@ -2252,7 +2295,7 @@ def test_infer_control_surface_maps_ca_servo_types_to_pwm_outputs(tmp_path, monk
 
     monkeypatch.setattr(ulog_control_surface, "ULog", FakeULog)
 
-    result = ulog_control_surface.infer_control_surface(log_path)
+    result = ulog_control_surface.infer_control_surface(log_path, source_path)
 
     assert result["vehicle_type"] == "fixed_wing"
     assert result["confidence"] == "medium"
@@ -2300,6 +2343,36 @@ def test_infer_control_surface_maps_ca_servo_types_to_pwm_outputs(tmp_path, monk
         "Control-surface mapping is inferred from logged PX4 parameters only; "
         "physical wiring and linkage direction are not confirmed."
     )
+
+
+def test_infer_control_surface_does_not_invent_labels_without_source(tmp_path, monkeypatch):
+    log_path = tmp_path / "flight.ulg"
+
+    class FakeULog:
+        def __init__(self, path):
+            self.path = path
+            self.initial_parameters = {
+                "CA_SV_CS_COUNT": 1,
+                "CA_SV_CS0_TYPE": 5,
+                "PWM_MAIN_FUNC1": 201,
+            }
+            self.data_list = [
+                SimpleNamespace(name="actuator_servos", data={}),
+            ]
+
+    monkeypatch.setattr(ulog_control_surface, "ULog", FakeULog)
+
+    result = ulog_control_surface.infer_control_surface(log_path)
+
+    assert result["assumed_actuator_mapping"] == {
+        "servo_1": {
+            "control_surface": "unknown",
+            "source_parameter": "CA_SV_CS0_TYPE",
+            "source_value": 5,
+            "output_channels": [],
+        }
+    }
+    assert result["confidence"] == "medium-low"
 
 
 def test_infer_control_surface_reports_parse_failure(tmp_path, monkeypatch):

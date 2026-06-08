@@ -1,39 +1,12 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
 from pyulog import ULog
 
-
-CONTROL_SURFACE_TYPE_LABELS = {
-    0: "not_set",
-    1: "left_aileron",
-    2: "right_aileron",
-    3: "elevator",
-    4: "rudder",
-    5: "left_elevon",
-    6: "right_elevon",
-    7: "left_v_tail",
-    8: "right_v_tail",
-    9: "left_flap",
-    10: "right_flap",
-    11: "airbrake",
-    12: "custom",
-    13: "left_a_tail",
-    14: "right_a_tail",
-    15: "single_channel_aileron",
-    16: "steering_wheel",
-    17: "left_spoiler",
-    18: "right_spoiler",
-}
-
-OUTPUT_FUNCTION_DISABLED = {
-    0: "disabled",
-    1: "constant_min",
-    2: "constant_max",
-}
 
 OUTPUT_FUNCTION_RE = re.compile(r"^(?P<bus>PWM_(?:MAIN|AUX|FMU)_FUNC)(?P<channel>\d+)$")
 CONTROL_SURFACE_TYPE_RE = re.compile(r"^CA_SV_CS(?P<index>\d+)_TYPE$")
@@ -50,8 +23,8 @@ def infer_control_surface(log_path: Path, source_path: Optional[Path] = None) ->
 
     parameters = getattr(ulog, "initial_parameters", {}) or {}
     topics = _extract_topic_names(ulog)
-    servo_types = _extract_control_surface_types(parameters)
-    output_functions = _extract_output_functions(parameters)
+    servo_types = _extract_control_surface_types(parameters, source_path)
+    output_functions = _extract_output_functions(parameters, source_path)
 
     result["vehicle_type"] = _infer_vehicle_type(parameters, topics, servo_types)
     result["assumed_actuator_mapping"] = _build_actuator_mapping(
@@ -88,7 +61,7 @@ def _extract_topic_names(ulog: Any) -> set[str]:
     }
 
 
-def _extract_control_surface_types(parameters: dict) -> dict[int, dict]:
+def _extract_control_surface_types(parameters: dict, source_path: Optional[Path]) -> dict[int, dict]:
     configured_count = _safe_int(parameters.get("CA_SV_CS_COUNT"))
     discovered_indexes = {
         int(match.group("index"))
@@ -103,7 +76,7 @@ def _extract_control_surface_types(parameters: dict) -> dict[int, dict]:
     for index in sorted(discovered_indexes):
         param_name = f"CA_SV_CS{index}_TYPE"
         raw_type = _safe_int(parameters.get(param_name))
-        label = CONTROL_SURFACE_TYPE_LABELS.get(raw_type, "unknown")
+        label = control_surface_type_labels(source_path).get(raw_type, "unknown")
         servo_types[index + 1] = {
             "parameter": param_name,
             "raw_type": raw_type,
@@ -113,8 +86,9 @@ def _extract_control_surface_types(parameters: dict) -> dict[int, dict]:
     return servo_types
 
 
-def _extract_output_functions(parameters: dict) -> dict[str, dict]:
+def _extract_output_functions(parameters: dict, source_path: Optional[Path]) -> dict[str, dict]:
     output_functions = {}
+    definitions = output_function_definitions(source_path)
 
     for name, value in sorted(parameters.items()):
         match = OUTPUT_FUNCTION_RE.match(name)
@@ -122,7 +96,7 @@ def _extract_output_functions(parameters: dict) -> dict[str, dict]:
             continue
 
         function_id = _safe_int(value)
-        decoded = _decode_output_function(function_id)
+        decoded = _decode_output_function(function_id, definitions)
         output_functions[name] = {
             "channel": int(match.group("channel")),
             "function_id": function_id,
@@ -132,27 +106,27 @@ def _extract_output_functions(parameters: dict) -> dict[str, dict]:
     return output_functions
 
 
-def _decode_output_function(function_id: Optional[int]) -> dict:
+def _decode_output_function(function_id: Optional[int], definitions: dict[str, Any]) -> dict:
     if function_id is None:
         return {"function": "unknown", "actuator_index": None}
 
-    if function_id in OUTPUT_FUNCTION_DISABLED:
+    exact = definitions.get("exact", {}).get(function_id)
+    if exact:
         return {
-            "function": OUTPUT_FUNCTION_DISABLED[function_id],
+            "function": exact,
             "actuator_index": None,
         }
 
-    if 101 <= function_id <= 112:
-        return {
-            "function": "motor",
-            "actuator_index": function_id - 100,
-        }
-
-    if 201 <= function_id <= 208:
-        return {
-            "function": "servo",
-            "actuator_index": function_id - 200,
-        }
+    for entry in definitions.get("ranges", []):
+        start = entry.get("start")
+        count = entry.get("count")
+        if start is None or count is None:
+            continue
+        if start <= function_id < start + count:
+            return {
+                "function": entry["function"],
+                "actuator_index": function_id - start + 1,
+            }
 
     return {"function": "unknown", "actuator_index": None}
 
@@ -314,6 +288,115 @@ def _safe_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def control_surface_type_labels(source_path: Optional[Path]) -> dict[int, str]:
+    if source_path is None:
+        return {}
+    root = Path(source_path)
+    if not root.exists():
+        return {}
+    return _control_surface_type_labels_cached(str(root.resolve()))
+
+
+@lru_cache(maxsize=16)
+def _control_surface_type_labels_cached(source_root: str) -> dict[int, str]:
+    path = Path(source_root) / "src" / "modules" / "control_allocator" / "module.yaml"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+    return _parse_parameter_enum_values(text, "CA_SV_CS${i}_TYPE")
+
+
+def output_function_definitions(source_path: Optional[Path]) -> dict[str, Any]:
+    empty = {"exact": {}, "ranges": []}
+    if source_path is None:
+        return empty
+    root = Path(source_path)
+    if not root.exists():
+        return empty
+    return _output_function_definitions_cached(str(root.resolve()))
+
+
+@lru_cache(maxsize=16)
+def _output_function_definitions_cached(source_root: str) -> dict[str, Any]:
+    path = Path(source_root) / "src" / "lib" / "mixer_module" / "output_functions.yaml"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return {"exact": {}, "ranges": []}
+
+    exact: dict[int, str] = {}
+    ranges: list[dict[str, Any]] = []
+    index = 0
+    while index < len(lines):
+        match = re.match(r"\s{4}(?P<name>[A-Za-z0-9_]+):\s*(?P<value>\d+)\s*$", lines[index])
+        if match:
+            exact[int(match.group("value"))] = _normalize_label(match.group("name"))
+            index += 1
+            continue
+
+        range_match = re.match(r"\s{4}(?P<name>[A-Za-z0-9_]+):\s*$", lines[index])
+        if not range_match:
+            index += 1
+            continue
+
+        name = range_match.group("name")
+        start = None
+        count = None
+        index += 1
+        while index < len(lines):
+            if re.match(r"\s{4}[A-Za-z0-9_]+:", lines[index]):
+                break
+            start_match = re.match(r"\s{6}start:\s*(?P<value>\d+)\s*$", lines[index])
+            count_match = re.match(r"\s{6}count:\s*(?P<value>\d+)\s*$", lines[index])
+            if start_match:
+                start = int(start_match.group("value"))
+            if count_match:
+                count = int(count_match.group("value"))
+            index += 1
+
+        if start is not None and count is not None:
+            ranges.append({
+                "function": _normalize_label(name),
+                "start": start,
+                "count": count,
+            })
+
+    return {"exact": exact, "ranges": ranges}
+
+
+def _parse_parameter_enum_values(text: str, parameter_name: str) -> dict[int, str]:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not re.match(rf"\s*{re.escape(parameter_name)}\s*:\s*$", line):
+            continue
+        values_index = None
+        for cursor in range(index + 1, min(index + 80, len(lines))):
+            if re.match(r"\s{12}values:\s*$", lines[cursor]):
+                values_index = cursor
+                break
+        if values_index is None:
+            continue
+
+        values: dict[int, str] = {}
+        for cursor in range(values_index + 1, len(lines)):
+            value_line = lines[cursor]
+            if value_line.strip() and len(value_line) - len(value_line.lstrip(" ")) <= 12:
+                break
+            match = re.match(r"\s{16}(?P<key>\d+):\s*(?P<label>.+?)\s*$", value_line)
+            if match:
+                values[int(match.group("key"))] = _normalize_label(match.group("label"))
+        return values
+    return {}
+
+
+def _normalize_label(value: str) -> str:
+    label = str(value or "").strip().strip("'\"")
+    label = label.strip("()")
+    label = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_").lower()
+    return label or "unknown"
 
 
 def _json_safe_value(value: Any) -> Any:

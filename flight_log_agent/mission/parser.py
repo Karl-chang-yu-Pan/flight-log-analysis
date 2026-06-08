@@ -7,15 +7,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-FRAME_NAMES = {
-    0: "MAV_FRAME_GLOBAL",
-    3: "MAV_FRAME_GLOBAL_RELATIVE_ALT",
-    6: "MAV_FRAME_GLOBAL_RELATIVE_ALT_INT",
-    10: "MAV_FRAME_GLOBAL_TERRAIN_ALT",
-    11: "MAV_FRAME_GLOBAL_TERRAIN_ALT_INT",
-}
-
-
 def parse_mission_file(
     mission_path: Optional[Path],
     source_path: Optional[Path] = None,
@@ -42,11 +33,13 @@ def parse_mission_file(
 
     if stripped.startswith("{"):
         command_names = load_mavlink_command_names(source_path)
-        return _parse_plan_json(mission_path, text, command_names)
+        frame_names = load_mavlink_frame_names(source_path)
+        return _parse_plan_json(mission_path, text, command_names, frame_names)
 
     if stripped.startswith("QGC WPL"):
         command_names = load_mavlink_command_names(source_path)
-        return _parse_qgc_wpl(mission_path, text, command_names)
+        frame_names = load_mavlink_frame_names(source_path)
+        return _parse_qgc_wpl(mission_path, text, command_names, frame_names)
 
     summary["warnings"].append("unsupported mission file format")
     return summary
@@ -68,7 +61,12 @@ def _empty_summary(mission_path: Path) -> dict:
     }
 
 
-def _parse_plan_json(mission_path: Path, text: str, command_names: dict[int, str]) -> dict:
+def _parse_plan_json(
+    mission_path: Path,
+    text: str,
+    command_names: dict[int, str],
+    frame_names: dict[int, str],
+) -> dict:
     summary = _empty_summary(mission_path)
     summary["format"] = "qgroundcontrol_plan"
 
@@ -103,12 +101,17 @@ def _parse_plan_json(mission_path: Path, text: str, command_names: dict[int, str
             summary["warnings"].append(f"skipped non-object mission item at index {index}")
             continue
 
-        summary["items"].append(_parse_plan_item(index, item, command_names))
+        summary["items"].append(_parse_plan_item(index, item, command_names, frame_names))
 
     return summary
 
 
-def _parse_plan_item(index: int, item: dict, command_names: dict[int, str]) -> dict:
+def _parse_plan_item(
+    index: int,
+    item: dict,
+    command_names: dict[int, str],
+    frame_names: dict[int, str],
+) -> dict:
     item_type = item.get("type")
     if item_type == "ComplexItem":
         return {
@@ -136,7 +139,7 @@ def _parse_plan_item(index: int, item: dict, command_names: dict[int, str]) -> d
         "command": command,
         "command_name": _command_name(command, command_names),
         "frame": frame,
-        "frame_name": _frame_name(frame),
+        "frame_name": _frame_name(frame, frame_names),
         "auto_continue": _json_safe_value(item.get("autoContinue")),
         "params": params,
         "latitude": _param(params, 4),
@@ -145,7 +148,12 @@ def _parse_plan_item(index: int, item: dict, command_names: dict[int, str]) -> d
     }
 
 
-def _parse_qgc_wpl(mission_path: Path, text: str, command_names: dict[int, str]) -> dict:
+def _parse_qgc_wpl(
+    mission_path: Path,
+    text: str,
+    command_names: dict[int, str],
+    frame_names: dict[int, str],
+) -> dict:
     summary = _empty_summary(mission_path)
     summary["format"] = "qgc_wpl"
 
@@ -181,7 +189,7 @@ def _parse_qgc_wpl(mission_path: Path, text: str, command_names: dict[int, str])
             "command": command,
             "command_name": _command_name(command, command_names),
             "frame": frame,
-            "frame_name": _frame_name(frame),
+            "frame_name": _frame_name(frame, frame_names),
             "auto_continue": auto_continue,
             "params": params,
             "latitude": _param(params, 4),
@@ -214,6 +222,19 @@ def _command_name(command: Optional[int], command_names: dict[int, str]) -> Opti
 
 
 def load_mavlink_command_names(source_path: Optional[Path]) -> dict[int, str]:
+    return load_mavlink_enum_names(source_path, enum_name="MAV_CMD", fallback_prefix="MAV_CMD")
+
+
+def load_mavlink_frame_names(source_path: Optional[Path]) -> dict[int, str]:
+    return load_mavlink_enum_names(source_path, enum_name="MAV_FRAME", fallback_prefix="MAV_FRAME")
+
+
+def load_mavlink_enum_names(
+    source_path: Optional[Path],
+    *,
+    enum_name: str,
+    fallback_prefix: str,
+) -> dict[int, str]:
     if source_path is None:
         return {}
 
@@ -222,12 +243,16 @@ def load_mavlink_command_names(source_path: Optional[Path]) -> dict[int, str]:
         return {}
 
     for path in _candidate_mavlink_xml_paths(root):
-        names = _load_mavlink_command_names_from_xml(path)
+        names = _load_mavlink_enum_names_from_xml(path, enum_name=enum_name)
         if names:
             return names
 
     for path in _candidate_mavlink_header_paths(root):
-        names = _load_mavlink_command_names_from_header(path)
+        names = _load_mavlink_enum_names_from_header(
+            path,
+            enum_name=enum_name,
+            fallback_prefix=fallback_prefix,
+        )
         if names:
             return names
 
@@ -254,7 +279,7 @@ def _candidate_mavlink_header_paths(root: Path) -> list[Path]:
     return [path for path in candidates if path.exists()]
 
 
-def _load_mavlink_command_names_from_xml(path: Path) -> dict[int, str]:
+def _load_mavlink_enum_names_from_xml(path: Path, *, enum_name: str) -> dict[int, str]:
     try:
         tree = ET.parse(path)
     except Exception:
@@ -262,7 +287,7 @@ def _load_mavlink_command_names_from_xml(path: Path) -> dict[int, str]:
 
     names: dict[int, str] = {}
     for enum in tree.findall(".//enum"):
-        if enum.attrib.get("name") != "MAV_CMD":
+        if enum.attrib.get("name") != enum_name:
             continue
         for entry in enum.findall("entry"):
             value = _safe_int(entry.attrib.get("value"))
@@ -272,29 +297,41 @@ def _load_mavlink_command_names_from_xml(path: Path) -> dict[int, str]:
     return names
 
 
-def _load_mavlink_command_names_from_header(path: Path) -> dict[int, str]:
+def _load_mavlink_enum_names_from_header(
+    path: Path,
+    *,
+    enum_name: str,
+    fallback_prefix: str,
+) -> dict[int, str]:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return {}
 
-    match = re.search(r"typedef\s+enum\s+MAV_CMD\s*\{(?P<body>.*?)\}\s*MAV_CMD\s*;", text, re.S)
+    match = re.search(
+        rf"typedef\s+enum\s+{re.escape(enum_name)}\s*\{{(?P<body>.*?)\}}\s*{re.escape(enum_name)}\s*;",
+        text,
+        re.S,
+    )
     if not match:
         return {}
 
     names: dict[int, str] = {}
     for item in match.group("body").split(","):
-        entry = re.search(r"\b(?P<name>MAV_CMD_[A-Z0-9_]+)\s*=\s*(?P<value>\d+)\b", item)
+        entry = re.search(
+            rf"\b(?P<name>{re.escape(fallback_prefix)}_[A-Z0-9_]+)\s*=\s*(?P<value>\d+)\b",
+            item,
+        )
         if entry:
             names[int(entry.group("value"))] = entry.group("name")
     return names
 
 
-def _frame_name(frame: Optional[int]) -> Optional[str]:
+def _frame_name(frame: Optional[int], frame_names: dict[int, str]) -> Optional[str]:
     if frame is None:
         return None
 
-    return FRAME_NAMES.get(frame, f"MAV_FRAME_{frame}")
+    return frame_names.get(frame, f"MAV_FRAME_{frame}")
 
 
 def _safe_int(value: Any) -> Optional[int]:
