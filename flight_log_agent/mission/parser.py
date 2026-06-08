@@ -24,7 +24,6 @@ def parse_mission_file(
         return None
 
     summary = _empty_summary(mission_path)
-    command_names = load_mavlink_command_names(source_path)
 
     if not mission_path.exists():
         summary["warnings"].append(f"mission file does not exist: {mission_path}")
@@ -42,9 +41,11 @@ def parse_mission_file(
         return summary
 
     if stripped.startswith("{"):
+        command_names = load_mavlink_command_names(source_path)
         return _parse_plan_json(mission_path, text, command_names)
 
     if stripped.startswith("QGC WPL"):
+        command_names = load_mavlink_command_names(source_path)
         return _parse_qgc_wpl(mission_path, text, command_names)
 
     summary["warnings"].append("unsupported mission file format")
@@ -235,25 +236,22 @@ def load_mavlink_command_names(source_path: Optional[Path]) -> dict[int, str]:
 
 def _candidate_mavlink_xml_paths(root: Path) -> list[Path]:
     candidates = [
+        root / "message_definitions" / "v1.0" / "common.xml",
         root / "mavlink" / "message_definitions" / "v1.0" / "common.xml",
         root / "src" / "modules" / "mavlink" / "mavlink" / "message_definitions" / "v1.0" / "common.xml",
         root / "src" / "modules" / "mavlink" / "mavlink" / "message_definitions" / "v1.0" / "minimal.xml",
     ]
-    existing = [path for path in candidates if path.exists()]
-    if existing:
-        return existing
-    return list(root.glob("**/message_definitions/v1.0/common.xml"))[:8]
+    return [path for path in candidates if path.exists()]
 
 
 def _candidate_mavlink_header_paths(root: Path) -> list[Path]:
     candidates = [
         root / "build" / "px4_sitl_default" / "mavlink" / "common" / "mavlink.h",
+        root / "build" / "px4_sitl_default" / "mavlink" / "mavlink" / "common" / "mavlink.h",
         root / "mavlink" / "include" / "mavlink" / "v2.0" / "common" / "mavlink.h",
+        root / "src" / "modules" / "mavlink" / "mavlink" / "include" / "mavlink" / "v2.0" / "common" / "mavlink.h",
     ]
-    existing = [path for path in candidates if path.exists()]
-    if existing:
-        return existing
-    return list(root.glob("**/mavlink/v*/common/mavlink.h"))[:8]
+    return [path for path in candidates if path.exists()]
 
 
 def _load_mavlink_command_names_from_xml(path: Path) -> dict[int, str]:

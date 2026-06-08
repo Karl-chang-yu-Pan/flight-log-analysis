@@ -804,6 +804,33 @@ def test_parse_mission_file_falls_back_to_numeric_command_name_without_source(tm
     assert result["items"][0]["command_name"] == "MAV_CMD_178"
 
 
+def test_parse_mission_file_does_not_recursively_discover_mavlink_xml(tmp_path):
+    mission_path = tmp_path / "mission.waypoints"
+    source_path = tmp_path / "PX4-Autopilot"
+    nested_xml = source_path / "unrelated" / "deep" / "message_definitions" / "v1.0" / "common.xml"
+    nested_xml.parent.mkdir(parents=True)
+    nested_xml.write_text(
+        """
+<mavlink>
+  <enums>
+    <enum name="MAV_CMD">
+      <entry value="178" name="MAV_CMD_DO_CHANGE_SPEED" />
+    </enum>
+  </enums>
+</mavlink>
+""",
+        encoding="utf-8",
+    )
+    mission_path.write_text(
+        "QGC WPL 110\n"
+        "0\t1\t3\t178\t0\t0\t0\t0\t47.397742\t8.545594\t50\t1\n"
+    )
+
+    result = mission_parser.parse_mission_file(mission_path, source_path=source_path)
+
+    assert result["items"][0]["command_name"] == "MAV_CMD_178"
+
+
 def test_parse_mission_file_reports_missing_file(tmp_path):
     mission_path = tmp_path / "missing.plan"
 

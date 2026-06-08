@@ -118,9 +118,10 @@ from flight_log_agent.px4.mechanism_cache import (
     MechanismSourceValidation,
     MechanismSourceValidator,
 )
-
-
-DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parents[1] / "ref" / "PX4-Autopilot"
+from flight_log_agent.source_path import (
+    DEFAULT_PX4_SOURCE_PATH,
+    resolve_source_path as resolve_source_path_impl,
+)
 
 
 # ============================================================
@@ -165,11 +166,7 @@ def parse_mission_file(
 
 
 def resolve_source_path(source_path: Optional[str | Path]) -> Optional[Path]:
-    if source_path:
-        return Path(source_path)
-    if DEFAULT_PX4_SOURCE_PATH.exists():
-        return DEFAULT_PX4_SOURCE_PATH
-    return None
+    return resolve_source_path_impl(source_path, default_source_path=DEFAULT_PX4_SOURCE_PATH)
 
 
 # ============================================================

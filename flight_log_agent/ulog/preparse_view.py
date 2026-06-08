@@ -10,6 +10,10 @@ from flight_log_agent.ulog.control_surface import infer_control_surface
 from flight_log_agent.ulog.inventory import parse_ulog_inventory
 from flight_log_agent.ulog.timeline import build_basic_timeline
 from flight_log_agent.mission.parser import parse_mission_file
+from flight_log_agent.source_path import (
+    DEFAULT_PX4_SOURCE_PATH,
+    resolve_source_path as resolve_source_path_impl,
+)
 
 
 FLOAT_TOLERANCE = 0.00001
@@ -24,7 +28,7 @@ def build_preparse_payload(
 ) -> dict[str, Any]:
     log_path_obj = Path(log_path)
     mission_path_obj = Path(mission_path) if mission_path else None
-    source_path_obj = Path(source_path) if source_path else None
+    source_path_obj = resolve_source_path(source_path)
     parameters_xml_path_obj = Path(parameters_xml_path) if parameters_xml_path else None
 
     inventory = parse_ulog_inventory(log_path_obj, source_path_obj)
@@ -50,6 +54,10 @@ def build_preparse_payload(
         "parameters": parameter_payload,
         "topics": build_topic_rows(inventory),
     }
+
+
+def resolve_source_path(source_path: str | Path | None) -> Optional[Path]:
+    return resolve_source_path_impl(source_path, default_source_path=DEFAULT_PX4_SOURCE_PATH)
 
 
 def build_parameter_payload(

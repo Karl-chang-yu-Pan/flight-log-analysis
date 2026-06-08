@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import flight_log_agent.ulog.preparse_view as preparse_view
 
@@ -116,3 +117,46 @@ def test_build_topic_rows_includes_missing_and_derived_fields():
     assert by_name["vehicle_attitude"]["has_derived_attitude_fields"] is True
     assert by_name["vehicle_status"]["field_count"] == 2
     assert by_name["mission_result"]["missing_expected"] is True
+
+
+def test_build_preparse_payload_uses_default_source_path_when_empty(tmp_path):
+    default_source = tmp_path / "ref" / "PX4-Autopilot"
+    default_source.mkdir(parents=True)
+    log_path = tmp_path / "flight.ulg"
+    mission_path = tmp_path / "mission.plan"
+
+    with patch.object(preparse_view, "DEFAULT_PX4_SOURCE_PATH", default_source), patch.object(
+        preparse_view,
+        "parse_ulog_inventory",
+        return_value={"available_topics": [], "topic_fields": {}},
+    ) as parse_inventory, patch.object(
+        preparse_view,
+        "build_basic_timeline",
+        return_value=[],
+    ), patch.object(
+        preparse_view,
+        "infer_control_surface",
+        return_value={},
+    ) as infer_control, patch.object(
+        preparse_view,
+        "parse_mission_file",
+        return_value={"items": []},
+    ) as parse_mission, patch.object(
+        preparse_view,
+        "load_parameter_metadata",
+        return_value={},
+    ), patch.object(
+        preparse_view,
+        "build_parameter_payload",
+        return_value={},
+    ):
+        result = preparse_view.build_preparse_payload(
+            log_path,
+            mission_path=mission_path,
+            source_path="",
+        )
+
+    parse_inventory.assert_called_once_with(log_path, default_source)
+    infer_control.assert_called_once_with(log_path, default_source)
+    parse_mission.assert_called_once_with(mission_path, source_path=default_source)
+    assert result["inputs"]["source_path"] == str(default_source)
