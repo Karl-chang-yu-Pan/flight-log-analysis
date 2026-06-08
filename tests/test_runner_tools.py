@@ -2364,7 +2364,7 @@ def test_infer_control_surface_maps_ca_servo_types_to_pwm_outputs(tmp_path, monk
 
     result = ulog_control_surface.infer_control_surface(log_path, source_path)
 
-    assert result["vehicle_type"] == "fixed_wing"
+    assert result["vehicle_type"] == "unknown"
     assert result["confidence"] == "medium"
     assert result["assumed_actuator_mapping"] == {
         "servo_1": {
@@ -2410,6 +2410,44 @@ def test_infer_control_surface_maps_ca_servo_types_to_pwm_outputs(tmp_path, monk
         "Control-surface mapping is inferred from logged PX4 parameters only; "
         "physical wiring and linkage direction are not confirmed."
     )
+
+
+def test_infer_control_surface_uses_logged_vehicle_type_enum(tmp_path, monkeypatch):
+    log_path = tmp_path / "flight.ulg"
+    source_path = tmp_path / "PX4-Autopilot"
+    msg_dir = source_path / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "VehicleStatus.msg").write_text(
+        """
+uint64 timestamp
+uint8 vehicle_type
+uint8 VEHICLE_TYPE_UNKNOWN = 0
+uint8 VEHICLE_TYPE_ROTARY_WING = 1
+uint8 VEHICLE_TYPE_FIXED_WING = 2
+""",
+        encoding="utf-8",
+    )
+
+    class FakeULog:
+        def __init__(self, path):
+            self.path = path
+            self.initial_parameters = {"FW_AIRSPD_TRIM": 17.0}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_status",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "vehicle_type": [2, 2],
+                    },
+                ),
+            ]
+
+    monkeypatch.setattr(ulog_control_surface, "ULog", FakeULog)
+
+    result = ulog_control_surface.infer_control_surface(log_path, source_path)
+
+    assert result["vehicle_type"] == "fixed_wing"
+    assert result["assumed_actuator_mapping"] == {}
 
 
 def test_infer_control_surface_does_not_invent_labels_without_source(tmp_path, monkeypatch):

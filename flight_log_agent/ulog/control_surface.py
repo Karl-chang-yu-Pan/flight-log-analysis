@@ -7,6 +7,9 @@ from typing import Any, Optional
 
 from pyulog import ULog
 
+from flight_log_agent.px4.msg_schema import load_px4_msg_enum_registry
+from flight_log_agent.source_path import resolve_source_path
+
 
 OUTPUT_FUNCTION_RE = re.compile(r"^(?P<bus>PWM_(?:MAIN|AUX|FMU)_FUNC)(?P<channel>\d+)$")
 CONTROL_SURFACE_TYPE_RE = re.compile(r"^CA_SV_CS(?P<index>\d+)_TYPE$")
@@ -26,7 +29,7 @@ def infer_control_surface(log_path: Path, source_path: Optional[Path] = None) ->
     servo_types = _extract_control_surface_types(parameters, source_path)
     output_functions = _extract_output_functions(parameters, source_path)
 
-    result["vehicle_type"] = _infer_vehicle_type(parameters, topics, servo_types)
+    result["vehicle_type"] = _observed_vehicle_type(ulog, source_path)
     result["assumed_actuator_mapping"] = _build_actuator_mapping(
         servo_types,
         output_functions,
@@ -223,36 +226,39 @@ def _build_evidence(
     return evidence
 
 
-def _infer_vehicle_type(
-    parameters: dict,
-    topics: set[str],
-    servo_types: dict[int, dict],
-) -> str:
-    parameter_names = set(parameters)
+def _observed_vehicle_type(ulog: Any, source_path: Optional[Path]) -> str:
+    values: list[int] = []
+    for data in getattr(ulog, "data_list", []) or []:
+        if getattr(data, "name", None) != "vehicle_status":
+            continue
+        observed = (getattr(data, "data", {}) or {}).get("vehicle_type")
+        if observed is None:
+            continue
+        for value in observed:
+            parsed = _safe_int(value)
+            if parsed is not None and parsed not in values:
+                values.append(parsed)
 
-    if "vtol_vehicle_status" in topics or any(name.startswith("VT_") for name in parameter_names):
-        return "vtol"
+    if len(values) != 1:
+        return "unknown"
 
-    has_fw_params = any(name.startswith("FW_") for name in parameter_names)
-    has_mc_params = any(name.startswith(("MC_", "MPC_")) for name in parameter_names)
+    entry = load_px4_msg_enum_registry(source_path).get("vehicle_status.vehicle_type") or {}
+    constants = entry.get("constants") or {}
+    names = [
+        _normalize_vehicle_type_label(name)
+        for name, value in constants.items()
+        if value == values[0]
+    ]
+    names = [name for name in names if name]
+    return names[0] if len(set(names)) == 1 else "unknown"
 
-    if servo_types and has_fw_params:
-        return "fixed_wing"
 
-    if servo_types:
-        return "fixed_wing_or_vtol"
-
-    if has_fw_params:
-        return "fixed_wing"
-
-    rotor_count = _safe_int(parameters.get("CA_ROTOR_COUNT"))
-    if rotor_count and rotor_count > 0:
-        return "multicopter_or_vtol"
-
-    if has_mc_params:
-        return "multicopter"
-
-    return "unknown"
+def _normalize_vehicle_type_label(name: str) -> str:
+    label = str(name or "")
+    prefix = "VEHICLE_TYPE_"
+    if label.startswith(prefix):
+        label = label[len(prefix):]
+    return _normalize_label(label)
 
 
 def _infer_confidence(

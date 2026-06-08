@@ -18,7 +18,7 @@ def build_airframe_context(inventory: dict, control_surface: dict) -> AirframeCo
     px4_tag = inventory.get("px4_tag") or inventory.get("git_tag")
 
     sys_autostart = _maybe_int(params.get("SYS_AUTOSTART"))
-    vehicle_type = infer_vehicle_type_string(inventory, params, control_surface)
+    vehicle_type = infer_vehicle_type_string(inventory, control_surface)
 
     return AirframeContext(
         px4_git_hash=px4_git_hash,
@@ -31,25 +31,9 @@ def build_airframe_context(inventory: dict, control_surface: dict) -> AirframeCo
     )
 
 
-def infer_vehicle_type_string(inventory: dict, params: dict, control_surface: dict) -> str:
-    vehicle_type = str(control_surface.get("vehicle_type") or inventory.get("vehicle_type") or "unknown").lower()
-    vt_type = params.get("VT_TYPE")
-
-    if "vtol" in vehicle_type or vt_type is not None:
-        vt_type_i = _maybe_int(vt_type)
-        if vt_type_i == 1:
-            return "vtol_tailsitter"
-        if vt_type_i == 2:
-            return "vtol_standard"
-        if vt_type_i == 3:
-            return "vtol_tiltrotor"
-        return "vtol_unknown_subtype"
-
-    if "fixed" in vehicle_type or "fw" in vehicle_type:
-        return "fixed_wing"
-    if "multi" in vehicle_type or "mc" in vehicle_type:
-        return "multicopter"
-    return vehicle_type or "unknown"
+def infer_vehicle_type_string(inventory: dict, control_surface: dict) -> str:
+    vehicle_type = str(control_surface.get("vehicle_type") or inventory.get("vehicle_type") or "unknown")
+    return vehicle_type.strip().lower() or "unknown"
 
 
 def summarize_control_surface(control_surface: dict) -> str:
