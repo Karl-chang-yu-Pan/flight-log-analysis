@@ -79,11 +79,18 @@ from flight_log_agent.models import (
 )
 from flight_log_agent.analysis.signature_verification import derive_confidence
 from flight_log_agent.analysis.signature_verification import evaluate_candidate_log_signature as evaluate_candidate_log_signature_impl
-from flight_log_agent.analysis.verification_plan import compile_verification_plan
+from flight_log_agent.analysis.verification_plan import (
+    compile_verification_plan,
+    resolved_candidate_predicate_signals,
+)
 from flight_log_agent.ulog.control_surface import infer_control_surface as infer_control_surface_impl
 from flight_log_agent.ulog.inventory import parse_ulog_inventory as parse_ulog_inventory_impl
 from flight_log_agent.ulog.plots import generate_signal_plot as generate_signal_plot_impl
-from flight_log_agent.ulog.timeline import build_basic_timeline as build_basic_timeline_impl
+from flight_log_agent.ulog.timeline import (
+    build_basic_timeline as build_basic_timeline_impl,
+    build_signal_timeline,
+    merge_timeline_events,
+)
 from flight_log_agent.px4.source_mechanism_models import (
     ParameterRequirement,
     SourceBackedParameterPredicate,
@@ -563,6 +570,16 @@ async def analyze_flight_log(
             for candidate in candidate_set.candidates
         ]
         candidates = candidate_set.candidates[:max_candidates]
+        predicate_signals = resolved_candidate_predicate_signals(
+            candidates,
+            inventory,
+            source_output_bindings,
+        )
+        if predicate_signals:
+            timeline = merge_timeline_events(
+                timeline,
+                build_signal_timeline(log_path_obj, predicate_signals),
+            )
 
         # ------------------------------------------------------------
         # Stage 5: deterministic applicability + log verification

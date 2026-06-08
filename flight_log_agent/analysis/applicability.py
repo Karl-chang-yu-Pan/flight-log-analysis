@@ -60,7 +60,11 @@ def evaluate_candidate_applicability(
 
     candidate_windows = derive_candidate_windows(candidate, timeline, mission, inventory=inventory)
     if not candidate_windows:
-        if candidate_has_logged_predicates(candidate):
+        predicate_signals = candidate_logged_predicate_signals(
+            candidate,
+            source_path=inventory.get("source_path"),
+        )
+        if predicate_signals and all(timeline_has_signal(timeline, signal) for signal in predicate_signals):
             excluded.append("No timeline window satisfied the candidate's logged source predicates.")
         else:
             unresolved.append("No candidate verification window could be derived from timeline/mission.")
@@ -127,6 +131,33 @@ def candidate_has_logged_predicates(candidate: MechanismCandidate) -> bool:
         parse_logged_predicate(predicate) is not None
         for group in candidate_source_predicate_groups(candidate)
         for predicate in group
+    )
+
+
+def candidate_logged_predicate_signals(
+    candidate: MechanismCandidate,
+    *,
+    source_path: Optional[str] = None,
+) -> list[str]:
+    signals: list[str] = []
+    for group in candidate_source_predicate_groups(candidate):
+        for predicate in group:
+            parsed = parse_logged_predicate(predicate, source_path=source_path)
+            if parsed and parsed["signal"] not in signals:
+                signals.append(parsed["signal"])
+    return signals
+
+
+def timeline_has_signal(timeline: list[dict], signal: str) -> bool:
+    if "." not in signal:
+        return False
+    topic, field = signal.split(".", 1)
+    return any(
+        isinstance(event, dict)
+        and event.get("topic") == topic
+        and event.get("field") == field
+        and isinstance(event.get("time_s"), (int, float))
+        for event in timeline or []
     )
 
 

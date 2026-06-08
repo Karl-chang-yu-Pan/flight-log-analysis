@@ -38,6 +38,17 @@ TIMELINE_FIELDS_BY_TOPIC = {
 
 
 def build_basic_timeline(log_path: Path) -> list[dict]:
+    return build_signal_timeline(
+        log_path,
+        [
+            f"{topic}.{field}"
+            for topic, fields in TIMELINE_FIELDS_BY_TOPIC.items()
+            for field in fields
+        ],
+    )
+
+
+def build_signal_timeline(log_path: Path, signals: Iterable[str]) -> list[dict]:
     try:
         ulog = ULog(str(log_path))
     except Exception as exc:
@@ -47,11 +58,18 @@ def build_basic_timeline(log_path: Path) -> list[dict]:
             "details": f"failed to parse ULog: {exc}",
         }]
 
-    events = []
+    fields_by_topic: dict[str, list[str]] = {}
+    for signal in signals:
+        topic, separator, field = str(signal or "").partition(".")
+        if separator and topic and field:
+            fields = fields_by_topic.setdefault(topic, [])
+            if field not in fields:
+                fields.append(field)
 
+    events = []
     for data in getattr(ulog, "data_list", []) or []:
         topic = getattr(data, "name", None)
-        if topic not in TIMELINE_FIELDS_BY_TOPIC:
+        if topic not in fields_by_topic:
             continue
 
         topic_data = getattr(data, "data", {}) or {}
@@ -59,7 +77,7 @@ def build_basic_timeline(log_path: Path) -> list[dict]:
         if timestamps is None:
             continue
 
-        for field in TIMELINE_FIELDS_BY_TOPIC[topic]:
+        for field in fields_by_topic[topic]:
             values = topic_data.get(field)
             if values is None:
                 continue
@@ -67,6 +85,24 @@ def build_basic_timeline(log_path: Path) -> list[dict]:
             events.extend(_field_change_events(topic, field, timestamps, values))
 
     return sorted(events, key=lambda event: _sort_key(event["time_s"]))
+
+
+def merge_timeline_events(*timelines: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for timeline in timelines:
+        for event in timeline or []:
+            if not isinstance(event, dict):
+                continue
+            key = (
+                event.get("time_s"),
+                event.get("event"),
+                event.get("topic"),
+                event.get("field"),
+                repr(event.get("value")),
+                event.get("details"),
+            )
+            events[key] = event
+    return sorted(events.values(), key=lambda event: _sort_key(event.get("time_s")))
 
 
 def _field_change_events(

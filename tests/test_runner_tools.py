@@ -591,6 +591,45 @@ def test_build_basic_timeline_reports_parse_failure(tmp_path, monkeypatch):
     }]
 
 
+def test_build_signal_timeline_accepts_arbitrary_logged_signal(tmp_path, monkeypatch):
+    log_path = tmp_path / "flight.ulg"
+
+    class FakeULog:
+        def __init__(self, path):
+            self.path = path
+            self.data_list = [
+                SimpleNamespace(
+                    name="custom_topic",
+                    data={
+                        "timestamp": [1_000_000, 2_000_000, 3_000_000],
+                        "branch_state": [0, 1, 1],
+                        "ignored": [5, 6, 7],
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(ulog_timeline, "ULog", FakeULog)
+
+    result = ulog_timeline.build_signal_timeline(log_path, ["custom_topic.branch_state"])
+
+    assert result == [
+        {
+            "time_s": 1.0,
+            "event": "initial_value",
+            "topic": "custom_topic",
+            "field": "branch_state",
+            "value": 0,
+        },
+        {
+            "time_s": 2.0,
+            "event": "value_changed",
+            "topic": "custom_topic",
+            "field": "branch_state",
+            "value": 1,
+        },
+    ]
+
+
 def test_runner_parse_ulog_inventory_delegates_to_inventory_module(tmp_path):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"
@@ -1063,6 +1102,34 @@ def test_applicability_derives_fallback_windows_from_check_names(tmp_path):
         }
     ]
     assert "No candidate verification window" not in " ".join(result.unresolved_conditions)
+
+
+def test_applicability_does_not_exclude_when_predicate_signal_has_no_timeline_samples(tmp_path):
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Custom branch",
+        summary="Only applies when a source-derived custom branch signal is active.",
+        source_refs=[],
+        mode_state_gates=["custom_topic.branch_state == 1"],
+    )
+
+    result = runner.evaluate_candidate_applicability(
+        candidate,
+        {
+            "available_topics": ["custom_topic"],
+            "topic_fields": {"custom_topic": ["branch_state"]},
+            "duration_s": 5.0,
+        },
+        [
+            {"time_s": 0.0, "topic": "vehicle_status", "field": "nav_state", "value": 1},
+            {"time_s": 5.0, "topic": "vehicle_status", "field": "nav_state", "value": 1},
+        ],
+        None,
+    )
+
+    assert result.applicable is True
+    assert result.excluded_by == []
+    assert "No candidate verification window could be derived" in " ".join(result.unresolved_conditions)
 
 
 def test_applicability_derives_windows_from_logged_source_predicates(tmp_path):

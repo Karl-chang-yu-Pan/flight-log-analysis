@@ -142,6 +142,33 @@ def compile_verification_plan(
     )
 
 
+def resolved_candidate_predicate_signals(
+    candidates: Iterable[MechanismCandidate],
+    inventory: dict[str, Any],
+    output_bindings: Iterable[Any] = (),
+) -> list[str]:
+    resolver = SignalResolver(inventory, output_bindings)
+    signals: list[str] = []
+    for candidate in candidates:
+        for predicate_group in candidate_source_predicate_groups(candidate):
+            for predicate in predicate_group:
+                for parsed in parse_and_resolve_predicates(predicate, resolver, inventory):
+                    signal = parsed.get("signal")
+                    if parsed.get("resolved") and parsed.get("kind") == "logged_signal" and signal:
+                        signals.append(str(signal))
+    return dedupe(signals)
+
+
+def candidate_source_predicate_groups(candidate: MechanismCandidate) -> list[list[str]]:
+    groups: list[list[str]] = []
+    if candidate.mode_state_gates:
+        groups.append(list(candidate.mode_state_gates))
+    for group in getattr(candidate, "branch_groups", []) or []:
+        if group.source_predicates:
+            groups.append(list(group.source_predicates))
+    return groups or [[]]
+
+
 def applicability_from_verification_plan(
     candidate: MechanismCandidate,
     plan: VerificationPlan,

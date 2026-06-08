@@ -4,6 +4,7 @@ from flight_log_agent.analysis.signature_verification import evaluate_candidate_
 from flight_log_agent.analysis.verification_plan import (
     applicability_from_verification_plan,
     compile_verification_plan,
+    resolved_candidate_predicate_signals,
 )
 from flight_log_agent.models import (
     MechanismBranchGroup,
@@ -55,6 +56,25 @@ def test_verification_plan_has_stable_branch_and_check_ids_and_roles():
         "mechanism_defining",
         "branch_applicability",
     ]
+
+
+def test_resolved_candidate_predicate_signals_returns_arbitrary_logged_signal():
+    candidate = MechanismCandidate(
+        name="Custom branch",
+        summary="Uses a source-derived custom branch signal.",
+        source_refs=[],
+        mode_state_gates=["custom_topic.branch_state == 1"],
+    )
+
+    signals = resolved_candidate_predicate_signals(
+        [candidate],
+        {
+            "available_topics": ["custom_topic"],
+            "topic_fields": {"custom_topic": ["branch_state"]},
+        },
+    )
+
+    assert signals == ["custom_topic.branch_state"]
 
 
 def test_verification_plan_resolves_source_predicate_and_intersects_windows(tmp_path):
