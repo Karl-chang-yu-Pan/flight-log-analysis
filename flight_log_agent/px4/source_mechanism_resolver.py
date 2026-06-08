@@ -192,8 +192,19 @@ class SourceMechanismResolver:
             published_topics.extend(uorb["published_topics"])
             subscribed_topics.extend(uorb["subscribed_topics"])
             parameter_refs.extend(self.profiler.extract_params_from_source(new_files))
-            assigned_fields.extend(self.profiler.extract_assigned_fields_from_source(new_files))
-            read_fields.extend(self.profiler.extract_read_fields_from_source(new_files))
+            relevance_terms = dedupe_keep_order([user_question, *all_queries, *selected_files])
+            assigned_fields.extend(
+                self.profiler.extract_assigned_fields_from_source(
+                    new_files,
+                    relevance_terms=relevance_terms,
+                )
+            )
+            read_fields.extend(
+                self.profiler.extract_read_fields_from_source(
+                    new_files,
+                    relevance_terms=relevance_terms,
+                )
+            )
             source_assignments.extend(self.profiler.extract_source_assignments_from_source(new_files))
             function_calls.extend(self.profiler.extract_function_calls_from_source(new_files))
             helper_expressions.extend(

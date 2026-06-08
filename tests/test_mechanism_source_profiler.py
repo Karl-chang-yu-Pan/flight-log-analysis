@@ -202,6 +202,64 @@ class RtlTest {
     )
 
 
+def test_unknown_field_extraction_uses_dynamic_relevance_terms(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    source_file = module_dir / "example.cpp"
+    source_file.write_text(
+        """
+void update()
+{
+    tecs_status.equivalent_airspeed_sp = candidate;
+    battery_state.voltage_v = voltage;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+
+    unrelated = profiler.extract_assigned_fields_from_source(
+        ["src/modules/example/example.cpp"],
+        relevance_terms=["battery voltage"],
+    )
+    assert {ref.variable for ref in unrelated} == {"battery_state"}
+
+    relevant = profiler.extract_assigned_fields_from_source(
+        ["src/modules/example/example.cpp"],
+        relevance_terms=["airspeed setpoint"],
+    )
+    assert {ref.variable for ref in relevant} == {"tecs_status"}
+
+
+def test_mapped_struct_fields_do_not_need_dynamic_relevance_terms(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    source_file = module_dir / "example.cpp"
+    source_file.write_text(
+        """
+void update()
+{
+    vehicle_status_s status{};
+    if (status.nav_state == 5) {
+        return;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    refs = profiler.extract_read_fields_from_source(
+        ["src/modules/example/example.cpp"],
+        relevance_terms=["battery voltage"],
+    )
+
+    assert any(ref.topic == "vehicle_status" and ref.field == "nav_state" for ref in refs)
+
+
 def test_search_ranks_px4_source_tiers(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     files = [

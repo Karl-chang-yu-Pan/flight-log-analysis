@@ -621,6 +621,8 @@ class MechanismSourceProfiler:
     def extract_assigned_fields_from_source(
         self,
         files: Sequence[Union[str, Path]],
+        *,
+        relevance_terms: Optional[Sequence[str]] = None,
     ) -> List[FieldRef]:
         """
         Extract assigned fields from source files.
@@ -635,10 +637,12 @@ class MechanismSourceProfiler:
 
             topic=vehicle_attitude_setpoint, field=pitch_body
 
-        It also keeps unknown fields when the variable is not mapped, because
-        those can still be useful branch/logic evidence for a resolver.
+        It also keeps unknown fields only when they match the active
+        question/search context, because unmapped variable names are not source
+        proof by themselves.
         """
         refs: List[FieldRef] = []
+        dynamic_terms = self._dynamic_relevance_terms(relevance_terms or [])
 
         for path in self._expand_companion_files(files):
             text = self._read_text(path)
@@ -659,9 +663,11 @@ class MechanismSourceProfiler:
                     op = match.group("op")
 
                     # Filter obvious non-message assignments. Keep mapped uORB
-                    # struct fields and likely PX4 setpoint/status variable names.
+                    # struct fields. Unknown structs must match the current
+                    # question/search context instead of a global flight-domain
+                    # keyword list.
                     struct = var_to_struct.get(var)
-                    if struct is None and not self._looks_like_relevant_assignment(var, field_name):
+                    if struct is None and not self._matches_dynamic_relevance(var, field_name, dynamic_terms):
                         continue
 
                     topic = self._topic_from_struct(struct) if struct else None
@@ -683,15 +689,18 @@ class MechanismSourceProfiler:
     def extract_read_fields_from_source(
         self,
         files: Sequence[Union[str, Path]],
+        *,
+        relevance_terms: Optional[Sequence[str]] = None,
     ) -> List[FieldRef]:
         """
         Extract non-assignment field accesses from source files.
 
         This is intentionally conservative. It keeps fields that can be mapped
-        to a visible uORB struct variable, plus likely setpoint/status accesses
-        that may need a resolver decision.
+        to a visible uORB struct variable, plus unknown fields that match the
+        active question/search context.
         """
         refs: List[FieldRef] = []
+        dynamic_terms = self._dynamic_relevance_terms(relevance_terms or [])
 
         for path in self._expand_companion_files(files):
             text = self._read_text(path)
@@ -714,7 +723,7 @@ class MechanismSourceProfiler:
                     var = match.group("var")
                     field_name = self._clean_field_path(match.group("field"))
                     struct = var_to_struct.get(var)
-                    if struct is None and not self._looks_like_relevant_assignment(var, field_name):
+                    if struct is None and not self._matches_dynamic_relevance(var, field_name, dynamic_terms):
                         continue
 
                     topic = self._topic_from_struct(struct) if struct else None
@@ -1055,8 +1064,8 @@ class MechanismSourceProfiler:
 
         uorb = self.extract_uorb_io_from_source(files)
         params = self.extract_params_from_source(files)
-        fields = self.extract_assigned_fields_from_source(files)
-        read_fields = self.extract_read_fields_from_source(files)
+        fields = self.extract_assigned_fields_from_source(files, relevance_terms=self._normalize_queries(queries))
+        read_fields = self.extract_read_fields_from_source(files, relevance_terms=self._normalize_queries(queries))
         source_assignments = self.extract_source_assignments_from_source(files)
         function_calls = self.extract_function_calls_from_source(files)
         helper_expressions = self.extract_helper_expressions_from_source(
@@ -2134,50 +2143,47 @@ class MechanismSourceProfiler:
             or "_param_" in member_l
         )
 
-    @staticmethod
-    def _looks_like_relevant_assignment(var: str, field_name: str) -> bool:
-        var_l = var.lower()
-        field_l = field_name.lower()
-        variable_hint = any(
-            token in var_l
-            for token in (
-                "sp",
-                "setpoint",
-                "status",
-                "vehicle",
-                "mission",
-                "pos",
-                "att",
-                "airspeed",
-                "tecs",
-                "npfg",
-                "control",
-            )
+    def _dynamic_relevance_terms(self, raw_terms: Sequence[str]) -> set[str]:
+        terms: set[str] = set()
+        for raw in raw_terms:
+            text = str(raw).strip().lower()
+            if not text:
+                continue
+            normalized = re.sub(r"[^a-z0-9_./]+", " ", text)
+            for token in normalized.split():
+                if not self._is_relevance_token(token):
+                    continue
+                terms.add(token)
+                if "." in token:
+                    terms.update(part for part in token.split(".") if self._is_relevance_token(part))
+                if "/" in token:
+                    terms.update(part for part in token.split("/") if self._is_relevance_token(part))
+        return terms
+
+    def _matches_dynamic_relevance(self, var: str, field_name: str, terms: set[str]) -> bool:
+        if not terms:
+            return False
+        candidates = {
+            part
+            for text in (var, field_name, f"{var}.{field_name}")
+            for part in re.split(r"[^A-Za-z0-9_]+", text.lower())
+            if part
+        }
+        candidates.add(f"{var}.{field_name}".lower())
+        return any(
+            term == candidate or (len(term) >= 4 and (term in candidate or candidate in term))
+            for term in terms
+            for candidate in candidates
         )
-        field_hint = any(
-            token in field_l
-            for token in (
-                "timestamp",
-                "lat",
-                "lon",
-                "alt",
-                "roll",
-                "pitch",
-                "yaw",
-                "thrust",
-                "airspeed",
-                "velocity",
-                "valid",
-                "type",
-                "nav_state",
-                "loiter",
-                "radius",
-                "current",
-                "previous",
-                "next",
-            )
-        )
-        return variable_hint and field_hint
+
+    def _is_relevance_token(self, token: str) -> bool:
+        if len(token) < 3:
+            return False
+        if token in self.LOW_VALUE_QUERY_TOKENS:
+            return False
+        if token.isdigit():
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Deduplication
