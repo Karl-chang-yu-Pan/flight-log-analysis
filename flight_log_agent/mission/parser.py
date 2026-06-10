@@ -6,12 +6,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Optional
 
-from flight_log_agent.source_path import resolve_source_path
+from flight_log_agent.px4.source_snapshot import SourceInput, SourceResolutionError, SourceSnapshot, source_handle
 
 
 def parse_mission_file(
     mission_path: Optional[Path],
-    source_path: Optional[Path] = None,
+    source_path: SourceInput = None,
 ) -> Optional[dict]:
     if mission_path is None:
         return None
@@ -36,15 +36,31 @@ def parse_mission_file(
     if stripped.startswith("{"):
         command_names = load_mavlink_command_names(source_path)
         frame_names = load_mavlink_frame_names(source_path)
-        return _parse_plan_json(mission_path, text, command_names, frame_names)
+        result = _parse_plan_json(mission_path, text, command_names, frame_names)
+        _append_source_enum_warning(result, source_path, command_names, frame_names)
+        return result
 
     if stripped.startswith("QGC WPL"):
         command_names = load_mavlink_command_names(source_path)
         frame_names = load_mavlink_frame_names(source_path)
-        return _parse_qgc_wpl(mission_path, text, command_names, frame_names)
+        result = _parse_qgc_wpl(mission_path, text, command_names, frame_names)
+        _append_source_enum_warning(result, source_path, command_names, frame_names)
+        return result
 
     summary["warnings"].append("unsupported mission file format")
     return summary
+
+
+def _append_source_enum_warning(
+    summary: dict[str, Any],
+    source_path: SourceInput,
+    command_names: dict[int, str],
+    frame_names: dict[int, str],
+) -> None:
+    if isinstance(source_path, SourceSnapshot) and not command_names and not frame_names:
+        summary.setdefault("warnings", []).append(
+            "Exact MAVLink submodule enums are unavailable for the resolved PX4 source snapshot."
+        )
 
 
 def _empty_summary(mission_path: Path) -> dict:
@@ -223,71 +239,72 @@ def _command_name(command: Optional[int], command_names: dict[int, str]) -> Opti
     return command_names.get(command, f"MAV_CMD_{command}")
 
 
-def load_mavlink_command_names(source_path: Optional[Path]) -> dict[int, str]:
+def load_mavlink_command_names(source_path: SourceInput) -> dict[int, str]:
     return load_mavlink_enum_names(source_path, enum_name="MAV_CMD", fallback_prefix="MAV_CMD")
 
 
-def load_mavlink_frame_names(source_path: Optional[Path]) -> dict[int, str]:
+def load_mavlink_frame_names(source_path: SourceInput) -> dict[int, str]:
     return load_mavlink_enum_names(source_path, enum_name="MAV_FRAME", fallback_prefix="MAV_FRAME")
 
 
 def load_mavlink_enum_names(
-    source_path: Optional[Path],
+    source_path: SourceInput,
     *,
     enum_name: str,
     fallback_prefix: str,
 ) -> dict[int, str]:
-    source_path = resolve_source_path(source_path)
-    if source_path is None:
+    source = source_handle(source_path)
+    if source is None:
         return {}
-
-    root = Path(source_path)
-    if not root.exists():
-        return {}
-
-    for path in _candidate_mavlink_xml_paths(root):
-        names = _load_mavlink_enum_names_from_xml(path, enum_name=enum_name)
-        if names:
-            return names
-
-    for path in _candidate_mavlink_header_paths(root):
-        names = _load_mavlink_enum_names_from_header(
-            path,
-            enum_name=enum_name,
-            fallback_prefix=fallback_prefix,
+    if isinstance(source, SourceSnapshot):
+        try:
+            source = source.submodule("src/modules/mavlink/mavlink")
+        except SourceResolutionError:
+            return {}
+        candidates = (
+            "message_definitions/v1.0/common.xml",
+            "message_definitions/v1.0/minimal.xml",
         )
+    else:
+        candidates = (
+            "message_definitions/v1.0/common.xml",
+            "mavlink/message_definitions/v1.0/common.xml",
+            "src/modules/mavlink/mavlink/message_definitions/v1.0/common.xml",
+            "src/modules/mavlink/mavlink/message_definitions/v1.0/minimal.xml",
+            "build/px4_sitl_default/mavlink/common/mavlink.h",
+            "build/px4_sitl_default/mavlink/mavlink/common/mavlink.h",
+            "mavlink/include/mavlink/v2.0/common/mavlink.h",
+            "src/modules/mavlink/mavlink/include/mavlink/v2.0/common/mavlink.h",
+        )
+    for relative_path in candidates:
+        if not source.file_exists(relative_path):
+            continue
+        try:
+            text = source.read_text(relative_path)
+            if relative_path.endswith(".xml"):
+                names = _load_mavlink_enum_names_from_xml_text(text, enum_name=enum_name)
+            else:
+                names = _load_mavlink_enum_names_from_header_text(
+                    text,
+                    enum_name=enum_name,
+                    fallback_prefix=fallback_prefix,
+                )
+        except Exception:
+            continue
         if names:
             return names
-
     return {}
 
 
-def _candidate_mavlink_xml_paths(root: Path) -> list[Path]:
-    candidates = [
-        root / "message_definitions" / "v1.0" / "common.xml",
-        root / "mavlink" / "message_definitions" / "v1.0" / "common.xml",
-        root / "src" / "modules" / "mavlink" / "mavlink" / "message_definitions" / "v1.0" / "common.xml",
-        root / "src" / "modules" / "mavlink" / "mavlink" / "message_definitions" / "v1.0" / "minimal.xml",
-    ]
-    return [path for path in candidates if path.exists()]
-
-
-def _candidate_mavlink_header_paths(root: Path) -> list[Path]:
-    candidates = [
-        root / "build" / "px4_sitl_default" / "mavlink" / "common" / "mavlink.h",
-        root / "build" / "px4_sitl_default" / "mavlink" / "mavlink" / "common" / "mavlink.h",
-        root / "mavlink" / "include" / "mavlink" / "v2.0" / "common" / "mavlink.h",
-        root / "src" / "modules" / "mavlink" / "mavlink" / "include" / "mavlink" / "v2.0" / "common" / "mavlink.h",
-    ]
-    return [path for path in candidates if path.exists()]
-
-
-def _load_mavlink_enum_names_from_xml(path: Path, *, enum_name: str) -> dict[int, str]:
+def _load_mavlink_enum_names_from_xml_text(text: str, *, enum_name: str) -> dict[int, str]:
     try:
-        tree = ET.parse(path)
+        root = ET.fromstring(text)
     except Exception:
         return {}
+    return _load_mavlink_enum_names_from_xml_root(root, enum_name=enum_name)
 
+
+def _load_mavlink_enum_names_from_xml_root(tree: Any, *, enum_name: str) -> dict[int, str]:
     names: dict[int, str] = {}
     for enum in tree.findall(".//enum"):
         if enum.attrib.get("name") != enum_name:
@@ -300,17 +317,12 @@ def _load_mavlink_enum_names_from_xml(path: Path, *, enum_name: str) -> dict[int
     return names
 
 
-def _load_mavlink_enum_names_from_header(
-    path: Path,
+def _load_mavlink_enum_names_from_header_text(
+    text: str,
     *,
     enum_name: str,
     fallback_prefix: str,
 ) -> dict[int, str]:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return {}
-
     match = re.search(
         rf"typedef\s+enum\s+{re.escape(enum_name)}\s*\{{(?P<body>.*?)\}}\s*{re.escape(enum_name)}\s*;",
         text,

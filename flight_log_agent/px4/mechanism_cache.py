@@ -22,7 +22,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from flight_log_agent.source_path import resolve_source_path
+from flight_log_agent.px4.source_snapshot import SourceHandle, SourceInput, SourceSnapshot, source_handle
 
 
 MECHANISM_CACHE_SCHEMA_VERSION = 1
@@ -58,6 +58,7 @@ class MechanismSourceRef(BaseModel):
     end_line: Optional[int] = None
     snippet: Optional[str] = None
     explanation: str = ""
+    commit_sha: Optional[str] = None
 
     file_sha256: Optional[str] = None
     function_sha256: Optional[str] = None
@@ -284,10 +285,13 @@ class MechanismRetriever:
 class MechanismSourceValidator:
     """Validates whether cached mechanism source refs still match a PX4 checkout."""
 
-    def __init__(self, source_path: Optional[str | Path], current_git_hash: Optional[str] = None):
-        resolved_source_path = resolve_source_path(source_path)
-        self.source_path = Path(resolved_source_path) if resolved_source_path else None
-        self.current_git_hash = current_git_hash
+    def __init__(
+        self,
+        source_path: SourceInput,
+        current_git_hash: Optional[str] = None,
+    ):
+        self.source = source_handle(source_path)
+        self.current_git_hash = source_path.commit_sha if isinstance(source_path, SourceSnapshot) else current_git_hash
 
     def validate_record(self, record: MechanismRecord) -> MechanismSourceValidation:
         cached_git = record.source_identity.px4_git_hash
@@ -300,7 +304,7 @@ class MechanismSourceValidator:
                 checked_refs=[],
             )
 
-        if self.source_path is None:
+        if self.source is None:
             return MechanismSourceValidation(
                 mechanism_id=record.mechanism_id,
                 status="source_unavailable_revalidation_required",
@@ -339,19 +343,9 @@ class MechanismSourceValidator:
         )
 
     def _validate_ref(self, ref: MechanismSourceRef) -> SourceRefValidation:
-        assert self.source_path is not None
-        path = (self.source_path / ref.file).resolve()
         try:
-            if not path.exists() or not path.is_file():
-                return SourceRefValidation(
-                    file=ref.file,
-                    function=ref.function,
-                    status="source_ref_missing",
-                    usable=False,
-                    reason="Referenced source file is missing in the current PX4 source tree.",
-                )
-
-            text = path.read_text(encoding="utf-8", errors="replace")
+            assert self.source is not None
+            text = self.source.read_text(ref.file)
         except Exception as exc:
             return SourceRefValidation(
                 file=ref.file,
@@ -443,7 +437,7 @@ class MechanismCacheWriter:
         candidate_payload: Any,
         airframe_context: Any,
         question_intent: Any,
-        source_path: Optional[str | Path] = None,
+        source_path: Optional[str | Path | SourceSnapshot] = None,
         source_evidence: Optional[Any] = None,
     ) -> MechanismRecord:
         candidate = _to_plain_dict(candidate_payload)
@@ -454,12 +448,12 @@ class MechanismCacheWriter:
         now = time.time()
 
         source_identity = SourceIdentity(
-            px4_git_hash=airframe.get("px4_git_hash"),
+            px4_git_hash=source_path.commit_sha if isinstance(source_path, SourceSnapshot) else airframe.get("px4_git_hash"),
             px4_version=airframe.get("px4_version"),
             px4_tag=airframe.get("px4_tag"),
         )
 
-        resolved_source_path = resolve_source_path(source_path)
+        resolved_source_path = source_handle(source_path)
         source_refs = [
             self._fingerprint_source_ref(ref, resolved_source_path)
             for ref in candidate.get("source_refs", [])
@@ -520,8 +514,13 @@ class MechanismCacheWriter:
             / f"{git}.json"
         )
 
-    def _fingerprint_source_ref(self, ref_payload: Any, source_path: Optional[str | Path]) -> MechanismSourceRef:
-        source_path = resolve_source_path(source_path)
+    def _fingerprint_source_ref(
+        self,
+        ref_payload: Any,
+        source_path: SourceInput,
+    ) -> MechanismSourceRef:
+        source_snapshot = source_path if isinstance(source_path, SourceSnapshot) else None
+        source = source_handle(source_path)
         ref = _to_plain_dict(ref_payload)
         source_ref = MechanismSourceRef(
             file=str(ref.get("file") or ""),
@@ -530,17 +529,14 @@ class MechanismCacheWriter:
             end_line=_maybe_int(ref.get("end_line")),
             snippet=ref.get("snippet"),
             explanation=str(ref.get("explanation") or ""),
+            commit_sha=source_snapshot.commit_sha if source_snapshot else None,
         )
 
-        if source_path is None or not source_ref.file:
-            return source_ref
-
-        path = Path(source_path) / source_ref.file
-        if not path.exists() or not path.is_file():
+        if source is None or not source_ref.file:
             return source_ref
 
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = source.read_text(source_ref.file)
         except Exception:
             return source_ref
 

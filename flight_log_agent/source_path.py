@@ -7,11 +7,20 @@ from typing import Optional
 DEFAULT_PX4_SOURCE_PATH = Path(__file__).resolve().parents[1] / "ref" / "PX4-Autopilot"
 
 
+class _SourceUnavailable:
+    pass
+
+
+SOURCE_UNAVAILABLE = _SourceUnavailable()
+
+
 def resolve_source_path(
-    source_path: Optional[str | Path],
+    source_path: Optional[str | Path] | _SourceUnavailable,
     *,
     default_source_path: Path | None = None,
 ) -> Optional[Path]:
+    if source_path is SOURCE_UNAVAILABLE:
+        return None
     if source_path:
         return Path(source_path)
     default_source_path = default_source_path or DEFAULT_PX4_SOURCE_PATH

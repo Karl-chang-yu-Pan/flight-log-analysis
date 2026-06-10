@@ -17,11 +17,14 @@ import flight_log_agent.ulog.control_surface as ulog_control_surface
 import flight_log_agent.ulog.metrics as ulog_metrics
 import flight_log_agent.ulog.signature_evaluator as ulog_signature_evaluator
 import flight_log_agent.px4.source as px4_source
+import flight_log_agent.px4.source_snapshot as source_snapshot_module
 import flight_log_agent.mission.parser as mission_parser
 import flight_log_agent.ulog.plots as ulog_plots
 from flight_log_agent.px4 import msg_schema as px4_msg_schema
 from flight_log_agent.analysis import control_predicate
 from flight_log_agent.px4 import source_mechanism_resolver
+from flight_log_agent.px4.source_snapshot import DirectorySource, SourceRepository
+from flight_log_agent.source_path import SOURCE_UNAVAILABLE
 
 
 class FakeLoggedMessage:
@@ -402,11 +405,14 @@ def test_parse_ulog_inventory_resolves_airframe_from_logged_git_revision(tmp_pat
 
     monkeypatch.setattr(ulog_inventory, "ULog", FakeULog)
 
-    result = ulog_inventory.parse_ulog_inventory(log_path, source_path)
+    result = ulog_inventory.parse_ulog_inventory(
+        log_path,
+        SourceRepository(source_path).resolve_snapshot(logged_hash),
+    )
 
     assert result["airframe"]["name"] == "Logged Revision Quad"
     assert result["airframe"]["type"] == "Quadrotor x"
-    assert result["airframe"]["source"] == f"{source_path}@{logged_hash[:8]}"
+    assert result["airframe"]["source"] == f"{source_path}@{logged_hash}"
 
 
 def test_parse_ulog_inventory_reports_parse_failure(tmp_path, monkeypatch):
@@ -659,6 +665,7 @@ def test_resolve_source_path_uses_repo_default_when_available(tmp_path):
     assert runner.resolve_source_path(None) == default_source
     assert runner.resolve_source_path("") == default_source
     assert runner.resolve_source_path(explicit_source) == explicit_source
+    assert runner.resolve_source_path(runner.SOURCE_UNAVAILABLE) is None
 
     runner.DEFAULT_PX4_SOURCE_PATH = tmp_path / "missing"
     assert runner.resolve_source_path(None) is None
@@ -685,18 +692,7 @@ uint8 nav_state
             self.dropouts = []
 
     monkeypatch.setattr(ulog_inventory, "ULog", FakeULog)
-    monkeypatch.setattr(
-        ulog_inventory,
-        "resolve_source_path",
-        lambda source_path: default_source if not source_path else Path(source_path),
-    )
-    monkeypatch.setattr(
-        px4_msg_schema,
-        "resolve_source_path",
-        lambda source_path: default_source if not source_path else Path(source_path),
-    )
-    px4_msg_schema._load_px4_msg_schema_cached.cache_clear()
-
+    monkeypatch.setattr(source_snapshot_module, "DEFAULT_SOURCE_DIRECTORY", default_source)
     inventory = ulog_inventory.parse_ulog_inventory(tmp_path / "flight.ulg")
 
     assert inventory["source_path"] == str(default_source)
@@ -805,16 +801,7 @@ uint8 TEST_CONSTANT = 7
         encoding="utf-8",
     )
 
-    def fake_resolve(source_path):
-        return default_source if not source_path else Path(source_path)
-
-    monkeypatch.setattr(mission_parser, "resolve_source_path", fake_resolve)
-    monkeypatch.setattr(ulog_control_surface, "resolve_source_path", fake_resolve)
-    monkeypatch.setattr(control_predicate, "resolve_source_path", fake_resolve)
-    monkeypatch.setattr(source_mechanism_resolver, "resolve_source_path", fake_resolve)
-
-    ulog_control_surface._control_surface_type_labels_cached.cache_clear()
-    ulog_control_surface._output_function_definitions_cached.cache_clear()
+    monkeypatch.setattr(source_snapshot_module, "DEFAULT_SOURCE_DIRECTORY", default_source)
 
     assert mission_parser.load_mavlink_command_names(None)[178] == "MAV_CMD_DO_CHANGE_SPEED"
     assert ulog_control_surface.control_surface_type_labels(None)[5] == "left_elevon"
@@ -1725,9 +1712,15 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
             "parameters": {"SYS_AUTOSTART": 4001},
         }
 
-    def fake_checkout(*args):
-        source_prepass_events.append("checkout")
-        return {"checkout_performed": True}
+    source_path.mkdir(parents=True, exist_ok=True)
+    source_snapshot = DirectorySource(
+        source_path,
+        commit_sha="abcdef1234567890",
+    )
+
+    def fake_resolve(*args):
+        source_prepass_events.append("resolve")
+        return source_snapshot
 
     def fake_infer_control_surface(*args):
         source_prepass_events.append("control_surface")
@@ -1743,9 +1736,13 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
         side_effect=fake_parse_inventory,
     ) as parse_inventory, patch.object(
         runner,
-        "checkout_px4_source_revision",
-        side_effect=fake_checkout,
-    ) as checkout_source, patch.object(
+        "SourceRepository",
+        return_value=SimpleNamespace(resolve_snapshot=fake_resolve),
+    ) as source_repository, patch.object(
+        runner,
+        "enrich_inventory_from_source",
+        side_effect=lambda inventory, snapshot: inventory,
+    ), patch.object(
         runner,
         "build_basic_timeline",
         return_value=[{"event": "initial_value"}],
@@ -1793,12 +1790,12 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     write_cache.assert_called_once()
     evaluate_applicability.assert_called_once()
     evaluate_signature.assert_called_once()
-    parse_inventory.assert_called_once_with(log_path, source_path)
-    checkout_source.assert_called_once_with(source_path, "abcdef1234567890")
+    parse_inventory.assert_called_once_with(log_path, runner.SOURCE_UNAVAILABLE)
+    source_repository.assert_called_once_with(source_path)
     build_timeline.assert_called_once_with(log_path)
-    infer_surface.assert_called_once_with(log_path, source_path)
-    parse_mission.assert_called_once_with(mission_path, source_path)
-    assert source_prepass_events == ["inventory", "checkout", "control_surface", "mission"]
+    infer_surface.assert_called_once_with(log_path, source_snapshot)
+    parse_mission.assert_called_once_with(mission_path, source_snapshot)
+    assert source_prepass_events == ["inventory", "resolve", "control_surface", "mission"]
 
     assert result is final_report
     assert [item["agent"] for item in captured] == [
@@ -1810,7 +1807,7 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     assert captured[0]["input"]["user_question"] == "Why did it loiter before the waypoint?"
     assert "log_inventory" not in captured[0]["input"]
     discovery_args = source_discovery.call_args.args
-    assert discovery_args[0] == source_path
+    assert discovery_args[0] is source_snapshot
     assert discovery_args[1] is question_intent
     assert discovery_args[2].parameters == {"SYS_AUTOSTART": 4001}
     assert discovery_args[2].available_topics == [
@@ -1934,7 +1931,21 @@ def test_analyze_flight_log_passes_valid_cache_hits_as_source_discovery_seeds(tm
         return_value={
             "available_topics": ["position_setpoint_triplet"],
             "parameters": {"FW_AIRSPD_TRIM": 18.0},
+            "git_hash": "abcdef1234567890",
         },
+    ), patch.object(
+        runner,
+        "SourceRepository",
+        return_value=SimpleNamespace(
+            resolve_snapshot=lambda revision: DirectorySource(
+                source_path,
+                commit_sha="abcdef1234567890",
+            )
+        ),
+    ), patch.object(
+        runner,
+        "enrich_inventory_from_source",
+        side_effect=lambda inventory, snapshot: inventory,
     ), patch.object(
         runner,
         "build_basic_timeline",
@@ -1997,7 +2008,7 @@ def test_analyze_flight_log_passes_valid_cache_hits_as_source_discovery_seeds(tm
     validate_cache.assert_called_once()
     source_discovery.assert_called_once()
     discovery_args = source_discovery.call_args.args
-    assert discovery_args[0] == source_path
+    assert discovery_args[0].commit_sha == "abcdef1234567890"
     assert [candidate.name for candidate in discovery_args[5]] == [cached_candidate.name]
 
 
@@ -2573,9 +2584,7 @@ def test_infer_control_surface_does_not_invent_labels_without_source(tmp_path, m
             ]
 
     monkeypatch.setattr(ulog_control_surface, "ULog", FakeULog)
-    monkeypatch.setattr(ulog_control_surface, "resolve_source_path", lambda source_path: None)
-
-    result = ulog_control_surface.infer_control_surface(log_path)
+    result = ulog_control_surface.infer_control_surface(log_path, SOURCE_UNAVAILABLE)
 
     assert result["assumed_actuator_mapping"] == {
         "servo_1": {
@@ -2625,42 +2634,20 @@ def test_runner_infer_control_surface_delegates_to_control_surface_module(tmp_pa
 def test_search_source_runs_rg_and_limits_output(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     source_path.mkdir()
-    stdout = "\n".join(f"match-{index}" for index in range(20))
-
-    with patch.object(px4_source.subprocess, "run") as run:
-        run.return_value = SimpleNamespace(stdout=stdout)
-
-        result = px4_source.search_source(source_path, "mission_result", max_results=2)
-
-    run.assert_called_once_with(
-        [
-            "rg",
-            "-n",
-            "--context",
-            "3",
-            "mission_result",
-            str(source_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
+    source_file = source_path / "mission.cpp"
+    source_file.write_text("mission_result\nother\nmission_result\nmission_result\n")
+    result = px4_source.search_source(source_path, "mission_result", max_results=2)
     assert result == [
         {
             "query": "mission_result",
-            "matches": [f"match-{index}" for index in range(16)],
+            "matches": ["mission.cpp:1:mission_result", "mission.cpp:3:mission_result"],
         }
     ]
 
 
 def test_search_source_returns_subprocess_errors(tmp_path):
-    source_path = tmp_path / "PX4-Autopilot"
-    source_path.mkdir()
-
-    with patch.object(px4_source.subprocess, "run", side_effect=TimeoutError("too slow")):
-        result = px4_source.search_source(source_path, "vehicle_status")
-
-    assert result == [{"error": "too slow"}]
+    result = px4_source.search_source(SOURCE_UNAVAILABLE, "vehicle_status")
+    assert result == [{"error": "PX4 source is unavailable."}]
 
 
 def test_read_source_file_returns_requested_line_range(tmp_path):
@@ -2737,90 +2724,8 @@ def test_read_source_file_caps_large_requested_ranges(tmp_path):
     assert result["lines"][-1] == {"line": 209, "text": "line 209"}
 
 
-def test_checkout_px4_source_revision_refuses_dirty_tree(tmp_path):
-    source_path = tmp_path / "PX4-Autopilot"
-    source_path.mkdir()
-
-    def fake_git(path, args):
-        if args == ["rev-parse", "--is-inside-work-tree"]:
-            return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
-        if args == ["status", "--porcelain"]:
-            return SimpleNamespace(returncode=0, stdout=" M src/file.cpp\n", stderr="")
-        raise AssertionError(args)
-
-    with patch.object(px4_source, "_git", side_effect=fake_git):
-        result = px4_source.checkout_px4_source_revision(source_path, "v1.14.0")
-
-    assert result == {
-        "error": "PX4 source tree has local changes; refusing to checkout.",
-        "status": [" M src/file.cpp"],
-    }
-
-
-def test_checkout_px4_source_revision_detaches_for_hash_or_tag(tmp_path):
-    source_path = tmp_path / "PX4-Autopilot"
-    source_path.mkdir()
-    calls = []
-
-    def fake_git(path, args):
-        calls.append(args)
-        if args == ["rev-parse", "--is-inside-work-tree"]:
-            return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
-        if args == ["status", "--porcelain"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args == ["rev-parse", "HEAD"]:
-            commit = "before\n" if calls.count(args) == 1 else "after\n"
-            return SimpleNamespace(returncode=0, stdout=commit, stderr="")
-        if args == ["show-ref", "--verify", "--quiet", "refs/heads/v1.14.0"]:
-            return SimpleNamespace(returncode=1, stdout="", stderr="")
-        if args == ["checkout", "--detach", "v1.14.0"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args == ["branch", "--show-current"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        raise AssertionError(args)
-
-    with patch.object(px4_source, "_git", side_effect=fake_git):
-        result = px4_source.checkout_px4_source_revision(source_path, "v1.14.0")
-
-    assert ["checkout", "--detach", "v1.14.0"] in calls
-    assert result == {
-        "source_path": str(source_path),
-        "requested_revision": "v1.14.0",
-        "before_commit": "before",
-        "after_commit": "after",
-        "active_branch": None,
-        "checked_out": True,
-    }
-
-
-def test_checkout_px4_source_revision_uses_local_branch(tmp_path):
-    source_path = tmp_path / "PX4-Autopilot"
-    source_path.mkdir()
-    calls = []
-
-    def fake_git(path, args):
-        calls.append(args)
-        if args == ["rev-parse", "--is-inside-work-tree"]:
-            return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
-        if args == ["status", "--porcelain"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args == ["rev-parse", "HEAD"]:
-            commit = "before\n" if calls.count(args) == 1 else "after\n"
-            return SimpleNamespace(returncode=0, stdout=commit, stderr="")
-        if args == ["show-ref", "--verify", "--quiet", "refs/heads/main"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args == ["checkout", "main"]:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args == ["branch", "--show-current"]:
-            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
-        raise AssertionError(args)
-
-    with patch.object(px4_source, "_git", side_effect=fake_git):
-        result = px4_source.checkout_px4_source_revision(source_path, "main")
-
-    assert ["checkout", "main"] in calls
-    assert result["active_branch"] == "main"
-    assert result["checked_out"] is True
+def test_runtime_source_api_has_no_checkout_operation():
+    assert not hasattr(px4_source, "checkout_px4_source_revision")
 
 
 def test_compute_log_metrics_returns_numeric_and_discrete_signal_metrics(tmp_path, monkeypatch):

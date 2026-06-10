@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 import re
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
 from pyulog import ULog
 
 from flight_log_agent.px4.msg_schema import load_px4_msg_enum_registry
-from flight_log_agent.source_path import resolve_source_path
+from flight_log_agent.px4.source_snapshot import SourceInput, source_handle
 
 
 OUTPUT_FUNCTION_RE = re.compile(r"^(?P<bus>PWM_(?:MAIN|AUX|FMU)_FUNC)(?P<channel>\d+)$")
 CONTROL_SURFACE_TYPE_RE = re.compile(r"^CA_SV_CS(?P<index>\d+)_TYPE$")
 
 
-def infer_control_surface(log_path: Path, source_path: Optional[Path] = None) -> dict:
-    source_path = resolve_source_path(source_path)
+def infer_control_surface(log_path: Path, source_path: SourceInput = None) -> dict:
+    source_path = source_handle(source_path)
     result = _empty_result()
 
     try:
@@ -297,45 +296,30 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
-def control_surface_type_labels(source_path: Optional[Path]) -> dict[int, str]:
-    source_path = resolve_source_path(source_path)
-    if source_path is None:
+def control_surface_type_labels(source_path: SourceInput) -> dict[int, str]:
+    source = source_handle(source_path)
+    if source is None:
         return {}
-    root = Path(source_path)
-    if not root.exists():
-        return {}
-    return _control_surface_type_labels_cached(str(root.resolve()))
-
-
-@lru_cache(maxsize=16)
-def _control_surface_type_labels_cached(source_root: str) -> dict[int, str]:
-    path = Path(source_root) / "src" / "modules" / "control_allocator" / "module.yaml"
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = source.read_text("src/modules/control_allocator/module.yaml")
     except Exception:
         return {}
     return _parse_parameter_enum_values(text, "CA_SV_CS${i}_TYPE")
 
 
-def output_function_definitions(source_path: Optional[Path]) -> dict[str, Any]:
+def output_function_definitions(source_path: SourceInput) -> dict[str, Any]:
     empty = {"exact": {}, "ranges": []}
-    source_path = resolve_source_path(source_path)
-    if source_path is None:
+    source = source_handle(source_path)
+    if source is None:
         return empty
-    root = Path(source_path)
-    if not root.exists():
-        return empty
-    return _output_function_definitions_cached(str(root.resolve()))
-
-
-@lru_cache(maxsize=16)
-def _output_function_definitions_cached(source_root: str) -> dict[str, Any]:
-    path = Path(source_root) / "src" / "lib" / "mixer_module" / "output_functions.yaml"
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = source.read_text("src/lib/mixer_module/output_functions.yaml").splitlines()
     except Exception:
-        return {"exact": {}, "ranges": []}
+        return empty
+    return _parse_output_function_definitions(lines)
 
+
+def _parse_output_function_definitions(lines: list[str]) -> dict[str, Any]:
     exact: dict[int, str] = {}
     ranges: list[dict[str, Any]] = []
     index = 0

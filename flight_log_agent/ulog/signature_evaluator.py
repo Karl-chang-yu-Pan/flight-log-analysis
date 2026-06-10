@@ -25,6 +25,8 @@ def evaluate_log_signature(
     required_signals: list[str],
     exclusion_checks: list[dict],
     numeric_checks: list[dict],
+    *,
+    source_path: Path | None = None,
 ) -> dict:
     try:
         ulog = ULog(str(log_path))
@@ -57,11 +59,11 @@ def evaluate_log_signature(
     ]
 
     numeric_results = [
-        _run_check(topics, windows, parameters, check, category="numeric")
+        _run_check(topics, windows, parameters, check, category="numeric", source_path=source_path)
         for check in numeric_checks
     ]
     exclusion_results = [
-        _run_check(topics, windows, parameters, check, category="exclusion")
+        _run_check(topics, windows, parameters, check, category="exclusion", source_path=source_path)
         for check in exclusion_checks
     ]
 
@@ -107,6 +109,7 @@ def _run_check(
     check: dict,
     *,
     category: str,
+    source_path: Path | None = None,
 ) -> dict:
     check_type = str(check.get("type") or "").strip()
     handlers = {
@@ -134,6 +137,7 @@ def _run_check(
         )
 
     try:
+        check = {**check, "_source_path": source_path}
         result = handler(topics, windows, parameters, check)
     except Exception as exc:
         result = _check_result(
@@ -200,7 +204,7 @@ def _check_transition_occurs(topics: dict[str, Any], windows: dict[str, dict], p
     if "result" in samples_result:
         return samples_result["result"]
 
-    normalized_samples = _normalize_state_samples(signal, samples_result["samples"])
+    normalized_samples = _normalize_state_samples(signal, samples_result["samples"], check.get("_source_path"))
     transitions = _transitions(normalized_samples)
     expected_from = check.get("from")
     if expected_from is None:
@@ -208,8 +212,8 @@ def _check_transition_occurs(topics: dict[str, Any], windows: dict[str, dict], p
     expected_to = check.get("to")
     if expected_to is None:
         expected_to = check.get("to_value")
-    expected_from = _normalize_state_value(signal, expected_from)
-    expected_to = _normalize_state_value(signal, expected_to)
+    expected_from = _normalize_state_value(signal, expected_from, check.get("_source_path"))
+    expected_to = _normalize_state_value(signal, expected_to, check.get("_source_path"))
     passed = any(
         (expected_from is None or transition.get("from") == expected_from)
         and (expected_to is None or transition.get("to") == expected_to)
@@ -230,7 +234,7 @@ def _check_no_transition(topics: dict[str, Any], windows: dict[str, dict], param
     if "result" in samples_result:
         return samples_result["result"]
 
-    transitions = _transitions(_normalize_state_samples(signal, samples_result["samples"]))
+    transitions = _transitions(_normalize_state_samples(signal, samples_result["samples"], check.get("_source_path")))
     passed = not transitions
     message = _message(check, passed, f"{signal} transitions: {transitions}")
     return _check_result(
@@ -247,8 +251,8 @@ def _check_state_equals(topics: dict[str, Any], windows: dict[str, dict], parame
     if "result" in samples_result:
         return samples_result["result"]
 
-    target = _normalize_state_value(signal, check.get("value"))
-    values = [value for _, value in _normalize_state_samples(signal, samples_result["samples"])]
+    target = _normalize_state_value(signal, check.get("value"), check.get("_source_path"))
+    values = [value for _, value in _normalize_state_samples(signal, samples_result["samples"], check.get("_source_path"))]
     mode = str(check.get("mode") or "any")
     passed = all(value == target for value in values) if mode == "all" else any(value == target for value in values)
     message = _message(check, passed, f"{signal} values include {dict(Counter(values))}")
@@ -266,8 +270,8 @@ def _check_state_not_equals(topics: dict[str, Any], windows: dict[str, dict], pa
     if "result" in samples_result:
         return samples_result["result"]
 
-    target = _normalize_state_value(signal, check.get("value"))
-    values = [value for _, value in _normalize_state_samples(signal, samples_result["samples"])]
+    target = _normalize_state_value(signal, check.get("value"), check.get("_source_path"))
+    values = [value for _, value in _normalize_state_samples(signal, samples_result["samples"], check.get("_source_path"))]
     passed = all(value != target for value in values)
     message = _message(check, passed, f"{signal} values include {dict(Counter(values))}")
     return _check_result(
@@ -1068,12 +1072,18 @@ def _transitions(samples: list[tuple[float, Any]]) -> list[dict]:
     return transitions
 
 
-def _normalize_state_samples(signal: str, samples: list[tuple[float, Any]]) -> list[tuple[float, Any]]:
-    return [(time_s, _normalize_state_value(signal, value)) for time_s, value in samples]
+def _normalize_state_samples(
+    signal: str,
+    samples: list[tuple[float, Any]],
+    source_path: Path | None = None,
+) -> list[tuple[float, Any]]:
+    return [(time_s, _normalize_state_value(signal, value, source_path)) for time_s, value in samples]
 
 
-def _normalize_state_value(signal: str, value: Any) -> Any:
-    return normalize_px4_enum_value(signal, value)
+def _normalize_state_value(signal: str, value: Any, source_path: Path | None = None) -> Any:
+    if source_path is None:
+        return normalize_px4_enum_value(signal, value)
+    return normalize_px4_enum_value(signal, value, source_path)
 
 
 def _numeric_delta(samples: list[tuple[float, Any]]) -> float | None:

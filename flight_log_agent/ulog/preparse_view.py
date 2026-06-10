@@ -6,13 +6,14 @@ from typing import Any, Optional
 
 from pyulog import ULog
 
-from flight_log_agent.px4.source import checkout_px4_source_revision
+from flight_log_agent.px4.source_snapshot import SourceRepository, SourceSnapshot
 from flight_log_agent.ulog.control_surface import infer_control_surface
-from flight_log_agent.ulog.inventory import parse_ulog_inventory
+from flight_log_agent.ulog.inventory import enrich_inventory_from_source, parse_ulog_inventory
 from flight_log_agent.ulog.timeline import build_basic_timeline
 from flight_log_agent.mission.parser import parse_mission_file
 from flight_log_agent.source_path import (
     DEFAULT_PX4_SOURCE_PATH,
+    SOURCE_UNAVAILABLE,
     resolve_source_path as resolve_source_path_impl,
 )
 
@@ -32,18 +33,28 @@ def build_preparse_payload(
     source_path_obj = resolve_source_path(source_path)
     parameters_xml_path_obj = Path(parameters_xml_path) if parameters_xml_path else None
 
-    inventory = parse_ulog_inventory(log_path_obj, source_path_obj)
+    inventory = parse_ulog_inventory(log_path_obj, SOURCE_UNAVAILABLE)
     logged_px4_git_hash = (
         inventory.get("git_hash")
         or inventory.get("px4_git_hash")
         or inventory.get("firmware_git_hash")
     )
+    source_snapshot = None
     if source_path_obj is not None and logged_px4_git_hash:
-        checkout_px4_source_revision(source_path_obj, logged_px4_git_hash)
+        try:
+            source_snapshot = SourceRepository(source_path_obj).resolve_snapshot(logged_px4_git_hash)
+        except Exception as exc:
+            status = getattr(exc, "status", "repository_unavailable")
+            inventory.setdefault("warnings", []).append(
+                f"Exact PX4 source is unavailable ({status}): {exc}"
+            )
+    if isinstance(source_snapshot, SourceSnapshot):
+        enrich_inventory_from_source(inventory, source_snapshot)
 
     timeline = build_basic_timeline(log_path_obj)
-    assumptions = infer_control_surface(log_path_obj, source_path_obj)
-    mission = parse_mission_file(mission_path_obj, source_path=source_path_obj)
+    exact_source = source_snapshot or SOURCE_UNAVAILABLE
+    assumptions = infer_control_surface(log_path_obj, exact_source)
+    mission = parse_mission_file(mission_path_obj, source_path=exact_source)
     parameter_metadata = load_parameter_metadata(parameters_xml_path_obj)
     parameter_payload = build_parameter_payload(log_path_obj, parameter_metadata)
 

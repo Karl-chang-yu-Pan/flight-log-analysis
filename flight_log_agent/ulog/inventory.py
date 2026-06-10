@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
 from pyulog import ULog
 from pyulog.px4_events import PX4Events
 
-from flight_log_agent.source_path import resolve_source_path
+from flight_log_agent.px4.source_snapshot import SourceHandle, SourceInput, SourceSnapshot, source_handle
 
 
 EXPECTED_TIMELINE_TOPICS = [
@@ -17,9 +16,12 @@ EXPECTED_TIMELINE_TOPICS = [
     "mission_result",
 ]
 
-def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> dict:
+def parse_ulog_inventory(
+    log_path: Path,
+    source_path: SourceInput = None,
+) -> dict:
     inventory = _empty_inventory()
-    source_path = resolve_source_path(source_path)
+    source = source_handle(source_path)
 
     try:
         ulog = ULog(str(log_path), None, disable_str_exceptions=True)
@@ -35,10 +37,16 @@ def parse_ulog_inventory(log_path: Path, source_path: Optional[Path] = None) -> 
     inventory["firmware_version"] = _extract_firmware_version(ulog)
     inventory["firmware_branch"] = _json_safe_value(info.get("ver_sw_branch"))
     inventory["git_hash"] = git_hash
-    inventory["airframe"] = _extract_airframe(ulog, source_path, git_hash)
+    inventory["airframe"] = _extract_airframe(ulog, source, git_hash)
     inventory["duration_s"] = _extract_duration_s(ulog)
     inventory["parameters"] = _extract_parameters(ulog)
-    inventory["source_path"] = str(source_path) if source_path else None
+    inventory["source_path"] = (
+        str(source.repository_path)
+        if isinstance(source, SourceSnapshot)
+        else source.identity if source else None
+    )
+    if isinstance(source, SourceSnapshot):
+        inventory["source_commit"] = source.commit_sha
     inventory["available_topics"] = available_topics
     inventory["topic_fields"] = _extract_topic_fields(ulog)
     inventory["topic_instances"] = _extract_topic_instances(ulog)
@@ -339,7 +347,7 @@ def _timestamp_to_seconds(timestamp: Any) -> Optional[float]:
 
 def _extract_airframe(
     ulog: Any,
-    source_path: Optional[Path],
+    source_path: Optional[SourceHandle],
     git_hash: Any,
 ) -> Optional[dict[str, Any]]:
     parameters = getattr(ulog, "initial_parameters", {}) or {}
@@ -358,67 +366,47 @@ def _extract_airframe(
 
 def _resolve_airframe_metadata(
     airframe_id: Any,
-    source_path: Optional[Path],
+    source_path: Optional[SourceHandle],
     git_hash: Any,
 ) -> Optional[dict[str, Any]]:
-    px4_source_path = resolve_source_path(source_path)
-    if px4_source_path is None:
+    if source_path is None:
         return None
+    return _airframe_metadata_from_source(source_path, airframe_id)
 
-    git_hash_str = _clean_string(git_hash)
-    if git_hash_str and _git_commit_exists(px4_source_path, git_hash_str):
-        metadata = _airframe_metadata_from_git(px4_source_path, git_hash_str, airframe_id)
+
+def enrich_inventory_from_source(inventory: dict[str, Any], source_snapshot: SourceSnapshot) -> dict[str, Any]:
+    inventory["source_path"] = str(source_snapshot.repository_path)
+    inventory["source_commit"] = source_snapshot.commit_sha
+    parameters = inventory.get("parameters") or {}
+    airframe_id = parameters.get("SYS_AUTOSTART")
+    if airframe_id is not None:
+        airframe = {"id": _json_safe_value(airframe_id)}
+        metadata = _airframe_metadata_from_source(source_snapshot, airframe_id)
         if metadata:
-            return metadata
+            airframe.update(metadata)
+        inventory["airframe"] = airframe
+    return inventory
 
-    return _airframe_metadata_from_worktree(px4_source_path, airframe_id)
 
-
-def _airframe_metadata_from_git(
-    source_path: Path,
-    git_hash: str,
+def _airframe_metadata_from_snapshot(
+    source_snapshot: SourceSnapshot,
     airframe_id: Any,
 ) -> Optional[dict[str, Any]]:
-    airframe_file = _find_airframe_file_in_git(source_path, git_hash, airframe_id)
-    if airframe_file is None:
-        return None
-
-    result = _git(source_path, ["show", f"{git_hash}:{airframe_file}"])
-    if result.returncode != 0:
-        return None
-
-    metadata = _parse_airframe_script_metadata(result.stdout)
-    metadata["source"] = f"{source_path}@{git_hash[:8]}"
-    metadata["file"] = airframe_file
-    return metadata
+    return _airframe_metadata_from_source(source_snapshot, airframe_id)
 
 
-def _find_airframe_file_in_git(source_path: Path, git_hash: str, airframe_id: Any) -> Optional[str]:
+def _airframe_metadata_from_source(
+    source_snapshot: SourceHandle,
+    airframe_id: Any,
+) -> Optional[dict[str, Any]]:
     prefix = f"{airframe_id}_"
     for airframe_dir in _airframe_dirs():
-        result = _git(source_path, ["ls-tree", "-r", "--name-only", git_hash, airframe_dir])
-        if result.returncode != 0:
-            continue
-        for line in result.stdout.splitlines():
-            if Path(line).name.startswith(prefix):
-                return line
-    return None
-
-
-def _airframe_metadata_from_worktree(source_path: Path, airframe_id: Any) -> Optional[dict[str, Any]]:
-    prefix = f"{airframe_id}_"
-    for airframe_dir in _airframe_dirs():
-        directory = source_path / airframe_dir
-        if not directory.is_dir():
-            continue
-        for file_path in sorted(directory.iterdir()):
-            if not file_path.is_file() or not file_path.name.startswith(prefix):
+        for file_path in source_snapshot.list_files(airframe_dir):
+            if not Path(file_path).name.startswith(prefix):
                 continue
-            metadata = _parse_airframe_script_metadata(
-                file_path.read_text(encoding="utf-8", errors="replace")
-            )
-            metadata["source"] = str(source_path)
-            metadata["file"] = str(file_path.relative_to(source_path))
+            metadata = _parse_airframe_script_metadata(source_snapshot.read_text(file_path))
+            metadata["source"] = source_snapshot.identity
+            metadata["file"] = file_path
             return metadata
     return None
 
@@ -442,22 +430,6 @@ def _airframe_dirs() -> tuple[str, ...]:
     return (
         "ROMFS/px4fmu_common/init.d/airframes",
         "ROMFS/px4fmu_common/init.d-posix/airframes",
-    )
-
-
-def _git_commit_exists(source_path: Path, git_hash: str) -> bool:
-    if not (source_path / ".git").exists():
-        return False
-    result = _git(source_path, ["cat-file", "-e", f"{git_hash}^{{commit}}"])
-    return result.returncode == 0
-
-
-def _git(source_path: Path, args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(source_path), *args],
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
 
 

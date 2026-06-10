@@ -9,6 +9,7 @@ from flight_log_agent.px4.msg_schema import (
     load_px4_msg_schema,
     normalize_px4_enum_value,
 )
+from flight_log_agent.px4.source_snapshot import source_from_inventory
 
 
 def evaluate_candidate_applicability(
@@ -29,7 +30,7 @@ def evaluate_candidate_applicability(
 
     params = inventory.get("parameters") or {}
     topic_fields = inventory.get("topic_fields") or {}
-    schema_topic_fields = load_px4_msg_schema(inventory.get("source_path"))
+    schema_topic_fields = load_px4_msg_schema(source_from_inventory(inventory))
     available_topics = set(inventory.get("available_topics") or topic_fields.keys())
 
     relevant_parameters = {
@@ -62,7 +63,7 @@ def evaluate_candidate_applicability(
     if not candidate_windows:
         predicate_signals = candidate_logged_predicate_signals(
             candidate,
-            source_path=inventory.get("source_path"),
+            source_path=source_from_inventory(inventory),
         )
         if predicate_signals and all(timeline_has_signal(timeline, signal) for signal in predicate_signals):
             excluded.append("No timeline window satisfied the candidate's logged source predicates.")
@@ -106,7 +107,7 @@ def derive_candidate_windows(
         return derive_logged_predicate_windows(
             candidate,
             timeline,
-            source_path=(inventory or {}).get("source_path"),
+            source_path=source_from_inventory(inventory or {}),
         )
 
     span = timeline_time_span(timeline)

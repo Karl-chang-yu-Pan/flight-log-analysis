@@ -12,9 +12,16 @@ def evaluate_candidate_log_signature(
     candidate: MechanismCandidate,
     applicability: ApplicabilityResult,
     verification_plan: VerificationPlan | None = None,
+    source_path: Path | None = None,
 ) -> SignatureEvaluation:
     if verification_plan is not None:
-        return evaluate_verification_plan(log_path, candidate, applicability, verification_plan)
+        return evaluate_verification_plan(
+            log_path,
+            candidate,
+            applicability,
+            verification_plan,
+            source_path=source_path,
+        )
     required_signals = [
         signal
         for signal in candidate.required_signals
@@ -28,6 +35,7 @@ def evaluate_candidate_log_signature(
         required_signals,
         [_model_to_dict(x) for x in candidate.exclusion_checks],
         [_model_to_dict(x) for x in candidate.numeric_checks],
+        source_path=source_path,
     )
     return normalize_signature_evaluation(candidate.name, raw, applicability)
 
@@ -37,6 +45,8 @@ def evaluate_verification_plan(
     candidate: MechanismCandidate,
     applicability: ApplicabilityResult,
     plan: VerificationPlan,
+    *,
+    source_path: Path | None = None,
 ) -> SignatureEvaluation:
     branch_results: list[dict[str, Any]] = []
     all_check_results: list[dict[str, Any]] = []
@@ -68,6 +78,7 @@ def evaluate_verification_plan(
                 list(branch.required_signals),
                 exclusion_checks,
                 numeric_checks,
+                source_path=source_path,
             )
             check_results = raw.get("check_results") if isinstance(raw.get("check_results"), list) else []
             all_check_results.extend(check_results)

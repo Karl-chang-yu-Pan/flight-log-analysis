@@ -97,8 +97,8 @@ def test_analysis_event_message_maps_run_progress_events():
     })["message"] == "Searching PX4 source"
     assert analysis_event_message({
         "event": "source.finished",
-        "name": "checkout_px4_source_revision",
-    })["message"] == "Checked out PX4 source revision"
+        "name": "resolve_px4_source_snapshot",
+    })["message"] == "Resolved exact PX4 source snapshot"
     assert analysis_event_message({
         "event": "mechanism_cache.started",
         "name": "retrieve_mechanisms",

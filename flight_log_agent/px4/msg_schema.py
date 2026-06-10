@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from flight_log_agent.source_path import resolve_source_path
+from flight_log_agent.px4.source_snapshot import SourceInput, SourceSnapshot, source_handle
 
 PRIMITIVE_TYPES = {
     "bool",
@@ -29,21 +29,31 @@ CONSTANT_RE = re.compile(
 )
 
 
-def load_px4_msg_schema(source_path: Optional[str | Path] = None) -> dict[str, list[str]]:
-    source_root = resolve_source_path(source_path)
-    if source_root is None:
+def load_px4_msg_schema(source_path: SourceInput = None) -> dict[str, list[str]]:
+    if isinstance(source_path, SourceSnapshot):
+        return _load_px4_msg_schema_snapshot_cached(
+            str(source_path.repository_path),
+            source_path.commit_sha,
+        )
+    source = source_handle(source_path)
+    if source is None:
         return {}
-    return _load_px4_msg_schema_cached(str(source_root.resolve()))
+    return _build_schema(_load_messages(source))
 
 
-def load_px4_msg_enum_registry(source_path: Optional[str | Path] = None) -> dict[str, dict[str, dict[str, int]]]:
-    source_root = resolve_source_path(source_path)
-    if source_root is None:
+def load_px4_msg_enum_registry(source_path: SourceInput = None) -> dict[str, dict[str, dict[str, int]]]:
+    if isinstance(source_path, SourceSnapshot):
+        return _load_px4_msg_enum_registry_snapshot_cached(
+            str(source_path.repository_path),
+            source_path.commit_sha,
+        )
+    source = source_handle(source_path)
+    if source is None:
         return {}
-    return _load_px4_msg_enum_registry_cached(str(source_root.resolve()))
+    return _build_enum_registry(_load_messages(source))
 
 
-def normalize_px4_enum_value(signal: str, value: Any, source_path: Optional[str | Path] = None) -> Any:
+def normalize_px4_enum_value(signal: str, value: Any, source_path: SourceInput = None) -> Any:
     registry = load_px4_msg_enum_registry(source_path)
     entry = registry.get(signal)
     if not entry or not isinstance(value, str):
@@ -57,7 +67,7 @@ def normalize_px4_enum_value(signal: str, value: Any, source_path: Optional[str 
     return value
 
 
-def is_valid_topic_field(signal: str, source_path: Optional[str | Path] = None) -> bool:
+def is_valid_topic_field(signal: str, source_path: SourceInput = None) -> bool:
     if "." not in signal:
         return False
     topic, field = signal.split(".", 1)
@@ -68,7 +78,7 @@ def is_valid_topic_field(signal: str, source_path: Optional[str | Path] = None) 
 def resolve_topic_field(
     topic: Optional[str],
     field: str,
-    source_path: Optional[str | Path] = None,
+    source_path: SourceInput = None,
 ) -> Optional[str]:
     if not topic or not field:
         return None
@@ -92,56 +102,37 @@ def field_or_flattened_prefix_present(field: str, fields: Iterable[str]) -> bool
     return field in known_fields or any(item.startswith(f"{field}.") for item in known_fields)
 
 
-@lru_cache(maxsize=8)
-def _load_px4_msg_schema_cached(source_root: str) -> dict[str, list[str]]:
-    msg_dir = Path(source_root) / "msg"
-    if not msg_dir.exists():
-        return {}
+@lru_cache(maxsize=32)
+def _load_px4_msg_schema_snapshot_cached(
+    repository_path: str,
+    commit_sha: str,
+) -> dict[str, list[str]]:
+    snapshot = SourceSnapshot(Path(repository_path), commit_sha)
+    return _build_schema(_load_messages(snapshot))
 
-    messages = {
-        path.stem: _parse_msg_file(path)
-        for path in msg_dir.glob("*.msg")
+
+@lru_cache(maxsize=32)
+def _load_px4_msg_enum_registry_snapshot_cached(
+    repository_path: str,
+    commit_sha: str,
+) -> dict[str, dict[str, dict[str, int]]]:
+    snapshot = SourceSnapshot(Path(repository_path), commit_sha)
+    return _build_enum_registry(_load_messages(snapshot))
+
+
+def _load_messages(source: Any) -> dict[str, dict[str, Any]]:
+    return {
+        Path(path).stem: _parse_msg_text(source.read_text(path))
+        for path in source.list_files("msg", patterns=["*.msg"])
     }
-    schema: dict[str, list[str]] = {}
-    for message_name in messages:
-        fields = sorted(_expand_message_fields(message_name, messages, seen=set()))
-        topics = messages[message_name]["topics"] or [_camel_to_snake(message_name)]
-        for topic in topics:
-            schema[topic] = fields
-    return schema
 
 
-@lru_cache(maxsize=8)
-def _load_px4_msg_enum_registry_cached(source_root: str) -> dict[str, dict[str, dict[str, int]]]:
-    msg_dir = Path(source_root) / "msg"
-    if not msg_dir.exists():
-        return {}
-
-    messages = {
-        path.stem: _parse_msg_file(path)
-        for path in msg_dir.glob("*.msg")
-    }
-    registry: dict[str, dict[str, dict[str, int]]] = {}
-    for message_name, message in messages.items():
-        topics = message["topics"] or [_camel_to_snake(message_name)]
-        enum_fields = _message_enum_fields(message_name, messages, seen=set())
-        for topic in topics:
-            for field_path, constants in enum_fields.items():
-                aliases = _enum_aliases(constants)
-                if aliases:
-                    registry[f"{topic}.{field_path}"] = {
-                        "constants": {constant["name"]: constant["value"] for constant in constants},
-                        "aliases": aliases,
-                    }
-    return registry
-
-
-def _parse_msg_file(path: Path) -> dict[str, Any]:
+def _parse_msg_text(text: str) -> dict[str, Any]:
     fields: list[tuple[str, str]] = []
     field_meta: dict[str, dict[str, Any]] = {}
     constants: list[dict[str, Any]] = []
     topics: list[str] = []
-    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
         raw = raw_line.strip()
         if not raw:
             continue
@@ -179,6 +170,32 @@ def _parse_msg_file(path: Path) -> dict[str, Any]:
             "comment": comment,
         }
     return {"fields": fields, "field_meta": field_meta, "constants": constants, "topics": topics}
+
+
+def _build_schema(messages: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
+    schema: dict[str, list[str]] = {}
+    for message_name in messages:
+        fields = sorted(_expand_message_fields(message_name, messages, seen=set()))
+        topics = messages[message_name]["topics"] or [_camel_to_snake(message_name)]
+        for topic in topics:
+            schema[topic] = fields
+    return schema
+
+
+def _build_enum_registry(messages: dict[str, dict[str, Any]]) -> dict[str, dict[str, dict[str, int]]]:
+    registry: dict[str, dict[str, dict[str, int]]] = {}
+    for message_name, message in messages.items():
+        topics = message["topics"] or [_camel_to_snake(message_name)]
+        enum_fields = _message_enum_fields(message_name, messages, seen=set())
+        for topic in topics:
+            for field_path, constants in enum_fields.items():
+                aliases = _enum_aliases(constants)
+                if aliases:
+                    registry[f"{topic}.{field_path}"] = {
+                        "constants": {constant["name"]: constant["value"] for constant in constants},
+                        "aliases": aliases,
+                    }
+    return registry
 
 
 def _expand_message_fields(

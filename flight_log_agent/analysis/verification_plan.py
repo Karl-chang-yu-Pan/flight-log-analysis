@@ -25,6 +25,7 @@ from flight_log_agent.px4.msg_schema import (
     load_px4_msg_schema,
     normalize_px4_enum_value,
 )
+from flight_log_agent.px4.source_snapshot import source_from_inventory
 
 
 CHECK_SIGNAL_FIELDS = ("signal", "first", "second", "actual", "setpoint")
@@ -176,7 +177,7 @@ def applicability_from_verification_plan(
 ) -> ApplicabilityResult:
     parameters = inventory.get("parameters") or {}
     topic_fields = inventory.get("topic_fields") or {}
-    schema = load_px4_msg_schema(inventory.get("source_path"))
+    schema = load_px4_msg_schema(source_from_inventory(inventory))
     available_topics = set(inventory.get("available_topics") or topic_fields.keys())
     applicable_branches = [branch for branch in plan.branches if branch.applicable and branch.windows]
     required_parameters = dedupe(
@@ -569,7 +570,7 @@ def parse_and_resolve_predicate_part(
         if resolution.status != "resolved" or not resolution.resolved:
             return unresolved_predicate_signal(comparison.group("left"), resolution)
         raw_value = comparison.group("value")
-        value = normalize_px4_enum_value(resolution.resolved, parse_literal(raw_value), inventory.get("source_path"))
+        value = normalize_px4_enum_value(resolution.resolved, parse_literal(raw_value), source_from_inventory(inventory))
         return {
             "resolved": True,
             "kind": "logged_signal",
@@ -823,7 +824,7 @@ def predicate_matches(actual: Any, op: str, expected: Any) -> bool:
 
 class SignalResolver:
     def __init__(self, inventory: dict[str, Any], output_bindings: Iterable[Any]) -> None:
-        schema = load_px4_msg_schema(inventory.get("source_path"))
+        schema = load_px4_msg_schema(source_from_inventory(inventory))
         topic_fields = inventory.get("topic_fields") or {}
         available_topics = set(inventory.get("available_topics") or topic_fields)
         self.logged_signals = {

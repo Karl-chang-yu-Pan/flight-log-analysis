@@ -1,42 +1,29 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
+
+from flight_log_agent.px4.source_snapshot import DirectorySource, SourceInput, UnavailableSource, source_handle
 
 
 DEFAULT_READ_LINE_LIMIT = 200
 
 
-def search_source(source_path: Path, query: str, max_results: int = 8) -> list[dict]:
-    cmd = [
-        "rg",
-        "-n",
-        "--context",
-        "3",
-        query,
-        str(source_path),
-    ]
-
+def search_source(source_path: SourceInput, query: str, max_results: int = 8) -> list[dict]:
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
+        source = source_handle(source_path)
+        if source is None or isinstance(source, UnavailableSource):
+            return [{"error": "PX4 source is unavailable."}]
+        matches = source.search(query)[:max_results]
     except Exception as exc:
         return [{"error": str(exc)}]
-
-    lines = result.stdout.splitlines()[:max_results * 8]
-
     return [{
         "query": query,
-        "matches": lines,
+        "matches": [f"{match.file}:{match.line}:{match.text}" for match in matches],
     }]
 
 
 def read_source_file(
-    source_path: Path,
+    source_path: SourceInput,
     relative_path: str,
     start_line: int = 1,
     end_line: int | None = None,
@@ -48,35 +35,25 @@ def read_source_file(
         return {"error": "end_line must be >= start_line."}
 
     try:
-        root = source_path.resolve()
+        source = source_handle(source_path)
+        if source is None or isinstance(source, UnavailableSource):
+            return {"error": "PX4 source is unavailable."}
         requested_path = Path(relative_path)
-        file_path = (
-            requested_path.resolve()
-            if requested_path.is_absolute()
-            else (root / requested_path).resolve()
-        )
+        if requested_path.is_absolute() and isinstance(source, DirectorySource):
+            try:
+                normalized_relative_path = requested_path.resolve().relative_to(source.root).as_posix()
+            except ValueError:
+                return {"error": "relative_path escapes the PX4 source path."}
+        else:
+            normalized_relative_path = str(relative_path).replace("\\", "/")
+        text = source.read_text(normalized_relative_path)
     except Exception as exc:
+        if "escapes repository" in str(exc):
+            return {"error": "relative_path escapes the PX4 source path."}
         return {"error": str(exc)}
-
-    if not _is_relative_to(file_path, root):
-        return {"error": "relative_path escapes the PX4 source path."}
-
-    normalized_relative_path = str(file_path.relative_to(root))
-
-    if not file_path.exists():
-        return {"error": f"PX4 source file does not exist: {normalized_relative_path}"}
-
-    if not file_path.is_file():
-        return {"error": f"PX4 source path is not a file: {normalized_relative_path}"}
-
     requested_end_line = end_line or start_line + DEFAULT_READ_LINE_LIMIT - 1
     capped_end_line = min(requested_end_line, start_line + DEFAULT_READ_LINE_LIMIT - 1)
-
-    try:
-        file_lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception as exc:
-        return {"error": str(exc)}
-
+    file_lines = text.splitlines()
     selected_lines = [
         {
             "line": line_number,
@@ -88,82 +65,14 @@ def read_source_file(
 
     return {
         "file": normalized_relative_path,
-        "path": str(file_path),
+        "path": (
+            str((source.root / normalized_relative_path).resolve())
+            if isinstance(source, DirectorySource)
+            else f"{source.identity}:{normalized_relative_path}"
+        ),
         "start_line": start_line,
         "end_line": min(capped_end_line, len(file_lines)),
         "total_lines": len(file_lines),
         "truncated": capped_end_line < requested_end_line or capped_end_line < len(file_lines),
         "lines": selected_lines,
     }
-
-
-def checkout_px4_source_revision(source_path: Path, revision: str) -> dict:
-    if not source_path.exists():
-        return {"error": f"PX4 source path does not exist: {source_path}"}
-
-    is_repo = _git(source_path, ["rev-parse", "--is-inside-work-tree"])
-    if is_repo.returncode != 0 or is_repo.stdout.strip() != "true":
-        return {"error": f"PX4 source path is not a git repository: {source_path}"}
-
-    status = _git(source_path, ["status", "--porcelain"])
-    if status.returncode != 0:
-        return {"error": status.stderr.strip() or "Failed to inspect PX4 source status."}
-
-    if status.stdout.strip():
-        return {
-            "error": "PX4 source tree has local changes; refusing to checkout.",
-            "status": status.stdout.splitlines(),
-        }
-
-    before_commit = _current_commit(source_path)
-    branch_exists = _git(
-        source_path,
-        ["show-ref", "--verify", "--quiet", f"refs/heads/{revision}"],
-    ).returncode == 0
-
-    checkout_args = ["checkout", revision] if branch_exists else ["checkout", "--detach", revision]
-    checkout = _git(source_path, checkout_args)
-    if checkout.returncode != 0:
-        return {
-            "error": checkout.stderr.strip() or f"Failed to checkout {revision}.",
-            "requested_revision": revision,
-            "before_commit": before_commit,
-        }
-
-    return {
-        "source_path": str(source_path),
-        "requested_revision": revision,
-        "before_commit": before_commit,
-        "after_commit": _current_commit(source_path),
-        "active_branch": _active_branch(source_path),
-        "checked_out": True,
-    }
-
-
-def _git(source_path: Path, args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(source_path), *args],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-
-
-def _current_commit(source_path: Path) -> str:
-    result = _git(source_path, ["rev-parse", "HEAD"])
-    return result.stdout.strip()
-
-
-def _active_branch(source_path: Path) -> str | None:
-    result = _git(source_path, ["branch", "--show-current"])
-    branch = result.stdout.strip()
-    return branch or None
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-
-    return True

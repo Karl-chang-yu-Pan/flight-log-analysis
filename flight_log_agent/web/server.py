@@ -413,9 +413,9 @@ def analysis_event_message(event: dict[str, Any]) -> dict[str, Any] | None:
             event_name,
             str(name),
             {
-                "checkout_px4_source_revision": (
-                    "Checking out PX4 source revision",
-                    "Checked out PX4 source revision",
+                "resolve_px4_source_snapshot": (
+                    "Resolving exact PX4 source snapshot",
+                    "Resolved exact PX4 source snapshot",
                 ),
                 "bounded_source_search": (
                     "Searching PX4 source",
@@ -542,8 +542,6 @@ def tool_progress_message(tool_name: str, *, started: bool) -> str:
         return "Verifying log signature" if started else "Verified log signature"
     if tool_name == "search_px4_source":
         return "Searching PX4 source" if started else "Searched PX4 source"
-    if tool_name == "checkout_px4_source":
-        return "Checking out PX4 source revision" if started else "Checked out PX4 source revision"
     if tool_name == "read_px4_source_file":
         return "Reading PX4 source file" if started else "Read PX4 source file"
     return f"{action or 'Running'} tool: {tool_name}"

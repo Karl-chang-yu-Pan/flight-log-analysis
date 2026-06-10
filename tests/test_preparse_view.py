@@ -156,13 +156,16 @@ def test_build_preparse_payload_uses_default_source_path_when_empty(tmp_path):
             source_path="",
         )
 
-    parse_inventory.assert_called_once_with(log_path, default_source)
-    infer_control.assert_called_once_with(log_path, default_source)
-    parse_mission.assert_called_once_with(mission_path, source_path=default_source)
+    parse_inventory.assert_called_once_with(log_path, preparse_view.SOURCE_UNAVAILABLE)
+    infer_control.assert_called_once_with(log_path, preparse_view.SOURCE_UNAVAILABLE)
+    parse_mission.assert_called_once_with(
+        mission_path,
+        source_path=preparse_view.SOURCE_UNAVAILABLE,
+    )
     assert result["inputs"]["source_path"] == str(default_source)
 
 
-def test_build_preparse_payload_checks_out_logged_revision_before_source_reads(tmp_path):
+def test_build_preparse_payload_resolves_logged_revision_before_source_reads(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     source_path.mkdir()
     log_path = tmp_path / "flight.ulg"
@@ -177,9 +180,11 @@ def test_build_preparse_payload_checks_out_logged_revision_before_source_reads(t
             "git_hash": "abcdef1234567890",
         }
 
-    def fake_checkout(*args):
-        events.append("checkout")
-        return {"checkout_performed": True}
+    snapshot = SimpleNamespace(commit_sha="abcdef1234567890")
+
+    def fake_resolve(*args):
+        events.append("resolve")
+        return snapshot
 
     def fake_control(*args):
         events.append("control_surface")
@@ -195,9 +200,9 @@ def test_build_preparse_payload_checks_out_logged_revision_before_source_reads(t
         side_effect=fake_inventory,
     ) as parse_inventory, patch.object(
         preparse_view,
-        "checkout_px4_source_revision",
-        side_effect=fake_checkout,
-    ) as checkout_source, patch.object(
+        "SourceRepository",
+        return_value=SimpleNamespace(resolve_snapshot=fake_resolve),
+    ) as source_repository, patch.object(
         preparse_view,
         "build_basic_timeline",
         return_value=[],
@@ -224,8 +229,8 @@ def test_build_preparse_payload_checks_out_logged_revision_before_source_reads(t
             source_path=source_path,
         )
 
-    parse_inventory.assert_called_once_with(log_path, source_path)
-    checkout_source.assert_called_once_with(source_path, "abcdef1234567890")
-    infer_control.assert_called_once_with(log_path, source_path)
-    parse_mission.assert_called_once_with(mission_path, source_path=source_path)
-    assert events == ["inventory", "checkout", "control_surface", "mission"]
+    parse_inventory.assert_called_once_with(log_path, preparse_view.SOURCE_UNAVAILABLE)
+    source_repository.assert_called_once_with(source_path)
+    infer_control.assert_called_once_with(log_path, snapshot)
+    parse_mission.assert_called_once_with(mission_path, source_path=snapshot)
+    assert events == ["inventory", "resolve", "control_surface", "mission"]

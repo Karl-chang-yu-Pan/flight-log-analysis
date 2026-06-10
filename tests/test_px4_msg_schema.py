@@ -5,6 +5,9 @@ from flight_log_agent.px4.msg_schema import (
     normalize_px4_enum_value,
     resolve_topic_field,
 )
+from flight_log_agent.px4.source_snapshot import SourceRepository
+
+import subprocess
 
 
 def test_px4_msg_schema_expands_nested_topics():
@@ -93,3 +96,42 @@ uint8 MODE_STATE_BAZ_BAR = 2
     assert aliases["FOO_BAR"] == 1
     assert aliases["BAZ_BAR"] == 2
     assert "BAR" not in aliases
+
+
+def test_px4_msg_schema_and_enums_are_keyed_by_snapshot_commit(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    msg_dir = source_path / "msg"
+    msg_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=source_path, check=True, capture_output=True)
+    message = msg_dir / "ModeStatus.msg"
+    message.write_text("uint8 old_state\nuint8 OLD_STATE_ACTIVE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=source_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "old"],
+        cwd=source_path,
+        check=True,
+        capture_output=True,
+    )
+    old_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    message.write_text("uint8 new_state\nuint8 NEW_STATE_ACTIVE = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=source_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "new"],
+        cwd=source_path,
+        check=True,
+        capture_output=True,
+    )
+    new_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    repository = SourceRepository(source_path)
+    old = repository.resolve_snapshot(old_sha)
+    new = repository.resolve_snapshot(new_sha)
+
+    assert load_px4_msg_schema(old)["mode_status"] == ["old_state"]
+    assert load_px4_msg_schema(new)["mode_status"] == ["new_state"]
+    assert normalize_px4_enum_value("mode_status.old_state", "OLD_STATE_ACTIVE", old) == 1
+    assert normalize_px4_enum_value("mode_status.new_state", "NEW_STATE_ACTIVE", new) == 2

@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -40,6 +39,7 @@ from flight_log_agent.expression_math import (
     is_safe_math_function_name,
     normalize_expression_function_names,
 )
+from flight_log_agent.px4.source_snapshot import SourceHandle, SourceInput, source_handle
 
 
 # ---------------------------------------------------------------------------
@@ -358,18 +358,18 @@ class MechanismSourceProfiler:
 
     def __init__(
         self,
-        source_path: Union[str, Path],
+        source_path: SourceInput,
         rg_path: str = "rg",
         read_limit_bytes: int = 2_000_000,
         excludes: Optional[Sequence[str]] = None,
     ) -> None:
-        self.source_path = Path(source_path).expanduser().resolve()
+        source = source_handle(source_path)
+        if source is None:
+            raise FileNotFoundError("PX4 source is unavailable.")
+        self.source: SourceHandle = source
         self.rg_path = rg_path
         self.read_limit_bytes = read_limit_bytes
         self.excludes = tuple(excludes) if excludes is not None else self.DEFAULT_EXCLUDES
-
-        if not self.source_path.exists():
-            raise FileNotFoundError(f"PX4 source path does not exist: {self.source_path}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -1102,7 +1102,7 @@ class MechanismSourceProfiler:
 
         profile = MechanismSourceProfile(
             query=query_text,
-            source_root=str(self.source_path),
+            source_root=self.source.identity,
             related_files=hits,
             published_topics=uorb["published_topics"],
             subscribed_topics=uorb["subscribed_topics"],
@@ -1151,57 +1151,16 @@ class MechanismSourceProfiler:
             return self._python_search(query)
 
     def _ripgrep_search(self, query: str) -> List[SourceMatch]:
-        cmd = [
-            self.rg_path,
-            "--json",
-            "--line-number",
-            "--ignore-case",
-            "--fixed-strings",
-        ]
-
-        for glob in self.SOURCE_GLOBS:
-            cmd += ["-g", glob]
-
-        for exclude in self.excludes:
-            cmd += ["-g", f"!{exclude}/**"]
-
-        cmd += [query, str(self.source_path)]
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=25,
-            check=False,
-        )
-
-        matches: List[SourceMatch] = []
-        for raw_line in result.stdout.splitlines():
-            try:
-                event = json.loads(raw_line)
-            except json.JSONDecodeError:
-                continue
-
-            if event.get("type") != "match":
-                continue
-
-            data = event.get("data", {})
-            path_text = data.get("path", {}).get("text")
-            line_number = data.get("line_number")
-            line_text = data.get("lines", {}).get("text", "").rstrip("\n")
-            if not path_text or line_number is None:
-                continue
-
-            matches.append(
-                SourceMatch(
-                    file=self._rel(Path(path_text)),
-                    line=int(line_number),
-                    text=line_text.strip(),
-                    query=query,
-                )
+        return [
+            SourceMatch(file=match.file, line=match.line, text=match.text.strip(), query=query)
+            for match in self.source.search(
+                query,
+                patterns=self.SOURCE_GLOBS,
+                ignore_case=True,
+                fixed_strings=True,
             )
-
-        return matches
+            if not self._is_excluded(match.file)
+        ]
 
     def _python_search(self, query: str) -> List[SourceMatch]:
         matches: List[SourceMatch] = []
@@ -1290,15 +1249,10 @@ class MechanismSourceProfiler:
     # ------------------------------------------------------------------
 
     def _iter_source_files(self) -> Iterable[Path]:
-        for path in self.source_path.rglob("*"):
-            if not path.is_file():
-                continue
-            if not any(path.match(f"**/{glob}") for glob in self.SOURCE_GLOBS):
-                continue
-            rel = self._rel(path)
+        for rel in self.source.list_files(patterns=self.SOURCE_GLOBS):
             if self._is_excluded(rel):
                 continue
-            yield path
+            yield Path(rel)
 
     def _is_excluded(self, rel_file: str) -> bool:
         rel_l = rel_file.lower()
@@ -1309,10 +1263,7 @@ class MechanismSourceProfiler:
         return False
 
     def _resolve_file(self, file_path: Union[str, Path]) -> Path:
-        path = Path(file_path)
-        if path.is_absolute():
-            return path
-        return self.source_path / path
+        return Path(str(file_path).replace("\\", "/"))
 
     def _expand_companion_files(self, files: Sequence[Union[str, Path]]) -> List[Path]:
         """
@@ -1332,10 +1283,10 @@ class MechanismSourceProfiler:
                     candidates.append(companion)
 
             for candidate in candidates:
-                if candidate.exists() and candidate.is_file():
-                    expanded[str(candidate.resolve())] = candidate.resolve()
+                if self.source.file_exists(candidate.as_posix()):
+                    expanded[candidate.as_posix()] = candidate
                     for include in self._local_include_files(candidate):
-                        expanded[str(include.resolve())] = include.resolve()
+                        expanded[include.as_posix()] = include
 
         return list(expanded.values())
 
@@ -1348,20 +1299,19 @@ class MechanismSourceProfiler:
             match = re.match(r'\s*#\s*include\s+"(?P<include>[^"]+)"', line)
             if not match:
                 continue
-            include_path = (path.parent / match.group("include")).resolve()
-            try:
-                include_path.relative_to(self.source_path)
-            except ValueError:
+            include_path = path.parent / match.group("include")
+            if include_path.is_absolute() or ".." in include_path.parts:
                 continue
-            if include_path.exists() and include_path.is_file():
+            if self.source.file_exists(include_path.as_posix()):
                 includes.append(include_path)
         return includes
 
     def _read_text(self, path: Path) -> Optional[str]:
         try:
-            if path.stat().st_size > self.read_limit_bytes:
+            text = self.source.read_text(self._rel(path), errors="ignore")
+            if len(text.encode("utf-8")) > self.read_limit_bytes:
                 return None
-            return path.read_text(errors="ignore")
+            return text
         except Exception:
             return None
 
@@ -2160,10 +2110,7 @@ class MechanismSourceProfiler:
         return re.sub(r"\s*(?:\.|->)\s*", ".", field_text.strip())
 
     def _rel(self, path: Path) -> str:
-        try:
-            return str(path.resolve().relative_to(self.source_path))
-        except Exception:
-            return str(path)
+        return path.as_posix()
 
     @staticmethod
     def _looks_like_param_member(member: str) -> bool:

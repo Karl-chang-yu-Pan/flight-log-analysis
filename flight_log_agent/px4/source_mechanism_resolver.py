@@ -38,7 +38,7 @@ from flight_log_agent.px4.source_mechanism_models import (
     SourceSnippet,
     TopicFieldRef,
 )
-from flight_log_agent.source_path import resolve_source_path
+from flight_log_agent.px4.source_snapshot import SourceHandle, SourceInput, source_handle
 
 
 def build_source_discovery_log_context(
@@ -69,13 +69,16 @@ class SourceMechanismResolver:
 
     def __init__(
         self,
-        source_path: str | Path,
+        source_path: SourceInput,
         *,
         profiler: Optional[MechanismSourceProfiler] = None,
         parameter_gate: Optional["ParameterFeasibilityGate"] = None,
     ) -> None:
-        self.source_path = Path(source_path)
-        self.profiler = profiler or MechanismSourceProfiler(self.source_path)
+        source = source_handle(source_path)
+        if source is None:
+            raise FileNotFoundError("PX4 source is unavailable.")
+        self.source: SourceHandle = source
+        self.profiler = profiler or MechanismSourceProfiler(source)
         self.parameter_gate = parameter_gate or ParameterFeasibilityGate()
 
     async def discover(
@@ -399,7 +402,7 @@ class SourceMechanismResolver:
                 dedupe_helper_expression_refs(helper_expressions),
                 source_assignments=dedupe_source_assignment_refs(source_assignments),
                 function_calls=dedupe_function_call_refs(function_calls),
-                source_path=self.source_path,
+                source_path=self.source,
                 limit=40,
             ),
             "branch_conditions": compact_refs(dedupe_branch_conditions(branch_conditions), limit=80),
@@ -618,14 +621,9 @@ class SourceMechanismResolver:
         hit_targets = self._snippet_targets_from_hits(hits or [])
 
         for file in files:
-            path = (self.source_path / file).resolve()
             try:
-                path.relative_to(self.source_path.resolve())
-            except ValueError:
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+                text = self.source.read_text(file)
+            except Exception:
                 continue
 
             lines = text.splitlines()
@@ -663,12 +661,7 @@ class SourceMechanismResolver:
         files: list[str] = []
         for query in queries:
             for file in extract_source_file_paths(query):
-                path = (self.source_path / file).resolve()
-                try:
-                    path.relative_to(self.source_path.resolve())
-                except ValueError:
-                    continue
-                if path.exists() and path.is_file():
+                if self.source.file_exists(file):
                     files.append(file)
         return dedupe_keep_order(files)
 
@@ -812,7 +805,7 @@ class SourceMechanismResolver:
             helper_expressions,
             source_assignments=source_assignments,
             function_calls=function_calls,
-            source_path=self.source_path,
+            source_path=self.source,
             limit=40,
         )
         if candidate_drafts:
@@ -2065,13 +2058,7 @@ def enum_constant_value_for_expression(
     return token
 
 
-def numeric_source_constants(source_path: str | Path | None) -> dict[str, float | int]:
-    source_path = resolve_source_path(source_path)
-    if source_path is None:
-        return {}
-    root = Path(source_path)
-    if not root.exists():
-        return {}
+def numeric_source_constants(source_path: SourceInput) -> dict[str, float | int]:
     constants: dict[str, float | int] = {}
     constant_re = re.compile(
         r"\b(?:static\s+)?constexpr\s+(?:float|double|int|uint\d+_t|int\d+_t)\s+"
@@ -2081,8 +2068,14 @@ def numeric_source_constants(source_path: str | Path | None) -> dict[str, float 
         r"^\s*#\s*define\s+(?P<name>[A-Z][A-Z0-9_]*)\s+"
         r"(?P<value>-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)[fF]?\b"
     )
-    for path in list(root.glob("src/lib/**/*.h")) + list(root.glob("src/lib/**/*.hpp")):
-        text = path.read_text(encoding="utf-8", errors="replace")
+    source = source_handle(source_path)
+    if source is None:
+        return {}
+    texts = [
+        source.read_text(path)
+        for path in source.list_files("src/lib", patterns=["*.h", "*.hpp"])
+    ]
+    for text in texts:
         for match in constant_re.finditer(text):
             constants[match.group("name")] = parse_numeric_literal(match.group("value"))
         for line in text.splitlines():

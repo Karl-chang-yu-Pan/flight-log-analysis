@@ -33,7 +33,6 @@ from agents import Agent, Runner, RunContextWrapper, function_tool
 
 from flight_log_agent.analysis.airframe_context import build_airframe_context
 from flight_log_agent.analysis.applicability import evaluate_candidate_applicability
-from flight_log_agent.px4.source import checkout_px4_source_revision
 from flight_log_agent.mission.parser import parse_mission_file as parse_mission_file_impl
 from flight_log_agent.analysis.report_postprocess import generate_report_plots as generate_report_plots_impl
 from flight_log_agent.analysis.report_validation import enforce_validation_downgrades, validate_report
@@ -84,7 +83,10 @@ from flight_log_agent.analysis.verification_plan import (
     resolved_candidate_predicate_signals,
 )
 from flight_log_agent.ulog.control_surface import infer_control_surface as infer_control_surface_impl
-from flight_log_agent.ulog.inventory import parse_ulog_inventory as parse_ulog_inventory_impl
+from flight_log_agent.ulog.inventory import (
+    enrich_inventory_from_source,
+    parse_ulog_inventory as parse_ulog_inventory_impl,
+)
 from flight_log_agent.ulog.plots import generate_signal_plot as generate_signal_plot_impl
 from flight_log_agent.ulog.timeline import (
     build_basic_timeline as build_basic_timeline_impl,
@@ -127,7 +129,14 @@ from flight_log_agent.px4.mechanism_cache import (
 )
 from flight_log_agent.source_path import (
     DEFAULT_PX4_SOURCE_PATH,
+    SOURCE_UNAVAILABLE,
     resolve_source_path as resolve_source_path_impl,
+)
+from flight_log_agent.px4.source_snapshot import (
+    SourceHandle,
+    SourceRepository,
+    SourceResolutionError,
+    SourceSnapshot,
 )
 
 
@@ -139,8 +148,9 @@ from flight_log_agent.source_path import (
 class FlightLogContext:
     log_path: Path
     mission_path: Optional[Path]
-    source_path: Optional[Path]
+    source_path: Optional[SourceHandle]
     output_dir: Path
+    source_snapshot: Optional[SourceSnapshot] = None
 
 
 # ============================================================
@@ -325,7 +335,9 @@ async def analyze_flight_log(
 ) -> FlightLogReport:
     log_path_obj = Path(log_path)
     mission_path_obj = Path(mission_path) if mission_path else None
-    source_path_obj = resolve_source_path(source_path)
+    source_repository_path = resolve_source_path(source_path)
+    source_path_obj: Optional[SourceHandle] = None
+    source_snapshot: Optional[SourceSnapshot] = None
     output_dir_obj = Path(output_dir)
     output_dir_obj.mkdir(parents=True, exist_ok=True)
 
@@ -337,7 +349,7 @@ async def analyze_flight_log(
             "runner_version": "v3_mechanism_first",
             "log_path": str(log_path_obj),
             "mission_path": str(mission_path_obj) if mission_path_obj else None,
-            "source_path": str(source_path_obj) if source_path_obj else None,
+            "source_path": str(source_repository_path) if source_repository_path else None,
             "output_dir": str(output_dir_obj),
             "report_path": str(report_path),
             "mechanism_cache_dir": mechanism_cache_dir,
@@ -348,8 +360,9 @@ async def analyze_flight_log(
     ctx = FlightLogContext(
         log_path=log_path_obj,
         mission_path=mission_path_obj,
-        source_path=source_path_obj,
+        source_path=None,
         output_dir=output_dir_obj,
+        source_snapshot=None,
     )
 
     try:
@@ -361,9 +374,9 @@ async def analyze_flight_log(
             "prepass",
             "parse_ulog_inventory",
             parse_ulog_inventory,
-            {"log_path": str(log_path_obj), "source_path": str(source_path_obj) if source_path_obj else None},
+            {"log_path": str(log_path_obj), "source_path": None},
             log_path_obj,
-            source_path_obj,
+            SOURCE_UNAVAILABLE,
         )
 
         logged_px4_git_hash = (
@@ -371,16 +384,28 @@ async def analyze_flight_log(
             or inventory.get("px4_git_hash")
             or inventory.get("firmware_git_hash")
         )
-        # Align before source-derived prepass steps read version-sensitive PX4 files.
-        if source_path_obj is not None and logged_px4_git_hash:
-            _audit_sync_call(
-                audit_logger,
-                "source",
-                "checkout_px4_source_revision",
-                checkout_px4_source_revision,
-                {"revision": logged_px4_git_hash},
-                source_path_obj,
-                logged_px4_git_hash,
+        if source_repository_path is not None and logged_px4_git_hash:
+            try:
+                source_snapshot = _audit_sync_call(
+                    audit_logger,
+                    "source",
+                    "resolve_px4_source_snapshot",
+                    SourceRepository(source_repository_path).resolve_snapshot,
+                    {"revision": logged_px4_git_hash},
+                    logged_px4_git_hash,
+                )
+                source_path_obj = source_snapshot
+                enrich_inventory_from_source(inventory, source_snapshot)
+                ctx.source_path = source_path_obj
+                ctx.source_snapshot = source_snapshot
+            except Exception as exc:
+                status = getattr(exc, "status", "repository_unavailable")
+                inventory.setdefault("warnings", []).append(
+                    f"Exact PX4 source is unavailable ({status}): {exc}"
+                )
+        elif source_repository_path is not None:
+            inventory.setdefault("warnings", []).append(
+                "Exact PX4 source is unavailable (revision_missing): log has no PX4 git hash."
             )
 
         timeline = _audit_sync_call(
@@ -398,7 +423,7 @@ async def analyze_flight_log(
             infer_control_surface,
             {"log_path": str(log_path_obj), "source_path": str(source_path_obj) if source_path_obj else None},
             log_path_obj,
-            source_path_obj,
+            source_snapshot or SOURCE_UNAVAILABLE,
         )
         mission = _audit_sync_call(
             audit_logger,
@@ -410,11 +435,13 @@ async def analyze_flight_log(
                 "source_path": str(source_path_obj) if source_path_obj else None,
             },
             mission_path_obj,
-            source_path_obj,
+            source_snapshot or SOURCE_UNAVAILABLE,
         )
 
         # Only this compact object may enter mechanism discovery.
         airframe_context = build_airframe_context(inventory, control_surface)
+        if source_snapshot is not None:
+            airframe_context.px4_git_hash = source_snapshot.commit_sha
 
         # ------------------------------------------------------------
         # Stage 2: normalize question into source-search intent
@@ -477,10 +504,10 @@ async def analyze_flight_log(
                     {
                         "mechanism_id": record.mechanism_id,
                         "source_path": str(source_path_obj) if source_path_obj else None,
-                        "current_git_hash": airframe_context.px4_git_hash,
+                        "current_git_hash": source_snapshot.commit_sha if source_snapshot else None,
                     },
-                    source_path_obj,
-                    airframe_context.px4_git_hash,
+                    source_snapshot,
+                    source_snapshot.commit_sha if source_snapshot else None,
                     record,
                 )
                 mechanism_cache_summary["source_validations"].append(validation.model_dump())
@@ -534,7 +561,7 @@ async def analyze_flight_log(
                     "max_candidates": max_candidates,
                     "cached_seed_candidate_names": [candidate.name for candidate in cached_candidates],
                 },
-                source_path_obj,
+                source_snapshot,
                 question_intent,
                 source_discovery_log_context,
                 max_candidates,
@@ -545,6 +572,7 @@ async def analyze_flight_log(
             candidate_set = source_mechanisms_to_candidates(
                 source_candidate_set,
                 output_bindings=source_output_bindings,
+                source_path=source_path_obj,
             )
             source_evidence = empty_source_discovery_evidence(
                 source_search_context,
@@ -567,7 +595,7 @@ async def analyze_flight_log(
                 candidate_set,
                 airframe_context,
                 question_intent,
-                source_path_obj,
+                source_snapshot,
                 source_evidence,
             )
             mechanism_cache_summary["written_records"] = written_records
@@ -712,21 +740,19 @@ def retrieve_cached_mechanisms(
 
 
 async def discover_source_mechanisms(
-    source_path: Optional[Path],
+    source_path: Optional[SourceHandle],
     question_intent: QuestionIntent,
     log_context: SourceDiscoveryLogContext,
     max_candidates: int,
     decide,
     cached_candidates: Optional[list[MechanismCandidate]] = None,
 ) -> SourceMechanismCandidateSet:
-    source_path = resolve_source_path(source_path)
     if source_path is None:
         return SourceMechanismCandidateSet(
             candidates=[],
             expansion_queries=list(question_intent.source_queries),
-            unresolved_questions=["PX4 source path is unavailable for source-mechanism discovery."],
+            unresolved_questions=["Exact PX4 source snapshot is unavailable for source-mechanism discovery."],
         )
-
     resolver = SourceMechanismResolver(source_path)
     return await resolver.discover(
         question_intent.original_question,
@@ -751,10 +777,15 @@ async def discover_source_mechanisms(
 def source_mechanisms_to_candidates(
     source_candidate_set: SourceMechanismCandidateSet,
     output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
+    source_path: Optional[Path] = None,
 ) -> MechanismCandidateSet:
     return MechanismCandidateSet(
         candidates=[
-            source_mechanism_to_candidate(candidate, output_bindings=output_bindings)
+            source_mechanism_to_candidate(
+                candidate,
+                output_bindings=output_bindings,
+                source_path=source_path,
+            )
             for candidate in source_candidate_set.candidates
         ],
         rejected_source_paths=[],
@@ -765,6 +796,7 @@ def source_mechanisms_to_candidates(
 def source_mechanism_to_candidate(
     source_candidate: SourceMechanismCandidate,
     output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
+    source_path: Optional[Path] = None,
 ) -> MechanismCandidate:
     canonicalizer = SignalCanonicalizer(output_bindings or [])
     required_parameters = dedupe_keep_order([
@@ -772,7 +804,11 @@ def source_mechanism_to_candidate(
         for requirement in getattr(source_candidate, "controlling_parameters", []) or []
         if requirement.name and requirement.name != "unknown"
     ])
-    required_signals = source_candidate_required_signals(source_candidate, canonicalizer=canonicalizer)
+    required_signals = source_candidate_required_signals(
+        source_candidate,
+        canonicalizer=canonicalizer,
+        source_path=source_path,
+    )
     parameter_checks = source_candidate_parameter_checks(source_candidate)
     explicit_exclusion_checks = source_candidate_verification_checks(
         source_candidate,
@@ -813,6 +849,7 @@ def source_mechanism_to_candidate(
             source_relevant_fields=source_candidate_relevant_field_signals(
                 source_candidate,
                 canonicalizer=canonicalizer,
+                source_path=source_path,
             ),
             primary_output_signals=dedupe_keep_order([
                 signal for signal in (
@@ -1155,6 +1192,7 @@ def source_candidate_required_signals(
     source_candidate: SourceMechanismCandidate,
     *,
     canonicalizer: SignalCanonicalizer,
+    source_path: Optional[Path] = None,
 ) -> list[str]:
     signals = []
     for source_check in getattr(source_candidate, "verification_checks", []) or []:
@@ -1162,19 +1200,19 @@ def source_candidate_required_signals(
         for signal in (check.signal, check.actual, check.setpoint, check.first, check.second):
             if signal and is_logged_signal_reference(str(signal)):
                 canonical_signal = canonicalizer.canonicalize(str(signal)) or str(signal)
-                if is_valid_required_signal(canonical_signal):
+                if is_valid_required_signal(canonical_signal, source_path):
                     signals.append(canonical_signal)
         for variable in check.variables:
             source = variable.get("source") if isinstance(variable, dict) else getattr(variable, "source", None)
             if source and is_logged_signal_reference(str(source)):
                 canonical_signal = canonicalizer.canonicalize(str(source)) or str(source)
-                if is_valid_required_signal(canonical_signal):
+                if is_valid_required_signal(canonical_signal, source_path):
                     signals.append(canonical_signal)
     for evidence in getattr(source_candidate, "required_log_evidence", []) or []:
         signal = extract_signal_reference(evidence)
         if signal:
             canonical_signal = canonicalizer.canonicalize(signal) or signal
-            if is_valid_required_signal(canonical_signal):
+            if is_valid_required_signal(canonical_signal, source_path):
                 signals.append(canonical_signal)
     return dedupe_keep_order(signals)
 
@@ -1183,11 +1221,12 @@ def source_candidate_relevant_field_signals(
     source_candidate: SourceMechanismCandidate,
     *,
     canonicalizer: SignalCanonicalizer,
+    source_path: Optional[Path] = None,
 ) -> list[str]:
     signals = []
     for field in getattr(source_candidate, "relevant_fields", []) or []:
         if field.topic and field.field:
-            resolved = resolve_topic_field(field.topic, field.field)
+            resolved = resolve_topic_field(field.topic, field.field, source_path)
             signal = resolved or f"{field.topic}.{field.field}"
             signals.append(canonicalizer.canonicalize(signal) or signal)
     for topic_ref in (
@@ -1200,8 +1239,8 @@ def source_candidate_relevant_field_signals(
     return dedupe_keep_order(signals)
 
 
-def is_valid_required_signal(signal: str) -> bool:
-    return is_logged_signal_reference(signal) and is_valid_topic_field(signal)
+def is_valid_required_signal(signal: str, source_path: Optional[Path] = None) -> bool:
+    return is_logged_signal_reference(signal) and is_valid_topic_field(signal, source_path)
 
 
 def signature_descriptions_with_signals(
@@ -1605,7 +1644,7 @@ def dedupe_keep_order(items: list[str]) -> list[str]:
 
 
 def validate_cached_mechanism_source(
-    source_path: Optional[Path],
+    source_path: Optional[Path | SourceSnapshot],
     current_git_hash: Optional[str],
     record: MechanismRecord,
 ) -> MechanismSourceValidation:
@@ -1636,7 +1675,7 @@ def write_resolved_mechanisms_to_cache(
     candidate_set: MechanismCandidateSet,
     airframe_context: AirframeContext,
     question_intent: QuestionIntent,
-    source_path: Optional[Path],
+    source_path: Optional[Path | SourceSnapshot],
     source_evidence: SourceEvidenceBundle,
 ) -> list[dict[str, Any]]:
     writer = MechanismCacheWriter(cache_config)
@@ -1665,7 +1704,13 @@ def evaluate_candidate_log_signature(
     applicability: ApplicabilityResult,
     verification_plan: Optional[VerificationPlan] = None,
 ) -> SignatureEvaluation:
-    return evaluate_candidate_log_signature_impl(ctx.log_path, candidate, applicability, verification_plan)
+    return evaluate_candidate_log_signature_impl(
+        ctx.log_path,
+        candidate,
+        applicability,
+        verification_plan,
+        source_path=ctx.source_path,
+    )
 
 
 def generate_report_plots(

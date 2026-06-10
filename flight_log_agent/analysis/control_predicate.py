@@ -13,7 +13,7 @@ from flight_log_agent.analysis.source_expression import (
     source_expression_names,
 )
 from flight_log_agent.px4.msg_schema import is_valid_topic_field, normalize_px4_enum_value
-from flight_log_agent.source_path import resolve_source_path
+from flight_log_agent.px4.source_snapshot import SourceInput, source_handle
 
 
 class LoweredControlPredicate(BaseModel):
@@ -134,21 +134,18 @@ def enum_value(token: str, signals: Any, source_path: str | Path | None) -> Any:
     return token
 
 
-def global_constant_value(token: str, source_path: str | Path | None) -> Any:
-    source_path = resolve_source_path(source_path)
-    if source_path is None:
+def global_constant_value(token: str, source_path: SourceInput) -> Any:
+    source = source_handle(source_path)
+    if source is None:
         return token
-    root = Path(source_path)
-    msg_dir = root / "msg"
-    if not msg_dir.exists():
-        return token
+    texts = [source.read_text(path) for path in source.list_files("msg", patterns=["*.msg"])]
     constant = token.rsplit("::", 1)[-1]
     pattern = re.compile(
         rf"^\s*[A-Za-z][A-Za-z0-9_]*(?:\[[0-9]*\])?\s+{re.escape(constant)}\s*=\s*(?P<value>-?(?:0x[0-9A-Fa-f]+|\d+))\b"
     )
     values = []
-    for path in msg_dir.glob("*.msg"):
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for text in texts:
+        for line in text.splitlines():
             match = pattern.match(line)
             if match:
                 values.append(int(match.group("value"), 0))
