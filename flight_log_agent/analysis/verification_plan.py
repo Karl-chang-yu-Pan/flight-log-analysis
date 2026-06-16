@@ -33,6 +33,7 @@ ALLOWED_EXPRESSION_NODES = (
     ast.Expression,
     ast.Constant,
     ast.Name,
+    ast.Load,
     ast.UnaryOp,
     ast.UAdd,
     ast.USub,
@@ -306,6 +307,12 @@ def compile_branch_plan(
     checks: list[VerificationCheckPlan] = []
     for category, source_checks in (("numeric", numeric_checks), ("exclusion", exclusion_checks)):
         for check in source_checks:
+            if (
+                check.type == "topic_field_present"
+                and check.signal
+                and not resolver.is_known_signal_reference(check.signal)
+            ):
+                continue
             checks.append(compile_check_plan(check, category, branch_id, resolver, inventory))
     check_signals = dedupe(
         signal
@@ -432,6 +439,8 @@ def validate_derived_expression(check: dict[str, Any], inventory: dict[str, Any]
 
 
 def check_role(check: RelationshipCheckSpec) -> str:
+    if check.type == "custom":
+        return "advisory"
     if check.type == "topic_field_present":
         return "evidence_availability"
     if check.type in {"parameter_equals", "branch_parameter_satisfied"}:
@@ -838,6 +847,7 @@ class SignalResolver:
             for field in fields
         }
         aliases: dict[str, set[str]] = {}
+        binding_suffix_aliases: dict[str, set[str]] = {}
         unavailable_aliases: dict[str, set[str]] = {}
         for signal in self.logged_signals:
             aliases.setdefault(normalize_symbol(signal), set()).add(signal)
@@ -861,9 +871,21 @@ class SignalResolver:
                     target_aliases.setdefault(normalized, set()).add(logged_signal)
                     parts = normalized.split(".")
                     for index in range(1, len(parts)):
-                        target_aliases.setdefault(".".join(parts[index:]), set()).add(logged_signal)
+                        binding_suffix_aliases.setdefault(".".join(parts[index:]), set()).add(logged_signal)
         self.aliases = aliases
+        self.binding_suffix_aliases = binding_suffix_aliases
         self.unavailable_aliases = unavailable_aliases
+
+    def is_known_signal_reference(self, reference: str) -> bool:
+        normalized = normalize_symbol(reference)
+        suffix = normalized.split(".", 1)[1] if "." in normalized else ""
+        return bool(
+            normalized in self.logged_signals
+            or normalized in self.schema_signals
+            or normalized in self.aliases
+            or normalized in self.unavailable_aliases
+            or suffix in self.binding_suffix_aliases
+        )
 
     def resolve(self, reference: str) -> VerificationSignalResolution:
         normalized = normalize_symbol(reference)
@@ -872,8 +894,7 @@ class SignalResolver:
             candidates.add(normalized)
         if not candidates and "." in normalized:
             suffix = normalized.split(".", 1)[1]
-            candidates.update(signal for signal in self.logged_signals if signal.endswith(f".{suffix}"))
-            candidates.update(self.aliases.get(suffix, set()))
+            candidates.update(self.binding_suffix_aliases.get(suffix, set()))
         ordered = sorted(candidates)
         if len(ordered) == 1:
             return VerificationSignalResolution(original=reference, status="resolved", resolved=ordered[0], candidates=ordered)

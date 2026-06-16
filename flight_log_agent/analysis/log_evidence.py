@@ -38,9 +38,14 @@ class ParameterResolution(BaseModel):
 
 
 class ULogEvidenceIndex:
-    def __init__(self, ulog: Any) -> None:
+    def __init__(self, ulog: Any, signal_references: Optional[list[str]] = None) -> None:
         self.parameters = dict(getattr(ulog, "initial_parameters", {}) or {})
         self._series: dict[tuple[str, int, str], EvidenceSeries] = {}
+        requested = {
+            parsed
+            for reference in signal_references or []
+            if (parsed := parse_signal_reference(reference)) is not None
+        }
         for data in getattr(ulog, "data_list", []) or []:
             topic = str(getattr(data, "name", "") or "")
             multi_id = int(getattr(data, "multi_id", 0) or 0)
@@ -50,6 +55,13 @@ class ULogEvidenceIndex:
                 continue
             for field, values in values_by_field.items():
                 if field == "timestamp":
+                    continue
+                if requested and not any(
+                    requested_topic == topic
+                    and requested_field == field
+                    and (requested_instance is None or requested_instance == multi_id)
+                    for requested_topic, requested_instance, requested_field in requested
+                ):
                     continue
                 samples = [
                     EvidenceSample(time_s=timestamp_to_seconds(timestamp), value=json_safe_value(value))
@@ -64,8 +76,14 @@ class ULogEvidenceIndex:
                 )
 
     @classmethod
-    def from_path(cls, log_path: Path) -> "ULogEvidenceIndex":
-        return cls(ULog(str(log_path)))
+    def from_path(cls, log_path: Path, signal_references: Optional[list[str]] = None) -> "ULogEvidenceIndex":
+        topics = sorted({
+            parsed[0]
+            for reference in signal_references or []
+            if (parsed := parse_signal_reference(reference)) is not None
+        })
+        ulog = ULog(str(log_path), topics) if topics else ULog(str(log_path))
+        return cls(ulog, signal_references=signal_references)
 
     def resolve_signal(self, reference: str) -> EvidenceResolution:
         parsed = parse_signal_reference(reference)

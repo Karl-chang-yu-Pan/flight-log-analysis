@@ -428,8 +428,10 @@ def _check_branch_parameter_satisfied(
         )
         if parsed is not None:
             _, op, expected = parsed
-            normalized.setdefault("op", op)
-            normalized.setdefault("value", expected)
+            if normalized.get("op") is None:
+                normalized["op"] = op
+            if normalized.get("value") is None:
+                normalized["value"] = expected
     result = _check_parameter_equals(topics, windows, parameters, normalized)
     result["type"] = check.get("type")
     return result

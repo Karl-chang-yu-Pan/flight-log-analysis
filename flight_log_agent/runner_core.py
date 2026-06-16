@@ -78,6 +78,8 @@ from flight_log_agent.models import (
 )
 from flight_log_agent.analysis.signature_verification import derive_confidence
 from flight_log_agent.analysis.signature_verification import evaluate_candidate_log_signature as evaluate_candidate_log_signature_impl
+from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
+from flight_log_agent.analysis.verification_graph import compile_verification_graphs
 from flight_log_agent.analysis.verification_plan import (
     compile_verification_plan,
     resolved_candidate_predicate_signals,
@@ -620,7 +622,23 @@ async def analyze_flight_log(
         # Stage 5: deterministic applicability + log verification
         # ------------------------------------------------------------
         verified_results: list[VerifiedMechanismResult] = []
-        for candidate in candidates:
+        verification_graphs = [
+            compile_verification_graphs(candidate, source_output_bindings, source_path=source_path_obj)
+            for candidate in candidates
+        ]
+        graph_signals = dedupe_keep_order([
+            node.logged_signal
+            for graphs in verification_graphs
+            for graph in graphs
+            for node in graph.nodes
+            if node.logged_signal
+        ])
+        graph_evidence_index = (
+            ULogEvidenceIndex.from_path(log_path_obj, graph_signals)
+            if graph_signals
+            else None
+        )
+        for candidate, candidate_graphs in zip(candidates, verification_graphs):
             verification_plan = compile_verification_plan(
                 candidate,
                 inventory,
@@ -667,6 +685,9 @@ async def analyze_flight_log(
                     candidate,
                     applicability,
                     verification_plan,
+                    source_output_bindings,
+                    graph_evidence_index,
+                    candidate_graphs,
                 )
 
             verified_results.append(
@@ -879,7 +900,11 @@ def source_mechanism_to_candidate(
             ],
             numeric_checks=[
                 *explicit_numeric_checks,
-                *source_candidate_signal_presence_checks(source_candidate, required_signals),
+                *source_candidate_signal_presence_checks(
+                    source_candidate,
+                    required_signals,
+                    source_path=source_path,
+                ),
             ],
             branch_groups=source_candidate_branch_groups(source_candidate, canonicalizer=canonicalizer),
             plot_requests=[],
@@ -1131,11 +1156,13 @@ def source_candidate_parameter_checks(source_candidate: SourceMechanismCandidate
 def source_candidate_signal_presence_checks(
     source_candidate: SourceMechanismCandidate,
     required_signals: list[str],
+    *,
+    source_path: Optional[Path] = None,
 ) -> list[RelationshipCheckSpec]:
     signals = list(required_signals)
     for evidence in getattr(source_candidate, "required_log_evidence", []) or []:
         signal = extract_signal_reference(evidence)
-        if signal:
+        if signal and is_valid_required_signal(signal, source_path):
             signals.append(signal)
     return [
         RelationshipCheckSpec(
@@ -1703,6 +1730,9 @@ def evaluate_candidate_log_signature(
     candidate: MechanismCandidate,
     applicability: ApplicabilityResult,
     verification_plan: Optional[VerificationPlan] = None,
+    output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
+    graph_evidence_index: Optional[ULogEvidenceIndex] = None,
+    verification_graphs: Optional[list[Any]] = None,
 ) -> SignatureEvaluation:
     return evaluate_candidate_log_signature_impl(
         ctx.log_path,
@@ -1710,6 +1740,9 @@ def evaluate_candidate_log_signature(
         applicability,
         verification_plan,
         source_path=ctx.source_path,
+        output_bindings=output_bindings or [],
+        graph_evidence_index=graph_evidence_index,
+        verification_graphs=verification_graphs,
     )
 
 

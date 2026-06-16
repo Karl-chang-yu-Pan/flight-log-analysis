@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -13,7 +14,7 @@ from flight_log_agent.analysis.source_expression import (
     source_expression_names,
 )
 from flight_log_agent.px4.msg_schema import is_valid_topic_field, normalize_px4_enum_value
-from flight_log_agent.px4.source_snapshot import SourceInput, source_handle
+from flight_log_agent.px4.source_snapshot import SourceInput, SourceSnapshot, source_handle
 
 
 class LoweredControlPredicate(BaseModel):
@@ -135,22 +136,42 @@ def enum_value(token: str, signals: Any, source_path: str | Path | None) -> Any:
 
 
 def global_constant_value(token: str, source_path: SourceInput) -> Any:
+    if isinstance(source_path, SourceSnapshot):
+        constants = _snapshot_global_constants(
+            str(source_path.repository_path),
+            source_path.commit_sha,
+        )
+        return constants.get(token.rsplit("::", 1)[-1], token)
     source = source_handle(source_path)
     if source is None:
         return token
+    constants = _global_constants(source)
+    return constants.get(token.rsplit("::", 1)[-1], token)
+
+
+@lru_cache(maxsize=32)
+def _snapshot_global_constants(repository_path: str, commit_sha: str) -> dict[str, int]:
+    return _global_constants(SourceSnapshot(Path(repository_path), commit_sha))
+
+
+def _global_constants(source: Any) -> dict[str, int]:
     texts = [source.read_text(path) for path in source.list_files("msg", patterns=["*.msg"])]
-    constant = token.rsplit("::", 1)[-1]
     pattern = re.compile(
-        rf"^\s*[A-Za-z][A-Za-z0-9_]*(?:\[[0-9]*\])?\s+{re.escape(constant)}\s*=\s*(?P<value>-?(?:0x[0-9A-Fa-f]+|\d+))\b"
+        r"^\s*[A-Za-z][A-Za-z0-9_]*(?:\[[0-9]*\])?\s+"
+        r"(?P<name>[A-Z][A-Z0-9_]*)\s*=\s*"
+        r"(?P<value>-?(?:0x[0-9A-Fa-f]+|\d+))\b"
     )
-    values = []
+    values: dict[str, list[int]] = {}
     for text in texts:
         for line in text.splitlines():
             match = pattern.match(line)
             if match:
-                values.append(int(match.group("value"), 0))
-    unique_values = set(values)
-    return values[0] if len(unique_values) == 1 else token
+                values.setdefault(match.group("name"), []).append(int(match.group("value"), 0))
+    return {
+        name: candidates[0]
+        for name, candidates in values.items()
+        if len(set(candidates)) == 1
+    }
 
 
 def replace_source_symbol(expression: str, symbol: str, replacement: str) -> str:

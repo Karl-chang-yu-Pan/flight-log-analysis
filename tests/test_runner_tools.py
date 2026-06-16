@@ -1339,6 +1339,20 @@ def test_source_mechanism_conversion_emits_executable_checks(tmp_path):
     assert candidate.numeric_checks[1].signal == "position_setpoint.alt"
 
 
+def test_source_mechanism_conversion_does_not_classify_source_filename_as_signal(tmp_path):
+    runner = load_runner(tmp_path)
+    source_candidate = runner.SourceMechanismCandidate(
+        title="RTL source note",
+        source_mechanism="The source note names rtl.cpp.",
+        required_log_evidence=["Inspect rtl.cpp before checking the log."],
+    )
+
+    candidate = runner.source_mechanism_to_candidate(source_candidate, source_path=tmp_path)
+
+    assert candidate.required_signals == []
+    assert not any(check.signal == "rtl.cpp" for check in candidate.numeric_checks)
+
+
 def test_source_mechanism_conversion_preserves_derived_expression_checks(tmp_path):
     runner = load_runner(tmp_path)
     source_candidate = runner.SourceMechanismCandidate(
@@ -1815,6 +1829,10 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
         "vehicle_local_position_setpoint",
     ]
     assert discovery_args[5] == []
+    signature_args = evaluate_signature.call_args.args
+    assert signature_args[4] == source_candidate_set.output_bindings
+    assert signature_args[5] is None
+    assert signature_args[6] == []
     assert list(captured[1]["input"].keys()) == ["verified_mechanism_results"]
     assert captured[1]["input"]["verified_mechanism_results"][0]["final_confidence"] == "medium"
     assert "raw" not in captured[1]["input"]["verified_mechanism_results"][0]["evaluation"]
@@ -1830,6 +1848,41 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     metadata = json.loads((run_dir / "metadata.json").read_text())
     assert metadata["runner_version"] == "v3_mechanism_first"
     assert metadata["report_path"] == str(output_dir / "report.json")
+
+
+def test_signal_canonicalizer_requires_exact_binding_alias(tmp_path):
+    runner = load_runner(tmp_path)
+    canonicalizer = runner.SignalCanonicalizer([
+        runner.SourceOutputBindingRecord(
+            binding_id="current-speed",
+            source_symbol="triplet.current.cruising_speed",
+            target_symbol="position_setpoint_triplet.current.cruising_speed",
+            logged_signal="position_setpoint_triplet.current.cruising_speed",
+        ),
+    ])
+
+    assert canonicalizer.canonicalize("triplet.current.cruising_speed") == (
+        "position_setpoint_triplet.current.cruising_speed"
+    )
+    assert canonicalizer.canonicalize("current.cruising_speed") == (
+        "position_setpoint_triplet.current.cruising_speed"
+    )
+
+    ambiguous = runner.SignalCanonicalizer([
+        runner.SourceOutputBindingRecord(
+            binding_id="previous-speed",
+            source_symbol="previous.cruising_speed",
+            target_symbol="triplet.previous.cruising_speed",
+            logged_signal="position_setpoint_triplet.previous.cruising_speed",
+        ),
+        runner.SourceOutputBindingRecord(
+            binding_id="current-speed",
+            source_symbol="current.cruising_speed",
+            target_symbol="triplet.current.cruising_speed",
+            logged_signal="position_setpoint_triplet.current.cruising_speed",
+        ),
+    ])
+    assert ambiguous.canonicalize("position_setpoint.cruising_speed") == "position_setpoint.cruising_speed"
 
 
 def test_analyze_flight_log_passes_valid_cache_hits_as_source_discovery_seeds(tmp_path):

@@ -2,8 +2,9 @@ from types import SimpleNamespace
 
 from flight_log_agent.analysis.graph_execution import execute_verification_graph
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
+from flight_log_agent.analysis.signature_verification import merge_graph_results
 from flight_log_agent.analysis.verification_graph import compile_verification_graphs
-from flight_log_agent.models import MechanismBranchGroup, MechanismCandidate, RelationshipCheckSpec
+from flight_log_agent.models import MechanismBranchGroup, MechanismCandidate, RelationshipCheckSpec, SignatureEvaluation
 from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
 
 
@@ -19,6 +20,7 @@ def build_graph():
         source_symbol="vehicle_global_position.alt",
         target_symbol="triplet.current.alt",
         logged_signal="position_setpoint_triplet.current.alt",
+        symbol_bindings={"vehicle_global_position.alt": "vehicle_global_position.alt"},
     )
     return compile_verification_graphs(candidate, [binding])[0]
 
@@ -81,6 +83,7 @@ def test_graph_execution_supports_only_after_terminal_log_comparison_matches():
     result = execute_verification_graph(build_graph(), build_index([10.0, 11.0]))
 
     assert result.verdict == "supported"
+    assert result.unresolved_dependencies == []
     comparison = next(item for item in result.node_results if item.status == "supported")
     assert comparison.value["sample_count"] == 2
     assert comparison.value["max_error"] == 0.0
@@ -92,6 +95,25 @@ def test_graph_execution_contradicts_when_terminal_log_comparison_mismatches():
     assert result.verdict == "contradicted"
     comparison = next(item for item in result.node_results if item.status == "contradicted")
     assert comparison.value["max_error"] == 1.0
+
+
+def test_conclusive_graph_result_changes_unresolved_signature_evaluation():
+    graph_result = execute_verification_graph(build_graph(), build_index([10.0, 11.0]))
+    evaluation = SignatureEvaluation(
+        candidate_name="Direct altitude publication",
+        verdict="unresolved",
+        confidence_ceiling="unresolved",
+    )
+
+    merged = merge_graph_results(evaluation, [graph_result])
+
+    assert merged.verdict == "supported"
+    assert merged.confidence_ceiling == "medium"
+    assert merged.evidence == [
+        "Primary-source reconstruction matched logged terminal output position_setpoint_triplet.current.alt."
+    ]
+    assert merged.check_results[0]["status"] == "passed"
+    assert merged.raw["verification_graphs"][0]["verdict"] == "supported"
 
 
 def test_graph_execution_reconstructs_stateless_source_expression():
@@ -106,6 +128,7 @@ def test_graph_execution_reconstructs_stateless_source_expression():
         source_symbol="vehicle_global_position.alt + RTL_RETURN_ALT",
         target_symbol="triplet.current.alt",
         logged_signal="position_setpoint_triplet.current.alt",
+        symbol_bindings={"vehicle_global_position.alt": "vehicle_global_position.alt"},
     )
     graph = compile_verification_graphs(candidate, [binding])[0]
 
@@ -150,7 +173,7 @@ def test_graph_execution_compares_constant_source_expression_to_logged_series():
     assert result.verdict == "supported"
 
 
-def test_graph_execution_evaluates_branch_predicate_without_using_it_as_terminal_proof():
+def test_graph_execution_does_not_duplicate_branch_plan_predicates():
     candidate = MechanismCandidate(
         name="Bitmask branch",
         summary="Publishes altitude while a source branch is active.",
@@ -178,6 +201,7 @@ def test_graph_execution_evaluates_branch_predicate_without_using_it_as_terminal
                 source_symbol="vehicle_global_position.alt",
                 target_symbol="triplet.current.alt",
                 logged_signal="position_setpoint_triplet.current.alt",
+                symbol_bindings={"vehicle_global_position.alt": "vehicle_global_position.alt"},
             )
         ],
     )[0]
@@ -185,7 +209,8 @@ def test_graph_execution_evaluates_branch_predicate_without_using_it_as_terminal
     result = execute_verification_graph(graph, build_index([10.0, 11.0], parameters={"MODE": 2}))
 
     assert result.verdict == "supported"
-    assert any(item.status == "applicable" for item in result.node_results)
+    assert result.unresolved_dependencies == []
+    assert not any(item.status in {"applicable", "excluded"} for item in result.node_results)
 
 
 def test_graph_execution_selects_exactly_one_controlled_producer_per_actual_timestamp():

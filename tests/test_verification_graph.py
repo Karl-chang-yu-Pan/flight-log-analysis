@@ -178,3 +178,25 @@ def test_graph_uses_transitive_primary_source_bindings():
     assert "mission_item.altitude" in graph_text
     assert "selected_altitude" in graph_text
     assert graph.validation_errors == []
+
+
+def test_graph_does_not_treat_unbound_source_member_as_logged_signal():
+    candidate = MechanismCandidate(
+        name="Source-only dependency",
+        summary="Calls a source member that is not a ULog field.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="publish",
+            source_symbol="navigator.get_global_position",
+            target_symbol="pos_sp_triplet.current.alt",
+            logged_signal="position_setpoint_triplet.current.alt",
+        ),
+    ]
+
+    graph = compile_verification_graphs(candidate, bindings)[0]
+    dependency = next(node for node in graph.nodes if node.symbol == "navigator.get_global_position")
+
+    assert dependency.logged_signal is None

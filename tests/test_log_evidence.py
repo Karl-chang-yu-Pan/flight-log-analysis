@@ -88,3 +88,10 @@ def test_evidence_index_does_not_use_suffix_or_fuzzy_signal_matching():
 
     assert resolution.status == "unavailable"
     assert resolution.reason == "exact topic, instance, and field are not logged"
+
+
+def test_evidence_index_can_materialize_only_requested_signals():
+    index = ULogEvidenceIndex(build_ulog(), ["vehicle_status.nav_state"])
+
+    assert index.resolve_signal("vehicle_status.nav_state").status == "observed"
+    assert index.resolve_signal("airspeed_wind.windspeed_north").status == "unavailable"

@@ -194,7 +194,7 @@ class VerificationSignalResolution(BaseModel):
 class VerificationCheckPlan(BaseModel):
     check_id: str
     branch_id: str
-    role: Literal["mechanism_defining", "branch_applicability", "evidence_availability"]
+    role: Literal["mechanism_defining", "branch_applicability", "evidence_availability", "advisory"]
     category: Literal["numeric", "exclusion"]
     check: RelationshipCheckSpec
     executable: bool = True

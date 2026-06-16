@@ -13,6 +13,7 @@ from flight_log_agent.models import (
     RelationshipCheckSpec,
 )
 from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+import flight_log_agent.analysis.log_evidence as log_evidence
 import flight_log_agent.ulog.signature_evaluator as signature_evaluator
 
 
@@ -180,6 +181,210 @@ def test_verification_plan_preserves_ambiguous_signal_as_unresolved():
         "topic_fields": {"topic_one": ["value"], "topic_two": ["value"]},
     })
     assert applicability.missing_required_signals == []
+
+
+def test_verification_plan_does_not_create_ambiguity_from_field_suffixes():
+    candidate = MechanismCandidate(
+        name="Exact cruising speed",
+        summary="Requires an exact source-to-log binding.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="threshold",
+                signal="position_setpoint.cruising_speed",
+                metric="mean",
+                op=">=",
+                value=0,
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "available_topics": ["position_setpoint_triplet"],
+        "topic_fields": {
+            "position_setpoint_triplet": [
+                "previous.cruising_speed",
+                "current.cruising_speed",
+                "next.cruising_speed",
+            ],
+        },
+    }
+
+    plan = compile_verification_plan(candidate, inventory, [], None)
+
+    check = plan.branches[0].checks[0]
+    assert check.executable is False
+    assert check.check.signal == "position_setpoint.cruising_speed"
+    assert "ambiguous" not in " ".join(check.unresolved_dependencies)
+
+
+def test_verification_plan_accepts_variable_load_context_in_derived_expression():
+    candidate = MechanismCandidate(
+        name="Derived expression",
+        summary="Uses ordinary variable reads.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="actual",
+                expected_expression="source_value + 1",
+                variables=[
+                    {"name": "actual", "source": "topic.actual"},
+                    {"name": "source_value", "source": "topic.source_value"},
+                ],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "available_topics": ["topic"],
+        "topic_fields": {"topic": ["actual", "source_value"]},
+    }
+
+    plan = compile_verification_plan(candidate, inventory, [], None)
+
+    assert plan.branches[0].checks[0].executable is True
+
+
+def test_custom_semantic_check_is_advisory_and_does_not_block_branch_verdict(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_local_position",
+                    data={"timestamp": [1_000_000], "z": [10.0]},
+                )
+            ]
+
+    monkeypatch.setattr(signature_evaluator, "ULog", FakeULog)
+    candidate = MechanismCandidate(
+        name="Advisory custom check",
+        summary="Has executable evidence and an advisory semantic note.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="threshold",
+                signal="vehicle_local_position.z",
+                metric="mean",
+                op=">=",
+                value=5,
+            ),
+        ],
+        exclusion_checks=[
+            RelationshipCheckSpec(type="custom", description="Review this manually."),
+        ],
+    )
+    inventory = {
+        "duration_s": 2.0,
+        "available_topics": ["vehicle_local_position"],
+        "topic_fields": {"vehicle_local_position": ["z"]},
+    }
+    plan = compile_verification_plan(candidate, inventory, [], None)
+    applicability = applicability_from_verification_plan(candidate, plan, inventory)
+
+    evaluation = evaluate_candidate_log_signature(tmp_path / "flight.ulg", candidate, applicability, plan)
+
+    custom = next(check for check in plan.branches[0].checks if check.check.type == "custom")
+    assert custom.role == "advisory"
+    assert custom.executable is False
+    assert evaluation.verdict == "supported"
+
+
+def test_signature_evaluation_executes_terminal_graph_and_uses_its_verdict(tmp_path, monkeypatch):
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_global_position",
+                    multi_id=0,
+                    data={"timestamp": [1_000_000, 2_000_000], "alt": [10.0, 11.0]},
+                ),
+                SimpleNamespace(
+                    name="position_setpoint_triplet",
+                    multi_id=0,
+                    data={"timestamp": [1_000_000, 2_000_000], "current.alt": [10.0, 11.0]},
+                ),
+            ]
+
+    monkeypatch.setattr(signature_evaluator, "ULog", FakeULog)
+    monkeypatch.setattr(log_evidence, "ULog", FakeULog)
+    candidate = MechanismCandidate(
+        name="Direct altitude publication",
+        summary="Publishes the current altitude directly.",
+        source_refs=[],
+        primary_output_signals=["position_setpoint_triplet.current.alt"],
+    )
+    binding = SourceOutputBindingRecord(
+        binding_id="altitude",
+        source_symbol="vehicle_global_position.alt",
+        target_symbol="triplet.current.alt",
+        logged_signal="position_setpoint_triplet.current.alt",
+        symbol_bindings={"vehicle_global_position.alt": "vehicle_global_position.alt"},
+    )
+    inventory = {
+        "duration_s": 2.0,
+        "available_topics": ["vehicle_global_position", "position_setpoint_triplet"],
+        "topic_fields": {
+            "vehicle_global_position": ["alt"],
+            "position_setpoint_triplet": ["current.alt"],
+        },
+    }
+    plan = compile_verification_plan(candidate, inventory, [], None, [binding])
+    applicability = applicability_from_verification_plan(candidate, plan, inventory)
+
+    evaluation = evaluate_candidate_log_signature(
+        tmp_path / "flight.ulg",
+        candidate,
+        applicability,
+        plan,
+        output_bindings=[binding],
+    )
+
+    assert evaluation.verdict == "supported"
+    assert evaluation.confidence_ceiling == "medium"
+    assert evaluation.raw["verification_graphs"][0]["verdict"] == "supported"
+
+
+def test_invalid_source_filename_presence_check_is_ignored():
+    candidate = MechanismCandidate(
+        name="Malformed source check",
+        summary="A source filename is not a ULog signal.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(type="topic_field_present", signal="rtl.cpp"),
+            RelationshipCheckSpec(type="topic_field_present", signal="vehicle_status.nav_state"),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "available_topics": ["vehicle_status"],
+        "topic_fields": {"vehicle_status": ["nav_state"]},
+    }
+
+    plan = compile_verification_plan(candidate, inventory, [], None)
+
+    assert [check.check.signal for check in plan.branches[0].checks] == ["vehicle_status.nav_state"]
+
+
+def test_branch_parameter_fallback_replaces_none_value_and_operator():
+    result = signature_evaluator._check_branch_parameter_satisfied(
+        {},
+        {},
+        {"FW_AIRSPD_MAX": 25.0},
+        {
+            "type": "branch_parameter_satisfied",
+            "parameter": "FW_AIRSPD_MAX",
+            "source_predicate": "FW_AIRSPD_MAX > 20",
+            "op": None,
+            "value": None,
+        },
+    )
+
+    assert result["status"] == "passed"
+    assert result["value"]["op"] == ">"
+    assert result["value"]["expected"] == 20
 
 
 def test_presence_check_cannot_support_mechanism_verdict(tmp_path, monkeypatch):

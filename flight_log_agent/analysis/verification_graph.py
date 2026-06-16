@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from flight_log_agent.analysis.control_predicate import lower_control_predicates
 from flight_log_agent.analysis.source_expression import source_expression_names
-from flight_log_agent.models import CodeRef, MechanismCandidate, RelationshipCheckSpec
+from flight_log_agent.models import CodeRef, MechanismCandidate
 
 
 class VerificationGraphNode(BaseModel):
@@ -41,7 +41,6 @@ class VerificationGraph(BaseModel):
     validation_errors: list[str] = Field(default_factory=list)
 
 
-CHECK_SIGNAL_FIELDS = ("signal", "first", "second", "actual", "setpoint")
 NON_SYMBOL_NAMES = {
     "True",
     "False",
@@ -106,14 +105,12 @@ def compile_verification_graph(
     terminal = normalize_symbol(terminal_output)
     bindings = [_binding_dict(binding) for binding in output_bindings]
     signal_bindings = source_signal_bindings(bindings)
+    known_logged_signals = {
+        normalize_symbol(str(binding.get("logged_signal") or ""))
+        for binding in bindings
+        if binding.get("logged_signal")
+    }
     relevant_bindings = backward_binding_slice(terminal, bindings)
-    reachable_symbols = binding_slice_symbols(terminal, relevant_bindings)
-    owned_checks = [
-        (branch_name, check)
-        for branch_name, check in candidate_checks(candidate)
-        if check_owned_by_terminal(check, terminal, reachable_symbols)
-    ]
-
     nodes: dict[str, VerificationGraphNode] = {}
     edges: dict[tuple[str, str, str], VerificationGraphEdge] = {}
     unresolved: list[str] = []
@@ -204,10 +201,7 @@ def compile_verification_graph(
                         kind="evidence",
                         label=f"producer control dependency: {dependency}",
                         symbol=dependency,
-                        logged_signal=(
-                            lowered_dependency_signals.get(dependency)
-                            or (dependency if looks_like_logged_signal(dependency) else None)
-                        ),
+                        logged_signal=lowered_dependency_signals.get(dependency),
                         metadata={"evidence_kind": "producer_control"},
                     )
                     add_edge(edges, evidence_id, control_id, "data")
@@ -228,61 +222,13 @@ def compile_verification_graph(
                 kind="evidence",
                 label=f"source dependency: {dependency}",
                 symbol=dependency,
-                logged_signal=dependency if looks_like_logged_signal(dependency) else None,
+                logged_signal=(
+                    signal_bindings.get(dependency)
+                    or (dependency if dependency in known_logged_signals else None)
+                ),
                 metadata={"evidence_kind": "unresolved_input"},
             )
             add_edge(edges, evidence_id, operation_id, "data")
-
-    for branch_name, check in owned_checks:
-        check_id = add_node(
-            nodes,
-            kind="operation",
-            label=check.description or check.supports or check.type,
-            check_type=check.type,
-            metadata={
-                "operation": "verification_check",
-                "check": _model_dump(check),
-                "branch_name": branch_name,
-            },
-        )
-        add_edge(edges, check_id, comparison_id, "comparison")
-        for dependency in check_input_symbols(check, terminal):
-            evidence_id = add_node(
-                nodes,
-                kind="evidence",
-                label=f"check dependency: {dependency}",
-                symbol=dependency,
-                logged_signal=dependency if looks_like_logged_signal(dependency) else None,
-                metadata={"evidence_kind": "input"},
-            )
-            add_edge(edges, evidence_id, check_id, "data")
-        if branch_name:
-            source_predicates = next(
-                (
-                    group.source_predicates
-                    for group in candidate.branch_groups
-                    if group.name == branch_name
-                ),
-                [],
-            )
-            branch_id = add_node(
-                nodes,
-                kind="branch",
-                label=f"branch: {branch_name}",
-                symbol=branch_name,
-                metadata={"source_predicates": source_predicates},
-            )
-            for dependency in expression_symbols(" and ".join(source_predicates)):
-                evidence_id = add_node(
-                    nodes,
-                    kind="evidence",
-                    label=f"branch dependency: {dependency}",
-                    symbol=dependency,
-                    logged_signal=dependency if looks_like_logged_signal(dependency) else None,
-                    metadata={"evidence_kind": "branch_input"},
-                )
-                add_edge(edges, evidence_id, branch_id, "data")
-            add_edge(edges, branch_id, check_id, "control")
 
     graph = VerificationGraph(
         graph_id=stable_id("graph", {"candidate": candidate.name, "terminal": terminal}),
@@ -324,15 +270,6 @@ def backward_binding_slice(terminal_output: str, bindings: list[dict[str, Any]])
     return selected
 
 
-def binding_slice_symbols(terminal_output: str, bindings: list[dict[str, Any]]) -> set[str]:
-    symbols = {normalize_symbol(terminal_output)}
-    for binding in bindings:
-        symbols.add(normalize_symbol(str(binding.get("logged_signal") or "")))
-        symbols.add(normalize_symbol(str(binding.get("target_symbol") or "")))
-        symbols.update(expression_symbols(str(binding.get("source_symbol") or "")))
-    return {symbol for symbol in symbols if symbol}
-
-
 def source_signal_bindings(bindings: list[dict[str, Any]]) -> dict[str, str]:
     signal_bindings: dict[str, str] = {}
     for binding in bindings:
@@ -354,71 +291,6 @@ def source_signal_bindings(bindings: list[dict[str, Any]]) -> dict[str, str]:
             if symbol:
                 signal_bindings[symbol] = logged_signal
     return signal_bindings
-
-
-def check_owned_by_terminal(
-    check: RelationshipCheckSpec,
-    terminal_output: str,
-    reachable_symbols: set[str],
-) -> bool:
-    primary_outputs = check_primary_outputs(check)
-    if terminal_output not in primary_outputs:
-        return False
-    dependencies = set(check_input_symbols(check, terminal_output))
-    return all(
-        dependency in reachable_symbols
-        or not looks_like_source_symbol(dependency)
-        or dependency.isupper()
-        for dependency in dependencies
-    )
-
-
-def check_primary_outputs(check: RelationshipCheckSpec) -> list[str]:
-    outputs: list[str] = []
-    actual = normalize_symbol(str(check.actual or ""))
-    if actual and looks_like_logged_signal(actual):
-        outputs.append(actual)
-    for variable in check.variables:
-        name = str(_get(variable, "name") or "")
-        source = normalize_symbol(str(_get(variable, "source") or ""))
-        if name == "actual" and looks_like_logged_signal(source):
-            outputs.append(source)
-    if not outputs and check.type not in {"topic_field_present", "parameter_equals", "branch_parameter_satisfied"}:
-        signal = normalize_symbol(str(check.signal or ""))
-        if signal and looks_like_logged_signal(signal):
-            outputs.append(signal)
-    return dedupe(outputs)
-
-
-def check_input_symbols(check: RelationshipCheckSpec, terminal_output: str) -> list[str]:
-    primary = set(check_primary_outputs(check))
-    inputs = []
-    for field in CHECK_SIGNAL_FIELDS:
-        value = normalize_symbol(str(getattr(check, field, None) or ""))
-        if value and value not in primary:
-            inputs.append(value)
-    for variable in check.variables:
-        source = normalize_symbol(str(_get(variable, "source") or ""))
-        if source and source not in primary:
-            inputs.append(source)
-    for expression in (check.expression, check.expected_expression):
-        inputs.extend(expression_symbols(str(expression or "")))
-    return dedupe(item for item in inputs if item != terminal_output)
-
-
-def mechanism_defining_checks(candidate: MechanismCandidate) -> list[RelationshipCheckSpec]:
-    return [
-        check
-        for _, check in candidate_checks(candidate)
-        if check.type not in {"topic_field_present", "parameter_equals", "branch_parameter_satisfied"}
-    ]
-
-
-def candidate_checks(candidate: MechanismCandidate) -> list[tuple[Optional[str], RelationshipCheckSpec]]:
-    checks = [(None, check) for check in [*candidate.numeric_checks, *candidate.exclusion_checks]]
-    for group in candidate.branch_groups:
-        checks.extend((group.name, check) for check in [*group.numeric_checks, *group.exclusion_checks])
-    return checks
 
 
 def validate_verification_graph(graph: VerificationGraph) -> list[str]:
@@ -548,14 +420,6 @@ def normalize_symbol(value: str) -> str:
     if normalized.startswith("_"):
         normalized = normalized[1:]
     return normalized
-
-
-def looks_like_logged_signal(value: str) -> bool:
-    return bool(re.fullmatch(r"[a-z][a-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+", value))
-
-
-def looks_like_source_symbol(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", value))
 
 
 def binding_key(binding: dict[str, Any]) -> tuple[str, ...]:
