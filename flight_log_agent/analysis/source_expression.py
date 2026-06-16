@@ -3,13 +3,78 @@ from __future__ import annotations
 import ast
 import math
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from flight_log_agent.expression_math import SAFE_MATH_FUNCTIONS, normalize_expression_function_names
 
 
+ALLOWED_EXPRESSION_NODES: tuple[type[ast.AST], ...] = (
+    ast.Expression,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.UnaryOp,
+    ast.UAdd,
+    ast.USub,
+    ast.Not,
+    ast.Invert,
+    ast.BoolOp,
+    ast.And,
+    ast.Or,
+    ast.IfExp,
+    ast.BinOp,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.Mod,
+    ast.BitAnd,
+    ast.BitOr,
+    ast.BitXor,
+    ast.Call,
+    ast.Compare,
+    ast.Gt,
+    ast.GtE,
+    ast.Lt,
+    ast.LtE,
+    ast.Eq,
+    ast.NotEq,
+)
+
+
+_PAREN_INDEX_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(\d+)\s*\)")
+
+
 class SourceExpressionError(ValueError):
     pass
+
+
+def alias_dotted_names(expression: str, names: Iterable[str]) -> tuple[str, dict[str, str]]:
+    """Replace occurrences of ``names`` in ``expression`` with safe flat aliases.
+
+    Returns ``(rewritten_expression, alias_to_name)``. Names are processed
+    longest-first so that ``topic.field.subfield`` is rewritten before
+    ``topic.field``. Empty names and names that don't appear are skipped.
+
+    This is the single place where dotted (``topic.field``) and bracketed
+    (``q[0]``) references are folded into flat identifiers before AST parsing,
+    so downstream validators and evaluators can rely on a plain ``Name``
+    instead of handling ``Attribute`` / ``Subscript`` directly.
+    """
+    rewritten = expression
+    alias_to_name: dict[str, str] = {}
+    sorted_names = sorted({name for name in names if name}, key=len, reverse=True)
+    for index, name in enumerate(sorted_names):
+        alias = f"__alias_{index}"
+        new_rewritten = re.sub(
+            rf"(?<![A-Za-z0-9_.]){re.escape(name)}(?![A-Za-z0-9_.])",
+            alias,
+            rewritten,
+        )
+        if new_rewritten != rewritten:
+            alias_to_name[alias] = name
+            rewritten = new_rewritten
+    return rewritten, alias_to_name
 
 
 def normalize_source_expression(expression: str) -> str:
@@ -22,7 +87,21 @@ def normalize_source_expression(expression: str) -> str:
     normalized = re.sub(r"(?P<number>\d+)\.[fF]\b", r"\g<number>.0", normalized)
     normalized = re.sub(r"(?<=\d)[fF]\b", "", normalized)
     normalized = normalize_simple_ternary(normalized)
+    normalized = _rewrite_paren_integer_index(normalized)
     return normalized.strip()
+
+
+def _rewrite_paren_integer_index(expression: str) -> str:
+    """Rewrite ``var(N)`` to ``var[N]`` for integer-literal ``N``.
+
+    PX4 matrix/vector types like ``matrix::Vector3f`` and ``matrix::Quatf``
+    overload ``operator()(size_t)`` for element access, but the ULog logs the
+    same data as bracket-indexed array fields. The rewrite is syntactic and
+    only fires when the argument is a digit sequence, so function calls with
+    non-literal arguments (e.g. ``isfinite(x)`` or ``fabs(value)``) are
+    untouched. Calls with no arguments (``x.get()``) also do not match.
+    """
+    return _PAREN_INDEX_RE.sub(r"\1[\2]", expression)
 
 
 def normalize_simple_ternary(expression: str) -> str:
@@ -81,17 +160,10 @@ def source_expression_names(expression: str) -> list[str]:
 
 def evaluate_source_expression(expression: str, env: dict[str, Any]) -> Any:
     normalized = normalize_source_expression(expression)
-    bound_env: dict[str, Any] = {}
-    for index, name in enumerate(sorted(env, key=len, reverse=True)):
-        alias = f"__value_{index}"
-        normalized = re.sub(
-            rf"(?<![A-Za-z0-9_.]){re.escape(name)}(?![A-Za-z0-9_.])",
-            alias,
-            normalized,
-        )
-        bound_env[alias] = env[name]
+    rewritten, alias_to_name = alias_dotted_names(normalized, env.keys())
+    bound_env = {alias: env[name] for alias, name in alias_to_name.items()}
     try:
-        tree = ast.parse(normalized, mode="eval")
+        tree = ast.parse(rewritten, mode="eval")
     except SyntaxError as exc:
         raise SourceExpressionError("invalid expression syntax") from exc
     return evaluate_node(tree, bound_env)

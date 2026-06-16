@@ -10,6 +10,11 @@ from typing import Any
 
 from pyulog import ULog
 
+from flight_log_agent.analysis.source_expression import (
+    alias_dotted_names,
+    normalize_source_expression,
+    source_expression_names,
+)
 from flight_log_agent.expression_math import SAFE_MATH_FUNCTIONS, normalize_expression_function_names
 from flight_log_agent.px4.msg_schema import field_or_flattened_prefix_present, normalize_px4_enum_value
 from flight_log_agent.utils import dedupe_keep_order
@@ -707,9 +712,9 @@ def _expression_context(
     expected_expression: str = "",
 ) -> dict[str, Any]:
     variables = _expression_variables_map(check.get("variables") or {})
-    names = _expression_names(expression)
+    names = source_expression_names(expression)
     if expected_expression:
-        names.extend(_expression_names(expected_expression))
+        names.extend(source_expression_names(expected_expression))
     names = dedupe_keep_order(names)
     defer_missing = _expression_has_conditional(expression) or _expression_has_conditional(expected_expression)
 
@@ -824,11 +829,18 @@ def _first_unresolved_helper_dependency(check: dict) -> dict[str, Any] | None:
 
 
 def _evaluate_expression_over_context(expression: str, context: dict[str, Any]) -> list[tuple[float | None, Any]]:
-    tree = _parse_expression(expression)
     series = context["series"]
     scalars = context["scalars"]
+    env_keys = list(series.keys()) + list(scalars.keys())
+    rewritten, alias_to_name = alias_dotted_names(normalize_source_expression(expression), env_keys)
+    tree = _parse_expression(rewritten)
+    name_to_alias = {name: alias for alias, name in alias_to_name.items()}
+
+    def _bind(env: dict[str, Any]) -> dict[str, Any]:
+        return {name_to_alias.get(name, name): value for name, value in env.items()}
+
     if not series:
-        return [(None, _eval_expression_node(tree, scalars))]
+        return [(None, _eval_expression_node(tree, _bind(scalars)))]
 
     results: list[tuple[float | None, Any]] = []
     for time_s in context["times"]:
@@ -838,27 +850,16 @@ def _evaluate_expression_over_context(expression: str, context: dict[str, Any]) 
             if value is None:
                 raise ExpressionEvaluationError(f"missing sample for {name} at {time_s}")
             env[name] = value
-        results.append((time_s, _eval_expression_node(tree, env)))
+        results.append((time_s, _eval_expression_node(tree, _bind(env))))
     return results
 
 
 def _parse_expression(expression: str) -> ast.Expression:
     try:
-        tree = ast.parse(normalize_expression_function_names(expression), mode="eval")
+        tree = ast.parse(expression, mode="eval")
     except SyntaxError as exc:
         raise ExpressionEvaluationError("invalid expression syntax") from exc
     return tree
-
-
-def _expression_names(expression: str) -> list[str]:
-    try:
-        tree = ast.parse(normalize_expression_function_names(expression), mode="eval")
-    except SyntaxError:
-        return []
-    return [
-        node.id for node in ast.walk(tree)
-        if isinstance(node, ast.Name)
-    ]
 
 
 def _eval_expression_node(node: ast.AST, env: dict[str, Any]) -> Any:

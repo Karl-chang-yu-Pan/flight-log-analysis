@@ -218,6 +218,100 @@ def test_verification_plan_does_not_create_ambiguity_from_field_suffixes():
     assert "ambiguous" not in " ".join(check.unresolved_dependencies)
 
 
+def test_derived_expression_accepts_dotted_variable_via_alias_rewrite():
+    """A check using ``tecs_status.true_airspeed_sp`` directly should be
+    executable when the variable is declared in canonical dotted form."""
+    candidate = MechanismCandidate(
+        name="True airspeed scaling",
+        summary="EAS-to-TAS scaling check.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="tecs_status.true_airspeed_sp",
+                expected_expression="tecs_status.equivalent_airspeed_sp * eas2tas",
+                variables=[
+                    {"name": "tecs_status.true_airspeed_sp", "source": "tecs_status.true_airspeed_sp"},
+                    {"name": "tecs_status.equivalent_airspeed_sp", "source": "tecs_status.equivalent_airspeed_sp"},
+                    {"name": "eas2tas", "source": "1.05"},
+                ],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "available_topics": ["tecs_status"],
+        "topic_fields": {"tecs_status": ["true_airspeed_sp", "equivalent_airspeed_sp"]},
+    }
+
+    plan = compile_verification_plan(candidate, inventory, [], None)
+
+    check = plan.branches[0].checks[0]
+    assert check.executable is True, check.unresolved_dependencies
+
+
+def test_derived_expression_rejects_undeclared_dotted_reference():
+    """A dotted reference not declared in variables remains an Attribute node
+    after alias rewriting, so the AST whitelist correctly rejects it."""
+    candidate = MechanismCandidate(
+        name="Undeclared attribute",
+        summary="Uses tecs_status.true_airspeed_sp without declaring it.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="tecs_status.true_airspeed_sp",
+                expected_expression="",
+                variables=[],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "available_topics": ["tecs_status"],
+        "topic_fields": {"tecs_status": ["true_airspeed_sp"]},
+    }
+
+    plan = compile_verification_plan(candidate, inventory, [], None)
+
+    check = plan.branches[0].checks[0]
+    assert check.executable is False
+    assert any(
+        "Attribute" in dep
+        for dep in check.unresolved_dependencies
+    ), check.unresolved_dependencies
+
+
+def test_derived_expression_accepts_quaternion_paren_via_normalize_rewrite():
+    """q(0) in the source-style expression should be normalized to q[0] and
+    matched against a declared variable using the bracket form."""
+    candidate = MechanismCandidate(
+        name="Quaternion element check",
+        summary="Vector element access via operator().",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="q(0)",
+                expected_expression="1.0",
+                variables=[
+                    {"name": "q[0]", "source": "vehicle_attitude.q[0]"},
+                ],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "available_topics": ["vehicle_attitude"],
+        "topic_fields": {"vehicle_attitude": ["q[0]"]},
+    }
+
+    plan = compile_verification_plan(candidate, inventory, [], None)
+
+    check = plan.branches[0].checks[0]
+    assert check.executable is True, check.unresolved_dependencies
+
+
 def test_verification_plan_accepts_variable_load_context_in_derived_expression():
     candidate = MechanismCandidate(
         name="Derived expression",

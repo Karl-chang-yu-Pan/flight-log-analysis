@@ -2,7 +2,9 @@ import pytest
 
 from flight_log_agent.analysis.source_expression import (
     SourceExpressionError,
+    alias_dotted_names,
     evaluate_source_expression,
+    normalize_source_expression,
     source_expression_names,
 )
 
@@ -24,3 +26,70 @@ def test_source_expression_evaluates_bitmask_branch_predicate():
 def test_source_expression_rejects_unsupported_helper_calls():
     with pytest.raises(SourceExpressionError, match="unsupported function"):
         evaluate_source_expression("stateful_helper(value)", {"value": 1.0})
+
+
+def test_alias_dotted_names_substitutes_longest_first():
+    expr, aliases = alias_dotted_names(
+        "tecs_status.true_airspeed_sp - tecs_status.equivalent_airspeed_sp",
+        ["tecs_status.true_airspeed_sp", "tecs_status.equivalent_airspeed_sp"],
+    )
+    assert "tecs_status" not in expr
+    assert set(aliases.values()) == {"tecs_status.true_airspeed_sp", "tecs_status.equivalent_airspeed_sp"}
+
+
+def test_alias_dotted_names_skips_unmentioned_names():
+    expr, aliases = alias_dotted_names("a + b", ["unused.topic"])
+    assert expr == "a + b"
+    assert aliases == {}
+
+
+def test_alias_dotted_names_handles_bracketed_index_as_identifier():
+    expr, aliases = alias_dotted_names(
+        "vehicle_attitude.q[0] * vehicle_attitude.q[0]",
+        ["vehicle_attitude.q[0]"],
+    )
+    assert "vehicle_attitude.q[0]" not in expr
+    assert list(aliases.values()) == ["vehicle_attitude.q[0]"]
+
+
+def test_normalize_source_expression_rewrites_paren_integer_index():
+    # Matrix/quaternion element access in PX4 source: q(0), P(2, 1) is
+    # rewritten only for the 1-D integer-literal case, since the 2-D flat
+    # index requires the matrix dimension to be known.
+    assert normalize_source_expression("q(0) + q(1)") == "q[0] + q[1]"
+    # No rewrite for function calls with identifier arguments.
+    assert normalize_source_expression("isfinite(x)") == "isfinite(x)"
+    # No rewrite for empty argument lists.
+    assert normalize_source_expression("_param_x.get()") == "_param_x.get()"
+
+
+def test_source_expression_evaluates_dotted_env_keys():
+    # End-to-end: a dotted env key (e.g. tecs_status.true_airspeed_sp) is
+    # consumed by evaluate_source_expression via the alias rewrite, without
+    # requiring ast.Attribute support in the evaluator itself.
+    result = evaluate_source_expression(
+        "tecs_status.true_airspeed_sp - tecs_status.equivalent_airspeed_sp",
+        {
+            "tecs_status.true_airspeed_sp": 25.0,
+            "tecs_status.equivalent_airspeed_sp": 20.0,
+        },
+    )
+    assert result == 5.0
+
+
+def test_source_expression_evaluates_bracket_index_as_identifier():
+    result = evaluate_source_expression(
+        "vehicle_attitude.q[0] + vehicle_attitude.q[1]",
+        {"vehicle_attitude.q[0]": 1.0, "vehicle_attitude.q[1]": 0.5},
+    )
+    assert result == 1.5
+
+
+def test_source_expression_evaluates_quaternion_paren_index_via_rewrite():
+    # The (N) → [N] syntactic rewrite means a PX4-style q(0) reference still
+    # resolves when the env uses the ULog bracket form q[0].
+    result = evaluate_source_expression(
+        "q(0) + q(1)",
+        {"q[0]": 0.7, "q[1]": 0.3},
+    )
+    assert result == 1.0

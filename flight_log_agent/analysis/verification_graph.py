@@ -43,30 +43,6 @@ class VerificationGraph(BaseModel):
     validation_errors: list[str] = Field(default_factory=list)
 
 
-NON_SYMBOL_NAMES = {
-    "True",
-    "False",
-    "F",
-    "and",
-    "abs",
-    "constrain",
-    "cos",
-    "fabs",
-    "fmax",
-    "fmin",
-    "isfinite",
-    "max",
-    "min",
-    "not",
-    "or",
-    "round",
-    "sin",
-    "sqrt",
-    "tan",
-    "f",
-}
-
-
 def compile_verification_graphs(
     candidate: MechanismCandidate,
     output_bindings: Iterable[Any] = (),
@@ -333,18 +309,14 @@ def reverse_reachable_node_ids(target_id: str, edges: list[VerificationGraphEdge
 
 
 def expression_symbols(expression: str) -> list[str]:
-    parsed_names = source_expression_names(expression)
-    if parsed_names:
-        return dedupe(normalize_symbol(name) for name in parsed_names)
-    symbols = []
-    for token in re.findall(
-        r"\b_?[A-Za-z][A-Za-z0-9_]*(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*)*\b",
-        expression,
-    ):
-        normalized = normalize_symbol(token)
-        if normalized and normalized not in NON_SYMBOL_NAMES and not normalized.isdigit():
-            symbols.append(normalized)
-    return dedupe(symbols)
+    """Return the dotted source-symbol references in ``expression``.
+
+    Backed by ``source_expression_names`` so attribute chains are captured
+    in one place. Expressions that fail to parse produce an empty list — the
+    upstream caller treats missing symbols as unresolved rather than guessing
+    via regex.
+    """
+    return dedupe(normalize_symbol(name) for name in source_expression_names(expression))
 
 
 def assignment_path_source_refs(path: list[dict[str, Any]]) -> list[CodeRef]:

@@ -6,6 +6,11 @@ import math
 import re
 from typing import Any, Iterable, Optional
 
+from flight_log_agent.analysis.source_expression import (
+    ALLOWED_EXPRESSION_NODES,
+    alias_dotted_names,
+    normalize_source_expression,
+)
 from flight_log_agent.expression_math import SAFE_MATH_FUNCTIONS, normalize_expression_function_names
 from flight_log_agent.models import (
     ApplicabilityResult,
@@ -31,34 +36,6 @@ from flight_log_agent.utils import stable_id
 
 
 CHECK_SIGNAL_FIELDS = ("signal", "first", "second", "actual", "setpoint")
-ALLOWED_EXPRESSION_NODES = (
-    ast.Expression,
-    ast.Constant,
-    ast.Name,
-    ast.Load,
-    ast.UnaryOp,
-    ast.UAdd,
-    ast.USub,
-    ast.Not,
-    ast.BoolOp,
-    ast.And,
-    ast.Or,
-    ast.IfExp,
-    ast.BinOp,
-    ast.Add,
-    ast.Sub,
-    ast.Mult,
-    ast.Div,
-    ast.Mod,
-    ast.Call,
-    ast.Compare,
-    ast.Gt,
-    ast.GtE,
-    ast.Lt,
-    ast.LtE,
-    ast.Eq,
-    ast.NotEq,
-)
 
 
 def compile_verification_plan(
@@ -420,8 +397,10 @@ def validate_derived_expression(check: dict[str, Any], inventory: dict[str, Any]
             if field == "expression":
                 unresolved.append("derived expression is missing")
             continue
+        normalized = normalize_source_expression(expression)
+        rewritten, aliases = alias_dotted_names(normalized, variable_sources.keys())
         try:
-            tree = ast.parse(normalize_expression_function_names(expression), mode="eval")
+            tree = ast.parse(rewritten, mode="eval")
         except SyntaxError:
             unresolved.append(f"{field} has invalid expression syntax")
             continue
@@ -433,7 +412,7 @@ def validate_derived_expression(check: dict[str, Any], inventory: dict[str, Any]
             node.id for node in ast.walk(tree)
             if isinstance(node, ast.Name)
         }
-        allowed_names = set(variable_sources) | parameters | set(SAFE_MATH_FUNCTIONS) | {"True", "False"}
+        allowed_names = set(variable_sources) | set(aliases) | parameters | set(SAFE_MATH_FUNCTIONS) | {"True", "False"}
         missing = sorted(names - allowed_names)
         if missing:
             unresolved.append(f"{field} has unresolved variables: {missing}")
