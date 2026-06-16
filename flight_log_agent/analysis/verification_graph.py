@@ -6,6 +6,7 @@ from typing import Any, Iterable, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from flight_log_agent.analysis.binding_index import BindingIndex
 from flight_log_agent.analysis.control_predicate import lower_control_predicates
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.models import CodeRef, MechanismCandidate
@@ -249,26 +250,13 @@ def backward_binding_slice(terminal_output: str, bindings: list[dict[str, Any]])
 
 
 def source_signal_bindings(bindings: list[dict[str, Any]]) -> dict[str, str]:
-    signal_bindings: dict[str, str] = {}
-    for binding in bindings:
-        for source, signal in dict(binding.get("symbol_bindings") or {}).items():
-            raw_source_symbol = str(source or "").strip()
-            source_symbol = normalize_symbol(raw_source_symbol)
-            logged = normalize_symbol(str(signal or ""))
-            if raw_source_symbol and logged:
-                signal_bindings[raw_source_symbol] = logged
-            if source_symbol and logged:
-                signal_bindings[source_symbol] = logged
-        logged_signal = normalize_symbol(str(binding.get("logged_signal") or ""))
-        if not logged_signal:
-            continue
-        for symbol in (
-            str(binding.get("target_symbol") or ""),
-            normalize_symbol(str(binding.get("target_symbol") or "")),
-        ):
-            if symbol:
-                signal_bindings[symbol] = logged_signal
-    return signal_bindings
+    """Return the flat source-symbol -> logged-signal map for control-predicate lowering.
+
+    Delegates to :class:`BindingIndex` so the lowering pipeline shares the
+    same alias-construction rules as :class:`SignalResolver` and
+    :class:`SignalCanonicalizer`.
+    """
+    return BindingIndex({}, bindings).symbol_bindings
 
 
 def validate_verification_graph(graph: VerificationGraph) -> list[str]:
