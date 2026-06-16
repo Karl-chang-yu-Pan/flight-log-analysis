@@ -33,6 +33,7 @@ from agents import Agent, Runner, RunContextWrapper, function_tool
 
 from flight_log_agent.analysis.airframe_context import build_airframe_context
 from flight_log_agent.analysis.applicability import evaluate_candidate_applicability
+from flight_log_agent.analysis.binding_index import BindingIndex
 from flight_log_agent.mission.parser import parse_mission_file as parse_mission_file_impl
 from flight_log_agent.analysis.report_postprocess import generate_report_plots as generate_report_plots_impl
 from flight_log_agent.analysis.report_validation import enforce_validation_downgrades, validate_report
@@ -921,48 +922,19 @@ def source_mechanism_to_candidate(
 
 
 class SignalCanonicalizer:
+    """Resolve abbreviated source-side symbols to canonical logged-signal names.
+
+    Backed by :class:`BindingIndex` so the canonicalization rules stay in
+    sync with :class:`SignalResolver` in the verification plan. Returns the
+    input unchanged when no unique resolution is available, matching the
+    previous behaviour.
+    """
+
     def __init__(self, output_bindings: list[SourceOutputBindingRecord]) -> None:
-        aliases: dict[str, set[str]] = {}
-        for binding in output_bindings:
-            logged_signal = str(binding.logged_signal or "")
-            if not logged_signal:
-                continue
-            for alias in self._binding_aliases(binding, logged_signal):
-                aliases.setdefault(alias, set()).add(logged_signal)
-        self._aliases = {
-            alias: next(iter(targets))
-            for alias, targets in aliases.items()
-            if len(targets) == 1
-        }
+        self._index = BindingIndex({}, output_bindings)
 
     def canonicalize(self, signal: Optional[str]) -> Optional[str]:
-        if not signal:
-            return signal
-        cleaned = self._normalize_symbol(signal)
-        if cleaned in self._aliases:
-            return self._aliases[cleaned]
-        if "." in cleaned:
-            suffix = cleaned.split(".", 1)[1]
-            if suffix in self._aliases:
-                return self._aliases[suffix]
-        return signal
-
-    @classmethod
-    def _binding_aliases(cls, binding: SourceOutputBindingRecord, logged_signal: str) -> set[str]:
-        aliases = {logged_signal}
-        for value in (binding.source_symbol, binding.target_symbol, logged_signal):
-            normalized = cls._normalize_symbol(value)
-            if not normalized:
-                continue
-            aliases.add(normalized)
-            parts = normalized.split(".")
-            for index in range(1, len(parts)):
-                aliases.add(".".join(parts[index:]))
-        return aliases
-
-    @staticmethod
-    def _normalize_symbol(value: str) -> str:
-        return normalize_symbol(value)
+        return self._index.canonicalize(signal)
 
 
 def canonicalize_mechanism_candidate_signals(
