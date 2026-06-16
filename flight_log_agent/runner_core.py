@@ -133,7 +133,7 @@ from flight_log_agent.px4.mechanism_cache import (
 from flight_log_agent.source_path import (
     DEFAULT_PX4_SOURCE_PATH,
     SOURCE_UNAVAILABLE,
-    resolve_source_path as resolve_source_path_impl,
+    resolve_source_path,
 )
 from flight_log_agent.px4.source_snapshot import (
     SourceHandle,
@@ -189,10 +189,6 @@ def parse_mission_file(
     source_path: Optional[Path] = None,
 ) -> Optional[dict]:
     return parse_mission_file_impl(mission_path, source_path=source_path)
-
-
-def resolve_source_path(source_path: Optional[str | Path]) -> Optional[Path]:
-    return resolve_source_path_impl(source_path, default_source_path=DEFAULT_PX4_SOURCE_PATH)
 
 
 # ============================================================

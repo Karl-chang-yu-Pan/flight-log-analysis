@@ -655,20 +655,25 @@ def test_runner_parse_ulog_inventory_delegates_to_inventory_module(tmp_path):
 
 
 def test_resolve_source_path_uses_repo_default_when_available(tmp_path):
+    import flight_log_agent.source_path as source_path_module
+
     runner = load_runner(tmp_path)
     default_source = tmp_path / "ref" / "PX4-Autopilot"
     default_source.mkdir(parents=True)
     explicit_source = tmp_path / "custom-px4"
 
-    runner.DEFAULT_PX4_SOURCE_PATH = default_source
+    original_default = source_path_module.DEFAULT_PX4_SOURCE_PATH
+    source_path_module.DEFAULT_PX4_SOURCE_PATH = default_source
+    try:
+        assert runner.resolve_source_path(None) == default_source
+        assert runner.resolve_source_path("") == default_source
+        assert runner.resolve_source_path(explicit_source) == explicit_source
+        assert runner.resolve_source_path(runner.SOURCE_UNAVAILABLE) is None
 
-    assert runner.resolve_source_path(None) == default_source
-    assert runner.resolve_source_path("") == default_source
-    assert runner.resolve_source_path(explicit_source) == explicit_source
-    assert runner.resolve_source_path(runner.SOURCE_UNAVAILABLE) is None
-
-    runner.DEFAULT_PX4_SOURCE_PATH = tmp_path / "missing"
-    assert runner.resolve_source_path(None) is None
+        source_path_module.DEFAULT_PX4_SOURCE_PATH = tmp_path / "missing"
+        assert runner.resolve_source_path(None) is None
+    finally:
+        source_path_module.DEFAULT_PX4_SOURCE_PATH = original_default
 
 
 def test_inventory_and_schema_use_shared_source_path_resolver(tmp_path, monkeypatch):

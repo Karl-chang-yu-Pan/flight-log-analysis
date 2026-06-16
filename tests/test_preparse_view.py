@@ -125,7 +125,9 @@ def test_build_preparse_payload_uses_default_source_path_when_empty(tmp_path):
     log_path = tmp_path / "flight.ulg"
     mission_path = tmp_path / "mission.plan"
 
-    with patch.object(preparse_view, "DEFAULT_PX4_SOURCE_PATH", default_source), patch.object(
+    import flight_log_agent.source_path as source_path_module
+
+    with patch.object(source_path_module, "DEFAULT_PX4_SOURCE_PATH", default_source), patch.object(
         preparse_view,
         "parse_ulog_inventory",
         return_value={"available_topics": [], "topic_fields": {}},
