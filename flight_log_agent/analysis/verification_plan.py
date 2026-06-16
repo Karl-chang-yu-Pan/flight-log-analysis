@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import itertools
-import json
 import math
 import re
 from typing import Any, Iterable, Optional
@@ -26,6 +24,10 @@ from flight_log_agent.px4.msg_schema import (
     normalize_px4_enum_value,
 )
 from flight_log_agent.px4.source_snapshot import source_from_inventory
+from flight_log_agent.symbols import looks_like_signal_reference, normalize_symbol
+from flight_log_agent.utils import dedupe_keep_order as dedupe
+from flight_log_agent.utils import model_dump as _model_dump
+from flight_log_agent.utils import stable_id
 
 
 CHECK_SIGNAL_FIELDS = ("signal", "first", "second", "actual", "setpoint")
@@ -953,19 +955,6 @@ def check_signal_availability(
     return available, missing
 
 
-def normalize_symbol(value: str) -> str:
-    normalized = value.strip().replace("->", ".").replace("::", ".").replace(" ", "").strip("&*")
-    normalized = re.sub(r"\[[^\]]+\]", "", normalized)
-    parts = normalized.split(".")
-    if parts and parts[0].startswith("_"):
-        parts[0] = parts[0][1:]
-    return ".".join(parts)
-
-
-def looks_like_signal_reference(value: str) -> bool:
-    return bool(re.fullmatch(r"_?[A-Za-z][A-Za-z0-9_]*(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*)+", value))
-
-
 def check_signal_references(check: RelationshipCheckSpec) -> list[str]:
     signals = [
         str(value)
@@ -979,11 +968,6 @@ def check_signal_references(check: RelationshipCheckSpec) -> list[str]:
     return dedupe(signals)
 
 
-def stable_id(prefix: str, value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return f"{prefix}_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:12]}"
-
-
 def parse_literal(value: str) -> Any:
     if value.lower() == "true":
         return True
@@ -994,16 +978,6 @@ def parse_literal(value: str) -> Any:
     except ValueError:
         return value
     return int(number) if number.is_integer() and "." not in value else number
-
-
-def dedupe(items: Iterable[str]) -> list[str]:
-    return list(dict.fromkeys(item for item in items if item))
-
-
-def _model_dump(value: Any) -> dict[str, Any]:
-    if hasattr(value, "model_dump"):
-        return value.model_dump(exclude_none=True)
-    return dict(value) if isinstance(value, dict) else dict(vars(value))
 
 
 def _get(value: Any, name: str) -> Any:

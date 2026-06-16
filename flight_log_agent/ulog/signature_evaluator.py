@@ -12,6 +12,7 @@ from pyulog import ULog
 
 from flight_log_agent.expression_math import SAFE_MATH_FUNCTIONS, normalize_expression_function_names
 from flight_log_agent.px4.msg_schema import field_or_flattened_prefix_present, normalize_px4_enum_value
+from flight_log_agent.utils import dedupe_keep_order
 
 
 NUMERIC_METRICS = {"min", "max", "mean", "median", "std", "start", "end", "delta", "count"}
@@ -966,15 +967,6 @@ def _expression_display_value(value: Any) -> Any:
     return _json_safe_value(value)
 
 
-def dedupe_keep_order(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return out
 
 
 def _topics_by_name(ulog: Any) -> dict[str, Any]:

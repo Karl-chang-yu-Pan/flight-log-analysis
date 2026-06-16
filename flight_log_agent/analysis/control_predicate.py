@@ -15,6 +15,7 @@ from flight_log_agent.analysis.source_expression import (
 )
 from flight_log_agent.px4.msg_schema import is_valid_topic_field, normalize_px4_enum_value
 from flight_log_agent.px4.source_snapshot import SourceInput, SourceSnapshot, source_handle
+from flight_log_agent.utils import dedupe_keep_order
 
 
 class LoweredControlPredicate(BaseModel):
@@ -210,7 +211,7 @@ def unresolved_symbols(expression: str, variables: dict[str, str]) -> list[str]:
         if name not in variable_names
         and name not in {"True", "False"}
     ]
-    return list(dict.fromkeys(names))
+    return dedupe_keep_order(names)
 
 
 def first_unsupported_call(tree: ast.AST) -> Optional[str]:

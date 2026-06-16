@@ -1,4 +1,6 @@
 - Preserve existing behavior unless the user explicitly asks to change it.
+- Keep the agent generic. Do not hardcode case-specific behavior — per-module shortcuts, per-mechanism formulas, per-question heuristics, or per-PX4-commit special cases. The same code path must work across any PX4 module, including those the agent has not been pointed at yet.
+- Do not maintain lookup tables (parameter lists, topic lists, mechanism catalogs, constant deny-lists, helper-name registries) that need updating as new domains, mechanisms, or PX4 versions are encountered. If a fact can be derived from the source under inspection, the .msg schema, or the ULog itself, derive it instead of tabulating it.
 - Keep generated reports and schemas stable unless the user asks to change them.
 - Prefer small, testable modules over putting all logic in runner.py.
 - Add or update tests when implementing new features.

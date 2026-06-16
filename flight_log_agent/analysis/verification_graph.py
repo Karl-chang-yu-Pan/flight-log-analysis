@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from collections import defaultdict, deque
 from typing import Any, Iterable, Literal, Optional
@@ -11,6 +9,10 @@ from pydantic import BaseModel, Field
 from flight_log_agent.analysis.control_predicate import lower_control_predicates
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.models import CodeRef, MechanismCandidate
+from flight_log_agent.symbols import normalize_symbol
+from flight_log_agent.utils import dedupe_keep_order as dedupe
+from flight_log_agent.utils import model_dump as _model_dump
+from flight_log_agent.utils import stable_id
 
 
 class VerificationGraphNode(BaseModel):
@@ -414,14 +416,6 @@ def add_edge(
     edges.setdefault(key, VerificationGraphEdge(source_id=source_id, target_id=target_id, kind=kind))
 
 
-def normalize_symbol(value: str) -> str:
-    normalized = str(value or "").strip().replace("->", ".").replace("::", ".").replace(" ", "").strip("&*")
-    normalized = re.sub(r"\[[^\]]+\]", "", normalized)
-    if normalized.startswith("_"):
-        normalized = normalized[1:]
-    return normalized
-
-
 def binding_key(binding: dict[str, Any]) -> tuple[str, ...]:
     return (
         normalize_symbol(str(binding.get("source_symbol") or "")),
@@ -432,23 +426,8 @@ def binding_key(binding: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
-def stable_id(prefix: str, value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return f"{prefix}_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:12]}"
-
-
-def dedupe(items: Iterable[str]) -> list[str]:
-    return list(dict.fromkeys(item for item in items if item))
-
-
 def _binding_dict(binding: Any) -> dict[str, Any]:
     return _model_dump(binding)
-
-
-def _model_dump(value: Any) -> dict[str, Any]:
-    if hasattr(value, "model_dump"):
-        return value.model_dump(exclude_none=True)
-    return dict(value) if isinstance(value, dict) else dict(vars(value))
 
 
 def _get(value: Any, name: str) -> Any:

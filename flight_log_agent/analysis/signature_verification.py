@@ -7,7 +7,10 @@ from flight_log_agent.analysis.graph_execution import GraphExecutionResult, exec
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.verification_graph import compile_verification_graphs
 from flight_log_agent.models import ApplicabilityResult, MechanismCandidate, SignatureEvaluation, VerificationPlan
+from flight_log_agent.symbols import is_signal_reference
 from flight_log_agent.ulog.signature_evaluator import evaluate_log_signature
+from flight_log_agent.utils import dedupe_keep_order as dedupe
+from flight_log_agent.utils import model_dump as _model_to_dict
 
 
 def evaluate_candidate_log_signature(
@@ -32,7 +35,7 @@ def evaluate_candidate_log_signature(
         required_signals = [
             signal
             for signal in candidate.required_signals
-            if _is_logged_signal_reference(signal)
+            if is_signal_reference(signal)
         ]
         raw = evaluate_log_signature(
             log_path,
@@ -356,10 +359,6 @@ def confidence_ceiling_for_plan(verdict: str, unresolved_defining: list[dict[str
     return "unresolved"
 
 
-def dedupe(items: list[str]) -> list[str]:
-    return list(dict.fromkeys(items))
-
-
 def normalize_signature_evaluation(
     candidate_name: str,
     raw: Any,
@@ -427,14 +426,6 @@ def derive_confidence(
     return evaluation.confidence_ceiling
 
 
-def _model_to_dict(value: Any) -> dict[str, Any]:
-    if hasattr(value, "model_dump"):
-        return value.model_dump(exclude_none=True)
-    if isinstance(value, dict):
-        return value
-    return {"value": value}
-
-
 def _extract_list(raw: dict[str, Any], keys: list[str]) -> list[Any]:
     for key in keys:
         value = raw.get(key)
@@ -443,13 +434,3 @@ def _extract_list(raw: dict[str, Any], keys: list[str]) -> list[Any]:
         if value:
             return [value]
     return []
-
-
-def _is_logged_signal_reference(value: str) -> bool:
-    if not isinstance(value, str) or "." not in value:
-        return False
-    topic, field = value.split(".", 1)
-    if not topic or not field:
-        return False
-    invalid_chars = set(" +-*/()")
-    return not any(char in invalid_chars for char in value)

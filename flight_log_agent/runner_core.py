@@ -140,6 +140,12 @@ from flight_log_agent.px4.source_snapshot import (
     SourceResolutionError,
     SourceSnapshot,
 )
+from flight_log_agent.symbols import is_signal_reference, normalize_symbol
+from flight_log_agent.utils import (
+    copy_model as copy_model_impl,
+    dedupe_keep_order as dedupe_keep_order_impl,
+    model_dump as _safe_model_dump_impl,
+)
 
 
 # ============================================================
@@ -956,13 +962,7 @@ class SignalCanonicalizer:
 
     @staticmethod
     def _normalize_symbol(value: str) -> str:
-        normalized = str(value or "").strip()
-        normalized = normalized.replace("->", ".")
-        normalized = normalized.replace("::", ".")
-        normalized = normalized.replace(" ", "")
-        normalized = normalized.strip("&*")
-        normalized = re.sub(r"\[[^\]]+\]", "", normalized)
-        return normalized
+        return normalize_symbol(value)
 
 
 def canonicalize_mechanism_candidate_signals(
@@ -1065,11 +1065,7 @@ def canonicalize_relationship_check_signals(
 
 
 def copy_model(value: Any, *, update: dict[str, Any]) -> Any:
-    if hasattr(value, "model_copy"):
-        return value.model_copy(update=update)
-    data = value.model_dump() if hasattr(value, "model_dump") else dict(vars(value))
-    data.update(update)
-    return value.__class__(**data)
+    return copy_model_impl(value, update=update)
 
 
 def source_candidate_branch_groups(
@@ -1651,8 +1647,7 @@ def sanitize_mechanism_candidate_contract(candidate: MechanismCandidate) -> Mech
 
 
 def is_logged_signal_reference(value: str) -> bool:
-    signal_part = r"[A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?"
-    return bool(re.fullmatch(rf"[a-z][a-z0-9_]*\.{signal_part}(?:\.{signal_part})*", value))
+    return is_signal_reference(value)
 
 
 def is_px4_parameter_name(value: str) -> bool:
@@ -1660,14 +1655,7 @@ def is_px4_parameter_name(value: str) -> bool:
 
 
 def dedupe_keep_order(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return out
+    return dedupe_keep_order_impl(items)
 
 
 def validate_cached_mechanism_source(
@@ -1892,13 +1880,7 @@ def _normalize_plot_overlays(overlays: Any) -> Optional[list[dict[str, Any]]]:
 
 
 def _safe_model_dump(value: Any) -> Any:
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if isinstance(value, list):
-        return [_safe_model_dump(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _safe_model_dump(v) for k, v in value.items()}
-    return value
+    return _safe_model_dump_impl(value)
 
 
 # ============================================================

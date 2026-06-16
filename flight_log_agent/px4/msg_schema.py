@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from flight_log_agent.px4.source_snapshot import SourceInput, SourceSnapshot, source_handle
+from flight_log_agent.utils import dedupe_keep_order
 
 PRIMITIVE_TYPES = {
     "bool",
@@ -313,15 +314,6 @@ def _normalize_enum_label(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_").upper()
 
 
-def dedupe_keep_order(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return out
 
 
 def _camel_to_snake(value: str) -> str:

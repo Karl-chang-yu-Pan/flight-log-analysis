@@ -8,6 +8,8 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 from pyulog import ULog
 
+from flight_log_agent.symbols import parse_signal_reference
+
 
 class EvidenceSample(BaseModel):
     time_s: float
@@ -174,17 +176,6 @@ class ULogEvidenceIndex:
             return resolution, None
         index = min(choices, key=lambda item: abs(times[item] - time_s))
         return resolution, samples[index]
-
-
-def parse_signal_reference(reference: str) -> tuple[str, Optional[int], str] | None:
-    match = re.fullmatch(
-        r"(?P<topic>[a-z][a-z0-9_]*)(?:\[(?P<instance>\d+)\])?\.(?P<field>.+)",
-        str(reference or "").strip(),
-    )
-    if not match:
-        return None
-    instance = match.group("instance")
-    return match.group("topic"), int(instance) if instance is not None else None, match.group("field")
 
 
 def format_signal(topic: str, field: str, multi_id: int) -> str:
