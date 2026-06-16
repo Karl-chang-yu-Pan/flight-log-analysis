@@ -6,6 +6,8 @@ import math
 import re
 from typing import Any, Iterable, Optional
 
+from flight_log_agent.analysis.binding_index import BindingIndex
+from flight_log_agent.analysis.binding_index import assignment_path_symbols as _binding_assignment_path_symbols
 from flight_log_agent.analysis.source_expression import (
     ALLOWED_EXPRESSION_NODES,
     alias_dotted_names,
@@ -45,7 +47,10 @@ def compile_verification_plan(
     mission: Optional[dict[str, Any]],
     output_bindings: Iterable[Any] = (),
 ) -> VerificationPlan:
-    resolver = SignalResolver(inventory, output_bindings)
+    bindings_list = list(output_bindings)
+    index = BindingIndex(inventory, bindings_list)
+    prefer = _prefer_signals_for_candidate(candidate, index)
+    resolver = SignalResolver.from_index(index, prefer=prefer)
     mechanism_id = stable_id("mechanism", {
         "name": candidate.name,
         "source_refs": [_model_dump(ref) for ref in candidate.source_refs],
@@ -813,102 +818,61 @@ def predicate_matches(actual: Any, op: str, expected: Any) -> bool:
 
 
 class SignalResolver:
-    def __init__(self, inventory: dict[str, Any], output_bindings: Iterable[Any]) -> None:
-        schema = load_px4_msg_schema(source_from_inventory(inventory))
-        topic_fields = inventory.get("topic_fields") or {}
-        available_topics = set(inventory.get("available_topics") or topic_fields)
-        self.logged_signals = {
-            f"{topic}.{field}"
-            for topic, fields in topic_fields.items()
-            for field in fields
-        }
-        self.schema_signals = {
-            f"{topic}.{field}"
-            for topic, fields in schema.items()
-            for field in fields
-        }
-        aliases: dict[str, set[str]] = {}
-        binding_suffix_aliases: dict[str, set[str]] = {}
-        unavailable_aliases: dict[str, set[str]] = {}
-        for signal in self.logged_signals:
-            aliases.setdefault(normalize_symbol(signal), set()).add(signal)
-        for binding in output_bindings:
-            logged_signal = str(_get(binding, "logged_signal") or "")
-            if not logged_signal:
-                continue
-            topic = logged_signal.split(".", 1)[0]
-            binding_is_logged = logged_signal in self.logged_signals or (
-                topic in available_topics and topic not in topic_fields
-            )
-            target_aliases = aliases if binding_is_logged else unavailable_aliases
-            for value in (
-                logged_signal,
-                _get(binding, "source_symbol"),
-                _get(binding, "target_symbol"),
-                *assignment_path_symbols(_get(binding, "assignment_path") or []),
-            ):
-                normalized = normalize_symbol(str(value or ""))
-                if normalized:
-                    target_aliases.setdefault(normalized, set()).add(logged_signal)
-                    parts = normalized.split(".")
-                    for index in range(1, len(parts)):
-                        binding_suffix_aliases.setdefault(".".join(parts[index:]), set()).add(logged_signal)
-        self.aliases = aliases
-        self.binding_suffix_aliases = binding_suffix_aliases
-        self.unavailable_aliases = unavailable_aliases
+    """Thin wrapper around :class:`BindingIndex` that preserves the existing
+    flat-plan callsite contract while routing all matching through the unified
+    index. The ``prefer`` set lets the caller pass a candidate-specific bias
+    (typically ``index.slice_for_terminal(primary_output)``) so that suffix
+    collisions like ``position_setpoint.cruising_speed`` resolve uniquely
+    against the candidate's terminal.
+    """
+
+    def __init__(
+        self,
+        inventory: dict[str, Any],
+        output_bindings: Iterable[Any],
+        *,
+        prefer: Iterable[str] = (),
+    ) -> None:
+        self._index = BindingIndex(inventory, output_bindings)
+        self._prefer = frozenset(prefer)
+        # Re-export attributes the existing tests inspect directly:
+        self.logged_signals = self._index.logged_signals
+        self.schema_signals = self._index.schema_signals
+        self.aliases = self._index.aliases
+        self.binding_suffix_aliases = self._index.binding_suffix_aliases
+        self.unavailable_aliases = self._index.unavailable_aliases
+
+    @classmethod
+    def from_index(cls, index: BindingIndex, *, prefer: Iterable[str] = ()) -> "SignalResolver":
+        resolver = cls.__new__(cls)
+        resolver._index = index
+        resolver._prefer = frozenset(prefer)
+        resolver.logged_signals = index.logged_signals
+        resolver.schema_signals = index.schema_signals
+        resolver.aliases = index.aliases
+        resolver.binding_suffix_aliases = index.binding_suffix_aliases
+        resolver.unavailable_aliases = index.unavailable_aliases
+        return resolver
 
     def is_known_signal_reference(self, reference: str) -> bool:
-        normalized = normalize_symbol(reference)
-        suffix = normalized.split(".", 1)[1] if "." in normalized else ""
-        return bool(
-            normalized in self.logged_signals
-            or normalized in self.schema_signals
-            or normalized in self.aliases
-            or normalized in self.unavailable_aliases
-            or suffix in self.binding_suffix_aliases
-        )
+        return self._index.is_known(reference)
 
     def resolve(self, reference: str) -> VerificationSignalResolution:
-        normalized = normalize_symbol(reference)
-        candidates = set(self.aliases.get(normalized, set()))
-        if normalized in self.logged_signals:
-            candidates.add(normalized)
-        if not candidates and "." in normalized:
-            suffix = normalized.split(".", 1)[1]
-            candidates.update(self.binding_suffix_aliases.get(suffix, set()))
-        ordered = sorted(candidates)
-        if len(ordered) == 1:
-            return VerificationSignalResolution(original=reference, status="resolved", resolved=ordered[0], candidates=ordered)
-        if len(ordered) > 1:
-            return VerificationSignalResolution(
-                original=reference,
-                status="ambiguous",
-                candidates=ordered,
-                reason="multiple deterministic logged-signal matches",
-            )
-        unavailable = sorted(self.unavailable_aliases.get(normalized, set()))
-        if normalized in self.schema_signals or unavailable:
-            return VerificationSignalResolution(
-                original=reference,
-                status="unresolved",
-                candidates=unavailable or [normalized],
-                reason="deterministic source/schema match is not present in the log",
-            )
-        return VerificationSignalResolution(
-            original=reference,
-            status="unresolved",
-            reason="no deterministic logged output-binding match",
-        )
+        return self._index.resolve(reference, prefer=self._prefer)
+
+
+def _prefer_signals_for_candidate(
+    candidate: MechanismCandidate,
+    index: BindingIndex,
+) -> set[str]:
+    prefer: set[str] = set()
+    for terminal in getattr(candidate, "primary_output_signals", None) or []:
+        prefer.update(index.slice_for_terminal(terminal))
+    return prefer
 
 
 def assignment_path_symbols(path: list[dict[str, Any]]) -> list[str]:
-    values: list[str] = []
-    for step in path:
-        for key in ("source", "target", "source_symbol", "target_symbol", "expression"):
-            value = step.get(key)
-            if isinstance(value, str) and re.fullmatch(r"[_A-Za-z][_A-Za-z0-9]*(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*)+", value):
-                values.append(value)
-    return values
+    return _binding_assignment_path_symbols(path)
 
 
 def check_signal_availability(

@@ -312,6 +312,73 @@ def test_derived_expression_accepts_quaternion_paren_via_normalize_rewrite():
     assert check.executable is True, check.unresolved_dependencies
 
 
+def test_signal_resolver_prefers_primary_output_slice_to_break_suffix_collision():
+    """The 6/14 cruising_speed gap: two bindings share the .cruising_speed
+    suffix (current and previous), so a bare ``position_setpoint.cruising_speed``
+    reference is ambiguous. When the candidate declares its primary output
+    as tecs_status.equivalent_airspeed_sp and a binding chain shows that
+    terminal is reached from current.cruising_speed (not previous), the
+    SignalResolver should resolve uniquely to the current side."""
+    from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+
+    bindings = [
+        SourceOutputBindingRecord(
+            binding_id="b_terminal",
+            logged_signal="tecs_status.equivalent_airspeed_sp",
+            source_symbol="position_setpoint_triplet.current.cruising_speed",
+            target_symbol="tecs_status.equivalent_airspeed_sp",
+        ),
+        SourceOutputBindingRecord(
+            binding_id="b_current",
+            logged_signal="position_setpoint_triplet.current.cruising_speed",
+            source_symbol="vehicle_command.param2",
+            target_symbol="position_setpoint_triplet.current.cruising_speed",
+        ),
+        SourceOutputBindingRecord(
+            binding_id="b_previous",
+            logged_signal="position_setpoint_triplet.previous.cruising_speed",
+            source_symbol="position_setpoint_triplet.current.cruising_speed",
+            target_symbol="position_setpoint_triplet.previous.cruising_speed",
+        ),
+    ]
+    candidate = MechanismCandidate(
+        name="DO_CHANGE_SPEED flow",
+        summary="vehicle_command.param2 sets cruising_speed which becomes the equivalent airspeed sp.",
+        primary_output_signals=["tecs_status.equivalent_airspeed_sp"],
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="threshold",
+                signal="position_setpoint.cruising_speed",
+                metric="mean",
+                op=">",
+                value=0,
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "available_topics": ["tecs_status", "position_setpoint_triplet", "vehicle_command"],
+        "topic_fields": {
+            "tecs_status": ["equivalent_airspeed_sp"],
+            "position_setpoint_triplet": [
+                "current.cruising_speed",
+                "previous.cruising_speed",
+            ],
+            "vehicle_command": ["param2"],
+        },
+    }
+
+    plan = compile_verification_plan(candidate, inventory, [], None, bindings)
+
+    threshold_check = next(
+        planned.check
+        for planned in plan.branches[0].checks
+        if planned.check.type == "threshold"
+    )
+    assert threshold_check.signal == "position_setpoint_triplet.current.cruising_speed"
+
+
 def test_verification_plan_accepts_variable_load_context_in_derived_expression():
     candidate = MechanismCandidate(
         name="Derived expression",

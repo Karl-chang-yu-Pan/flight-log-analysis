@@ -111,10 +111,17 @@ class BindingIndex:
                 if not normalized:
                     continue
                 target_aliases.setdefault(normalized, set()).add(logged_signal)
-                parts = normalized.split(".")
-                for index in range(1, len(parts)):
-                    suffix = ".".join(parts[index:])
-                    binding_suffix_aliases.setdefault(suffix, set()).add(logged_signal)
+
+            # Suffix aliases only come from the logged_signal itself.
+            # Building them from source / target / assignment-path symbols
+            # would map unrelated dependencies (e.g. a terminal whose source
+            # symbol happens to end in `.cruising_speed`) onto the same
+            # suffix as the actual `.cruising_speed` logged signal, which
+            # creates spurious ambiguity at resolve time.
+            logged_parts = normalize_symbol(logged_signal).split(".")
+            for index in range(1, len(logged_parts)):
+                suffix = ".".join(logged_parts[index:])
+                binding_suffix_aliases.setdefault(suffix, set()).add(logged_signal)
 
             # Per-binding source_symbol → logged_signal map (legacy
             # source_signal_bindings consumers expect a flat str → str dict
