@@ -1499,10 +1499,13 @@ def shape_report_evidence(
     report: FlightLogReport,
     verified_results: list[VerifiedMechanismResult],
 ) -> FlightLogReport:
-    unresolved_by_title = {
-        result.candidate.name: unresolved_messages_from_check_results(result.evaluation.check_results)
-        for result in verified_results
-    }
+    unresolved_by_title = {}
+    for result in verified_results:
+        graph_conclusive = _evaluation_has_conclusive_graph(result.evaluation)
+        unresolved_by_title[result.candidate.name] = unresolved_messages_from_check_results(
+            result.evaluation.check_results,
+            skip_mechanism_defining=graph_conclusive,
+        )
     for hypothesis in report.ranked_hypotheses:
         unresolved = list(getattr(hypothesis, "unresolved_evidence", []) or [])
         expected_unresolved = unresolved_by_title.get(hypothesis.known_px4_mechanism) or unresolved_by_title.get(hypothesis.title) or []
@@ -1521,14 +1524,46 @@ def shape_report_evidence(
     return report
 
 
-def unresolved_messages_from_check_results(check_results: list[Any]) -> list[str]:
+def unresolved_messages_from_check_results(
+    check_results: list[Any],
+    *,
+    skip_mechanism_defining: bool = False,
+) -> list[str]:
+    """Collect ``unresolved`` check messages from a list of flat-plan results.
+
+    When ``skip_mechanism_defining`` is True (used by ``shape_report_evidence``
+    when the graph path already produced a conclusive verdict for the
+    candidate), unresolved messages tagged ``role == "mechanism_defining"``
+    are dropped. The graph's primary-source verdict already covers the same
+    question, so propagating the flat plan's per-check noise about the same
+    terminal would just clutter the report. Applicability, evidence-
+    availability, and advisory messages still flow through because they
+    carry information the graph doesn't.
+    """
     messages: list[str] = []
     for result in check_results or []:
         if not isinstance(result, dict):
             continue
-        if result.get("status") == "unresolved" and result.get("message"):
-            messages.append(str(result["message"]))
+        if result.get("status") != "unresolved" or not result.get("message"):
+            continue
+        if skip_mechanism_defining and result.get("role") == "mechanism_defining":
+            continue
+        messages.append(str(result["message"]))
     return dedupe_keep_order(messages)
+
+
+def _evaluation_has_conclusive_graph(evaluation: SignatureEvaluation) -> bool:
+    """Whether any primary-source graph for this evaluation produced a
+    supported or contradicted verdict (i.e. not unresolved)."""
+    graphs = evaluation.raw.get("verification_graphs") if isinstance(evaluation.raw, dict) else None
+    for graph in graphs or []:
+        if isinstance(graph, dict):
+            verdict = graph.get("verdict")
+        else:
+            verdict = getattr(graph, "verdict", None)
+        if verdict in ("supported", "contradicted"):
+            return True
+    return False
 
 
 def is_unresolved_evidence_text(text: str) -> bool:

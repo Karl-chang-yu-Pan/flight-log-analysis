@@ -2142,6 +2142,177 @@ def test_shape_report_evidence_moves_unresolved_items_out_of_contradictions(tmp_
     ]
 
 
+def test_shape_report_evidence_drops_mechanism_defining_unresolved_when_graph_is_conclusive(tmp_path):
+    """When the primary-source graph is conclusive for a candidate, the flat
+    plan's per-check unresolved messages about the same mechanism are
+    redundant and should be suppressed."""
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Reconstruction-style mechanism",
+        summary="Best verified via the primary-source graph.",
+        source_refs=[],
+    )
+    applicability = runner.ApplicabilityResult(
+        candidate_name=candidate.name,
+        applicable=True,
+    )
+    evaluation = runner.SignatureEvaluation(
+        candidate_name=candidate.name,
+        verdict="supported",
+        confidence_ceiling="medium",
+        evidence=["Primary-source reconstruction matched the logged terminal."],
+        contradictions=[],
+        check_results=[
+            # Flat-plan unresolved for a mechanism-defining check: this
+            # SHOULD be filtered because the graph already decided.
+            {
+                "type": "derived_expression",
+                "role": "mechanism_defining",
+                "status": "unresolved",
+                "message": "derived expression has unresolved variables: ['some_intermediate']",
+            },
+            # An advisory unresolved message: this should still propagate.
+            {
+                "type": "custom",
+                "role": "advisory",
+                "status": "unresolved",
+                "message": "custom semantic requirement is not executable",
+            },
+        ],
+        raw={
+            "verification_graphs": [
+                {
+                    "graph_id": "g1",
+                    "terminal_output": "tecs_status.equivalent_airspeed_sp",
+                    "verdict": "supported",
+                }
+            ],
+        },
+    )
+    report = runner.FlightLogReport(
+        airframe_summary="placeholder",
+        question_intent_summary="placeholder",
+        ranked_hypotheses=[
+            runner.HypothesisReportItem(
+                title="Reconstruction-style mechanism",
+                known_px4_mechanism=candidate.name,
+                mechanism="placeholder",
+                source_refs=[],
+                expected_logged_signature=[],
+                applicability=runner.ApplicabilityReport(applicable=True),
+                evidence=[],
+                contradicting_evidence=[],
+                exclusion_checks=[],
+                numeric_checks=[],
+                confidence="medium",
+            )
+        ],
+        excluded_mechanisms=[],
+        confirmed=[candidate.name],
+        unconfirmed=[],
+        final_summary="placeholder",
+    )
+
+    runner.shape_report_evidence(
+        report,
+        [
+            runner.VerifiedMechanismResult(
+                candidate=candidate,
+                applicability=applicability,
+                evaluation=evaluation,
+                final_confidence="medium",
+            )
+        ],
+    )
+
+    hypothesis = report.ranked_hypotheses[0]
+    # Mechanism-defining unresolved was filtered out.
+    assert "derived expression has unresolved variables: ['some_intermediate']" not in hypothesis.unresolved_evidence
+    # Advisory unresolved still propagates.
+    assert "custom semantic requirement is not executable" in hypothesis.unresolved_evidence
+
+
+def test_shape_report_evidence_keeps_mechanism_defining_unresolved_when_graph_is_unresolved(tmp_path):
+    """When the primary-source graph itself is unresolved (or there is no
+    graph), the flat plan's mechanism-defining unresolved messages remain
+    the only signal for the reader and must propagate."""
+    runner = load_runner(tmp_path)
+    candidate = runner.MechanismCandidate(
+        name="Mechanism without conclusive graph",
+        summary="No graph verdict; flat-plan unresolved is the only signal.",
+        source_refs=[],
+    )
+    applicability = runner.ApplicabilityResult(
+        candidate_name=candidate.name,
+        applicable=True,
+    )
+    evaluation = runner.SignatureEvaluation(
+        candidate_name=candidate.name,
+        verdict="unresolved",
+        confidence_ceiling="unresolved",
+        evidence=[],
+        contradictions=[],
+        check_results=[
+            {
+                "type": "derived_expression",
+                "role": "mechanism_defining",
+                "status": "unresolved",
+                "message": "derived expression has unresolved variables: ['some_intermediate']",
+            }
+        ],
+        raw={
+            "verification_graphs": [
+                {
+                    "graph_id": "g1",
+                    "terminal_output": "tecs_status.equivalent_airspeed_sp",
+                    "verdict": "unresolved",
+                }
+            ],
+        },
+    )
+    report = runner.FlightLogReport(
+        airframe_summary="placeholder",
+        question_intent_summary="placeholder",
+        ranked_hypotheses=[
+            runner.HypothesisReportItem(
+                title="Mechanism without conclusive graph",
+                known_px4_mechanism=candidate.name,
+                mechanism="placeholder",
+                source_refs=[],
+                expected_logged_signature=[],
+                applicability=runner.ApplicabilityReport(applicable=True),
+                evidence=[],
+                contradicting_evidence=[],
+                exclusion_checks=[],
+                numeric_checks=[],
+                confidence="unresolved",
+            )
+        ],
+        excluded_mechanisms=[],
+        confirmed=[],
+        unconfirmed=[candidate.name],
+        final_summary="placeholder",
+    )
+
+    runner.shape_report_evidence(
+        report,
+        [
+            runner.VerifiedMechanismResult(
+                candidate=candidate,
+                applicability=applicability,
+                evaluation=evaluation,
+                final_confidence="unresolved",
+            )
+        ],
+    )
+
+    hypothesis = report.ranked_hypotheses[0]
+    assert (
+        "derived expression has unresolved variables: ['some_intermediate']"
+        in hypothesis.unresolved_evidence
+    )
+
+
 def test_generate_report_plots_updates_complete_v3_plot_specs(tmp_path):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"

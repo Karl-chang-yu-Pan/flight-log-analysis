@@ -1,3 +1,28 @@
+"""Candidate log-signature verification.
+
+Two complementary pipelines run for every candidate:
+
+- **Flat path** (``evaluate_verification_plan`` / ``evaluate_log_signature``):
+  dispatches each typed check (``threshold``, ``state_equals``,
+  ``tracks_setpoint``, ``derived_expression``, …) to a dedicated handler
+  in :mod:`flight_log_agent.ulog.signature_evaluator`. Produces the
+  per-branch / per-window / per-check breakdown that the report renders.
+
+- **Graph path** (``compile_verification_graphs`` / ``execute_verification_graph``):
+  builds one DAG per ``candidate.primary_output_signals[i]`` that
+  reconstructs the terminal output from the backward binding slice and
+  compares it to the logged actual. Produces a single conclusive verdict
+  per terminal when the source bindings are complete.
+
+These answer different questions about the same candidate, so they are
+not redundant: the flat path supplies the per-check granularity; the
+graph path supplies the primary-source reconstruction verdict.
+``merge_graph_results`` overlays the graph verdict on top of the flat
+evaluation — promoting unresolved to supported / contradicted when the
+graph is conclusive, and capping the confidence ceiling so a graph
+promotion can never exceed the strength of the underlying evidence.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
