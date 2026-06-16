@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import math
+
+import pytest
+
+from flight_log_agent.analysis.parameter_lookup import (
+    PX4_PARAM_NAME_LIMIT,
+    filter_present_parameters,
+    get_parameter,
+    has_parameter,
+    is_px4_parameter_name,
+)
+
+
+class TestIsPx4ParameterName:
+    @pytest.mark.parametrize(
+        "name",
+        ["RTL_RETURN_ALT", "SYS_AUTOSTART", "MC_PITCH_P", "FW_AIRSPD_TRIM"],
+    )
+    def test_accepts_real_px4_params(self, name):
+        assert is_px4_parameter_name(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "rtl_return_alt",         # lowercase
+            "RtlReturnAlt",           # mixed case
+            "RTL",                    # no underscore
+            "_RTL_TYPE",              # leading underscore
+            "FLT_EPSILON_TOO_LONG_NAME",  # > 16 chars
+            "",
+        ],
+    )
+    def test_rejects_non_param_names(self, name):
+        assert is_px4_parameter_name(name) is False
+
+    def test_enforces_16_char_limit(self):
+        assert PX4_PARAM_NAME_LIMIT == 16
+        assert is_px4_parameter_name("A" * 17) is False
+        assert is_px4_parameter_name("A_" + "B" * 14) is True   # exactly 16
+
+
+class TestGetParameter:
+    def test_returns_native_int_in_auto_mode(self):
+        inv = {"parameters": {"SYS_AUTOSTART": 13000, "RTL_TYPE": 0}}
+        value, reason = get_parameter(inv, "SYS_AUTOSTART")
+        assert value == 13000
+        assert isinstance(value, int)
+        assert reason is None
+
+    def test_returns_native_float_in_auto_mode(self):
+        inv = {"parameters": {"FW_AIRSPD_TRIM": 21.0}}
+        value, reason = get_parameter(inv, "FW_AIRSPD_TRIM")
+        assert value == 21.0
+        assert isinstance(value, float)
+        assert reason is None
+
+    def test_does_not_promote_int_to_float_in_auto_mode(self):
+        inv = {"parameters": {"RTL_TYPE": 0}}
+        value, _ = get_parameter(inv, "RTL_TYPE")
+        assert isinstance(value, int)
+        assert not isinstance(value, float)
+
+    def test_float_kind_coerces_int_to_float(self):
+        inv = {"parameters": {"RTL_TYPE": 2}}
+        value, reason = get_parameter(inv, "RTL_TYPE", kind="float")
+        assert value == 2.0
+        assert isinstance(value, float)
+        assert reason is None
+
+    def test_int_kind_truncates_float(self):
+        inv = {"parameters": {"FW_AIRSPD_TRIM": 21.7}}
+        value, reason = get_parameter(inv, "FW_AIRSPD_TRIM", kind="int")
+        assert value == 21
+        assert isinstance(value, int)
+        assert reason is None
+
+    def test_bool_kind_treats_nonzero_as_true(self):
+        inv = {"parameters": {"MAV_USEHILGPS": 1, "MAV_PROTO_VER": 0}}
+        assert get_parameter(inv, "MAV_USEHILGPS", kind="bool") == (True, None)
+        assert get_parameter(inv, "MAV_PROTO_VER", kind="bool") == (False, None)
+
+    def test_missing_parameter_returns_actionable_reason(self):
+        inv = {"parameters": {"RTL_RETURN_ALT": 30.0}}
+        value, reason = get_parameter(inv, "RTL_TYPE")
+        assert value is None
+        assert reason is not None
+        assert "RTL_TYPE" in reason
+        assert "not set in this log" in reason
+
+    def test_rejects_non_px4_parameter_shape(self):
+        inv = {"parameters": {"FLT_EPSILON": 1e-7}}  # would be stored erroneously
+        value, reason = get_parameter(inv, "flt_epsilon")
+        assert value is None
+        assert reason is not None
+        assert "not a PX4 parameter name" in reason
+
+    def test_empty_name_rejected(self):
+        value, reason = get_parameter({}, "")
+        assert value is None
+        assert reason == "parameter name is empty"
+
+    def test_inventory_can_be_parameters_dict_directly(self):
+        # Some callers pass the parameters dict, not the full inventory.
+        value, reason = get_parameter({"RTL_RETURN_ALT": 30.0}, "RTL_RETURN_ALT")
+        assert value == 30.0
+        assert reason is None
+
+    def test_non_numeric_value_with_float_kind_reports_reason(self):
+        inv = {"parameters": {"RTL_RETURN_ALT": "not a number"}}
+        value, reason = get_parameter(inv, "RTL_RETURN_ALT", kind="float")
+        assert value is None
+        assert reason is not None
+        assert "not numeric" in reason
+
+    def test_nan_is_rejected_in_float_kind(self):
+        inv = {"parameters": {"RTL_RETURN_ALT": math.nan}}
+        value, reason = get_parameter(inv, "RTL_RETURN_ALT", kind="float")
+        assert value is None
+        assert reason is not None
+
+
+class TestHasAndFilter:
+    def test_has_parameter(self):
+        inv = {"parameters": {"RTL_RETURN_ALT": 30.0}}
+        assert has_parameter(inv, "RTL_RETURN_ALT") is True
+        assert has_parameter(inv, "RTL_TYPE") is False
+
+    def test_filter_present_parameters_preserves_order(self):
+        inv = {"parameters": {"RTL_RETURN_ALT": 30.0, "SYS_AUTOSTART": 13000}}
+        names = ["RTL_TYPE", "RTL_RETURN_ALT", "MC_PITCH_P", "SYS_AUTOSTART"]
+        assert filter_present_parameters(inv, names) == ["RTL_RETURN_ALT", "SYS_AUTOSTART"]

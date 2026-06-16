@@ -34,6 +34,7 @@ from agents import Agent, Runner, RunContextWrapper, function_tool
 from flight_log_agent.analysis.airframe_context import build_airframe_context
 from flight_log_agent.analysis.applicability import evaluate_candidate_applicability
 from flight_log_agent.analysis.binding_index import BindingIndex
+from flight_log_agent.analysis.parameter_lookup import is_px4_parameter_name as _is_px4_parameter_name
 from flight_log_agent.mission.parser import parse_mission_file as parse_mission_file_impl
 from flight_log_agent.analysis.report_postprocess import generate_report_plots as generate_report_plots_impl
 from flight_log_agent.analysis.report_validation import enforce_validation_downgrades, validate_report
@@ -1619,7 +1620,7 @@ def is_logged_signal_reference(value: str) -> bool:
 
 
 def is_px4_parameter_name(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", value)) and "_" in value
+    return _is_px4_parameter_name(value)
 
 
 def dedupe_keep_order(items: list[str]) -> list[str]:

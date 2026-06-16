@@ -10,6 +10,7 @@ from typing import Any
 
 from pyulog import ULog
 
+from flight_log_agent.analysis.parameter_lookup import get_parameter as _get_parameter
 from flight_log_agent.analysis.source_expression import (
     alias_dotted_names,
     normalize_source_expression,
@@ -400,15 +401,16 @@ def _check_parameter_equals(topics: dict[str, Any], windows: dict[str, dict], pa
     parameter = str(check.get("parameter") or "")
     if not parameter:
         return _check_result(check, status="unresolved", message="parameter is missing")
-    if parameter not in parameters:
-        return _check_result(check, status="unresolved", message=f"missing parameter: {parameter}")
+    raw_actual, missing_reason = _get_parameter(parameters, parameter)
+    if missing_reason:
+        return _check_result(check, status="unresolved", message=missing_reason)
 
     op = str(check.get("op") or "==").strip()
     expected = check.get("value")
     if expected is None:
         return _check_result(check, status="unresolved", message=f"expected value is missing for {parameter}")
 
-    actual = _json_safe_value(parameters.get(parameter))
+    actual = _json_safe_value(raw_actual)
     tolerance = _safe_float(check.get("max_error"))
     passed = _compare_literal(actual, op, expected, tolerance=tolerance)
     message = _message(check, passed, f"{parameter} actual {actual} {op} expected {expected}")
@@ -453,12 +455,9 @@ def _check_tracks_parameter_value(
     signal = str(check.get("signal") or "")
     if not parameter:
         return _check_result(check, status="unresolved", message="parameter is missing")
-    if parameter not in parameters:
-        return _check_result(check, status="unresolved", message=f"missing parameter: {parameter}")
-
-    expected = _number(parameters.get(parameter))
-    if expected is None:
-        return _check_result(check, status="unresolved", message=f"parameter is not numeric: {parameter}")
+    expected, missing_reason = _get_parameter(parameters, parameter, kind="float")
+    if missing_reason:
+        return _check_result(check, status="unresolved", message=missing_reason)
 
     samples_result = _check_samples(topics, windows, check, signal)
     if "result" in samples_result:
