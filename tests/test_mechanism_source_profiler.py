@@ -679,6 +679,45 @@ float adapt_airspeed_setpoint(float calibrated_min_airspeed, float weight_ratio)
     assert by_line[6].function == "adapt_airspeed_setpoint"
 
 
+def test_pointer_struct_alias_binds_to_topic_field(tmp_path):
+    """A C++ pointer struct (vehicle_status_s *vstatus) should bind so that
+    vstatus->vehicle_type resolves to topic vehicle_status's field vehicle_type."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "controller.cpp").write_text(
+        """
+void check(vehicle_status_s *vstatus, vehicle_global_position_s &gpos,
+           position_setpoint_triplet_s sp_triplet)
+{
+    if (vstatus->vehicle_type == 1) {
+        sp_triplet.current.alt = gpos.alt;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    read_fields = profiler.extract_read_fields_from_source(
+        ["src/modules/example/controller.cpp"]
+    )
+
+    bound = {(ref.variable, ref.field): ref for ref in read_fields if ref.topic}
+
+    # Pointer form (->): vstatus → vehicle_status
+    pointer_ref = bound.get(("vstatus", "vehicle_type"))
+    assert pointer_ref is not None, "vstatus->vehicle_type should be captured as a read field"
+    assert pointer_ref.topic == "vehicle_status"
+    assert pointer_ref.struct == "vehicle_status_s"
+
+    # Reference form (&): gpos → vehicle_global_position
+    ref_ref = bound.get(("gpos", "alt"))
+    assert ref_ref is not None, "gpos.alt should be captured as a read field"
+    assert ref_ref.topic == "vehicle_global_position"
+    assert ref_ref.struct == "vehicle_global_position_s"
+
+
 def test_helper_expression_translation_marks_complex_helpers_unresolved(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
