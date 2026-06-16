@@ -5,6 +5,12 @@ from typing import Any, Iterable, Literal
 
 from flight_log_agent.analysis.graph_execution import GraphExecutionResult, execute_verification_graph
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
+from flight_log_agent.analysis.verdict import (
+    aggregate as _aggregate_verdict,
+    branch_result as _branch_result,
+    ceiling_for,
+    combine_verdicts,
+)
 from flight_log_agent.analysis.verification_graph import compile_verification_graphs
 from flight_log_agent.models import ApplicabilityResult, MechanismCandidate, SignatureEvaluation, VerificationPlan
 from flight_log_agent.symbols import is_signal_reference
@@ -99,7 +105,7 @@ def merge_graph_results(
     if not conclusive:
         return evaluation.model_copy(update={"raw": raw})
 
-    graph_verdict = aggregate_graph_verdict(conclusive)
+    graph_verdict = _aggregate_verdict(conclusive, level="graph")
     graph_checks = []
     evidence = list(evaluation.evidence)
     contradictions = list(evaluation.contradictions)
@@ -127,39 +133,19 @@ def merge_graph_results(
 
     return evaluation.model_copy(update={
         "verdict": verdict,
-        "confidence_ceiling": confidence_ceiling_after_graph(evaluation, verdict),
+        "confidence_ceiling": ceiling_for(
+            verdict,
+            max_ceiling=(
+                evaluation.confidence_ceiling
+                if evaluation.verdict == "supported"
+                else "medium"
+            ),
+        ),
         "evidence": dedupe(evidence),
         "contradictions": dedupe(contradictions),
         "check_results": [*evaluation.check_results, *graph_checks],
         "raw": raw,
     })
-
-
-def aggregate_graph_verdict(results: list[GraphExecutionResult]) -> str:
-    verdicts = {result.verdict for result in results}
-    if verdicts == {"supported"}:
-        return "supported"
-    if verdicts == {"contradicted"}:
-        return "contradicted"
-    return "mixed"
-
-
-def combine_verdicts(current: str, graph: str) -> str:
-    if current == "unresolved":
-        return graph
-    if graph == "mixed" or current == "mixed":
-        return "mixed"
-    return current if current == graph else "mixed"
-
-
-def confidence_ceiling_after_graph(evaluation: SignatureEvaluation, verdict: str) -> str:
-    if verdict == "supported":
-        return evaluation.confidence_ceiling if evaluation.verdict == "supported" else "medium"
-    if verdict == "mixed":
-        return "medium"
-    if verdict == "contradicted":
-        return "low"
-    return "unresolved"
 
 
 def evaluate_verification_plan(
@@ -206,7 +192,7 @@ def evaluate_verification_plan(
             all_check_results.extend(check_results)
             window_results.append({
                 "window": _model_to_dict(window),
-                "verdict": verdict_from_role_results(check_results),
+                "verdict": _aggregate_verdict(check_results, level="check_list"),
                 "check_results": check_results,
             })
         unresolved_checks = [
@@ -222,10 +208,9 @@ def evaluate_verification_plan(
             if not planned.executable
         ]
         all_check_results.extend(unresolved_checks)
-        branch_result = aggregate_branch_results(branch, window_results, unresolved_checks)
-        branch_results.append(branch_result)
+        branch_results.append(_branch_result(branch, window_results, unresolved_checks))
 
-    verdict = aggregate_mechanism_verdict(branch_results)
+    verdict = _aggregate_verdict(branch_results, level="mechanism")
     evidence_branch_ids = {
         result["branch_id"]
         for result in branch_results
@@ -256,7 +241,10 @@ def evaluate_verification_plan(
     ]
     if applicability.missing_required_signals:
         warnings.append(f"Missing required signals: {applicability.missing_required_signals}")
-    ceiling = confidence_ceiling_for_plan(verdict, unresolved_defining)
+    ceiling = ceiling_for(
+        verdict,
+        has_unresolved_defining=bool(unresolved_defining),
+    )
     return SignatureEvaluation(
         candidate_name=candidate.name,
         verdict=verdict,
@@ -283,82 +271,6 @@ def _planned_check_dict(planned: Any, window_name: str) -> dict[str, Any]:
     return data
 
 
-def verdict_from_role_results(results: list[dict[str, Any]]) -> str:
-    applicability_results = [result for result in results if result.get("role") == "branch_applicability"]
-    if any(result.get("status") == "failed" for result in applicability_results):
-        return "excluded"
-    if any(result.get("status") == "unresolved" for result in applicability_results):
-        return "unresolved"
-    defining = [result for result in results if result.get("role") == "mechanism_defining"]
-    if not defining or any(result.get("status") == "unresolved" for result in defining):
-        return "unresolved"
-    passed = any(result.get("status") == "passed" for result in defining)
-    failed = any(result.get("status") == "failed" for result in defining)
-    if passed and failed:
-        return "mixed"
-    if failed:
-        return "contradicted"
-    if all(result.get("status") == "passed" for result in defining):
-        return "supported"
-    return "unresolved"
-
-
-def aggregate_branch_results(branch: Any, windows: list[dict[str, Any]], unresolved_checks: list[dict[str, Any]]) -> dict[str, Any]:
-    verdicts = [window["verdict"] for window in windows]
-    if branch.unresolved_dependencies or any(item.get("role") == "mechanism_defining" for item in unresolved_checks):
-        verdict = "unresolved"
-    elif "supported" in verdicts and any(item in {"contradicted", "mixed"} for item in verdicts):
-        verdict = "mixed"
-    elif "supported" in verdicts:
-        verdict = "supported"
-    elif "mixed" in verdicts:
-        verdict = "mixed"
-    elif verdicts and all(item == "excluded" for item in verdicts):
-        verdict = "excluded"
-    elif "contradicted" in verdicts:
-        verdict = "contradicted"
-    else:
-        verdict = "unresolved"
-    return {
-        "branch_id": branch.branch_id,
-        "name": branch.name,
-        "verdict": verdict,
-        "has_mechanism_defining_checks": any(
-            planned.role == "mechanism_defining"
-            for planned in branch.checks
-        ),
-        "unresolved_dependencies": list(branch.unresolved_dependencies),
-        "window_results": windows,
-    }
-
-
-def aggregate_mechanism_verdict(branch_results: list[dict[str, Any]]) -> str:
-    verdicts = [
-        result["verdict"]
-        for result in branch_results
-        if result["verdict"] != "excluded" and result.get("has_mechanism_defining_checks")
-    ]
-    if "supported" in verdicts and any(item in {"contradicted", "mixed"} for item in verdicts):
-        return "mixed"
-    if "supported" in verdicts:
-        return "supported"
-    if "mixed" in verdicts:
-        return "mixed"
-    if verdicts and all(item == "contradicted" for item in verdicts):
-        return "contradicted"
-    return "unresolved"
-
-
-def confidence_ceiling_for_plan(verdict: str, unresolved_defining: list[dict[str, Any]]) -> str:
-    if verdict == "supported":
-        return "medium" if unresolved_defining else "high"
-    if verdict == "mixed":
-        return "medium"
-    if verdict == "contradicted":
-        return "low"
-    return "unresolved"
-
-
 def normalize_signature_evaluation(
     candidate_name: str,
     raw: Any,
@@ -381,25 +293,17 @@ def normalize_signature_evaluation(
         verdict = "contradicted"
     elif "mixed" in verdict_raw:
         verdict = "mixed"
-    elif evidence and contradictions:
-        verdict = "mixed"
-    elif evidence:
-        verdict = "supported"
-    elif contradictions:
-        verdict = "contradicted"
     else:
-        verdict = "unresolved"
+        from flight_log_agent.analysis.verdict import verdict_from_counts
+        verdict = verdict_from_counts(
+            supported=len(evidence),
+            contradicted=len(contradictions),
+        )
 
-    if applicability.missing_required_signals:
-        ceiling = "low"
-    elif verdict == "supported":
-        ceiling = "high"
-    elif verdict == "mixed":
-        ceiling = "medium"
-    elif verdict == "contradicted":
-        ceiling = "low"
-    else:
-        ceiling = "unresolved"
+    ceiling = ceiling_for(
+        verdict,
+        missing_required_signals=bool(applicability.missing_required_signals),
+    )
 
     check_results = raw.get("check_results") if isinstance(raw.get("check_results"), list) else []
 

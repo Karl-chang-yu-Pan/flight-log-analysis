@@ -16,6 +16,7 @@ from flight_log_agent.analysis.source_expression import (
     normalize_source_expression,
     source_expression_names,
 )
+from flight_log_agent.analysis.verdict import ceiling_for, verdict_from_counts
 from flight_log_agent.expression_math import SAFE_MATH_FUNCTIONS, normalize_expression_function_names
 from flight_log_agent.px4.msg_schema import field_or_flattened_prefix_present, normalize_px4_enum_value
 from flight_log_agent.utils import dedupe_keep_order
@@ -1287,24 +1288,16 @@ def _verdict(
     unresolved: list[str],
     missing: list[str],
 ) -> tuple[str, str]:
-    if contradictions and evidence:
-        verdict = "mixed"
-    elif contradictions:
-        verdict = "contradicted"
-    elif evidence:
-        verdict = "supported"
-    else:
-        verdict = "unresolved"
-
-    if missing:
-        return verdict, "low"
-    if verdict == "supported":
-        return verdict, "medium" if unresolved else "high"
-    if verdict == "mixed":
-        return verdict, "medium"
-    if verdict == "contradicted":
-        return verdict, "low"
-    return verdict, "unresolved"
+    verdict = verdict_from_counts(
+        supported=len(evidence),
+        contradicted=len(contradictions),
+    )
+    ceiling = ceiling_for(
+        verdict,
+        has_unresolved_defining=bool(unresolved),
+        missing_required_signals=bool(missing),
+    )
+    return verdict, ceiling
 
 
 def _summary(confidence: str, evidence: list[str], contradictions: list[str], unresolved: list[str]) -> str:
