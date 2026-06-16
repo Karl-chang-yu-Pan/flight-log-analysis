@@ -21,6 +21,24 @@ graph path supplies the primary-source reconstruction verdict.
 evaluation — promoting unresolved to supported / contradicted when the
 graph is conclusive, and capping the confidence ceiling so a graph
 promotion can never exceed the strength of the underlying evidence.
+
+Why static checks (``parameter_equals``, ``branch_parameter_satisfied``,
+``topic_field_present``) stay on the flat path even though the graph
+could in principle express them:
+
+- The graph executor only runs when the candidate declares
+  ``primary_output_signals`` *and* output bindings reach those signals.
+  Moving static checks into the graph would silently lose them for
+  candidates without a primary terminal (mode/state/parameter questions
+  that aren't about reconstructing a downstream signal).
+- The three flat handlers together total ~36 LOC and share the same
+  helpers (``_get_parameter``, ``_compare_literal``, ``_parse_signal``)
+  as the eleven other typed check kinds, so moving them does not delete
+  any infrastructure — it would add new node types to
+  ``graph_execution.execute_node`` while keeping the shared helpers
+  alive for the remaining handlers.
+- The result is net +LOC, lost coverage, and no simplification.
+  Keep them flat.
 """
 
 from __future__ import annotations
