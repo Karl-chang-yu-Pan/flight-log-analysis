@@ -508,6 +508,243 @@ def test_signature_evaluation_executes_terminal_graph_and_uses_its_verdict(tmp_p
     assert evaluation.raw["verification_graphs"][0]["verdict"] == "supported"
 
 
+def test_helper_substitution_clears_unresolved_when_profiler_lowered_the_body(tmp_path, monkeypatch):
+    """A derived_expression check that lists a helper_dependency with an
+    LLM-supplied unresolved_reason should be evaluable when the source
+    profile actually contains a clean ``lowered_return_expression`` for
+    that helper. The verifier substitutes the helper body into the
+    expression and proceeds with normal evaluation."""
+
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {"NAV_ACC_RAD": 10.0}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_global_position",
+                    multi_id=0,
+                    data={"timestamp": [1_000_000, 2_000_000], "alt": [20.0, 20.0]},
+                ),
+            ]
+
+    monkeypatch.setattr(signature_evaluator, "ULog", FakeULog)
+    monkeypatch.setattr(log_evidence, "ULog", FakeULog)
+
+    candidate = MechanismCandidate(
+        name="Helper-lowering smoke",
+        summary="Floors altitude at twice the acceptance radius.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="vehicle_global_position.alt",
+                expected_expression="2.0 * get_acceptance_radius()",
+                op=">=",
+                max_error=1.0,
+                variables=[
+                    {"name": "vehicle_global_position.alt", "source": "vehicle_global_position.alt"},
+                ],
+                helper_dependencies=[
+                    {
+                        "name": "get_acceptance_radius",
+                        "args": [],
+                        "source_file": "src/modules/navigator/navigator_main.cpp",
+                        "source_line": 100,
+                        # LLM marks this conservatively; the profile knows better.
+                        "unresolved_reason": "Later verification needs the exact default branch.",
+                    }
+                ],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 2.0,
+        "parameters": {"NAV_ACC_RAD": 10.0},
+        "available_topics": ["vehicle_global_position"],
+        "topic_fields": {"vehicle_global_position": ["alt"]},
+    }
+    # The profiler's lowered form for get_acceptance_radius() on the
+    # rotary-wing default branch.
+    helper_expressions = [
+        {
+            "name": "get_acceptance_radius",
+            "file": "src/modules/navigator/navigator_main.cpp",
+            "line": 100,
+            "evidence": "",
+            "parameters": [],
+            "lowered_return_expression": "NAV_ACC_RAD",
+            "branches": [],
+            "unresolved_reason": None,
+        }
+    ]
+
+    plan = compile_verification_plan(
+        candidate,
+        inventory,
+        [],
+        None,
+        helper_expressions=helper_expressions,
+    )
+    applicability = applicability_from_verification_plan(candidate, plan, inventory)
+
+    evaluation = evaluate_candidate_log_signature(
+        tmp_path / "flight.ulg",
+        candidate,
+        applicability,
+        plan,
+        helper_expressions=helper_expressions,
+    )
+
+    # The check now evaluates instead of returning "cannot evaluate helper".
+    assert evaluation.verdict == "supported"
+    # No "cannot evaluate helper" message in the check_results.
+    helper_failure_messages = [
+        result.get("message", "")
+        for result in evaluation.check_results
+        if "cannot evaluate helper" in str(result.get("message", ""))
+    ]
+    assert helper_failure_messages == []
+
+
+def test_helper_substitution_picks_branch_using_inventory_parameter(tmp_path, monkeypatch):
+    """A branched helper whose condition references an inventory parameter
+    should be resolved at plan-compile time: the verifier evaluates each
+    condition against the known parameter values and substitutes the
+    matching branch into the expression."""
+
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {"NAV_ACC_RAD": 10.0, "RTL_CONE_ANG": 45}
+            self.data_list = [
+                SimpleNamespace(
+                    name="vehicle_global_position",
+                    multi_id=0,
+                    data={"timestamp": [1_000_000, 2_000_000], "alt": [30.0, 30.0]},
+                ),
+            ]
+
+    monkeypatch.setattr(signature_evaluator, "ULog", FakeULog)
+    monkeypatch.setattr(log_evidence, "ULog", FakeULog)
+
+    # A helper with two branches. With RTL_CONE_ANG=45, the cone branch is
+    # selected and ``acceptance_floor()`` lowers to ``2.0 * NAV_ACC_RAD``.
+    helper_expressions = [
+        {
+            "name": "acceptance_floor",
+            "file": "src/modules/navigator/rtl.cpp",
+            "line": 720,
+            "parameters": [],
+            "branches": [
+                {"condition": "RTL_CONE_ANG > 0", "expression": "2.0 * NAV_ACC_RAD"},
+                {"condition": "default", "expression": "0.0"},
+            ],
+            "unresolved_reason": None,
+        }
+    ]
+
+    candidate = MechanismCandidate(
+        name="Branched helper smoke",
+        summary="Floors altitude at the branch-resolved acceptance floor.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="vehicle_global_position.alt",
+                expected_expression="acceptance_floor()",
+                op=">=",
+                max_error=1.0,
+                variables=[
+                    {"name": "vehicle_global_position.alt", "source": "vehicle_global_position.alt"},
+                ],
+                helper_dependencies=[
+                    {
+                        "name": "acceptance_floor",
+                        "args": [],
+                        "source_file": "src/modules/navigator/rtl.cpp",
+                        "source_line": 720,
+                        "unresolved_reason": "Acceptance-radius branch resolution remained unresolved.",
+                    }
+                ],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 2.0,
+        "parameters": {"NAV_ACC_RAD": 10.0, "RTL_CONE_ANG": 45},
+        "available_topics": ["vehicle_global_position"],
+        "topic_fields": {"vehicle_global_position": ["alt"]},
+    }
+
+    plan = compile_verification_plan(
+        candidate, inventory, [], None, helper_expressions=helper_expressions,
+    )
+    applicability = applicability_from_verification_plan(candidate, plan, inventory)
+
+    check = plan.branches[0].checks[0]
+    assert check.executable is True, check.unresolved_dependencies
+
+    evaluation = evaluate_candidate_log_signature(
+        tmp_path / "flight.ulg",
+        candidate,
+        applicability,
+        plan,
+        helper_expressions=helper_expressions,
+    )
+    assert evaluation.verdict == "supported"
+
+
+def test_helper_substitution_does_not_resolve_when_branch_condition_fails(tmp_path):
+    """When a branched helper's conditions all fail against the static
+    parameter env and there is no default branch, the check stays
+    unresolved at compile time."""
+
+    helper_expressions = [
+        {
+            "name": "f",
+            "file": "fake.cpp",
+            "line": 1,
+            "parameters": [],
+            "branches": [
+                {"condition": "MISSING_PARAM > 0", "expression": "1.0"},
+            ],
+            "unresolved_reason": None,
+        }
+    ]
+    candidate = MechanismCandidate(
+        name="No matching branch",
+        summary="",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="vehicle_global_position.alt",
+                expected_expression="f()",
+                variables=[
+                    {"name": "vehicle_global_position.alt", "source": "vehicle_global_position.alt"},
+                ],
+                helper_dependencies=[
+                    {
+                        "name": "f",
+                        "args": [],
+                        "unresolved_reason": "Branch not statically resolvable.",
+                    }
+                ],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {},
+        "available_topics": ["vehicle_global_position"],
+        "topic_fields": {"vehicle_global_position": ["alt"]},
+    }
+    plan = compile_verification_plan(
+        candidate, inventory, [], None, helper_expressions=helper_expressions,
+    )
+    check = plan.branches[0].checks[0]
+    assert check.executable is False
+    assert any("helper f" in dep for dep in check.unresolved_dependencies), check.unresolved_dependencies
+
+
 def test_invalid_source_filename_presence_check_is_ignored():
     candidate = MechanismCandidate(
         name="Malformed source check",

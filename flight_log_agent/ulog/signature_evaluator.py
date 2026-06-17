@@ -10,6 +10,7 @@ from typing import Any
 
 from pyulog import ULog
 
+from flight_log_agent.analysis.helper_resolution import HelperRegistry, substitute_helpers
 from flight_log_agent.analysis.parameter_lookup import get_parameter as _get_parameter
 from flight_log_agent.analysis.source_expression import (
     alias_dotted_names,
@@ -37,9 +38,7 @@ def evaluate_log_signature(
     source_path: Path | None = None,
     helper_expressions: Iterable[dict[str, Any]] = (),
 ) -> dict:
-    # helper_expressions plumbed through for P3 (source-derived helper
-    # substitution). Not consumed yet at this layer.
-    _ = list(helper_expressions)
+    helper_registry = HelperRegistry(list(helper_expressions))
     try:
         ulog = ULog(str(log_path))
     except Exception as exc:
@@ -71,11 +70,11 @@ def evaluate_log_signature(
     ]
 
     numeric_results = [
-        _run_check(topics, windows, parameters, check, category="numeric", source_path=source_path)
+        _run_check(topics, windows, parameters, check, category="numeric", source_path=source_path, helper_registry=helper_registry)
         for check in numeric_checks
     ]
     exclusion_results = [
-        _run_check(topics, windows, parameters, check, category="exclusion", source_path=source_path)
+        _run_check(topics, windows, parameters, check, category="exclusion", source_path=source_path, helper_registry=helper_registry)
         for check in exclusion_checks
     ]
 
@@ -122,6 +121,7 @@ def _run_check(
     *,
     category: str,
     source_path: Path | None = None,
+    helper_registry: HelperRegistry | None = None,
 ) -> dict:
     check_type = str(check.get("type") or "").strip()
     handlers = {
@@ -149,7 +149,7 @@ def _run_check(
         )
 
     try:
-        check = {**check, "_source_path": source_path}
+        check = {**check, "_source_path": source_path, "_helper_registry": helper_registry}
         result = handler(topics, windows, parameters, check)
     except Exception as exc:
         result = _check_result(
@@ -508,8 +508,24 @@ def _check_derived_expression(
     if window is None:
         return _check_result(check, status="unresolved", message=f"unknown window: {check.get('window')}")
 
+    expected_expression = str(check.get("expected_expression") or "").strip()
+
+    # Source-derived helper substitution: when a HelperRegistry is in scope
+    # and the LLM wrote helper calls into the expression text, replace
+    # them with their lowered bodies (single-return or branch-picked).
+    # If substitution succeeds and no unresolved-reason helper_dependencies
+    # remain that aren't also resolvable via the registry, we proceed; if
+    # any blocker remains we fall back to the original "cannot evaluate
+    # helper X" path.
+    helper_registry = check.get("_helper_registry")
+    if isinstance(helper_registry, HelperRegistry):
+        substitution_env = _helper_substitution_env(parameters)
+        expression = substitute_helpers(expression, registry=helper_registry, env=substitution_env)
+        if expected_expression:
+            expected_expression = substitute_helpers(expected_expression, registry=helper_registry, env=substitution_env)
+
     helper_dependency = _first_unresolved_helper_dependency(check)
-    if helper_dependency is not None:
+    if helper_dependency is not None and not _helper_dependency_resolved(helper_dependency, helper_registry):
         helper_name = helper_dependency["name"]
         reason = helper_dependency.get("unresolved_reason") or "helper has not been translated into safe expression IR"
         return _check_result(
@@ -528,7 +544,7 @@ def _check_derived_expression(
         check,
         expression,
         window,
-        expected_expression=str(check.get("expected_expression") or "").strip(),
+        expected_expression=expected_expression,
     )
     if context["missing"] and not context.get("defer_missing"):
         missing = ", ".join(context["missing"])
@@ -553,7 +569,6 @@ def _check_derived_expression(
         return _check_result(check, status="unresolved", message=f"no expression samples for {expression}")
 
     op = str(check.get("op") or "").strip()
-    expected_expression = str(check.get("expected_expression") or "").strip()
     expected_literal = check.get("value")
     comparisons: list[bool] = []
     expected_values: list[Any] = []
@@ -810,6 +825,47 @@ def _expression_variables_map(raw_variables: Any) -> dict[str, str]:
         if name and source:
             variables[str(name)] = str(source)
     return variables
+
+
+def _helper_substitution_env(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Build the env used to evaluate branch conditions during substitution.
+
+    Today this is just the inventory parameters keyed by name. The verifier
+    cannot easily provide window-bound signal samples here because helper
+    substitution runs before window slicing; conditions that reference
+    runtime signal values therefore fall through to compile-time
+    resolution in verification_plan (P4) or remain unresolved.
+    """
+    env: dict[str, Any] = {}
+    for name, value in (parameters or {}).items():
+        if name and not isinstance(name, str):
+            continue
+        env[str(name)] = value
+    return env
+
+
+def _helper_dependency_resolved(
+    dependency: dict[str, Any] | None,
+    registry: Any,
+) -> bool:
+    """Whether a helper_dependency's unresolved_reason can be cleared.
+
+    True when a HelperRegistry is in scope AND the registry has a record
+    for the dependency's name with no unresolved_reason of its own — i.e.
+    the profiler successfully lowered the helper from source, regardless
+    of what the LLM wrote into the dependency's unresolved_reason string.
+    """
+    if dependency is None:
+        return False
+    if not isinstance(registry, HelperRegistry):
+        return False
+    name = str(dependency.get("name") or "").strip()
+    if not name:
+        return False
+    ref = registry.get(name)
+    if ref is None:
+        return False
+    return not ref.get("unresolved_reason")
 
 
 def _first_unresolved_helper_dependency(check: dict) -> dict[str, Any] | None:

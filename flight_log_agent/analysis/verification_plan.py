@@ -8,6 +8,7 @@ from typing import Any, Iterable, Optional
 
 from flight_log_agent.analysis.binding_index import BindingIndex
 from flight_log_agent.analysis.binding_index import assignment_path_symbols as _binding_assignment_path_symbols
+from flight_log_agent.analysis.helper_resolution import HelperRegistry, substitute_helpers
 from flight_log_agent.analysis.source_expression import (
     ALLOWED_EXPRESSION_NODES,
     alias_dotted_names,
@@ -49,10 +50,7 @@ def compile_verification_plan(
     *,
     helper_expressions: Iterable[dict[str, Any]] = (),
 ) -> VerificationPlan:
-    # helper_expressions is accepted for forward-compatibility with the
-    # source-derived helper substitution work; not consumed yet (P1 is the
-    # plumbing-only step).
-    _ = list(helper_expressions)
+    helper_registry = HelperRegistry(list(helper_expressions))
     bindings_list = list(output_bindings)
     index = BindingIndex(inventory, bindings_list)
     prefer = _prefer_signals_for_candidate(candidate, index)
@@ -116,6 +114,7 @@ def compile_verification_plan(
             timeline=timeline,
             mission=mission,
             resolver=resolver,
+            helper_registry=helper_registry,
         )
         for (
             name,
@@ -236,6 +235,7 @@ def compile_branch_plan(
     timeline: list[dict[str, Any]],
     mission: Optional[dict[str, Any]],
     resolver: "SignalResolver",
+    helper_registry: HelperRegistry | None = None,
 ) -> VerificationBranchPlan:
     branch_id = stable_id("branch", {
         "mechanism_id": mechanism_id,
@@ -303,7 +303,7 @@ def compile_branch_plan(
                 and not resolver.is_known_signal_reference(check.signal)
             ):
                 continue
-            checks.append(compile_check_plan(check, category, branch_id, resolver, inventory))
+            checks.append(compile_check_plan(check, category, branch_id, resolver, inventory, helper_registry=helper_registry))
     check_signals = dedupe(
         signal
         for planned in checks
@@ -335,6 +335,8 @@ def compile_check_plan(
     branch_id: str,
     resolver: "SignalResolver",
     inventory: dict[str, Any],
+    *,
+    helper_registry: HelperRegistry | None = None,
 ) -> VerificationCheckPlan:
     role = check_role(check)
     data = _model_dump(check)
@@ -365,12 +367,38 @@ def compile_check_plan(
         variables.append(variable_data)
     data["variables"] = variables
 
+    # Source-derived helper substitution: if a registry is in scope and
+    # the LLM wrote helper calls into expression / expected_expression,
+    # rewrite them now (before validation). This also lets the verifier
+    # consult the source profile to determine whether a helper the LLM
+    # marked "unresolved" can actually be resolved (the LLM tends to
+    # declare and defer; the profile knows what was lowered).
+    helper_substitution_env: dict[str, Any] = {}
+    for parameter_name, parameter_value in (inventory.get("parameters") or {}).items():
+        if isinstance(parameter_name, str):
+            helper_substitution_env[parameter_name] = parameter_value
+    if helper_registry is not None and check.type == "derived_expression":
+        for field in ("expression", "expected_expression"):
+            value = data.get(field)
+            if isinstance(value, str) and value:
+                data[field] = substitute_helpers(
+                    value,
+                    registry=helper_registry,
+                    env=helper_substitution_env,
+                )
+
     helper_dependencies = data.get("helper_dependencies") or []
-    unresolved.extend(
-        f"helper {dependency.get('name')}: {dependency.get('unresolved_reason')}"
-        for dependency in helper_dependencies
-        if dependency.get("unresolved_reason")
-    )
+    for dependency in helper_dependencies:
+        reason = dependency.get("unresolved_reason")
+        if not reason:
+            continue
+        if helper_registry is not None and _helper_is_resolvable_in_registry(
+            dependency.get("name") or "",
+            helper_registry,
+            env=helper_substitution_env,
+        ):
+            continue
+        unresolved.append(f"helper {dependency.get('name')}: {reason}")
     if check.type == "derived_expression":
         unresolved.extend(validate_derived_expression(data, inventory))
 
@@ -865,6 +893,44 @@ class SignalResolver:
 
     def resolve(self, reference: str) -> VerificationSignalResolution:
         return self._index.resolve(reference, prefer=self._prefer)
+
+
+def _helper_is_resolvable_in_registry(
+    name: str,
+    registry: HelperRegistry,
+    *,
+    env: dict[str, Any],
+) -> bool:
+    """Whether ``registry`` has a record for ``name`` that can be lowered.
+
+    A helper is resolvable when the profile lists no ``unresolved_reason``
+    and at least one branch's condition holds against ``env`` (or there is
+    a default branch / a single-return body). Branch conditions that
+    reference signals not in ``env`` count as not holding, but a default
+    branch still resolves the helper.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return False
+    ref = registry.get(name)
+    if ref is None or ref.get("unresolved_reason"):
+        return False
+    if ref.get("lowered_return_expression") or ref.get("return_expression"):
+        return True
+    branches = ref.get("branches") or []
+    if not branches:
+        return False
+    from flight_log_agent.analysis.helper_resolution import _condition_holds
+
+    for branch in branches:
+        condition = str(branch.get("condition") or "").strip()
+        expression = str(branch.get("expression") or "").strip()
+        if not expression:
+            continue
+        if not condition or condition == "default":
+            return True
+        if _condition_holds(condition, env):
+            return True
+    return False
 
 
 def _prefer_signals_for_candidate(
