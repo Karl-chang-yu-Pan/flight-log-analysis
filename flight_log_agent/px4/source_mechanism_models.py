@@ -121,6 +121,12 @@ class SourceMechanismCandidateSet(BaseModel):
     expansion_queries: list[str] = Field(default_factory=list)
     unresolved_questions: list[str] = Field(default_factory=list)
     output_bindings: list[SourceOutputBindingRecord] = Field(default_factory=list)
+    # Helper expression refs discovered during source profiling. Kept as
+    # opaque dicts (model_dump shape) so the candidate-set model stays
+    # decoupled from mechanism_source_profiler.HelperExpressionRef while
+    # the verifier still has access to lowered_return_expression, branches,
+    # parameters, and symbol_bindings.
+    helper_expressions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SourceDiscoveryCandidateDraft(BaseModel):

@@ -35,7 +35,11 @@ def evaluate_log_signature(
     numeric_checks: list[dict],
     *,
     source_path: Path | None = None,
+    helper_expressions: Iterable[dict[str, Any]] = (),
 ) -> dict:
+    # helper_expressions plumbed through for P3 (source-derived helper
+    # substitution). Not consumed yet at this layer.
+    _ = list(helper_expressions)
     try:
         ulog = ULog(str(log_path))
     except Exception as exc:

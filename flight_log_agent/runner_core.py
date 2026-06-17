@@ -526,6 +526,7 @@ async def analyze_flight_log(
         ]
         mechanism_cache_summary["cache_hit_candidate_names"] = [c.name for c in cached_candidates]
         source_output_bindings: list[SourceOutputBindingRecord] = []
+        source_helper_expressions: list[dict[str, Any]] = []
 
         if cached_candidates and source_path_obj is None:
             source_evidence = empty_source_discovery_evidence(source_search_context)
@@ -575,6 +576,7 @@ async def analyze_flight_log(
                 cached_candidates,
             )
             source_output_bindings = list(source_candidate_set.output_bindings)
+            source_helper_expressions = list(source_candidate_set.helper_expressions)
             candidate_set = source_mechanisms_to_candidates(
                 source_candidate_set,
                 output_bindings=source_output_bindings,
@@ -649,6 +651,7 @@ async def analyze_flight_log(
                 timeline,
                 mission,
                 source_output_bindings,
+                helper_expressions=source_helper_expressions,
             )
             applicability = _audit_sync_call(
                 audit_logger,
@@ -692,6 +695,7 @@ async def analyze_flight_log(
                     source_output_bindings,
                     graph_evidence_index,
                     candidate_graphs,
+                    source_helper_expressions,
                 )
 
             verified_results.append(
@@ -1725,6 +1729,7 @@ def evaluate_candidate_log_signature(
     output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
     graph_evidence_index: Optional[ULogEvidenceIndex] = None,
     verification_graphs: Optional[list[Any]] = None,
+    helper_expressions: Optional[list[dict[str, Any]]] = None,
 ) -> SignatureEvaluation:
     return evaluate_candidate_log_signature_impl(
         ctx.log_path,
@@ -1735,6 +1740,7 @@ def evaluate_candidate_log_signature(
         output_bindings=output_bindings or [],
         graph_evidence_index=graph_evidence_index,
         verification_graphs=verification_graphs,
+        helper_expressions=helper_expressions or [],
     )
 
 

@@ -330,6 +330,10 @@ class SourceMechanismResolver:
             expansion_queries=all_queries,
             unresolved_questions=[],
             output_bindings=output_bindings,
+            helper_expressions=[
+                ref.model_dump(exclude_none=True)
+                for ref in dedupe_helper_expression_refs(helper_expressions)
+            ],
         )
 
     def _build_iteration_packet(

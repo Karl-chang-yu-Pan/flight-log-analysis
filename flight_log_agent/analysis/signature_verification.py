@@ -71,6 +71,7 @@ def evaluate_candidate_log_signature(
     output_bindings: Iterable[Any] = (),
     graph_evidence_index: ULogEvidenceIndex | None = None,
     verification_graphs: Iterable[Any] | None = None,
+    helper_expressions: Iterable[dict[str, Any]] = (),
 ) -> SignatureEvaluation:
     if verification_plan is not None:
         evaluation = evaluate_verification_plan(
@@ -79,6 +80,7 @@ def evaluate_candidate_log_signature(
             applicability,
             verification_plan,
             source_path=source_path,
+            helper_expressions=helper_expressions,
         )
     else:
         required_signals = [
@@ -198,7 +200,9 @@ def evaluate_verification_plan(
     plan: VerificationPlan,
     *,
     source_path: Path | None = None,
+    helper_expressions: Iterable[dict[str, Any]] = (),
 ) -> SignatureEvaluation:
+    helper_refs = list(helper_expressions)
     branch_results: list[dict[str, Any]] = []
     all_check_results: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -230,6 +234,7 @@ def evaluate_verification_plan(
                 exclusion_checks,
                 numeric_checks,
                 source_path=source_path,
+                helper_expressions=helper_refs,
             )
             check_results = raw.get("check_results") if isinstance(raw.get("check_results"), list) else []
             all_check_results.extend(check_results)

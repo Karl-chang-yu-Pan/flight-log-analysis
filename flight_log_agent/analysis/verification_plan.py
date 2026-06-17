@@ -46,7 +46,13 @@ def compile_verification_plan(
     timeline: list[dict[str, Any]],
     mission: Optional[dict[str, Any]],
     output_bindings: Iterable[Any] = (),
+    *,
+    helper_expressions: Iterable[dict[str, Any]] = (),
 ) -> VerificationPlan:
+    # helper_expressions is accepted for forward-compatibility with the
+    # source-derived helper substitution work; not consumed yet (P1 is the
+    # plumbing-only step).
+    _ = list(helper_expressions)
     bindings_list = list(output_bindings)
     index = BindingIndex(inventory, bindings_list)
     prefer = _prefer_signals_for_candidate(candidate, index)
