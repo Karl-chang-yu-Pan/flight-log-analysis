@@ -337,6 +337,22 @@ class MechanismSourceProfiler:
         r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
         r"\s*=\s*(?P<expr>[^;]+);"
     )
+    # C++ reference declaration: ``[const] Type &name = expression;``.
+    # Captured per-function so subsequent uses of ``name.X`` in the body can
+    # be rewritten to ``expression.X`` before assignments / field accesses are
+    # extracted. The alias is only applied when the RHS ends in a member
+    # access (``.foo`` or ``->foo`` without trailing ``()``) — otherwise the
+    # existing struct-var binding path (which handles cases like
+    # ``Type &name = *getter();``) is the better resolution.
+    _REFERENCE_ALIAS_PATTERN = re.compile(
+        r"(?:const\s+)?"
+        r"(?P<type>[A-Za-z_][A-Za-z0-9_:<>]*)"
+        r"\s*&\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+        r"\s*=\s*(?P<expr>[^;]+);"
+    )
+    _ALIAS_TRAILING_MEMBER_ACCESS_RE = re.compile(
+        r"(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*\s*$"
+    )
     _SOURCE_COMPOUND_ASSIGNMENT_PATTERN = re.compile(
         r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
         r"\s*(?P<op>\+=|-=|\*=|/=|%=|\|=|&=|\^=)\s*(?P<expr>[^;]+);"
@@ -756,6 +772,7 @@ class MechanismSourceProfiler:
             rel_file = self._rel(path)
             var_to_struct = self._extract_struct_variables(text)
             definitions = self._extract_function_definitions(text, rel_file)
+            aliases_per_function = self._extract_reference_aliases_per_function(definitions)
             control_predicates = self._control_predicates_by_line(text)
 
             for line_no, line in self._iter_code_lines(text):
@@ -763,9 +780,26 @@ class MechanismSourceProfiler:
                 if not stripped or stripped.startswith("//"):
                     continue
                 function_name = self._function_name_for_line(definitions, line_no)
+                func_aliases = aliases_per_function.get(function_name or "", {})
                 for match in self._SOURCE_ASSIGNMENT_PATTERN.finditer(line):
                     target = self._clean_field_path(match.group("target"))
+                    target = self._apply_reference_alias(target, func_aliases)
                     expression = self._normalize_source_expression(match.group("expr"))
+                    # Skip self-writes that the alias substitution produces.
+                    # Two cases this covers:
+                    #   1. The alias declaration line itself, which the
+                    #      assignment regex matches as ``curr_sp = X.Y``;
+                    #      after substitution that collapses to a self-write.
+                    #   2. A pointer initialisation like
+                    #      ``Type *curr_sp = &X.Y;`` that lives in an outer
+                    #      scope but shares the variable name with a
+                    #      reference declared in an inner block — the
+                    #      profiler's alias extractor is function-scoped
+                    #      (not block-scoped), so the alias leaks across.
+                    #      Stripping leading ``&*`` from the expression lets
+                    #      the self-write check still catch these.
+                    if self._clean_field_path(expression.lstrip("&* ")) == target:
+                        continue
                     definition = self._function_definition_for_line(definitions, line_no)
                     root, field = split_source_field(target)
                     struct = var_to_struct.get(root)
@@ -792,6 +826,7 @@ class MechanismSourceProfiler:
                     )
                 for match in self._SOURCE_COMPOUND_ASSIGNMENT_PATTERN.finditer(line):
                     target = self._clean_field_path(match.group("target"))
+                    target = self._apply_reference_alias(target, func_aliases)
                     operator = match.group("op")
                     expression = self._compound_assignment_expression(
                         target,
@@ -2108,6 +2143,70 @@ class MechanismSourceProfiler:
     @staticmethod
     def _clean_field_path(field_text: str) -> str:
         return re.sub(r"\s*(?:\.|->)\s*", ".", field_text.strip())
+
+    @classmethod
+    def _extract_reference_aliases_per_function(
+        cls,
+        definitions: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, str]]:
+        """Per-function map ``{function_name: {var: aliased_path}}``.
+
+        Only aliases whose RHS resolves to a field projection on another
+        struct (``container.field`` / ``container->field`` / chained getters
+        ending in ``->field``) are kept. The dereferenced-getter pattern
+        ``Type &name = *getter();`` is intentionally *excluded* — the
+        existing struct-var path handles those cleanly via the struct type
+        and the alias would only obscure the resolution.
+        """
+        aliases_per_function: Dict[str, Dict[str, str]] = {}
+        for definition in definitions:
+            function_name = str(definition.get("name") or "")
+            body = str(definition.get("body") or "")
+            if not function_name or not body:
+                continue
+            func_aliases: Dict[str, str] = {}
+            for match in cls._REFERENCE_ALIAS_PATTERN.finditer(body):
+                name = match.group("name")
+                raw_expr = match.group("expr").strip()
+                if not cls._alias_rhs_is_field_projection(raw_expr):
+                    continue
+                func_aliases[name] = cls._clean_field_path(raw_expr.lstrip("*&"))
+            if func_aliases:
+                aliases_per_function[function_name] = func_aliases
+        return aliases_per_function
+
+    @classmethod
+    def _is_alias_declaration_line(cls, line: str) -> bool:
+        return bool(cls._REFERENCE_ALIAS_PATTERN.match(line.strip()))
+
+    @classmethod
+    def _alias_rhs_is_field_projection(cls, rhs: str) -> bool:
+        """Whether ``rhs`` ends in a member access without a trailing call.
+
+        Used to filter alias declarations: only ``Type &name = <expr>.field``
+        or ``Type &name = ...->field`` style declarations get aliased. A
+        plain ``Type &name = *getter()`` is left alone so the struct-var
+        path continues to bind ``name.X`` via the struct type.
+        """
+        return bool(cls._ALIAS_TRAILING_MEMBER_ACCESS_RE.search(rhs))
+
+    @staticmethod
+    def _apply_reference_alias(path: str, aliases: Dict[str, str]) -> str:
+        """If ``path``'s leading identifier is in ``aliases``, substitute it.
+
+        Returns ``path`` unchanged when no alias applies. Substitution is
+        textual on the leading dotted identifier; the rest of the path is
+        preserved verbatim so e.g. ``curr_sp.lat`` becomes
+        ``<alias>.lat`` and ``curr_sp.acceptance_radius`` becomes
+        ``<alias>.acceptance_radius``.
+        """
+        if not aliases or not path:
+            return path
+        head, sep, tail = path.partition(".")
+        if head in aliases:
+            replacement = aliases[head]
+            return f"{replacement}.{tail}" if tail else replacement
+        return path
 
     def _rel(self, path: Path) -> str:
         return path.as_posix()

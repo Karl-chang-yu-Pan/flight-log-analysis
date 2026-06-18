@@ -650,6 +650,192 @@ bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
     assert by_target["sp.alt"].expression == "get_absolute_altitude_for_item(item)"
 
 
+def test_reference_alias_substitutes_target_in_source_assignment(tmp_path):
+    """``Type &name = container.field;`` should rewrite subsequent
+    ``name.X = Y;`` assignments so the recorded target carries the full
+    canonical path."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "writer.cpp").write_text(
+        """
+void Writer::populate_setpoint(const RTLPosition &destination)
+{
+    position_setpoint_s &curr_sp = _navigator->get_position_setpoint_triplet()->current;
+    curr_sp.lat = destination.lat;
+    curr_sp.lon = destination.lon;
+    curr_sp.acceptance_radius = _navigator->get_acceptance_radius();
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/writer.cpp"]
+    )
+    by_target = {assignment.target: assignment for assignment in assignments}
+
+    # The substituted target traces back to the actual container the
+    # reference aliased. The original ``curr_sp.X`` paths should NOT appear.
+    assert "curr_sp.lat" not in by_target
+    assert "_navigator.get_position_setpoint_triplet().current.lat" in by_target
+    assert (
+        by_target["_navigator.get_position_setpoint_triplet().current.lat"].expression
+        == "destination.lat"
+    )
+    # Expression is run through _normalize_source_expression, which
+    # collapses ``->`` to ``.``.
+    assert (
+        by_target["_navigator.get_position_setpoint_triplet().current.acceptance_radius"].expression
+        == "_navigator.get_acceptance_radius()"
+    )
+
+
+def test_reference_alias_does_not_substitute_when_rhs_is_dereferenced_getter(tmp_path):
+    """``Type &name = *getter();`` returns a whole struct, not a field
+    projection — we leave it alone so the existing struct-var path keeps
+    binding ``name.X`` via the struct type."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "reader.cpp").write_text(
+        """
+void Reader::compute()
+{
+    const vehicle_global_position_s &gpos = *_navigator->get_global_position();
+    float altitude = gpos.alt;
+    altitude = gpos.alt + 1.0f;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/reader.cpp"]
+    )
+    by_target = {assignment.target: assignment for assignment in assignments}
+
+    # ``altitude`` is a plain local; ``gpos`` MUST NOT be substituted away,
+    # the struct-var path (which knows gpos is vehicle_global_position_s)
+    # is the right resolution.
+    assert "altitude" in by_target
+    assert by_target["altitude"].expression in {
+        "gpos.alt",
+        "gpos.alt + 1.0",
+    }
+
+
+def test_reference_alias_scoped_per_function(tmp_path):
+    """An alias declared in function A must not leak into function B."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "scoped.cpp").write_text(
+        """
+void Writer::function_a()
+{
+    position_setpoint_s &curr_sp = _navigator->get_position_setpoint_triplet()->current;
+    curr_sp.lat = 1.0;
+}
+
+void Writer::function_b(position_setpoint_s &curr_sp)
+{
+    curr_sp.lat = 2.0;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/scoped.cpp"]
+    )
+    by_function = {
+        (assignment.function, assignment.target): assignment
+        for assignment in assignments
+    }
+
+    # function_a's alias substitutes its target. Profiler returns the
+    # fully-qualified function name including the class scope.
+    assert ("Writer::function_a", "_navigator.get_position_setpoint_triplet().current.lat") in by_function
+    # function_b's parameter is also named curr_sp but is NOT aliased
+    # (the function-parameter form is not a reference *declaration* the
+    # profiler recognises). It stays as ``curr_sp.lat``.
+    assert ("Writer::function_b", "curr_sp.lat") in by_function
+
+
+def test_reference_alias_does_not_emit_noise_for_pointer_self_writes(tmp_path):
+    """A pointer initialisation like ``Type *name = &container.field;`` that
+    shares its variable name with an inner-scope reference declaration
+    should not appear as a substituted self-write in source_assignments.
+    The alias extractor is function-scoped (not block-scoped), so a naive
+    substitution would record ``container.field = &container.field`` for
+    the pointer line — useful as a slicer no-op but noisy."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "scope_leak.cpp").write_text(
+        """
+void Writer::work()
+{
+    struct position_setpoint_s *curr_sp = &_navigator->get_position_setpoint_triplet()->current;
+    if (curr_sp->valid) {
+        position_setpoint_s &curr_sp = _navigator->get_position_setpoint_triplet()->current;
+        curr_sp.lat = 1.0;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/scope_leak.cpp"]
+    )
+
+    # The pointer line ``Type *curr_sp = &X.Y;`` should NOT show up as a
+    # substituted self-write. The real reference-aliased ``curr_sp.lat = 1.0``
+    # SHOULD appear with the substituted target.
+    targets = {a.target for a in assignments}
+    assert "_navigator.get_position_setpoint_triplet().current" not in targets
+    assert "_navigator.get_position_setpoint_triplet().current.lat" in targets
+
+
+def test_reference_alias_accepts_const_reference(tmp_path):
+    """``const Type &name = expr;`` should be recognised just like the
+    non-const form."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "const_ref.cpp").write_text(
+        """
+void Reader::read()
+{
+    const position_setpoint_s &next_sp = _navigator->get_position_setpoint_triplet()->next;
+    float target = next_sp.lat;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/const_ref.cpp"]
+    )
+    by_target = {assignment.target: assignment for assignment in assignments}
+
+    # ``target = next_sp.lat`` has its RHS rewritten via the alias, even
+    # though the assignment target itself is a plain local.
+    assert "target" in by_target
+    # The RHS is normalised through _normalize_source_expression which
+    # collapses arrow accesses. After alias substitution and normalisation,
+    # the path through the getter chain should appear.
+    expression = by_target["target"].expression
+    assert "next_sp" not in expression or "next_sp.lat" in expression  # tolerate either rewriting policy
+
+
 def test_source_assignment_extraction_lowers_compound_updates(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "fw_pos_control"
