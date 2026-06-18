@@ -865,6 +865,107 @@ float adapt_airspeed_setpoint(float calibrated_min_airspeed, float weight_ratio)
     assert by_line[6].function == "adapt_airspeed_setpoint"
 
 
+def test_recursive_helper_extraction_follows_calls_into_other_files(tmp_path):
+    """When a helper body calls another helper defined in a different file,
+    the recursive extractor finds that file via source search and inlines
+    the callee's body into the caller's lowered_return_expression."""
+    source_path = tmp_path / "PX4-Autopilot"
+    caller_dir = source_path / "src" / "modules" / "navigator"
+    callee_dir = source_path / "src" / "lib" / "geo"
+    caller_dir.mkdir(parents=True)
+    callee_dir.mkdir(parents=True)
+    (caller_dir / "compute.cpp").write_text(
+        """
+float compute_total(float a, float b)
+{
+    return scale_pair(a, b) + 1.0f;
+}
+""",
+        encoding="utf-8",
+    )
+    (callee_dir / "scale.cpp").write_text(
+        """
+float scale_pair(float a, float b)
+{
+    return a * 2.0f + b;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    refs = profiler.extract_helper_expressions_recursive(
+        ["src/modules/navigator/compute.cpp"],
+        helper_names=["compute_total"],
+    )
+
+    by_name = {ref.name: ref for ref in refs}
+    assert "compute_total" in by_name
+    composed = by_name["compute_total"].lowered_return_expression or ""
+    # After cross-file composition, scale_pair's body is inlined.
+    assert "scale_pair" not in composed
+    assert "2.0" in composed
+
+
+def test_recursive_helper_extraction_stops_when_no_new_callees(tmp_path):
+    """A helper with no helper_calls (just safe-math) should not trigger
+    further file searches; one pass of extraction is enough."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "noop.cpp").write_text(
+        """
+float self_contained(float a, float b)
+{
+    return max(a, b) + 1.0f;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    refs = profiler.extract_helper_expressions_recursive(
+        ["src/modules/example/noop.cpp"],
+        helper_names=["self_contained"],
+    )
+
+    by_name = {ref.name: ref for ref in refs}
+    assert "self_contained" in by_name
+    # No expansion happened — the only ref is the requested one.
+    assert by_name["self_contained"].unresolved_reason is None
+
+
+def test_recursive_helper_extraction_does_not_chase_safe_math(tmp_path):
+    """Safe-math callees (sin, cos, max, sqrt, isfinite, ...) must not
+    trigger candidate-file searches — those would burn IO on every helper
+    that does ordinary arithmetic."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "trig.cpp").write_text(
+        """
+float distance(float lat1, float lat2)
+{
+    return sqrt(sin(lat1) * sin(lat1) + cos(lat2) * cos(lat2));
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    refs = profiler.extract_helper_expressions_recursive(
+        ["src/modules/example/trig.cpp"],
+        helper_names=["distance"],
+    )
+
+    by_name = {ref.name: ref for ref in refs}
+    assert "distance" in by_name
+    # Safe-math calls stay as-is in the lowered expression.
+    lowered = by_name["distance"].lowered_return_expression or ""
+    assert "sin(" in lowered or "sin (" in lowered
+    assert "sqrt(" in lowered or "sqrt (" in lowered
+
+
 def test_pointer_struct_alias_binds_to_topic_field(tmp_path):
     """A C++ pointer struct (vehicle_status_s *vstatus) should bind so that
     vstatus->vehicle_type resolves to topic vehicle_status's field vehicle_type."""

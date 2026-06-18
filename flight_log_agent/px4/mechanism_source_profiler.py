@@ -987,6 +987,87 @@ class MechanismSourceProfiler:
 
         return self._dedupe_helper_expression_refs(self._compose_helper_expressions(refs, all_refs))
 
+    def extract_helper_expressions_recursive(
+        self,
+        files: Sequence[Union[str, Path]],
+        helper_names: Optional[Sequence[str]] = None,
+        *,
+        max_passes: int = 3,
+        max_candidate_files_per_callee: int = 2,
+    ) -> List[HelperExpressionRef]:
+        """Expand the helper scan to follow ``helper_calls`` across files.
+
+        Closes the cross-file composition gap: the cone helper in
+        ``rtl.cpp`` calls ``get_distance_to_next_waypoint`` defined in
+        ``lib/geo/geo.cpp``, but a fresh scan of just ``rtl.cpp`` doesn't
+        include the callee, so the lowered expression keeps the literal
+        call. This method walks each helper's ``helper_calls`` list, finds
+        candidate files containing those callees via the existing source
+        search, re-extracts, and runs a final compose pass over the union
+        so the cone helper inlines the haversine body even when the
+        initial caller's scope didn't include the geo library.
+
+        Bounded by ``max_passes`` so a callee chain doesn't run away;
+        ``max_candidate_files_per_callee`` caps the per-callee search
+        breadth (the source search is approximate — it returns files
+        containing the name, not just the definition file).
+        """
+        initial_files = list(files)
+        initial_names = list(helper_names or [])
+
+        visited_files: set[str] = {self._rel(Path(f)) for f in initial_files}
+        explored_callees: set[str] = set()
+        for name in initial_names:
+            explored_callees.add(name)
+            explored_callees.add(name.split("::")[-1])
+
+        current_files: list[Union[str, Path]] = initial_files
+        current_names: Optional[list[str]] = initial_names if initial_names else None
+
+        all_refs: List[HelperExpressionRef] = []
+
+        for _ in range(max(1, max_passes)):
+            pass_refs = self.extract_helper_expressions_from_source(current_files, current_names)
+            all_refs.extend(pass_refs)
+
+            new_callees: list[str] = []
+            for ref in pass_refs:
+                for call in ref.helper_calls or []:
+                    short = call.split("::")[-1]
+                    if not short:
+                        continue
+                    if short in explored_callees or call in explored_callees:
+                        continue
+                    if is_safe_math_function_name(call) or is_safe_math_function_name(short):
+                        continue
+                    explored_callees.add(call)
+                    explored_callees.add(short)
+                    new_callees.append(short)
+
+            if not new_callees:
+                break
+
+            candidate_files: list[Union[str, Path]] = []
+            for callee in new_callees:
+                hits = self.search_related_source_files([callee], max_files=max_candidate_files_per_callee)
+                for hit in hits:
+                    if hit.file in visited_files:
+                        continue
+                    visited_files.add(hit.file)
+                    candidate_files.append(hit.file)
+
+            if not candidate_files:
+                break
+
+            current_files = candidate_files
+            current_names = new_callees
+
+        # Final compose pass so callees discovered in later passes inline
+        # into helpers extracted in earlier passes.
+        return self._dedupe_helper_expression_refs(
+            self._compose_helper_expressions(all_refs, all_refs)
+        )
+
     def extract_branch_conditions_from_source(
         self,
         files: Sequence[Union[str, Path]],
