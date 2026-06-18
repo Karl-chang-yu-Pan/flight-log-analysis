@@ -7,6 +7,8 @@ from pyulog import ULog
 from pyulog.px4_events import PX4Events
 
 from flight_log_agent.px4.source_snapshot import SourceHandle, SourceInput, SourceSnapshot, source_handle
+from flight_log_agent.utils import json_safe_value as _json_safe_value
+from flight_log_agent.utils import timestamp_to_seconds
 
 
 EXPECTED_TIMELINE_TOPICS = [
@@ -77,14 +79,6 @@ def _empty_inventory() -> dict:
     }
 
 
-def _json_safe_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").rstrip("\x00")
-
-    if hasattr(value, "item"):
-        return value.item()
-
-    return value
 
 
 def _extract_topic_names(ulog: Any) -> list[str]:
@@ -340,7 +334,7 @@ def _timestamp_to_seconds(timestamp: Any) -> Optional[float]:
     if timestamp is None:
         return None
     try:
-        return round(float(_json_safe_value(timestamp)) / 1_000_000, 6)
+        return timestamp_to_seconds(timestamp)
     except (TypeError, ValueError):
         return None
 

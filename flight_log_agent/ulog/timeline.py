@@ -5,6 +5,9 @@ from typing import Any, Iterable
 
 from pyulog import ULog
 
+from flight_log_agent.utils import json_safe_value as _json_safe_value
+from flight_log_agent.utils import timestamp_to_seconds
+
 
 TIMELINE_FIELDS_BY_TOPIC = {
     "vehicle_status": [
@@ -133,17 +136,7 @@ def _field_change_events(
 
 
 def _timestamp_to_seconds(timestamp: Any) -> float:
-    return round(_json_safe_value(timestamp) / 1_000_000, 3)
-
-
-def _json_safe_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").rstrip("\x00")
-
-    if hasattr(value, "item"):
-        return value.item()
-
-    return value
+    return round(timestamp_to_seconds(timestamp), 3)
 
 
 def _sort_key(time_s: Any) -> tuple[int, float]:

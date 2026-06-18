@@ -8,6 +8,14 @@ from typing import Any
 
 from pyulog import ULog
 
+from flight_log_agent.symbols import parse_simple_signal as _parse_signal
+from flight_log_agent.utils import (
+    is_number as _is_number,
+    json_safe_value as _json_safe_value,
+    round_float as _round_float,
+    timestamp_to_seconds as _timestamp_to_seconds,
+)
+
 
 DISCRETE_UNIQUE_LIMIT = 20
 
@@ -115,17 +123,6 @@ def _compute_signal_metrics(
     return {"metrics": _summarize_samples(field_name, samples)}
 
 
-def _parse_signal(signal: str) -> tuple[str, str] | None:
-    if "." not in signal:
-        return None
-
-    topic, field = signal.split(".", 1)
-    if not topic or not field:
-        return None
-
-    return topic, field
-
-
 def _window_samples(
     timestamps: Any,
     values: Any,
@@ -220,30 +217,6 @@ def _sample_rate_hz(times: list[float]) -> float | None:
         return None
 
     return _round_float((len(times) - 1) / duration_s)
-
-
-def _timestamp_to_seconds(timestamp: Any) -> float:
-    return float(_json_safe_value(timestamp)) / 1_000_000
-
-
-def _json_safe_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").rstrip("\x00")
-
-    if hasattr(value, "item"):
-        return value.item()
-
-    return value
-
-
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not (
-        isinstance(value, float) and math.isnan(value)
-    )
-
-
-def _round_float(value: float) -> float:
-    return round(float(value), 6)
 
 
 def _unit_hint(field_name: str) -> str | None:

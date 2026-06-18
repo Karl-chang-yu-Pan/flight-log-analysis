@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 from pydantic import BaseModel
 
-from flight_log_agent.utils import copy_model, dedupe_keep_order, model_dump, stable_id
+from flight_log_agent.utils import (
+    compare,
+    copy_model,
+    dedupe_keep_order,
+    is_number,
+    json_safe_value,
+    model_dump,
+    round_float,
+    safe_float,
+    safe_int,
+    stable_id,
+    timestamp_to_seconds,
+)
 
 
 class TestDedupeKeepOrder:
@@ -87,3 +101,127 @@ class TestCopyModel:
         updated = copy_model(original, update={"value": 99})
         assert updated.value == 99
         assert original.value == 1
+
+
+class TestJsonSafeValue:
+    def test_bytes_decoded_and_stripped(self):
+        assert json_safe_value(b"PX4\x00") == "PX4"
+
+    def test_invalid_utf8_does_not_raise(self):
+        # errors="replace" mode keeps the call safe.
+        assert isinstance(json_safe_value(b"\xff"), str)
+
+    def test_numpy_scalar_unwrapped(self):
+        class Fake:
+            def item(self):
+                return 42
+
+        assert json_safe_value(Fake()) == 42
+
+    def test_scalar_passes_through(self):
+        assert json_safe_value(3.14) == 3.14
+        assert json_safe_value("hello") == "hello"
+        assert json_safe_value(None) is None
+
+
+class TestTimestampToSeconds:
+    def test_microseconds_to_seconds_at_6dp(self):
+        assert timestamp_to_seconds(1_234_567) == 1.234567
+
+    def test_unwraps_numpy_scalar(self):
+        class Fake:
+            def item(self):
+                return 2_000_000
+
+        assert timestamp_to_seconds(Fake()) == 2.0
+
+
+class TestSafeFloat:
+    def test_finite_float(self):
+        assert safe_float(3.14) == 3.14
+
+    def test_int_promotes_to_float(self):
+        assert safe_float(2) == 2.0
+
+    def test_bool_rejected(self):
+        assert safe_float(True) is None
+        assert safe_float(False) is None
+
+    def test_nan_rejected(self):
+        assert safe_float(math.nan) is None
+
+    def test_infinity_rejected(self):
+        assert safe_float(math.inf) is None
+        assert safe_float(-math.inf) is None
+
+    def test_string_coerces(self):
+        assert safe_float("2.5") == 2.5
+
+    def test_none_returns_none(self):
+        assert safe_float(None) is None
+
+    def test_garbage_returns_none(self):
+        assert safe_float("not a number") is None
+        assert safe_float([]) is None
+
+
+class TestSafeInt:
+    def test_int_passthrough(self):
+        assert safe_int(7) == 7
+
+    def test_float_truncates(self):
+        assert safe_int(7.9) == 7
+
+    def test_none_returns_none(self):
+        assert safe_int(None) is None
+
+    def test_garbage_returns_none(self):
+        assert safe_int("not a number") is None
+
+    def test_numpy_scalar_unwrapped(self):
+        class Fake:
+            def item(self):
+                return 13
+
+        assert safe_int(Fake()) == 13
+
+
+class TestIsNumber:
+    def test_finite_number(self):
+        assert is_number(2.5) is True
+
+    def test_bool_rejected(self):
+        assert is_number(True) is False
+
+    def test_nan_rejected(self):
+        assert is_number(math.nan) is False
+
+    def test_string_coerces(self):
+        assert is_number("3.14") is True
+
+
+class TestRoundFloat:
+    def test_rounds_to_six_dp(self):
+        assert round_float(1.2345678901) == 1.234568
+
+
+class TestCompare:
+    @pytest.mark.parametrize(
+        "left, op, right, expected",
+        [
+            (1, "==", 1, True),
+            (1, "!=", 2, True),
+            (1, "<", 2, True),
+            (2, ">", 1, True),
+            (1, "<=", 1, True),
+            (1, ">=", 1, True),
+            ("a", "==", "a", True),
+            (1, "==", 2, False),
+        ],
+    )
+    def test_supported_ops(self, left, op, right, expected):
+        assert compare(left, op, right) is expected
+
+    def test_unsupported_op_raises(self):
+        with pytest.raises(ValueError, match="unsupported operator"):
+            compare(1, "<>", 2)

@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from flight_log_agent.px4.source_snapshot import SourceInput, SourceResolutionError, SourceSnapshot, source_handle
+from flight_log_agent.utils import json_safe_value as _json_safe_value
+from flight_log_agent.utils import safe_int as _safe_int
 
 
 def parse_mission_file(
@@ -349,26 +351,9 @@ def _frame_name(frame: Optional[int], frame_names: dict[int, str]) -> Optional[s
     return frame_names.get(frame, f"MAV_FRAME_{frame}")
 
 
-def _safe_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _safe_number(value: str) -> int | float:
     parsed = float(value)
     if parsed.is_integer():
         return int(parsed)
 
     return parsed
-
-
-def _json_safe_value(value: Any) -> Any:
-    if hasattr(value, "item"):
-        return value.item()
-
-    return value

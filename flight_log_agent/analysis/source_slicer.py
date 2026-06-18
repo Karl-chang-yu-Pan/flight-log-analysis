@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Iterator, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.symbols import normalize_symbol
@@ -52,8 +52,6 @@ class SliceBlocker(BaseModel):
 
 
 class ConditionalSlice(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
     condition: str
     source_file: Optional[str] = None
     source_line: Optional[int] = None

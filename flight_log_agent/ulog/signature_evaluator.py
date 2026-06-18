@@ -12,6 +12,16 @@ from pyulog import ULog
 
 from flight_log_agent.analysis.helper_resolution import HelperRegistry, substitute_helpers
 from flight_log_agent.analysis.parameter_lookup import get_parameter as _get_parameter
+from flight_log_agent.symbols import parse_simple_signal as _parse_signal
+from flight_log_agent.utils import (
+    compare as _compare,
+    is_number as _is_number,
+    json_safe_value as _json_safe_value,
+    round_float as _round_float,
+    safe_float as _safe_float,
+    safe_float as _number,
+    timestamp_to_seconds as _timestamp_to_seconds,
+)
 from flight_log_agent.analysis.source_expression import (
     alias_dotted_names,
     normalize_source_expression,
@@ -1078,15 +1088,6 @@ def _window_for_check(windows: dict[str, dict], check: dict) -> dict | None:
     return next(iter(windows.values()))
 
 
-def _parse_signal(signal: str) -> tuple[str, str] | None:
-    if "." not in signal:
-        return None
-    topic, field = signal.split(".", 1)
-    if not topic or not field:
-        return None
-    return topic, field
-
-
 def _window_samples(timestamps: Any, values: Any, start_s: float, end_s: float) -> list[tuple[float, Any]]:
     samples = []
     for timestamp, value in zip(timestamps, values):
@@ -1147,22 +1148,6 @@ def _numeric_delta(samples: list[tuple[float, Any]]) -> float | None:
     if len(values) < 2:
         return None
     return values[-1] - values[0]
-
-
-def _compare(actual: float, op: str, expected: float) -> bool:
-    if op == ">":
-        return actual > expected
-    if op == ">=":
-        return actual >= expected
-    if op == "<":
-        return actual < expected
-    if op == "<=":
-        return actual <= expected
-    if op == "==":
-        return actual == expected
-    if op == "!=":
-        return actual != expected
-    raise ValueError(f"unsupported operator: {op}")
 
 
 def _compare_literal(actual: Any, op: str, expected: Any, *, tolerance: float | None = None) -> bool:
@@ -1367,44 +1352,6 @@ def _summary(confidence: str, evidence: list[str], contradictions: list[str], un
         f"{len(contradictions)} contradicting checks, "
         f"{len(unresolved)} unresolved checks."
     )
-
-
-def _timestamp_to_seconds(timestamp: Any) -> float:
-    return float(_json_safe_value(timestamp)) / 1_000_000
-
-
-def _json_safe_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").rstrip("\x00")
-    if hasattr(value, "item"):
-        return value.item()
-    return value
-
-
-def _safe_float(value: Any) -> float | None:
-    return _number(value)
-
-
-def _is_number(value: Any) -> bool:
-    return _number(value) is not None
-
-
-def _number(value: Any) -> float | None:
-    if value is None:
-        return None
-    if hasattr(value, "item"):
-        value = value.item()
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
-
-
-def _round_float(value: float) -> float:
-    return round(float(value), 6)
 
 
 def _interpolated_value(times: list[float], values: list[float], target_time: float) -> float | None:

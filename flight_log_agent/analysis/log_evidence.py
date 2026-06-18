@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from pyulog import ULog
 
 from flight_log_agent.symbols import parse_signal_reference
+from flight_log_agent.utils import json_safe_value, timestamp_to_seconds
 
 
 class EvidenceSample(BaseModel):
@@ -182,13 +183,3 @@ def format_signal(topic: str, field: str, multi_id: int) -> str:
     return f"{topic}[{multi_id}].{field}"
 
 
-def timestamp_to_seconds(timestamp: Any) -> float:
-    return float(json_safe_value(timestamp)) / 1_000_000.0
-
-
-def json_safe_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").rstrip("\x00")
-    if hasattr(value, "item"):
-        return value.item()
-    return value

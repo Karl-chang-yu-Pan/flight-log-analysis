@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from flight_log_agent.models import AirframeContext, CodeRef, RelationshipCheckSpec
+from flight_log_agent.utils import compare
 from flight_log_agent.px4.mechanism_source_profiler import (
     BranchConditionRef,
     FieldRef,
@@ -1300,19 +1301,10 @@ def _coerce_literal(value: Any) -> Any:
 
 
 def _compare_values(actual: Any, operator: str, expected: Any) -> bool:
-    if operator == "==":
-        return actual == expected
-    if operator == "!=":
-        return actual != expected
-    if operator == ">":
-        return actual > expected
-    if operator == ">=":
-        return actual >= expected
-    if operator == "<":
-        return actual < expected
-    if operator == "<=":
-        return actual <= expected
-    raise TypeError(f"unsupported operator: {operator}")
+    try:
+        return compare(actual, operator, expected)
+    except ValueError as exc:
+        raise TypeError(str(exc)) from exc
 
 
 def dedupe_keep_order(items: list[str]) -> list[str]:

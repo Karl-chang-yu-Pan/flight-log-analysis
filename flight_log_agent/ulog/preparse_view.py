@@ -12,6 +12,7 @@ from flight_log_agent.ulog.inventory import enrich_inventory_from_source, parse_
 from flight_log_agent.ulog.timeline import build_basic_timeline
 from flight_log_agent.mission.parser import parse_mission_file
 from flight_log_agent.source_path import SOURCE_UNAVAILABLE, resolve_source_path
+from flight_log_agent.utils import json_safe_value as _json_safe_value
 
 
 FLOAT_TOLERANCE = 0.00001
@@ -311,9 +312,3 @@ def _is_float_like(value: Any) -> bool:
     return False
 
 
-def _json_safe_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").rstrip("\x00")
-    if hasattr(value, "item"):
-        return value.item()
-    return value

@@ -83,3 +83,18 @@ def looks_like_enum_constant(value: str) -> bool:
         return False
     leaf = value.rsplit(".", 1)[-1]
     return bool(_ENUM_CONSTANT_LEAF_RE.fullmatch(leaf))
+
+
+def parse_simple_signal(value: str) -> Optional[tuple[str, str]]:
+    """Split a ``"topic.field"`` string into ``(topic, field)`` or return None.
+
+    A stripped-down counterpart to :func:`parse_signal_reference` that
+    doesn't try to extract a multi-instance index. Used by the ULog
+    sample-reading path where signals are already in canonical form.
+    """
+    if not isinstance(value, str) or "." not in value:
+        return None
+    topic, field = value.split(".", 1)
+    if not topic or not field:
+        return None
+    return topic, field

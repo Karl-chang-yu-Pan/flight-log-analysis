@@ -8,6 +8,7 @@ from flight_log_agent.symbols import (
     looks_like_signal_reference,
     normalize_symbol,
     parse_signal_reference,
+    parse_simple_signal,
 )
 
 
@@ -128,6 +129,29 @@ class TestParseSignalReference:
         formatted = "sensor_accel[2].temperature"
         parsed = parse_signal_reference(formatted)
         assert parsed == ("sensor_accel", 2, "temperature")
+
+
+class TestParseSimpleSignal:
+    def test_topic_dot_field(self):
+        assert parse_simple_signal("vehicle_status.nav_state") == ("vehicle_status", "nav_state")
+
+    def test_topic_dot_nested_field(self):
+        # Nested field stays as-is; the split is on the first dot only.
+        assert parse_simple_signal("position_setpoint_triplet.current.alt") == (
+            "position_setpoint_triplet",
+            "current.alt",
+        )
+
+    def test_no_dot_returns_none(self):
+        assert parse_simple_signal("topic") is None
+
+    def test_empty_topic_or_field_returns_none(self):
+        assert parse_simple_signal(".field") is None
+        assert parse_simple_signal("topic.") is None
+
+    def test_non_string_returns_none(self):
+        assert parse_simple_signal(None) is None  # type: ignore[arg-type]
+        assert parse_simple_signal(123) is None  # type: ignore[arg-type]
 
 
 class TestLooksLikeEnumConstant:

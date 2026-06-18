@@ -8,6 +8,8 @@ from pyulog import ULog
 
 from flight_log_agent.px4.msg_schema import load_px4_msg_enum_registry
 from flight_log_agent.px4.source_snapshot import SourceInput, source_handle
+from flight_log_agent.utils import json_safe_value as _json_safe_value
+from flight_log_agent.utils import safe_int as _safe_int
 
 
 OUTPUT_FUNCTION_RE = re.compile(r"^(?P<bus>PWM_(?:MAIN|AUX|FMU)_FUNC)(?P<channel>\d+)$")
@@ -283,19 +285,6 @@ def _infer_confidence(
     return "medium-low"
 
 
-def _safe_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-
-    if hasattr(value, "item"):
-        value = value.item()
-
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def control_surface_type_labels(source_path: SourceInput) -> dict[int, str]:
     source = source_handle(source_path)
     if source is None:
@@ -392,8 +381,3 @@ def _normalize_label(value: str) -> str:
     return label or "unknown"
 
 
-def _json_safe_value(value: Any) -> Any:
-    if hasattr(value, "item"):
-        return value.item()
-
-    return value
