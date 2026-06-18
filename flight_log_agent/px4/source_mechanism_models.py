@@ -127,6 +127,11 @@ class SourceMechanismCandidateSet(BaseModel):
     # the verifier still has access to lowered_return_expression, branches,
     # parameters, and symbol_bindings.
     helper_expressions: list[dict[str, Any]] = Field(default_factory=list)
+    # Source assignment refs (target = expression) discovered during
+    # profiling. Consumed by analysis.source_slicer to backward-slice
+    # unbound dotted symbols in derived_expression checks; also kept as
+    # opaque dicts to avoid coupling with SourceAssignmentRef.
+    source_assignments: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SourceDiscoveryCandidateDraft(BaseModel):

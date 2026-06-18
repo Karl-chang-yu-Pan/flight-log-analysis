@@ -13,7 +13,9 @@ from flight_log_agent.analysis.source_expression import (
     ALLOWED_EXPRESSION_NODES,
     alias_dotted_names,
     normalize_source_expression,
+    source_expression_names,
 )
+from flight_log_agent.analysis.source_slicer import slice_expression
 from flight_log_agent.expression_math import SAFE_MATH_FUNCTIONS, normalize_expression_function_names
 from flight_log_agent.models import (
     ApplicabilityResult,
@@ -49,8 +51,10 @@ def compile_verification_plan(
     output_bindings: Iterable[Any] = (),
     *,
     helper_expressions: Iterable[dict[str, Any]] = (),
+    source_assignments: Iterable[dict[str, Any]] = (),
 ) -> VerificationPlan:
     helper_registry = HelperRegistry(list(helper_expressions))
+    source_assignments_list = list(source_assignments)
     bindings_list = list(output_bindings)
     index = BindingIndex(inventory, bindings_list)
     prefer = _prefer_signals_for_candidate(candidate, index)
@@ -115,6 +119,7 @@ def compile_verification_plan(
             mission=mission,
             resolver=resolver,
             helper_registry=helper_registry,
+            source_assignments=source_assignments_list,
         )
         for (
             name,
@@ -236,6 +241,7 @@ def compile_branch_plan(
     mission: Optional[dict[str, Any]],
     resolver: "SignalResolver",
     helper_registry: HelperRegistry | None = None,
+    source_assignments: list[dict[str, Any]] | None = None,
 ) -> VerificationBranchPlan:
     branch_id = stable_id("branch", {
         "mechanism_id": mechanism_id,
@@ -303,7 +309,7 @@ def compile_branch_plan(
                 and not resolver.is_known_signal_reference(check.signal)
             ):
                 continue
-            checks.append(compile_check_plan(check, category, branch_id, resolver, inventory, helper_registry=helper_registry))
+            checks.append(compile_check_plan(check, category, branch_id, resolver, inventory, helper_registry=helper_registry, source_assignments=source_assignments))
     check_signals = dedupe(
         signal
         for planned in checks
@@ -337,6 +343,7 @@ def compile_check_plan(
     inventory: dict[str, Any],
     *,
     helper_registry: HelperRegistry | None = None,
+    source_assignments: list[dict[str, Any]] | None = None,
 ) -> VerificationCheckPlan:
     role = check_role(check)
     data = _model_dump(check)
@@ -387,6 +394,44 @@ def compile_check_plan(
                     env=helper_substitution_env,
                 )
 
+    # Source-derived backward slicing: after helper substitution, any
+    # remaining unbound dotted symbol (e.g. ``_destination.alt`` left over
+    # from the cone helper body) is fed to the slicer. Resolved symbols
+    # get rewritten in place; partially-resolved ones get a nested ternary
+    # whose unresolved branches surface as warnings on the plan (non-
+    # blocking — the runtime evaluator's lazy ternary picks the active
+    # branch at sample time).
+    warnings: list[str] = []
+    if (
+        check.type == "derived_expression"
+        and source_assignments
+    ):
+        logged_signal_set = _logged_signals_from_inventory(inventory)
+        parameter_set = set((inventory.get("parameters") or {}).keys())
+        for field in ("expression", "expected_expression"):
+            value = data.get(field)
+            if not isinstance(value, str) or not value:
+                continue
+            slice_result = slice_expression(
+                value,
+                source_assignments=source_assignments,
+                logged_signals=logged_signal_set,
+                parameters=parameter_set,
+            )
+            data[field] = slice_result.expression
+            for unresolved_result in slice_result.unresolved:
+                blocker = unresolved_result.blocker
+                if blocker is None:
+                    continue
+                warnings.append(
+                    f"slicer: {blocker.symbol}: {blocker.kind} ({blocker.detail})"
+                )
+        _extend_variables_with_slice_symbols(
+            data,
+            logged_signal_set=logged_signal_set,
+            parameter_set=parameter_set,
+        )
+
     helper_dependencies = data.get("helper_dependencies") or []
     for dependency in helper_dependencies:
         reason = dependency.get("unresolved_reason")
@@ -419,6 +464,7 @@ def compile_check_plan(
         unresolved_dependencies=dedupe(unresolved or (
             ["custom semantic requirement is not executable"] if check.type == "custom" else []
         )),
+        warnings=dedupe(warnings),
     )
 
 
@@ -893,6 +939,69 @@ class SignalResolver:
 
     def resolve(self, reference: str) -> VerificationSignalResolution:
         return self._index.resolve(reference, prefer=self._prefer)
+
+
+def _logged_signals_from_inventory(inventory: dict[str, Any]) -> set[str]:
+    """Set of ``topic.field`` references that are actually logged."""
+    logged: set[str] = set()
+    for topic, fields in (inventory.get("topic_fields") or {}).items():
+        if not isinstance(topic, str):
+            continue
+        for field in fields or []:
+            if isinstance(field, str) and field:
+                logged.add(f"{topic}.{field}")
+    return logged
+
+
+def _extend_variables_with_slice_symbols(
+    data: dict[str, Any],
+    *,
+    logged_signal_set: set[str],
+    parameter_set: set[str],
+) -> None:
+    """Append synthetic variables[] entries for every dotted symbol now
+    referenced by the rewritten expression and not already declared.
+
+    The slicer can introduce three kinds of symbol into an expression:
+
+    1. A logged signal it sliced *to* (e.g. ``home_position.alt``) — gets
+       a synthetic entry pointing at itself so the runtime expression
+       context binds it from the topic.
+    2. A parameter it introduces in a branch condition (e.g.
+       ``RTL_DESTINATION``) — same treatment, the runtime context binds
+       it from the inventory.
+    3. A *fallback* symbol left in place from a partially-resolved
+       conditional (e.g. ``_destination.alt`` kept as the unresolved
+       branch). This one isn't resolvable, but it must still appear in
+       ``variables[]`` so :func:`validate_derived_expression` doesn't
+       reject the rewritten expression at compile time. At runtime,
+       ``_expression_context``'s ``defer_missing`` path (active when the
+       expression contains a ternary) lets evaluation proceed; the
+       fallback only fails if the active branch is the unresolved one.
+    """
+    existing_names: set[str] = set()
+    for variable in data.get("variables") or []:
+        if isinstance(variable, dict):
+            name = variable.get("name")
+            if isinstance(name, str):
+                existing_names.add(name)
+
+    fresh_variables: list[dict[str, str]] = []
+    seen: set[str] = set(existing_names)
+    for field in ("expression", "expected_expression"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        for name in source_expression_names(value):
+            if name in seen:
+                continue
+            if "." not in name and "[" not in name:
+                # Bare identifiers (locals, math functions) aren't variables.
+                continue
+            fresh_variables.append({"name": name, "source": name})
+            seen.add(name)
+    if fresh_variables:
+        data["variables"] = list(data.get("variables") or []) + fresh_variables
 
 
 def _helper_is_resolvable_in_registry(

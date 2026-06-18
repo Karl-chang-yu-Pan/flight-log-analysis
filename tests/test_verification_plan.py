@@ -692,6 +692,208 @@ def test_helper_substitution_picks_branch_using_inventory_parameter(tmp_path, mo
     assert evaluation.verdict == "supported"
 
 
+def test_slicer_resolves_unbound_symbol_from_source_assignments(tmp_path, monkeypatch):
+    """A derived_expression check whose lowered body still references a
+    class-member symbol like ``_destination.lat`` should become executable
+    when source_assignments trace that symbol back to a logged signal."""
+
+    class FakeULog:
+        def __init__(self, path):
+            self.initial_parameters = {}
+            self.data_list = [
+                SimpleNamespace(
+                    name="position_setpoint_triplet",
+                    multi_id=0,
+                    data={
+                        "timestamp": [1_000_000, 2_000_000],
+                        "current.lat": [47.3977, 47.3978],
+                    },
+                ),
+            ]
+
+    monkeypatch.setattr(signature_evaluator, "ULog", FakeULog)
+    monkeypatch.setattr(log_evidence, "ULog", FakeULog)
+
+    candidate = MechanismCandidate(
+        name="Slicer smoke",
+        summary="Compares destination latitude against the logged setpoint.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="position_setpoint_triplet.current.lat",
+                expected_expression="_destination.lat",
+                op="==",
+                max_error=0.001,
+                variables=[
+                    {
+                        "name": "position_setpoint_triplet.current.lat",
+                        "source": "position_setpoint_triplet.current.lat",
+                    },
+                ],
+                helper_dependencies=[],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "available_topics": ["position_setpoint_triplet"],
+        "topic_fields": {"position_setpoint_triplet": ["current.lat"]},
+    }
+    # source_assignments dict shape mirrors SourceAssignmentRef.model_dump.
+    source_assignments = [
+        {
+            "target": "_destination.lat",
+            "expression": "position_setpoint_triplet.current.lat",
+            "control_predicates": [],
+            "file": "src/modules/navigator/rtl.cpp",
+            "line": 100,
+            "evidence": "_destination.lat = position_setpoint_triplet.current.lat;",
+            "function": "RTL::find_RTL_destination",
+        },
+    ]
+
+    plan = compile_verification_plan(
+        candidate,
+        inventory,
+        [],
+        None,
+        source_assignments=source_assignments,
+    )
+
+    check = plan.branches[0].checks[0]
+    # The slicer rewrites the expression so the dotted symbol now refers
+    # to the actually-logged signal.
+    assert "position_setpoint_triplet.current.lat" in check.check.expected_expression
+    assert check.executable is True, check.unresolved_dependencies
+
+
+def test_slicer_attaches_warnings_on_partial_substitution(tmp_path):
+    """When the slicer can resolve one branch but another dead-ends in an
+    external call, the partial expression is kept executable and the
+    unresolved branch is surfaced as a warning."""
+    candidate = MechanismCandidate(
+        name="Slicer partial smoke",
+        summary="Conditional binding resolved on one branch.",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="vehicle_global_position.alt",
+                expected_expression="_destination.alt",
+                variables=[
+                    {
+                        "name": "vehicle_global_position.alt",
+                        "source": "vehicle_global_position.alt",
+                    },
+                ],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {"RTL_DESTINATION": 0},
+        "available_topics": ["vehicle_global_position", "home_position"],
+        "topic_fields": {
+            "vehicle_global_position": ["alt"],
+            "home_position": ["alt"],
+        },
+    }
+    source_assignments = [
+        {
+            "target": "_destination.alt",
+            "expression": "home_position.alt",
+            "control_predicates": ["RTL_DESTINATION == 0"],
+            "file": "src/modules/navigator/rtl.cpp",
+            "line": 100,
+            "evidence": "",
+            "function": "RTL::find_RTL_destination",
+        },
+        {
+            "target": "_destination.alt",
+            "expression": "dm_read(DM_KEY_MISSION_LANDING, 0)",
+            "control_predicates": ["RTL_DESTINATION == 1"],
+            "file": "src/modules/navigator/rtl.cpp",
+            "line": 110,
+            "evidence": "",
+            "function": "RTL::find_RTL_destination",
+        },
+    ]
+
+    plan = compile_verification_plan(
+        candidate, inventory, [], None,
+        source_assignments=source_assignments,
+    )
+
+    check = plan.branches[0].checks[0]
+    # Partial substitution keeps the check executable.
+    assert check.executable is True
+    # Warning carries actionable detail naming the specific symbol.
+    assert any("destination.alt" in w for w in check.warnings), check.warnings
+    # The rewritten expression is a ternary that inlines the resolved
+    # branch (home_position.alt) under the RTL_DESTINATION == 0 condition.
+    assert "home_position.alt" in check.check.expected_expression
+    assert "RTL_DESTINATION" in check.check.expected_expression
+
+
+def test_slicer_extends_variables_with_introduced_symbols(tmp_path):
+    """Slicer-introduced logged signals / parameters get appended to the
+    check's variables[] so the runtime expression context binds them."""
+    candidate = MechanismCandidate(
+        name="Variables extension smoke",
+        summary="",
+        source_refs=[],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="derived_expression",
+                expression="vehicle_global_position.alt",
+                expected_expression="_destination.alt",
+                variables=[
+                    {
+                        "name": "vehicle_global_position.alt",
+                        "source": "vehicle_global_position.alt",
+                    },
+                ],
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {"RTL_DESTINATION": 0},
+        "available_topics": ["vehicle_global_position", "home_position"],
+        "topic_fields": {
+            "vehicle_global_position": ["alt"],
+            "home_position": ["alt"],
+        },
+    }
+    source_assignments = [
+        {
+            "target": "_destination.alt",
+            "expression": "home_position.alt",
+            "control_predicates": ["RTL_DESTINATION == 0"],
+            "file": "x.cpp", "line": 1, "evidence": "", "function": "f",
+        },
+    ]
+
+    plan = compile_verification_plan(
+        candidate, inventory, [], None,
+        source_assignments=source_assignments,
+    )
+
+    variable_names = {
+        (v.get("name") if isinstance(v, dict) else v.name)
+        for v in plan.branches[0].checks[0].check.variables
+    }
+    # Logged signal introduced by the slicer is declared so the validator
+    # accepts the rewritten Attribute reference. (Bare parameter names
+    # like RTL_DESTINATION don't need variables[] entries — the runtime
+    # expression context auto-resolves them from inventory.parameters.)
+    assert "home_position.alt" in variable_names
+    # The fallback symbol for the partially-resolved branch is also
+    # declared so the validator's Attribute check passes.
+    assert "_destination.alt" in variable_names or "destination.alt" in variable_names
+
+
 def test_helper_substitution_does_not_resolve_when_branch_condition_fails(tmp_path):
     """When a branched helper's conditions all fail against the static
     parameter env and there is no default branch, the check stays

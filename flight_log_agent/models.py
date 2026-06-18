@@ -199,6 +199,11 @@ class VerificationCheckPlan(BaseModel):
     check: RelationshipCheckSpec
     executable: bool = True
     unresolved_dependencies: list[str] = Field(default_factory=list)
+    # Non-blocking diagnostic notes attached by compile-time passes such
+    # as the source slicer when partial substitution leaves some branches
+    # unresolved. ``executable`` stays True so the runtime evaluator can
+    # try; warnings make the diagnostic information visible in the report.
+    warnings: list[str] = Field(default_factory=list)
 
 
 class VerificationBranchPlan(BaseModel):

@@ -527,6 +527,7 @@ async def analyze_flight_log(
         mechanism_cache_summary["cache_hit_candidate_names"] = [c.name for c in cached_candidates]
         source_output_bindings: list[SourceOutputBindingRecord] = []
         source_helper_expressions: list[dict[str, Any]] = []
+        source_assignments: list[dict[str, Any]] = []
 
         if cached_candidates and source_path_obj is None:
             source_evidence = empty_source_discovery_evidence(source_search_context)
@@ -577,6 +578,7 @@ async def analyze_flight_log(
             )
             source_output_bindings = list(source_candidate_set.output_bindings)
             source_helper_expressions = list(source_candidate_set.helper_expressions)
+            source_assignments = list(source_candidate_set.source_assignments)
             candidate_set = source_mechanisms_to_candidates(
                 source_candidate_set,
                 output_bindings=source_output_bindings,
@@ -652,6 +654,7 @@ async def analyze_flight_log(
                 mission,
                 source_output_bindings,
                 helper_expressions=source_helper_expressions,
+                source_assignments=source_assignments,
             )
             applicability = _audit_sync_call(
                 audit_logger,

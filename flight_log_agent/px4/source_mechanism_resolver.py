@@ -334,6 +334,10 @@ class SourceMechanismResolver:
                 ref.model_dump(exclude_none=True)
                 for ref in dedupe_helper_expression_refs(helper_expressions)
             ],
+            source_assignments=[
+                ref.model_dump(exclude_none=True)
+                for ref in dedupe_source_assignment_refs(source_assignments)
+            ],
         )
 
     def _build_iteration_packet(
