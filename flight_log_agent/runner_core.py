@@ -610,30 +610,59 @@ async def analyze_flight_log(
             )
             mechanism_cache_summary["written_records"] = written_records
 
-        candidate_set.candidates = [
-            sanitize_mechanism_candidate_contract(candidate)
-            for candidate in candidate_set.candidates
-        ]
+        candidate_set.candidates = _audit_stage(
+            audit_logger,
+            "post_source.sanitize",
+            "sanitize_candidates",
+            {"candidate_count": len(candidate_set.candidates)},
+            lambda: [
+                sanitize_mechanism_candidate_contract(candidate)
+                for candidate in candidate_set.candidates
+            ],
+        )
         candidates = candidate_set.candidates[:max_candidates]
-        predicate_signals = resolved_candidate_predicate_signals(
+        predicate_signals = _audit_stage(
+            audit_logger,
+            "post_source.predicate_signals",
+            "resolve_predicate_signals",
+            {
+                "candidate_count": len(candidates),
+                "output_binding_count": len(source_output_bindings),
+            },
+            resolved_candidate_predicate_signals,
             candidates,
             inventory,
             source_output_bindings,
         )
         if predicate_signals:
-            timeline = merge_timeline_events(
-                timeline,
-                build_signal_timeline(log_path_obj, predicate_signals),
+            signal_timeline_events = _audit_stage(
+                audit_logger,
+                "post_source.signal_timeline",
+                "build_signal_timeline",
+                {"signal_count": len(predicate_signals)},
+                build_signal_timeline,
+                log_path_obj,
+                predicate_signals,
             )
+            timeline = merge_timeline_events(timeline, signal_timeline_events)
 
         # ------------------------------------------------------------
         # Stage 5: deterministic applicability + log verification
         # ------------------------------------------------------------
         verified_results: list[VerifiedMechanismResult] = []
-        verification_graphs = [
-            compile_verification_graphs(candidate, source_output_bindings, source_path=source_path_obj)
-            for candidate in candidates
-        ]
+        verification_graphs = _audit_stage(
+            audit_logger,
+            "post_source.verification_graphs",
+            "compile_candidate_graphs",
+            {
+                "candidate_count": len(candidates),
+                "output_binding_count": len(source_output_bindings),
+            },
+            lambda: [
+                compile_verification_graphs(candidate, source_output_bindings, source_path=source_path_obj)
+                for candidate in candidates
+            ],
+        )
         graph_signals = dedupe_keep_order([
             node.logged_signal
             for graphs in verification_graphs
@@ -642,12 +671,30 @@ async def analyze_flight_log(
             if node.logged_signal
         ])
         graph_evidence_index = (
-            ULogEvidenceIndex.from_path(log_path_obj, graph_signals)
+            _audit_stage(
+                audit_logger,
+                "post_source.evidence_index",
+                "build_ulog_evidence_index",
+                {"signal_count": len(graph_signals)},
+                ULogEvidenceIndex.from_path,
+                log_path_obj,
+                graph_signals,
+            )
             if graph_signals
             else None
         )
         for candidate, candidate_graphs in zip(candidates, verification_graphs):
-            verification_plan = compile_verification_plan(
+            verification_plan = _audit_stage(
+                audit_logger,
+                "post_source.verification_plan",
+                f"compile_verification_plan:{candidate.name}",
+                {
+                    "candidate": candidate.name,
+                    "output_binding_count": len(source_output_bindings),
+                    "helper_expression_count": len(source_helper_expressions),
+                    "source_assignment_count": len(source_assignments),
+                },
+                compile_verification_plan,
                 candidate,
                 inventory,
                 timeline,
@@ -1828,6 +1875,45 @@ def _audit_sync_call(
         f"{event_prefix}.finished",
         name=name,
         output=_safe_model_dump(result),
+        duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+    )
+    return result
+
+
+def _audit_stage(
+    audit_logger: Optional[DeveloperAuditLogger],
+    event_prefix: str,
+    name: str,
+    input_summary: dict[str, Any],
+    func: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Like ``_audit_sync_call`` but does not dump the result.
+
+    Use for stages where the result is either captured by a downstream
+    audit event, too large to log usefully, or opaque (non-pydantic).
+    The point is timing visibility — if a stage hangs, the last event
+    is its ``.started``.
+    """
+    if audit_logger is None:
+        return func(*args, **kwargs)
+
+    started_at = time.perf_counter()
+    audit_logger.log_event(f"{event_prefix}.started", name=name, input=input_summary)
+    try:
+        result = func(*args, **kwargs)
+    except Exception as exc:
+        audit_logger.log_event(
+            f"{event_prefix}.failed",
+            name=name,
+            error=repr(exc),
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+        )
+        raise
+    audit_logger.log_event(
+        f"{event_prefix}.finished",
+        name=name,
         duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
     )
     return result
