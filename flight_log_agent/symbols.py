@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Optional
 
 
@@ -33,6 +34,17 @@ def normalize_symbol(value: str) -> str:
       - a single leading ``_`` (PX4 private-member convention) is stripped
         from the start of the whole string; nested underscores are preserved
     """
+    if isinstance(value, str):
+        return _normalize_symbol_cached(value)
+    return _normalize_symbol_uncached(value)
+
+
+@lru_cache(maxsize=16384)
+def _normalize_symbol_cached(value: str) -> str:
+    return _normalize_symbol_uncached(value)
+
+
+def _normalize_symbol_uncached(value: str) -> str:
     normalized = str(value or "").strip().replace("->", ".").replace("::", ".").replace(" ", "").strip("&*")
     normalized = _BRACKET_INDEX_RE.sub("", normalized)
     if normalized.startswith("_"):

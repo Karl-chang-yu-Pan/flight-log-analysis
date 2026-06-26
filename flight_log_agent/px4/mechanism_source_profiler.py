@@ -386,6 +386,10 @@ class MechanismSourceProfiler:
         self.rg_path = rg_path
         self.read_limit_bytes = read_limit_bytes
         self.excludes = tuple(excludes) if excludes is not None else self.DEFAULT_EXCLUDES
+        # Per-instance cache: the same file is hit by 10+ extraction
+        # methods across multiple source_discovery iterations. Keyed by
+        # the rel path string so the path-resolution variants converge.
+        self._text_cache: dict[str, Optional[str]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -1423,13 +1427,18 @@ class MechanismSourceProfiler:
         return includes
 
     def _read_text(self, path: Path) -> Optional[str]:
+        rel = self._rel(path)
+        cached = self._text_cache.get(rel)
+        if cached is not None or rel in self._text_cache:
+            return cached
         try:
-            text = self.source.read_text(self._rel(path), errors="ignore")
+            text = self.source.read_text(rel, errors="ignore")
             if len(text.encode("utf-8")) > self.read_limit_bytes:
-                return None
-            return text
+                text = None
         except Exception:
-            return None
+            text = None
+        self._text_cache[rel] = text
+        return text
 
     def _iter_code_lines(self, text: str) -> Iterable[Tuple[int, str]]:
         # Strip block comments lightly. This is deliberately simple and avoids
