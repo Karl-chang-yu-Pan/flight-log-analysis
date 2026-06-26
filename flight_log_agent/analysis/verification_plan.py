@@ -52,11 +52,12 @@ def compile_verification_plan(
     *,
     helper_expressions: Iterable[dict[str, Any]] = (),
     source_assignments: Iterable[dict[str, Any]] = (),
+    binding_index: Optional[BindingIndex] = None,
 ) -> VerificationPlan:
     helper_registry = HelperRegistry(list(helper_expressions))
     source_assignments_list = list(source_assignments)
     bindings_list = list(output_bindings)
-    index = BindingIndex(inventory, bindings_list)
+    index = binding_index if binding_index is not None else BindingIndex(inventory, bindings_list)
     prefer = _prefer_signals_for_candidate(candidate, index)
     resolver = SignalResolver.from_index(index, prefer=prefer)
     mechanism_id = stable_id("mechanism", {
@@ -143,8 +144,14 @@ def resolved_candidate_predicate_signals(
     candidates: Iterable[MechanismCandidate],
     inventory: dict[str, Any],
     output_bindings: Iterable[Any] = (),
+    *,
+    binding_index: Optional[BindingIndex] = None,
 ) -> list[str]:
-    resolver = SignalResolver(inventory, output_bindings)
+    resolver = (
+        SignalResolver.from_index(binding_index)
+        if binding_index is not None
+        else SignalResolver(inventory, output_bindings)
+    )
     signals: list[str] = []
     for candidate in candidates:
         for predicate_group in candidate_source_predicate_groups(candidate):

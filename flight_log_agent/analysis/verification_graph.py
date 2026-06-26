@@ -49,10 +49,17 @@ def compile_verification_graphs(
     output_bindings: Iterable[Any] = (),
     *,
     source_path: Optional[str] = None,
+    binding_index: Optional["BindingIndex"] = None,
 ) -> list[VerificationGraph]:
     bindings = [_binding_dict(binding) for binding in output_bindings]
     return [
-        compile_verification_graph(candidate, terminal, bindings, source_path=source_path)
+        compile_verification_graph(
+            candidate,
+            terminal,
+            bindings,
+            source_path=source_path,
+            binding_index=binding_index,
+        )
         for terminal in terminal_outputs(candidate, bindings)
     ]
 
@@ -80,10 +87,15 @@ def compile_verification_graph(
     output_bindings: Iterable[Any] = (),
     *,
     source_path: Optional[str] = None,
+    binding_index: Optional["BindingIndex"] = None,
 ) -> VerificationGraph:
     terminal = normalize_symbol(terminal_output)
     bindings = [_binding_dict(binding) for binding in output_bindings]
-    signal_bindings = source_signal_bindings(bindings)
+    signal_bindings = (
+        binding_index.symbol_bindings
+        if binding_index is not None
+        else source_signal_bindings(bindings)
+    )
     known_logged_signals = {
         normalize_symbol(str(binding.get("logged_signal") or ""))
         for binding in bindings

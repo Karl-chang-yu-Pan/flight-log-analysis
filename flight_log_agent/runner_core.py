@@ -528,6 +528,7 @@ async def analyze_flight_log(
         source_output_bindings: list[SourceOutputBindingRecord] = []
         source_helper_expressions: list[dict[str, Any]] = []
         source_assignments: list[dict[str, Any]] = []
+        shared_binding_index: Optional[BindingIndex] = None
 
         if cached_candidates and source_path_obj is None:
             source_evidence = empty_source_discovery_evidence(source_search_context)
@@ -579,10 +580,12 @@ async def analyze_flight_log(
             source_output_bindings = list(source_candidate_set.output_bindings)
             source_helper_expressions = list(source_candidate_set.helper_expressions)
             source_assignments = list(source_candidate_set.source_assignments)
+            shared_binding_index = BindingIndex(inventory, source_output_bindings)
             candidate_set = source_mechanisms_to_candidates(
                 source_candidate_set,
                 output_bindings=source_output_bindings,
                 source_path=source_path_obj,
+                canonicalizer=SignalCanonicalizer.from_index(shared_binding_index),
             )
             source_evidence = empty_source_discovery_evidence(
                 source_search_context,
@@ -610,6 +613,8 @@ async def analyze_flight_log(
             )
             mechanism_cache_summary["written_records"] = written_records
 
+        if shared_binding_index is None:
+            shared_binding_index = BindingIndex(inventory, source_output_bindings)
         candidate_set.candidates = _audit_stage(
             audit_logger,
             "post_source.sanitize",
@@ -633,6 +638,7 @@ async def analyze_flight_log(
             candidates,
             inventory,
             source_output_bindings,
+            binding_index=shared_binding_index,
         )
         if predicate_signals:
             signal_timeline_events = _audit_stage(
@@ -659,7 +665,12 @@ async def analyze_flight_log(
                 "output_binding_count": len(source_output_bindings),
             },
             lambda: [
-                compile_verification_graphs(candidate, source_output_bindings, source_path=source_path_obj)
+                compile_verification_graphs(
+                    candidate,
+                    source_output_bindings,
+                    source_path=source_path_obj,
+                    binding_index=shared_binding_index,
+                )
                 for candidate in candidates
             ],
         )
@@ -702,6 +713,7 @@ async def analyze_flight_log(
                 source_output_bindings,
                 helper_expressions=source_helper_expressions,
                 source_assignments=source_assignments,
+                binding_index=shared_binding_index,
             )
             applicability = _audit_sync_call(
                 audit_logger,
@@ -857,13 +869,17 @@ def source_mechanisms_to_candidates(
     source_candidate_set: SourceMechanismCandidateSet,
     output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
     source_path: Optional[Path] = None,
+    canonicalizer: Optional["SignalCanonicalizer"] = None,
 ) -> MechanismCandidateSet:
+    if canonicalizer is None:
+        canonicalizer = SignalCanonicalizer(output_bindings or [])
     return MechanismCandidateSet(
         candidates=[
             source_mechanism_to_candidate(
                 candidate,
                 output_bindings=output_bindings,
                 source_path=source_path,
+                canonicalizer=canonicalizer,
             )
             for candidate in source_candidate_set.candidates
         ],
@@ -876,8 +892,10 @@ def source_mechanism_to_candidate(
     source_candidate: SourceMechanismCandidate,
     output_bindings: Optional[list[SourceOutputBindingRecord]] = None,
     source_path: Optional[Path] = None,
+    canonicalizer: Optional["SignalCanonicalizer"] = None,
 ) -> MechanismCandidate:
-    canonicalizer = SignalCanonicalizer(output_bindings or [])
+    if canonicalizer is None:
+        canonicalizer = SignalCanonicalizer(output_bindings or [])
     required_parameters = dedupe_keep_order([
         requirement.name
         for requirement in getattr(source_candidate, "controlling_parameters", []) or []
@@ -983,6 +1001,13 @@ class SignalCanonicalizer:
 
     def __init__(self, output_bindings: list[SourceOutputBindingRecord]) -> None:
         self._index = BindingIndex({}, output_bindings)
+
+    @classmethod
+    def from_index(cls, index: BindingIndex) -> "SignalCanonicalizer":
+        """Build a canonicalizer that reuses an already-constructed index."""
+        canonicalizer = cls.__new__(cls)
+        canonicalizer._index = index
+        return canonicalizer
 
     def canonicalize(self, signal: Optional[str]) -> Optional[str]:
         return self._index.canonicalize(signal)
