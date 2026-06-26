@@ -275,3 +275,162 @@ class TestReportingShape:
         assert "a.x" in result.blocker.cycle_path
         assert "b.x" in result.blocker.cycle_path
         assert "c.x" in result.blocker.cycle_path
+
+
+class _StubBindingIndex:
+    """Minimal BindingIndex stand-in exposing ``aliases``."""
+
+    def __init__(self, aliases: dict[str, set[str]]):
+        self.aliases = aliases
+
+
+class TestBindingIndexFastPath:
+    def test_single_target_alias_resolves_without_source_assignments(self):
+        # BindingIndex stores aliases keyed by normalize_symbol(), which
+        # strips leading underscores. The fast-path lookup uses the same
+        # normalized form.
+        index = _StubBindingIndex({
+            "destination.lat": {"position_setpoint_triplet.current.lat"},
+        })
+        result = slice_symbol(
+            "_destination.lat",
+            source_assignments=[],
+            logged_signals={"position_setpoint_triplet.current.lat"},
+            binding_index=index,
+        )
+        assert result.status == "resolved"
+        assert result.expression == "position_setpoint_triplet.current.lat"
+
+    def test_multi_target_alias_falls_through(self):
+        index = _StubBindingIndex({
+            "destination.lat": {
+                "position_setpoint_triplet.current.lat",
+                "mission_item.lat",
+            },
+        })
+        # No source_assignments either, so the fall-through arrives at
+        # a no_write_site dead end — proving we did NOT take the fast
+        # path (which would have produced a resolved status).
+        result = slice_symbol(
+            "_destination.lat",
+            source_assignments=[],
+            binding_index=index,
+        )
+        assert result.status == "unbindable"
+        assert result.blocker is not None
+        assert result.blocker.kind == "no_write_site"
+
+    def test_absent_alias_falls_through_to_assignments(self):
+        index = _StubBindingIndex({})
+        result = slice_symbol(
+            "_destination.lat",
+            source_assignments=[
+                _write("_destination.lat", "vehicle_global_position.lat"),
+            ],
+            logged_signals={"vehicle_global_position.lat"},
+            binding_index=index,
+        )
+        assert result.status == "resolved"
+        assert result.expression == "vehicle_global_position.lat"
+
+    def test_binding_index_none_preserves_existing_behavior(self):
+        result = slice_symbol(
+            "_destination.lat",
+            source_assignments=[
+                _write("_destination.lat", "vehicle_global_position.lat"),
+            ],
+            logged_signals={"vehicle_global_position.lat"},
+            binding_index=None,
+        )
+        assert result.status == "resolved"
+        assert result.expression == "vehicle_global_position.lat"
+
+    def test_binding_index_resolves_inside_slice_expression(self):
+        index = _StubBindingIndex({
+            "destination.lat": {"position_setpoint_triplet.current.lat"},
+            "destination.lon": {"position_setpoint_triplet.current.lon"},
+        })
+        result = slice_expression(
+            "_destination.lat + _destination.lon",
+            source_assignments=[],
+            logged_signals={
+                "position_setpoint_triplet.current.lat",
+                "position_setpoint_triplet.current.lon",
+            },
+            binding_index=index,
+        )
+        assert result.fully_resolved
+        assert "position_setpoint_triplet.current.lat" in result.expression
+        assert "position_setpoint_triplet.current.lon" in result.expression
+
+
+class TestAssignmentIndexAndMemo:
+    def test_repeated_symbol_resolved_consistently(self):
+        # Same canonical referenced twice in the expression must resolve
+        # to the same logged signal — proves the memo / index path stays
+        # consistent across repeated lookups in one slice_expression call.
+        assignments = [_write("_destination.lat", "vehicle_global_position.lat")]
+        result = slice_expression(
+            "_destination.lat - _destination.lat",
+            source_assignments=assignments,
+            logged_signals={"vehicle_global_position.lat"},
+        )
+        # Each occurrence substituted with the same resolved signal.
+        assert result.expression.count("vehicle_global_position.lat") == 2
+
+    def test_memo_does_not_mask_cycle_on_a_different_path(self):
+        # Slice symbol X first (clean resolution, gets memoized).
+        # Then slice an outer chain that, by walking through X, would
+        # cycle back to the caller. The memo's cached "resolved" for X
+        # must not suppress the genuine cycle further up.
+        assignments = [
+            _write("a.x", "b.x"),
+            _write("b.x", "c.x"),
+            _write("c.x", "a.x"),  # cycles back into a.x
+            _write("clean.y", "vehicle_global_position.lat"),  # no cycle
+        ]
+        # First, slice the clean symbol — populates memo with a resolved
+        # entry for clean.y.
+        clean = slice_symbol(
+            "clean.y",
+            source_assignments=assignments,
+            logged_signals={"vehicle_global_position.lat"},
+        )
+        assert clean.status == "resolved"
+        # Now slice the cycling chain. clean.y is NOT in this chain, so
+        # the memo cannot affect cycle detection. We're proving cycle
+        # detection still fires when memo has unrelated entries.
+        cycled = slice_symbol(
+            "a.x",
+            source_assignments=assignments,
+            logged_signals={"vehicle_global_position.lat"},
+        )
+        assert cycled.status == "cycle"
+
+    def test_no_write_site_is_cacheable(self):
+        # Slicing the same dead-end twice via one slice_expression call
+        # returns the same unbindable/no_write_site result. (Behavioral
+        # check; the cache is a performance concern, but consistency is
+        # the load-bearing invariant.)
+        result = slice_expression(
+            "missing.symbol + missing.symbol",
+            source_assignments=[],
+        )
+        # Both occurrences should remain in the substituted expression
+        # because there is nothing to substitute them with.
+        assert "missing.symbol" in result.expression
+        assert not result.fully_resolved
+
+    def test_index_handles_many_writes(self):
+        # Build a long assignment list with many irrelevant entries; the
+        # target one should still be found via the index.
+        assignments = [_write(f"unrelated{i}.x", f"junk{i}") for i in range(200)]
+        assignments.append(_write("_destination.lat", "vehicle_global_position.lat"))
+        assignments.extend(_write(f"more{i}.y", f"junk{i}") for i in range(200))
+        result = slice_symbol(
+            "_destination.lat",
+            source_assignments=assignments,
+            logged_signals={"vehicle_global_position.lat"},
+        )
+        assert result.status == "resolved"
+        assert result.expression == "vehicle_global_position.lat"

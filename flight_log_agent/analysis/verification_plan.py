@@ -120,6 +120,7 @@ def compile_verification_plan(
             resolver=resolver,
             helper_registry=helper_registry,
             source_assignments=source_assignments_list,
+            binding_index=index,
         )
         for (
             name,
@@ -242,6 +243,7 @@ def compile_branch_plan(
     resolver: "SignalResolver",
     helper_registry: HelperRegistry | None = None,
     source_assignments: list[dict[str, Any]] | None = None,
+    binding_index: BindingIndex | None = None,
 ) -> VerificationBranchPlan:
     branch_id = stable_id("branch", {
         "mechanism_id": mechanism_id,
@@ -309,7 +311,7 @@ def compile_branch_plan(
                 and not resolver.is_known_signal_reference(check.signal)
             ):
                 continue
-            checks.append(compile_check_plan(check, category, branch_id, resolver, inventory, helper_registry=helper_registry, source_assignments=source_assignments))
+            checks.append(compile_check_plan(check, category, branch_id, resolver, inventory, helper_registry=helper_registry, source_assignments=source_assignments, binding_index=binding_index))
     check_signals = dedupe(
         signal
         for planned in checks
@@ -344,6 +346,7 @@ def compile_check_plan(
     *,
     helper_registry: HelperRegistry | None = None,
     source_assignments: list[dict[str, Any]] | None = None,
+    binding_index: BindingIndex | None = None,
 ) -> VerificationCheckPlan:
     role = check_role(check)
     data = _model_dump(check)
@@ -417,6 +420,7 @@ def compile_check_plan(
                 source_assignments=source_assignments,
                 logged_signals=logged_signal_set,
                 parameters=parameter_set,
+                binding_index=binding_index,
             )
             data[field] = slice_result.expression
             for unresolved_result in slice_result.unresolved:

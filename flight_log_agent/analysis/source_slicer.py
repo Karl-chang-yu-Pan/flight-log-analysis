@@ -86,18 +86,30 @@ def slice_symbol(
     source_assignments: Iterable[Any],
     logged_signals: Iterable[str] = (),
     parameters: Iterable[str] = (),
+    binding_index: Optional[Any] = None,
     _path: tuple[str, ...] = (),
 ) -> SliceResult:
-    """Backward-slice ``symbol`` to logged signals / parameters / dead end."""
+    """Backward-slice ``symbol`` to logged signals / parameters / dead end.
+
+    When ``binding_index`` is provided (typically the
+    :class:`BindingIndex` already built by ``compile_verification_plan``),
+    symbols whose alias resolves to a single logged signal are returned
+    immediately without walking ``source_assignments``. Multi-target and
+    absent symbols fall through to the assignment walk.
+    """
     logged_set = _frozen(logged_signals)
     parameter_set = _frozen(parameters)
     assignments = list(source_assignments)
+    index = _build_assignment_index(assignments)
+    memo: dict[str, SliceResult] = {}
     return _slice_symbol(
         symbol,
-        assignments=assignments,
+        index=index,
         logged_set=logged_set,
         parameter_set=parameter_set,
         path=_path,
+        memo=memo,
+        binding_index=binding_index,
     )
 
 
@@ -107,11 +119,20 @@ def slice_expression(
     source_assignments: Iterable[Any],
     logged_signals: Iterable[str] = (),
     parameters: Iterable[str] = (),
+    binding_index: Optional[Any] = None,
 ) -> ExpressionSliceResult:
-    """Walk every unbound dotted symbol in ``expression`` and substitute."""
+    """Walk every unbound dotted symbol in ``expression`` and substitute.
+
+    ``binding_index`` short-circuits symbols already mapped by the
+    resolver-produced :class:`BindingIndex`, eliminating the redundant
+    backward walk for the common case where a symbol has a single
+    unambiguous logged-signal alias.
+    """
     logged_set = _frozen(logged_signals)
     parameter_set = _frozen(parameters)
     assignments = list(source_assignments)
+    index = _build_assignment_index(assignments)
+    memo: dict[str, SliceResult] = {}
 
     names = _expression_symbols(expression)
     unresolved: list[SliceResult] = []
@@ -129,10 +150,12 @@ def slice_expression(
             continue
         result = _slice_symbol(
             canonical,
-            assignments=assignments,
+            index=index,
             logged_set=logged_set,
             parameter_set=parameter_set,
             path=(),
+            memo=memo,
+            binding_index=binding_index,
         )
         if result.status == "resolved" and result.expression is not None:
             substituted = _substitute_symbol(substituted, name, result.expression)
@@ -163,10 +186,12 @@ def slice_expression(
 def _slice_symbol(
     symbol: str,
     *,
-    assignments: list[Any],
+    index: dict[str, list[Any]],
     logged_set: frozenset[str],
     parameter_set: frozenset[str],
     path: tuple[str, ...],
+    memo: dict[str, SliceResult],
+    binding_index: Optional[Any] = None,
 ) -> SliceResult:
     canonical = normalize_symbol(symbol)
     if not canonical:
@@ -192,9 +217,20 @@ def _slice_symbol(
             trace=cycle_path,
         )
 
-    writes = _find_writes(canonical, assignments)
+    cached = memo.get(canonical)
+    if cached is not None:
+        return cached
+
+    binding_result = _resolve_via_binding_index(canonical, binding_index, path)
+    if binding_result is not None:
+        memo[canonical] = binding_result
+        return binding_result
+
+    writes = _find_writes(canonical, index)
     if not writes:
-        return _unbindable(canonical, "no_write_site", f"no assignment writes to {canonical}", path)
+        result = _unbindable(canonical, "no_write_site", f"no assignment writes to {canonical}", path)
+        memo[canonical] = result
+        return result
 
     new_path = path + (canonical,)
 
@@ -203,10 +239,12 @@ def _slice_symbol(
         return _slice_single_write(
             canonical,
             writes[0],
-            assignments=assignments,
+            index=index,
             logged_set=logged_set,
             parameter_set=parameter_set,
             path=new_path,
+            memo=memo,
+            binding_index=binding_index,
         )
 
     # Multiple writes — see whether they're distinguishable via control
@@ -232,10 +270,12 @@ def _slice_symbol(
         condition = _condition_from_write(write)
         sub_result = _slice_expression_string(
             _get(write, "expression"),
-            assignments=assignments,
+            index=index,
             logged_set=logged_set,
             parameter_set=parameter_set,
             path=new_path,
+            memo=memo,
+            binding_index=binding_index,
         )
         branches.append(
             ConditionalSlice(
@@ -290,18 +330,22 @@ def _slice_single_write(
     symbol: str,
     write: Any,
     *,
-    assignments: list[Any],
+    index: dict[str, list[Any]],
     logged_set: frozenset[str],
     parameter_set: frozenset[str],
     path: tuple[str, ...],
+    memo: dict[str, SliceResult],
+    binding_index: Optional[Any] = None,
 ) -> SliceResult:
     rhs = _get(write, "expression") or ""
     sub_result = _slice_expression_string(
         rhs,
-        assignments=assignments,
+        index=index,
         logged_set=logged_set,
         parameter_set=parameter_set,
         path=path,
+        memo=memo,
+        binding_index=binding_index,
     )
     if _get(write, "control_predicates"):
         condition = _condition_from_write(write)
@@ -336,10 +380,12 @@ def _slice_single_write(
 def _slice_expression_string(
     expression: str,
     *,
-    assignments: list[Any],
+    index: dict[str, list[Any]],
     logged_set: frozenset[str],
     parameter_set: frozenset[str],
     path: tuple[str, ...],
+    memo: dict[str, SliceResult],
+    binding_index: Optional[Any] = None,
 ) -> SliceResult:
     """Slice every dotted symbol in ``expression``; substitute resolved ones."""
     if not expression or not isinstance(expression, str):
@@ -373,10 +419,12 @@ def _slice_expression_string(
             continue
         sub = _slice_symbol(
             canonical,
-            assignments=assignments,
+            index=index,
             logged_set=logged_set,
             parameter_set=parameter_set,
             path=path,
+            memo=memo,
+            binding_index=binding_index,
         )
         if sub.status == "resolved" and sub.expression is not None:
             substituted = _substitute_symbol(substituted, name, sub.expression)
@@ -451,21 +499,58 @@ def _frozen(values: Iterable[str]) -> frozenset[str]:
     return frozenset(normalize_symbol(v) for v in values if v)
 
 
+def _resolve_via_binding_index(
+    canonical: str,
+    binding_index: Optional[Any],
+    path: tuple[str, ...],
+) -> Optional[SliceResult]:
+    """Return a resolved SliceResult when ``binding_index`` has a single alias.
+
+    Reuses the resolver's already-completed backward slice so the slicer
+    does not redo the work for symbols the resolver materialized as
+    output bindings. Multi-target aliases and absent symbols fall back to
+    the assignment walk.
+    """
+    if binding_index is None:
+        return None
+    aliases = getattr(binding_index, "aliases", None)
+    if not isinstance(aliases, dict):
+        return None
+    targets = aliases.get(canonical)
+    if not targets or len(targets) != 1:
+        return None
+    logged = next(iter(targets))
+    if not isinstance(logged, str) or not logged:
+        return None
+    return SliceResult(
+        status="resolved",
+        expression=logged,
+        trace=list(path) + [canonical, logged],
+    )
+
+
 def _get(obj: Any, name: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(name)
     return getattr(obj, name, None)
 
 
-def _find_writes(symbol: str, assignments: list[Any]) -> list[Any]:
-    writes: list[Any] = []
+def _build_assignment_index(assignments: list[Any]) -> dict[str, list[Any]]:
+    """Group assignments by normalized ``target`` for O(1) lookup."""
+    index: dict[str, list[Any]] = {}
     for assignment in assignments:
         target = _get(assignment, "target")
         if not target:
             continue
-        if normalize_symbol(target) == symbol:
-            writes.append(assignment)
-    return writes
+        key = normalize_symbol(str(target))
+        if not key:
+            continue
+        index.setdefault(key, []).append(assignment)
+    return index
+
+
+def _find_writes(symbol: str, index: dict[str, list[Any]]) -> list[Any]:
+    return index.get(symbol, [])
 
 
 def _writes_have_distinct_predicates(writes: list[Any]) -> bool:
