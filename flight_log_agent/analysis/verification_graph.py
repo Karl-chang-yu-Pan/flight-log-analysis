@@ -101,7 +101,11 @@ def compile_verification_graph(
         for binding in bindings
         if binding.get("logged_signal")
     }
-    relevant_bindings = backward_binding_slice(terminal, bindings)
+    relevant_bindings = (
+        binding_index.bindings_reaching(terminal)
+        if binding_index is not None
+        else backward_binding_slice(terminal, bindings)
+    )
     nodes: dict[str, VerificationGraphNode] = {}
     edges: dict[tuple[str, str, str], VerificationGraphEdge] = {}
     unresolved: list[str] = []
@@ -234,31 +238,14 @@ def compile_verification_graph(
 
 
 def backward_binding_slice(terminal_output: str, bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    terminal = normalize_symbol(terminal_output)
-    by_output: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for binding in bindings:
-        logged_signal = normalize_symbol(str(binding.get("logged_signal") or ""))
-        target_symbol = normalize_symbol(str(binding.get("target_symbol") or ""))
-        if logged_signal:
-            by_output[logged_signal].append(binding)
-        if target_symbol:
-            by_target[target_symbol].append(binding)
+    """Backward-walk bindings to find those contributing to ``terminal_output``.
 
-    selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    frontier = deque(by_output.get(terminal, []))
-    while frontier:
-        binding = frontier.popleft()
-        key = binding_key(binding)
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(binding)
-        source_expression = str(binding.get("source_symbol") or "")
-        for symbol in expression_symbols(source_expression):
-            frontier.extend(by_target.get(symbol, []))
-    return selected
+    Standalone fallback for callers that don't have a :class:`BindingIndex`
+    in scope. When one is available, ``BindingIndex.bindings_reaching``
+    is preferred — it uses indexes built once at construction time and is
+    the single owner of the walk.
+    """
+    return BindingIndex({}, bindings).bindings_reaching(terminal_output)
 
 
 def source_signal_bindings(bindings: list[dict[str, Any]]) -> dict[str, str]:

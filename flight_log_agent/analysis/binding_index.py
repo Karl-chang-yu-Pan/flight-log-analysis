@@ -28,6 +28,23 @@ def _get(value: Any, name: str) -> Any:
     return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
 
 
+def logged_signals_from_inventory(inventory: dict[str, Any]) -> set[str]:
+    """Set of ``topic.field`` references that are actually logged.
+
+    Single owner of the derivation that previously lived inline in
+    ``BindingIndex.__init__`` and in
+    ``verification_plan._logged_signals_from_inventory``.
+    """
+    out: set[str] = set()
+    for topic, fields in (inventory.get("topic_fields") or {}).items():
+        if not isinstance(topic, str):
+            continue
+        for field in fields or []:
+            if isinstance(field, str) and field:
+                out.add(f"{topic}.{field}")
+    return out
+
+
 def assignment_path_symbols(path: list[dict[str, Any]] | None) -> list[str]:
     """Return dotted symbol references found in an assignment-path list.
 
@@ -71,11 +88,7 @@ class BindingIndex:
         topic_fields = inventory.get("topic_fields") or {}
         available_topics = set(inventory.get("available_topics") or topic_fields)
 
-        self.logged_signals: set[str] = {
-            f"{topic}.{field}"
-            for topic, fields in topic_fields.items()
-            for field in fields
-        }
+        self.logged_signals: set[str] = logged_signals_from_inventory(inventory)
         self.schema_signals: set[str] = {
             f"{topic}.{field}"
             for topic, fields in schema.items()
@@ -150,6 +163,20 @@ class BindingIndex:
         self.unavailable_aliases = unavailable_aliases
         self.symbol_bindings = symbol_bindings
         self._bindings = bindings
+
+        # Backward-slice indexes — built once so per-terminal walks
+        # (slice_for_terminal, bindings_reaching) and downstream consumers
+        # (verification_graph.backward_binding_slice) share one index set
+        # instead of rebuilding defaultdicts on each call.
+        self._by_output: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for binding in bindings:
+            logged_signal = normalize_symbol(str(binding.get("logged_signal") or ""))
+            target_symbol = normalize_symbol(str(binding.get("target_symbol") or ""))
+            if logged_signal:
+                self._by_output[logged_signal].append(binding)
+            if target_symbol:
+                self._by_target[target_symbol].append(binding)
 
         # Resolved-chain tables: materialize each helper's lowered return
         # expression and each assignment's RHS once, against this index.
@@ -267,40 +294,46 @@ class BindingIndex:
     def slice_for_terminal(self, terminal: str) -> set[str]:
         """Return the logged signals reachable backward from ``terminal``.
 
-        Mirrors ``verification_graph.backward_binding_slice`` but returns
-        the *set of logged signals* covered by the slice, suitable for use
-        as ``prefer=`` in :meth:`resolve`.
+        Delegates the walk to :meth:`bindings_reaching` and projects
+        each visited binding's ``logged_signal``. Suitable for use as
+        ``prefer=`` in :meth:`resolve`.
         """
         if not terminal:
             return set()
-        terminal_norm = normalize_symbol(terminal)
-        by_output: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for binding in self._bindings:
-            logged_signal = normalize_symbol(str(binding.get("logged_signal") or ""))
-            target_symbol = normalize_symbol(str(binding.get("target_symbol") or ""))
-            if logged_signal:
-                by_output[logged_signal].append(binding)
-            if target_symbol:
-                by_target[target_symbol].append(binding)
-
-        seen: set[int] = set()
         signals: set[str] = set()
-        frontier = deque(by_output.get(terminal_norm, []))
+        for binding in self.bindings_reaching(terminal):
+            logged_signal = str(binding.get("logged_signal") or "")
+            if logged_signal:
+                signals.add(logged_signal)
+        return signals
+
+    def bindings_reaching(self, terminal: str) -> list[dict[str, Any]]:
+        """Return the binding records that contribute to ``terminal``.
+
+        Single owner of the backward walk over ``output_bindings``: the
+        ``by_output`` / ``by_target`` indexes are built once at
+        construction time and reused. Replaces the standalone
+        ``verification_graph.backward_binding_slice`` so the two
+        previously-parallel implementations cannot drift.
+        """
+        if not terminal:
+            return []
+        terminal_norm = normalize_symbol(terminal)
+        seen: set[int] = set()
+        selected: list[dict[str, Any]] = []
+        frontier = deque(self._by_output.get(terminal_norm, []))
         while frontier:
             binding = frontier.popleft()
             key = id(binding)
             if key in seen:
                 continue
             seen.add(key)
-            logged_signal = str(binding.get("logged_signal") or "")
-            if logged_signal:
-                signals.add(logged_signal)
+            selected.append(binding)
             for symbol in self._source_expression_symbols(
                 str(binding.get("source_symbol") or "")
             ):
-                frontier.extend(by_target.get(symbol, []))
-        return signals
+                frontier.extend(self._by_target.get(symbol, []))
+        return selected
 
     # ------------------------------------------------------------
     # Internals

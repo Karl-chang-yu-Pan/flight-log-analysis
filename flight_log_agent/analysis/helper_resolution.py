@@ -75,6 +75,41 @@ class HelperRegistry:
             if short and short != name:
                 self._by_short_name.setdefault(short, []).append(ref)
 
+    @classmethod
+    def from_index(
+        cls,
+        binding_index: Any,
+        helper_expressions: Iterable[Any] = (),
+    ) -> "HelperRegistry":
+        """Build a registry whose helper bodies are the index-resolved forms.
+
+        For each helper, if ``binding_index.helper_resolutions`` has an
+        :class:`ExpressionSliceResult` for it, replace the helper's
+        ``lowered_return_expression`` with the resolved (terminal-form)
+        expression. ``substitute_helpers`` therefore inlines that form
+        in one pass instead of re-expanding nested bodies.
+        """
+        resolutions = getattr(binding_index, "helper_resolutions", {}) or {}
+        records: list[dict[str, Any]] = []
+        for helper in helper_expressions:
+            if isinstance(helper, dict):
+                record = dict(helper)
+            elif hasattr(helper, "model_dump"):
+                record = helper.model_dump(exclude_none=True)
+            else:
+                record = dict(vars(helper))
+            name = str(record.get("name") or "")
+            resolution = resolutions.get(name)
+            if resolution is None and "::" in name:
+                resolution = resolutions.get(name.split("::")[-1])
+            resolved_expression = (
+                getattr(resolution, "expression", None) if resolution is not None else None
+            )
+            if isinstance(resolved_expression, str) and resolved_expression:
+                record["lowered_return_expression"] = resolved_expression
+            records.append(record)
+        return cls(records)
+
     def get(self, name: str) -> Optional[dict[str, Any]]:
         if not isinstance(name, str):
             return None

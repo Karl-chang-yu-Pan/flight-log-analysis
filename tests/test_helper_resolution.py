@@ -65,6 +65,42 @@ class TestHelperRegistry:
         assert "foo" in registry
         assert "bar" not in registry
 
+    def test_from_index_substitutes_resolved_body(self):
+        # When the BindingIndex has materialized a helper's resolved
+        # return expression, HelperRegistry.from_index swaps the
+        # helper's lowered_return_expression with that resolved form.
+
+        class _StubResult:
+            expression = "vehicle_global_position.alt"
+
+        class _StubBindingIndex:
+            helper_resolutions = {"get_alt": _StubResult()}
+
+        helper_expressions = [
+            {
+                "name": "get_alt",
+                "lowered_return_expression": "nested(call(chain))",
+                "parameters": [],
+            }
+        ]
+        registry = HelperRegistry.from_index(_StubBindingIndex(), helper_expressions)
+        record = registry.get("get_alt")
+        assert record is not None
+        assert record["lowered_return_expression"] == "vehicle_global_position.alt"
+
+    def test_from_index_with_no_resolutions_keeps_original_body(self):
+        helper_expressions = [
+            {"name": "untouched", "lowered_return_expression": "original_body"},
+        ]
+
+        class _Empty:
+            helper_resolutions = {}
+
+        registry = HelperRegistry.from_index(_Empty(), helper_expressions)
+        record = registry.get("untouched")
+        assert record is not None
+        assert record["lowered_return_expression"] == "original_body"
+
 
 class TestLowerHelperCall:
     def test_single_return_substitutes_parameters(self):

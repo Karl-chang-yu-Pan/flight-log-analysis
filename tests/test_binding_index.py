@@ -302,6 +302,47 @@ class TestSliceForTerminal:
         assert index.slice_for_terminal("totally.unknown") == set()
 
 
+class TestBindingsReaching:
+    def test_returns_bindings_in_terminal_chain(self):
+        bindings = [
+            _binding(
+                logged_signal="tecs_status.equivalent_airspeed_sp",
+                source_symbol="position_setpoint_triplet.current.cruising_speed",
+                target_symbol="tecs_status.equivalent_airspeed_sp",
+            ),
+            _binding(
+                logged_signal="position_setpoint_triplet.current.cruising_speed",
+                source_symbol="vehicle_command.param2",
+                target_symbol="position_setpoint_triplet.current.cruising_speed",
+            ),
+            _binding(
+                logged_signal="vehicle_global_position.alt",
+                source_symbol="unrelated_field",
+                target_symbol="vehicle_global_position.alt",
+            ),
+        ]
+        index = BindingIndex(
+            _inventory({
+                "tecs_status": ["equivalent_airspeed_sp"],
+                "position_setpoint_triplet": ["current.cruising_speed"],
+                "vehicle_command": ["param2"],
+                "vehicle_global_position": ["alt"],
+            }),
+            bindings,
+        )
+
+        reaching = index.bindings_reaching("tecs_status.equivalent_airspeed_sp")
+        logged_signals = {b.get("logged_signal") for b in reaching}
+        assert "tecs_status.equivalent_airspeed_sp" in logged_signals
+        assert "position_setpoint_triplet.current.cruising_speed" in logged_signals
+        # Unrelated binding NOT in the slice.
+        assert "vehicle_global_position.alt" not in logged_signals
+
+    def test_empty_terminal_returns_empty_list(self):
+        index = BindingIndex(_inventory({}), [])
+        assert index.bindings_reaching("") == []
+
+
 def _helper(
     *,
     name: str,

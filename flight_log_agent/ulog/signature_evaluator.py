@@ -10,7 +10,7 @@ from typing import Any
 
 from pyulog import ULog
 
-from flight_log_agent.analysis.helper_resolution import HelperRegistry, substitute_helpers
+from flight_log_agent.analysis.helper_resolution import HelperRegistry
 from flight_log_agent.analysis.parameter_lookup import get_parameter as _get_parameter
 from flight_log_agent.symbols import parse_simple_signal as _parse_signal
 from flight_log_agent.utils import (
@@ -520,19 +520,12 @@ def _check_derived_expression(
 
     expected_expression = str(check.get("expected_expression") or "").strip()
 
-    # Source-derived helper substitution: when a HelperRegistry is in scope
-    # and the LLM wrote helper calls into the expression text, replace
-    # them with their lowered bodies (single-return or branch-picked).
-    # If substitution succeeds and no unresolved-reason helper_dependencies
-    # remain that aren't also resolvable via the registry, we proceed; if
-    # any blocker remains we fall back to the original "cannot evaluate
-    # helper X" path.
+    # Helper substitution already ran at compile time inside
+    # compile_check_plan against helpers whose lowered_return_expression
+    # was replaced with the BindingIndex-materialized resolved form. The
+    # registry stays available for the dependency-resolution check
+    # below; the runtime substitute_helpers walk is redundant.
     helper_registry = check.get("_helper_registry")
-    if isinstance(helper_registry, HelperRegistry):
-        substitution_env = _helper_substitution_env(parameters)
-        expression = substitute_helpers(expression, registry=helper_registry, env=substitution_env)
-        if expected_expression:
-            expected_expression = substitute_helpers(expected_expression, registry=helper_registry, env=substitution_env)
 
     helper_dependency = _first_unresolved_helper_dependency(check)
     if helper_dependency is not None and not _helper_dependency_resolved(helper_dependency, helper_registry):
@@ -835,23 +828,6 @@ def _expression_variables_map(raw_variables: Any) -> dict[str, str]:
         if name and source:
             variables[str(name)] = str(source)
     return variables
-
-
-def _helper_substitution_env(parameters: dict[str, Any]) -> dict[str, Any]:
-    """Build the env used to evaluate branch conditions during substitution.
-
-    Today this is just the inventory parameters keyed by name. The verifier
-    cannot easily provide window-bound signal samples here because helper
-    substitution runs before window slicing; conditions that reference
-    runtime signal values therefore fall through to compile-time
-    resolution in verification_plan (P4) or remain unresolved.
-    """
-    env: dict[str, Any] = {}
-    for name, value in (parameters or {}).items():
-        if name and not isinstance(name, str):
-            continue
-        env[str(name)] = value
-    return env
 
 
 def _helper_dependency_resolved(
