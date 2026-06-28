@@ -213,7 +213,7 @@ class SourceMechanismResolver:
             source_assignments.extend(self.profiler.extract_source_assignments_from_source(new_files))
             function_calls.extend(self.profiler.extract_function_calls_from_source(new_files))
             helper_expressions.extend(
-                self.profiler.extract_helper_expressions_from_source(
+                self.profiler.extract_helper_expressions_recursive(
                     new_files,
                     helper_names=[ref.name for ref in function_calls],
                 )

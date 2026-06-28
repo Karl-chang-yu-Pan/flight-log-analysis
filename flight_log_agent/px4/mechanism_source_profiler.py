@@ -1116,9 +1116,6 @@ class MechanismSourceProfiler:
 
         visited_files: set[str] = {self._rel(Path(f)) for f in initial_files}
         explored_callees: set[str] = set()
-        for name in initial_names:
-            explored_callees.add(name)
-            explored_callees.add(name.split("::")[-1])
 
         current_files: list[Union[str, Path]] = initial_files
         current_names: Optional[list[str]] = initial_names if initial_names else None
@@ -1128,6 +1125,15 @@ class MechanismSourceProfiler:
         for _ in range(max(1, max_passes)):
             pass_refs = self.extract_helper_expressions_from_source(current_files, current_names)
             all_refs.extend(pass_refs)
+            # Mark helpers actually FOUND in this pass as explored so we
+            # don't re-search files for them. Names in helper_names that
+            # were NOT found stay unexplored so subsequent passes can
+            # follow ``helper_calls`` to the file that defines them.
+            for ref in pass_refs:
+                if not ref.name:
+                    continue
+                explored_callees.add(ref.name)
+                explored_callees.add(ref.name.split("::")[-1])
 
             new_callees: list[str] = []
             for ref in pass_refs:

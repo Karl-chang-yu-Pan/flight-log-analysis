@@ -324,6 +324,68 @@ void run_vehicle_mode()
     assert "output_binding_required" not in verification_candidate
 
 
+def test_source_mechanism_resolver_pulls_cross_file_helper_into_registry(tmp_path):
+    """The resolver's recursive extraction follows helper_calls into a
+    file the seed query did not select, so the cross-file callee
+    appears in the iteration packet's helper_expressions."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    lib_dir = source_path / "src" / "lib" / "geo"
+    lib_dir.mkdir(parents=True)
+    (module_dir / "mode.cpp").write_text(
+        """
+float top_helper(float v)
+{
+    return clip_with_floor(v);
+}
+
+void run_mode()
+{
+    top_helper(1.0f);
+}
+""",
+        encoding="utf-8",
+    )
+    (lib_dir / "helpers.cpp").write_text(
+        """
+float clip_with_floor(float v)
+{
+    return max(v, 0.0f);
+}
+""",
+        encoding="utf-8",
+    )
+    resolver = SourceMechanismResolver(
+        source_path,
+        profiler=MechanismSourceProfiler(source_path, rg_path="missing-rg"),
+    )
+    packets = []
+
+    async def decide(packet):
+        packets.append(packet)
+        if packet.source_profile.get("stage") == "search_hits_only":
+            return SourceDiscoveryDecision(relevant_files=["src/modules/navigator/mode.cpp"])
+        return SourceDiscoveryDecision(stop=True)
+
+    asyncio.run(
+        resolver.discover(
+            "Why did run_mode use top_helper?",
+            build_source_discovery_log_context({}),
+            seed_queries=["run_mode"],
+            decide=decide,
+            max_depth=1,
+        )
+    )
+
+    profile_packet = next(packet for packet in packets if packet.new_files)
+    helpers = profile_packet.source_profile["helper_expressions"]
+    names = {item["name"] for item in helpers}
+    assert "top_helper" in names
+    # The cross-file callee was pulled in by the recursive scan.
+    assert "clip_with_floor" in names
+
+
 def test_source_output_binding_candidates_bind_call_arguments_to_logged_output(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
