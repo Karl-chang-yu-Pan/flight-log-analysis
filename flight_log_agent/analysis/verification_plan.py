@@ -35,6 +35,7 @@ from flight_log_agent.px4.msg_schema import (
 )
 from flight_log_agent.px4.source_snapshot import source_from_inventory
 from flight_log_agent.symbols import looks_like_signal_reference, normalize_symbol
+from flight_log_agent.utils import copy_model
 from flight_log_agent.utils import dedupe_keep_order as dedupe
 from flight_log_agent.utils import model_dump as _model_dump
 from flight_log_agent.utils import stable_id
@@ -323,6 +324,7 @@ def compile_branch_plan(
                 and not resolver.is_known_signal_reference(check.signal)
             ):
                 continue
+            check = _inject_source_predicate_from_gates(check, source_predicates, inventory)
             checks.append(compile_check_plan(check, category, branch_id, resolver, inventory, helper_registry=helper_registry, source_assignments=source_assignments, binding_index=binding_index))
     check_signals = dedupe(
         signal
@@ -715,6 +717,47 @@ def parse_and_resolve_predicate_part(
             "text": f"{resolution.resolved} == {str(expected).lower()}",
         }
     return {"resolved": False, "reason": f"Unsupported source predicate: {predicate}"}
+
+
+def _inject_source_predicate_from_gates(
+    check: RelationshipCheckSpec,
+    source_predicates: list[str],
+    inventory: dict[str, Any],
+) -> RelationshipCheckSpec:
+    """Fill ``source_predicate`` on parameter checks missing op+value+predicate.
+
+    The LLM frequently emits ``branch_parameter_satisfied`` /
+    ``parameter_equals`` checks naming a ``parameter`` but no comparison
+    info. The signature_evaluator's ``_check_branch_parameter_satisfied``
+    can recover op/value from ``source_predicate`` — but only if a
+    predicate text is present. The candidate's ``mode_state_gates``
+    typically include exactly such a predicate (e.g.
+    ``_param_fw_wind_arsp_sc.get() != 0``); scan them and inject the
+    matching one so the existing recovery path completes the check.
+    """
+    if check.type not in {"parameter_equals", "branch_parameter_satisfied"}:
+        return check
+    if check.op or check.value is not None or check.source_predicate:
+        return check
+    parameter = (check.parameter or "").strip()
+    if not parameter:
+        return check
+    for predicate in source_predicates or []:
+        if not isinstance(predicate, str) or not predicate.strip():
+            continue
+        if _predicate_references_parameter(predicate, parameter, inventory):
+            return copy_model(check, update={"source_predicate": predicate})
+    return check
+
+
+def _predicate_references_parameter(
+    predicate: str, parameter: str, inventory: dict[str, Any]
+) -> bool:
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*(?:\.\s*get\s*\(\s*\))?", predicate):
+        resolved = parameter_name_for_accessor(token, inventory)
+        if resolved == parameter:
+            return True
+    return False
 
 
 def parameter_name_for_accessor(value: str, inventory: dict[str, Any]) -> Optional[str]:

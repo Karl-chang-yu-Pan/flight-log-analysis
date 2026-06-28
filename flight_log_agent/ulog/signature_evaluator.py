@@ -12,6 +12,7 @@ from pyulog import ULog
 
 from flight_log_agent.analysis.helper_resolution import HelperRegistry
 from flight_log_agent.analysis.parameter_lookup import get_parameter as _get_parameter
+from flight_log_agent.analysis.parameter_lookup import resolve_numeric_value as _resolve_numeric_value
 from flight_log_agent.symbols import parse_simple_signal as _parse_signal
 from flight_log_agent.utils import (
     compare as _compare,
@@ -192,19 +193,24 @@ def _check_threshold(topics: dict[str, Any], windows: dict[str, dict], parameter
 
     op = str(check.get("op") or ">=").strip()
     actual = metrics[metric_name]
-    expected = _safe_float(check.get("value"))
     if op in ("between", "outside"):
-        lower = _safe_float(check.get("lower"))
-        upper = _safe_float(check.get("upper"))
+        lower, lower_missing = _resolve_numeric_value(check.get("lower"), parameters)
+        upper, upper_missing = _resolve_numeric_value(check.get("upper"), parameters)
         if lower is None or upper is None:
-            return _check_result(check, status="unresolved", message=f"{op} threshold requires lower and upper")
+            reason = lower_missing or upper_missing or f"{op} threshold requires lower and upper"
+            return _check_result(check, status="unresolved", message=reason)
         passed = lower <= actual <= upper
         if op == "outside":
             passed = not passed
         expected_label = f"{lower}..{upper}"
     else:
+        expected, expected_missing = _resolve_numeric_value(check.get("value"), parameters)
         if expected is None:
-            return _check_result(check, status="unresolved", message="threshold value is missing")
+            return _check_result(
+                check,
+                status="unresolved",
+                message=expected_missing or "threshold value is missing",
+            )
         passed = _compare(actual, op, expected)
         expected_label = str(expected)
     message = _message(

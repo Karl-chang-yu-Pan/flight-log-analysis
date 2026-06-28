@@ -10,6 +10,7 @@ from flight_log_agent.analysis.parameter_lookup import (
     get_parameter,
     has_parameter,
     is_px4_parameter_name,
+    resolve_numeric_value,
 )
 
 
@@ -131,3 +132,31 @@ class TestHasAndFilter:
         inv = {"parameters": {"RTL_RETURN_ALT": 30.0, "SYS_AUTOSTART": 13000}}
         names = ["RTL_TYPE", "RTL_RETURN_ALT", "MC_PITCH_P", "SYS_AUTOSTART"]
         assert filter_present_parameters(inv, names) == ["RTL_RETURN_ALT", "SYS_AUTOSTART"]
+
+
+class TestResolveNumericValue:
+    def test_passes_through_numeric_literal(self):
+        v, missing = resolve_numeric_value(21.0, {})
+        assert v == 21.0 and missing is None
+
+    def test_parses_numeric_string(self):
+        v, missing = resolve_numeric_value("21.0", {})
+        assert v == 21.0 and missing is None
+
+    def test_looks_up_px4_parameter_name(self):
+        inv = {"parameters": {"FW_AIRSPD_TRIM": 21.0}}
+        v, missing = resolve_numeric_value("FW_AIRSPD_TRIM", inv)
+        assert v == 21.0 and missing is None
+
+    def test_missing_parameter_returns_reason(self):
+        inv = {"parameters": {}}
+        v, missing = resolve_numeric_value("FW_AIRSPD_TRIM", inv)
+        assert v is None and missing is not None
+
+    def test_unknown_identifier_returns_reason(self):
+        v, missing = resolve_numeric_value("not_a_param", {})
+        assert v is None and missing is not None
+
+    def test_none_passes_through(self):
+        v, missing = resolve_numeric_value(None, {})
+        assert v is None and missing is None

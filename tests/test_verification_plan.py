@@ -1295,3 +1295,59 @@ def test_branch_groups_still_produce_independent_branches():
     }
     plan = compile_verification_plan(candidate, inventory, [], None)
     assert len(plan.branches) == 2
+
+
+def test_branch_parameter_check_inherits_source_predicate_from_mode_state_gate():
+    """When the LLM emits branch_parameter_satisfied with parameter set but
+    no op/value/source_predicate, the compiler injects a matching predicate
+    from the candidate's mode_state_gates so the runtime evaluator can
+    recover op/value via its existing parse path."""
+    candidate = MechanismCandidate(
+        name="Inject source_predicate smoke",
+        summary="",
+        source_refs=[],
+        mode_state_gates=["_param_fw_wind_arsp_sc.get() > 0"],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="branch_parameter_satisfied",
+                parameter="FW_WIND_ARSP_SC",
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {"FW_WIND_ARSP_SC": 0.0},
+        "available_topics": [],
+        "topic_fields": {},
+    }
+    plan = compile_verification_plan(candidate, inventory, [], None)
+    check = plan.branches[0].checks[0].check
+    assert check.source_predicate == "_param_fw_wind_arsp_sc.get() > 0"
+
+
+def test_branch_parameter_check_unchanged_when_already_complete():
+    """A check already carrying op+value must not be modified."""
+    candidate = MechanismCandidate(
+        name="Pre-filled check stays",
+        summary="",
+        source_refs=[],
+        mode_state_gates=["_param_fw_wind_arsp_sc.get() > 0"],
+        numeric_checks=[
+            RelationshipCheckSpec(
+                type="branch_parameter_satisfied",
+                parameter="FW_WIND_ARSP_SC",
+                op=">",
+                value=0,
+            ),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {"FW_WIND_ARSP_SC": 0.0},
+        "available_topics": [],
+        "topic_fields": {},
+    }
+    plan = compile_verification_plan(candidate, inventory, [], None)
+    check = plan.branches[0].checks[0].check
+    # source_predicate stays None because op+value were already set.
+    assert check.source_predicate is None

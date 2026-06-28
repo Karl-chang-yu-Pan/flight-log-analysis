@@ -103,6 +103,45 @@ def has_parameter(inventory: Any, name: str) -> bool:
     return name in _parameters_from(inventory)
 
 
+def resolve_numeric_value(
+    value: Any,
+    inventory: Any,
+    *,
+    kind: Kind = "float",
+) -> Tuple[Optional[float], Optional[str]]:
+    """Coerce ``value`` to a numeric, looking up PX4 parameter names.
+
+    Accepts either a numeric literal or a string that may be a PX4
+    parameter name. Returns ``(numeric_value, missing_reason)`` with
+    the same convention as :func:`get_parameter`.
+
+    Used by check handlers that take a comparison value emitted by the
+    LLM — the LLM frequently writes parameter names like
+    ``FW_AIRSPD_TRIM`` where a float is expected; this helper resolves
+    them against the inventory's parameters in one place.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return float(value), None
+    if isinstance(value, (int, float)):
+        coerced = _coerce_float(value)
+        if coerced is None:
+            return None, f"value {value!r} is not a finite number"
+        return coerced, None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None, None
+        coerced = _coerce_float(stripped)
+        if coerced is not None:
+            return coerced, None
+        if is_px4_parameter_name(stripped):
+            return get_parameter(inventory, stripped, kind=kind)
+        return None, f"value {value!r} is not numeric or a PX4 parameter name"
+    return None, f"value {value!r} is not numeric or a PX4 parameter name"
+
+
 def filter_present_parameters(
     inventory: Any,
     names: Iterable[str],
