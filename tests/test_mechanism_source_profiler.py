@@ -1074,3 +1074,52 @@ def test_parameter_feasibility_gate_uses_only_discovered_parameters():
     assert requirements[1].name == "NAV_ACC_RAD"
     assert requirements[1].role == "threshold"
     assert requirements[1].gate_result == "verification_required"
+
+
+def test_enum_entries_extracted_as_source_assignments(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "config.hpp").write_text(
+        """
+enum {
+    STICK_CONFIG_SWAP_STICKS_BIT = (1 << 0),
+    STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT = (1 << 1),
+    STICK_CONFIG_THIRD_BIT = (1 << 2),
+};
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(["src/modules/example/config.hpp"])
+    by_target = {a.target: a.expression for a in assignments}
+    assert by_target["STICK_CONFIG_SWAP_STICKS_BIT"] == "(1 << 0)"
+    assert by_target["STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT"] == "(1 << 1)"
+    assert by_target["STICK_CONFIG_THIRD_BIT"] == "(1 << 2)"
+    # File and per-entry line preserved.
+    entry = next(a for a in assignments if a.target == "STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT")
+    assert entry.file.endswith("config.hpp")
+    assert entry.line >= 1
+
+
+def test_define_macros_extracted_as_source_assignments(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "tunables.hpp").write_text(
+        """
+#define SIMPLE_CONST 4
+#define COMPLEX_CONST (1 << 5)
+#define MAX_MACRO(a, b) ((a) > (b) ? (a) : (b))
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(["src/modules/example/tunables.hpp"])
+    by_target = {a.target: a.expression for a in assignments}
+    assert by_target["SIMPLE_CONST"] == "4"
+    assert by_target["COMPLEX_CONST"] == "(1 << 5)"
+    # Function-like macros are intentionally skipped.
+    assert "MAX_MACRO" not in by_target

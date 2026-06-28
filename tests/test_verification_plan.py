@@ -1325,6 +1325,43 @@ def test_branch_parameter_check_inherits_source_predicate_from_mode_state_gate()
     assert check.source_predicate == "_param_fw_wind_arsp_sc.get() > 0"
 
 
+def test_bitmask_predicate_resolves_symbolic_mask_via_assignment():
+    """A predicate ``param & SYMBOL == 0`` resolves the SYMBOL via
+    BindingIndex.assignment_resolutions when the profiler has extracted
+    SYMBOL = expression as a source_assignment (e.g. from an enum
+    entry)."""
+    from flight_log_agent.analysis.binding_index import BindingIndex
+    from flight_log_agent.analysis.verification_plan import (
+        parse_and_resolve_predicate_part,
+        SignalResolver,
+    )
+
+    inventory = {
+        "parameters": {"FW_POS_STK_CONF": 2},
+        "available_topics": [],
+        "topic_fields": {},
+    }
+    assignments = [
+        {
+            "target": "STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT",
+            "expression": "(1 << 1)",
+            "control_predicates": [],
+            "file": "x.hpp", "line": 1, "evidence": "", "function": None,
+        },
+    ]
+    index = BindingIndex(inventory, [], source_assignments=assignments)
+    resolver = SignalResolver.from_index(index)
+
+    result = parse_and_resolve_predicate_part(
+        "_param_fw_pos_stk_conf.get() & STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT == 0",
+        resolver, inventory, binding_index=index,
+    )
+    assert result["resolved"] is True
+    assert result["kind"] == "parameter"
+    # bit 1 of 2 is set, so the "clear" form (== 0) is FALSE.
+    assert result["satisfied"] is False
+
+
 def test_branch_parameter_check_unchanged_when_already_complete():
     """A check already carrying op+value must not be modified."""
     candidate = MechanismCandidate(

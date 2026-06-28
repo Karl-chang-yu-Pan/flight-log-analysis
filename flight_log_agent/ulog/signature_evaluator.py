@@ -11,6 +11,16 @@ from typing import Any
 from pyulog import ULog
 
 from flight_log_agent.analysis.helper_resolution import HelperRegistry
+from flight_log_agent.analysis.safe_eval import (
+    ALLOWED_EXPRESSION_FUNCTIONS,
+    ExpressionEvaluationError,
+    _compare_literal,
+    _comparison_operator,
+    _eval_expression_node,
+    _normalized_literal,
+    _numeric_expression_value,
+    _parse_expression,
+)
 from flight_log_agent.analysis.parameter_lookup import get_parameter as _get_parameter
 from flight_log_agent.analysis.parameter_lookup import resolve_numeric_value as _resolve_numeric_value
 from flight_log_agent.symbols import parse_simple_signal as _parse_signal
@@ -723,13 +733,6 @@ def _check_samples(
     return {"samples": samples, "window": window}
 
 
-class ExpressionEvaluationError(ValueError):
-    pass
-
-
-ALLOWED_EXPRESSION_FUNCTIONS = SAFE_MATH_FUNCTIONS
-
-
 def _expression_context(
     topics: dict[str, Any],
     parameters: dict[str, Any],
@@ -906,93 +909,9 @@ def _evaluate_expression_over_context(expression: str, context: dict[str, Any]) 
     return results
 
 
-def _parse_expression(expression: str) -> ast.Expression:
-    try:
-        tree = ast.parse(expression, mode="eval")
-    except SyntaxError as exc:
-        raise ExpressionEvaluationError("invalid expression syntax") from exc
-    return tree
-
-
-def _eval_expression_node(node: ast.AST, env: dict[str, Any]) -> Any:
-    if isinstance(node, ast.Expression):
-        return _eval_expression_node(node.body, env)
-    if isinstance(node, ast.Constant):
-        if isinstance(node.value, (int, float, bool)):
-            return node.value
-        raise ExpressionEvaluationError("string literals are not supported")
-    if isinstance(node, ast.Name):
-        if node.id not in env:
-            raise ExpressionEvaluationError(f"missing runtime variable {node.id}")
-        return env[node.id]
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        operand = _numeric_expression_value(_eval_expression_node(node.operand, env))
-        return operand if isinstance(node.op, ast.UAdd) else -operand
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        return not bool(_eval_expression_node(node.operand, env))
-    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
-        return all(bool(_eval_expression_node(value, env)) for value in node.values)
-    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
-        return any(bool(_eval_expression_node(value, env)) for value in node.values)
-    if isinstance(node, ast.IfExp):
-        branch = node.body if bool(_eval_expression_node(node.test, env)) else node.orelse
-        return _eval_expression_node(branch, env)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod)):
-        left = _numeric_expression_value(_eval_expression_node(node.left, env))
-        right = _numeric_expression_value(_eval_expression_node(node.right, env))
-        if isinstance(node.op, ast.Add):
-            return left + right
-        if isinstance(node.op, ast.Sub):
-            return left - right
-        if isinstance(node.op, ast.Mult):
-            return left * right
-        if right == 0:
-            raise ExpressionEvaluationError("division by zero")
-        if isinstance(node.op, ast.Mod):
-            return left % right
-        return left / right
-    if isinstance(node, ast.Call):
-        if not isinstance(node.func, ast.Name) or node.func.id not in ALLOWED_EXPRESSION_FUNCTIONS:
-            raise ExpressionEvaluationError("unsupported function")
-        if node.keywords:
-            raise ExpressionEvaluationError("keyword arguments are not supported")
-        args = [_numeric_expression_value(_eval_expression_node(arg, env)) for arg in node.args]
-        if not args:
-            raise ExpressionEvaluationError("function requires at least one argument")
-        return ALLOWED_EXPRESSION_FUNCTIONS[node.func.id](*args)
-    if isinstance(node, ast.Compare):
-        left = _eval_expression_node(node.left, env)
-        for operator, comparator in zip(node.ops, node.comparators):
-            right = _eval_expression_node(comparator, env)
-            op = _comparison_operator(operator)
-            if not _compare_literal(left, op, right):
-                return False
-            left = right
-        return True
-    raise ExpressionEvaluationError("unsupported expression syntax")
-
-
-def _comparison_operator(operator: ast.cmpop) -> str:
-    if isinstance(operator, ast.Gt):
-        return ">"
-    if isinstance(operator, ast.GtE):
-        return ">="
-    if isinstance(operator, ast.Lt):
-        return "<"
-    if isinstance(operator, ast.LtE):
-        return "<="
-    if isinstance(operator, ast.Eq):
-        return "=="
-    if isinstance(operator, ast.NotEq):
-        return "!="
-    raise ExpressionEvaluationError("unsupported comparison operator")
-
-
-def _numeric_expression_value(value: Any) -> float:
-    number = _number(value)
-    if number is None:
-        raise ExpressionEvaluationError(f"non-numeric expression value: {value}")
-    return number
+# AST evaluator (_eval_expression_node), parser helper, numeric coercion,
+# comparison operator, ExpressionEvaluationError, and ALLOWED_EXPRESSION_FUNCTIONS
+# now live in flight_log_agent.analysis.safe_eval and are imported above.
 
 
 def _series_value_at(samples: list[tuple[float, Any]], target_time: float) -> Any:
@@ -1132,33 +1051,8 @@ def _numeric_delta(samples: list[tuple[float, Any]]) -> float | None:
     return values[-1] - values[0]
 
 
-def _compare_literal(actual: Any, op: str, expected: Any, *, tolerance: float | None = None) -> bool:
-    actual_number = _number(actual)
-    expected_number = _number(expected)
-    if actual_number is not None and expected_number is not None:
-        if op == "==" and tolerance is not None:
-            return abs(actual_number - expected_number) <= tolerance
-        if op == "!=" and tolerance is not None:
-            return abs(actual_number - expected_number) > tolerance
-        return _compare(actual_number, op, expected_number)
-
-    if op == "==":
-        return _normalized_literal(actual) == _normalized_literal(expected)
-    if op == "!=":
-        return _normalized_literal(actual) != _normalized_literal(expected)
-    raise ValueError(f"operator {op} requires numeric values")
-
-
-def _normalized_literal(value: Any) -> Any:
-    value = _json_safe_value(value)
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered == "true":
-            return True
-        if lowered == "false":
-            return False
-        return value.strip()
-    return value
+# _compare_literal and _normalized_literal moved to
+# flight_log_agent.analysis.safe_eval and re-imported above.
 
 
 def _parse_parameter_predicate(predicate: str, parameter: str) -> tuple[str, str, Any] | None:

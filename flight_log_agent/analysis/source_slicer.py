@@ -548,10 +548,8 @@ def _resolve_via_assignment_resolutions(
     """
     if binding_index is None:
         return None
-    resolutions = getattr(binding_index, "assignment_resolutions", None)
-    if not isinstance(resolutions, dict):
-        return None
-    pre = resolutions.get(canonical)
+    lookup = getattr(binding_index, "assignment_resolution_for", None)
+    pre = lookup(canonical) if callable(lookup) else None
     if pre is None:
         return None
     expression = getattr(pre, "expression", None)

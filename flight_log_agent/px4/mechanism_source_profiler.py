@@ -357,6 +357,28 @@ class MechanismSourceProfiler:
         r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
         r"\s*(?P<op>\+=|-=|\*=|/=|%=|\|=|&=|\^=)\s*(?P<expr>[^;]+);"
     )
+    # C/C++ enum block: ``enum [class] [Name] [: base] { body };``. Used to
+    # extract NAME = VALUE entries inside the body so PX4-defined bitmask
+    # constants flow through source_assignments and become resolvable by
+    # the slicer + predicate parser like any other symbol.
+    _ENUM_BLOCK_PATTERN = re.compile(
+        r"enum\s+(?:class\s+|struct\s+)?"
+        r"(?:[A-Za-z_][A-Za-z0-9_]*\s*)?"
+        r"(?::\s*[A-Za-z_][A-Za-z0-9_:\s]*\s*)?"
+        r"\{(?P<body>[^{}]*)\}",
+        re.DOTALL,
+    )
+    _ENUM_ENTRY_PATTERN = re.compile(
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>[^,\n]+?)\s*(?:,|$)",
+        re.MULTILINE,
+    )
+    # Simple object-like ``#define NAME VALUE`` macro. Function-like macros
+    # (``#define NAME(args) body``) don't match because they lack the
+    # required whitespace between NAME and the body.
+    _DEFINE_PATTERN = re.compile(
+        r"^\s*#\s*define\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<value>[^/\n]+?)(?:\s*//.*)?\s*$",
+        re.MULTILINE,
+    )
     _FUNCTION_SIGNATURE_PATTERN = re.compile(
         r"(?P<prefix>[A-Za-z_][A-Za-z0-9_:<>,~*&\s]*?)\s+"
         r"(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)"
@@ -861,7 +883,80 @@ class MechanismSourceProfiler:
                             ),
                         )
                     )
+
+            refs.extend(self._extract_constant_definitions(text, rel_file))
         return self._dedupe_source_assignment_refs(refs)
+
+    def _extract_constant_definitions(
+        self,
+        text: str,
+        rel_file: str,
+    ) -> List[SourceAssignmentRef]:
+        """Extract enum entries and object-like ``#define`` macros.
+
+        Both forms become :class:`SourceAssignmentRef` records with
+        ``target = NAME`` and ``expression = VALUE``, so the slicer and
+        the predicate parser can look them up via the same
+        ``assignment_resolutions`` path that handles ordinary
+        assignments. Without this extraction, PX4-defined bitmask
+        constants (e.g. ``STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT``)
+        appear as opaque identifiers and predicates referencing them
+        stay unresolved.
+        """
+        cleaned = self._strip_block_comments_preserve_lines(text)
+        refs: List[SourceAssignmentRef] = []
+
+        for block in self._ENUM_BLOCK_PATTERN.finditer(cleaned):
+            body = block.group("body")
+            body_start = block.start("body")
+            body_line_offset = cleaned[:body_start].count("\n")
+            for entry in self._ENUM_ENTRY_PATTERN.finditer(body):
+                name = entry.group("name").strip()
+                value = entry.group("value").strip()
+                if not name or not value:
+                    continue
+                line_no = body_line_offset + body[:entry.start()].count("\n") + 1
+                refs.append(
+                    SourceAssignmentRef(
+                        target=name,
+                        expression=value,
+                        target_topic=None,
+                        target_field=None,
+                        function=None,
+                        function_parameters=[],
+                        assignment_operator="=",
+                        file=rel_file,
+                        line=line_no,
+                        evidence=f"{name} = {value}",
+                        control_predicates=[],
+                        symbol_bindings={},
+                    )
+                )
+
+        for match in self._DEFINE_PATTERN.finditer(cleaned):
+            name = match.group("name").strip()
+            value = match.group("value").strip()
+            if not name or not value:
+                continue
+            line_no = cleaned[:match.start()].count("\n") + 1
+            refs.append(
+                SourceAssignmentRef(
+                    target=name,
+                    expression=value,
+                    target_topic=None,
+                    target_field=None,
+                    function=None,
+                    function_parameters=[],
+                    assignment_operator="=",
+                    file=rel_file,
+                    line=line_no,
+                    evidence=match.group(0).strip(),
+                    control_predicates=[],
+                    symbol_bindings={},
+                )
+            )
+
+        return refs
 
     def _control_predicates_by_line(self, text: str) -> Dict[int, List[str]]:
         predicates_by_line: Dict[int, List[str]] = {}

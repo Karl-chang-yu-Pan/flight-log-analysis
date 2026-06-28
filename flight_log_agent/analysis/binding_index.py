@@ -291,6 +291,18 @@ class BindingIndex:
             return resolution.resolved
         return reference
 
+    def assignment_resolution_for(self, name: str) -> Any:
+        """Return the materialized resolution for ``name``, or None.
+
+        Single lookup used by both the slicer's fast path and the
+        predicate parser's symbolic-constant fallback. Wraps the
+        ``assignment_resolutions`` dict so callers do not duplicate the
+        ``normalize_symbol`` + ``.get`` pair.
+        """
+        if not isinstance(name, str) or not name:
+            return None
+        return self.assignment_resolutions.get(normalize_symbol(name))
+
     def slice_for_terminal(self, terminal: str) -> set[str]:
         """Return the logged signals reachable backward from ``terminal``.
 

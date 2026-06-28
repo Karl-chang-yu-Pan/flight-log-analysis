@@ -5,11 +5,13 @@ import math
 import pytest
 
 from flight_log_agent.analysis.parameter_lookup import (
+    CXX_STDLIB_CONSTANTS,
     PX4_PARAM_NAME_LIMIT,
     filter_present_parameters,
     get_parameter,
     has_parameter,
     is_px4_parameter_name,
+    lookup_cxx_constant,
     resolve_numeric_value,
 )
 
@@ -160,3 +162,42 @@ class TestResolveNumericValue:
     def test_none_passes_through(self):
         v, missing = resolve_numeric_value(None, {})
         assert v is None and missing is None
+
+
+# Const-expression evaluator tests live in test_safe_eval.py.
+
+
+class TestLookupCxxConstant:
+    def test_flt_epsilon_is_single_precision(self):
+        # FLT_EPSILON is the IEEE 754 single-precision epsilon, ~1.19e-7.
+        v = lookup_cxx_constant("FLT_EPSILON")
+        assert v is not None
+        assert 1e-7 < v < 2e-7
+
+    def test_dbl_epsilon_distinct_from_flt(self):
+        # DBL_EPSILON is the double-precision epsilon, ~2.22e-16.
+        assert lookup_cxx_constant("DBL_EPSILON") < lookup_cxx_constant("FLT_EPSILON")
+
+    def test_m_pi(self):
+        v = lookup_cxx_constant("M_PI")
+        assert v is not None
+        assert 3.14 < v < 3.15
+
+    def test_unknown_returns_none(self):
+        assert lookup_cxx_constant("NOT_A_CONST") is None
+        assert lookup_cxx_constant("") is None
+        assert lookup_cxx_constant(None) is None  # type: ignore[arg-type]
+
+
+class TestResolveNumericValueStdlibFallback:
+    def test_flt_epsilon_resolved_via_stdlib(self):
+        v, missing = resolve_numeric_value("FLT_EPSILON", {})
+        assert v is not None and missing is None
+        assert 1e-7 < v < 2e-7
+
+    def test_param_wins_over_stdlib_when_present(self):
+        # If a PX4 parameter shares a name with a stdlib constant (an
+        # edge case but worth pinning), the parameter value wins.
+        inv = {"parameters": {"M_PI": 999.0}}
+        v, missing = resolve_numeric_value("M_PI", inv)
+        assert v == 999.0 and missing is None

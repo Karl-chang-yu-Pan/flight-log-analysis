@@ -9,6 +9,8 @@ from typing import Any, Iterable, Optional
 from flight_log_agent.analysis.binding_index import BindingIndex
 from flight_log_agent.analysis.binding_index import assignment_path_symbols as _binding_assignment_path_symbols
 from flight_log_agent.analysis.helper_resolution import HelperRegistry, substitute_helpers
+from flight_log_agent.analysis.parameter_lookup import lookup_cxx_constant
+from flight_log_agent.analysis.safe_eval import eval_const_expression
 from flight_log_agent.analysis.source_expression import (
     ALLOWED_EXPRESSION_NODES,
     alias_dotted_names,
@@ -162,7 +164,7 @@ def resolved_candidate_predicate_signals(
     for candidate in candidates:
         for predicate_group in candidate_source_predicate_groups(candidate):
             for predicate in predicate_group:
-                for parsed in parse_and_resolve_predicates(predicate, resolver, inventory):
+                for parsed in parse_and_resolve_predicates(predicate, resolver, inventory, binding_index=binding_index):
                     signal = parsed.get("signal")
                     if parsed.get("resolved") and parsed.get("kind") == "logged_signal" and signal:
                         signals.append(str(signal))
@@ -279,7 +281,7 @@ def compile_branch_plan(
     parsed_predicates: list[dict[str, Any]] = []
     excluded_by = []
     for predicate in source_predicates:
-        parsed_parts = parse_and_resolve_predicates(predicate, resolver, inventory)
+        parsed_parts = parse_and_resolve_predicates(predicate, resolver, inventory, binding_index=binding_index)
         unresolved.extend(
             parsed["reason"]
             for parsed in parsed_parts
@@ -574,6 +576,8 @@ def parse_and_resolve_predicates(
     predicate: str,
     resolver: "SignalResolver",
     inventory: dict[str, Any],
+    *,
+    binding_index: Optional[BindingIndex] = None,
 ) -> list[dict[str, Any]]:
     expression = strip_outer_parentheses(predicate)
     if len(split_top_level(expression, "||")) > 1:
@@ -591,7 +595,7 @@ def parse_and_resolve_predicates(
         if part.strip()
     ]
     return [
-        parse_and_resolve_predicate_part(part, resolver, inventory)
+        parse_and_resolve_predicate_part(part, resolver, inventory, binding_index=binding_index)
         for part in parts
     ]
 
@@ -600,6 +604,8 @@ def parse_and_resolve_predicate_part(
     predicate: str,
     resolver: "SignalResolver",
     inventory: dict[str, Any],
+    *,
+    binding_index: Optional[BindingIndex] = None,
 ) -> dict[str, Any]:
     bitmask_match = re.fullmatch(
         r"\(?\s*(?P<left>[_A-Za-z][_A-Za-z0-9]*(?:\s*\.\s*get\s*\(\s*\)|(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*)*))"
@@ -610,6 +616,8 @@ def parse_and_resolve_predicate_part(
         parameter = parameter_name_for_accessor(bitmask_match.group("left"), inventory)
         mask = parse_literal(bitmask_match.group("mask"))
         expected = parse_literal(bitmask_match.group("value"))
+        if not isinstance(mask, int):
+            mask = _resolve_constant_via_assignments(bitmask_match.group("mask"), binding_index)
         if not isinstance(mask, int):
             return {"resolved": False, "reason": f"Bitmask constant is unresolved: {bitmask_match.group('mask')}"}
         bit_op = "bit_set" if (
@@ -665,13 +673,20 @@ def parse_and_resolve_predicate_part(
             parameters = inventory.get("parameters") or {}
             if parameter not in parameters:
                 return {"resolved": False, "reason": f"Predicate parameter {parameter} is missing from the log."}
-            expected = parse_literal(comparison.group("value"))
+            raw_value = comparison.group("value")
+            expected = parse_literal(raw_value)
+            if expected is None:
+                expected = _resolve_constant_via_assignments(raw_value, binding_index)
+            if expected is None:
+                expected = lookup_cxx_constant(raw_value)
+            if expected is None:
+                return {"resolved": False, "reason": f"Comparison constant is unresolved: {raw_value}"}
             op = comparison.group("op")
             return {
                 "resolved": True,
                 "kind": "parameter",
                 "satisfied": predicate_matches(parameters[parameter], op, expected),
-                "text": f"{parameter} {op} {comparison.group('value')}",
+                "text": f"{parameter} {op} {raw_value}",
             }
         resolution = resolver.resolve(comparison.group("left"))
         if resolution.status != "resolved" or not resolution.resolved:
@@ -717,6 +732,28 @@ def parse_and_resolve_predicate_part(
             "text": f"{resolution.resolved} == {str(expected).lower()}",
         }
     return {"resolved": False, "reason": f"Unsupported source predicate: {predicate}"}
+
+
+def _resolve_constant_via_assignments(
+    identifier: str,
+    binding_index: Optional[BindingIndex],
+) -> Optional[int | float]:
+    """Resolve a symbolic identifier via materialized assignment resolutions.
+
+    Used by the predicate parser when ``parse_literal`` fails on a
+    bitmask or comparison RHS. The profiler now extracts PX4 enum
+    entries and ``#define`` macros into ``source_assignments``, and
+    :class:`BindingIndex` materializes their resolved expressions —
+    so a symbolic mask like ``STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT``
+    can be looked up here and folded to its numeric value.
+    """
+    if binding_index is None:
+        return None
+    result = binding_index.assignment_resolution_for(identifier)
+    expression = getattr(result, "expression", None) if result is not None else None
+    if not isinstance(expression, str):
+        return None
+    return eval_const_expression(expression)
 
 
 def _inject_source_predicate_from_gates(

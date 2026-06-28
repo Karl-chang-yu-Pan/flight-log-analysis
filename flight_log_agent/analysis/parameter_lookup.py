@@ -13,8 +13,11 @@ promotion — important for INT32 parameters used as bitmasks (``SYS_AUTOSTART``
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Iterable, Literal, Optional, Tuple
+
+import numpy as _np
 
 
 Kind = Literal["auto", "int", "float", "bool"]
@@ -25,6 +28,41 @@ _PX4_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 # PX4 enforces a 16-character upper bound on parameter names via the
 # parameter storage subsystem (see `param_name_t` in src/lib/parameters/).
 PX4_PARAM_NAME_LIMIT = 16
+
+
+# C-stdlib numeric constants that PX4 source uses as comparison RHSes.
+# The set is bounded by the C standard / IEEE 754 and version-invariant
+# across PX4 releases, so a fixed lookup is appropriate. Values come
+# from Python's stdlib + numpy at module load (not transcribed by hand)
+# so the table stays in sync with the IEEE 754 definitions.
+CXX_STDLIB_CONSTANTS: dict[str, float] = {
+    "FLT_EPSILON": float(_np.finfo(_np.float32).eps),
+    "DBL_EPSILON": float(_np.finfo(_np.float64).eps),
+    "FLT_MAX":     float(_np.finfo(_np.float32).max),
+    "FLT_MIN":     float(_np.finfo(_np.float32).tiny),
+    "DBL_MAX":     float(_np.finfo(_np.float64).max),
+    "DBL_MIN":     float(_np.finfo(_np.float64).tiny),
+    "M_PI":        math.pi,
+    "M_PI_2":      math.pi / 2.0,
+    "M_PI_4":      math.pi / 4.0,
+    "M_E":         math.e,
+    "INFINITY":    math.inf,
+    "NAN":         math.nan,
+}
+
+
+def lookup_cxx_constant(name: str) -> Optional[float]:
+    """Return the value of a C-stdlib numeric constant by name.
+
+    ``None`` when the name is not in :data:`CXX_STDLIB_CONSTANTS`. The
+    predicate parser and ``resolve_numeric_value`` consult this as the
+    last fallback so identifiers like ``FLT_EPSILON`` and ``M_PI`` —
+    which appear in PX4 source as comparison RHSes but are not defined
+    in the PX4 tree — resolve to their numeric values.
+    """
+    if not isinstance(name, str):
+        return None
+    return CXX_STDLIB_CONSTANTS.get(name.strip())
 
 
 def is_px4_parameter_name(name: str) -> bool:
@@ -137,7 +175,16 @@ def resolve_numeric_value(
         if coerced is not None:
             return coerced, None
         if is_px4_parameter_name(stripped):
-            return get_parameter(inventory, stripped, kind=kind)
+            param_value, missing = get_parameter(inventory, stripped, kind=kind)
+            if param_value is not None:
+                return param_value, None
+            stdlib_value = lookup_cxx_constant(stripped)
+            if stdlib_value is not None:
+                return stdlib_value, None
+            return None, missing
+        stdlib_value = lookup_cxx_constant(stripped)
+        if stdlib_value is not None:
+            return stdlib_value, None
         return None, f"value {value!r} is not numeric or a PX4 parameter name"
     return None, f"value {value!r} is not numeric or a PX4 parameter name"
 
