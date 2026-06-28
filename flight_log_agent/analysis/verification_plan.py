@@ -542,15 +542,22 @@ def checks_for_branch(
 
 
 def expand_disjunctive_branch_inputs(branch_inputs: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
-    expanded: list[tuple[Any, ...]] = []
-    for branch_input in branch_inputs:
-        name, source_refs, source_predicates, *rest = branch_input
-        alternatives = [safe_disjunction_alternatives(predicate) for predicate in source_predicates]
-        combinations = list(itertools.product(*alternatives)) if alternatives else [()]
-        for index, predicates in enumerate(combinations, start=1):
-            expanded_name = name if len(combinations) == 1 else f"{name}:alternative-{index}"
-            expanded.append((expanded_name, source_refs, list(predicates), *rest))
-    return expanded
+    """Identity. Disjunctive predicates are now opaque booleans.
+
+    Previously expanded ``||`` in mode_state_gates into a Cartesian
+    product of branch alternatives, which on a typical RTL candidate
+    with 12 disjunctive predicates blew up to 2**12 = 4096 branches.
+    That treated ``||`` as a sub-mechanism fork, but the disjunctions
+    are far more often compound single-conditions
+    (e.g. ``param_invalid || fetch_failed``) and the Cartesian
+    expansion couldn't represent genuine sub-mechanism differences
+    anyway because ``primary_output_signals`` / ``checks`` were
+    identical across the 4096 expanded branches. Genuine sub-variants
+    must be emitted as ``branch_groups``; arbitrary ``||`` in
+    mode_state_gates is now handled as one boolean by
+    :func:`parse_and_resolve_predicates`.
+    """
+    return list(branch_inputs)
 
 
 def safe_disjunction_alternatives(predicate: str) -> list[str]:
@@ -568,7 +575,14 @@ def parse_and_resolve_predicates(
 ) -> list[dict[str, Any]]:
     expression = strip_outer_parentheses(predicate)
     if len(split_top_level(expression, "||")) > 1:
-        return [{"resolved": False, "reason": f"Disjunctive source predicate was not expanded safely: {predicate}"}]
+        # Treat the disjunction as one opaque boolean. Cannot statically
+        # determine truth or narrow the timeline window from a
+        # disjunction without per-alternative evaluation. The
+        # downstream loop in compile_branch_plan filters by kind, so an
+        # opaque kind is skipped for both exclusion (kind=parameter)
+        # and timeline narrowing (kind=logged_signal). The predicate
+        # text is preserved for reporting.
+        return [{"resolved": True, "kind": "opaque_boolean", "text": predicate}]
     parts = [
         strip_outer_parentheses(part.strip())
         for part in split_top_level(expression, "&&")

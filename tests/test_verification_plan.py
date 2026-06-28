@@ -1202,3 +1202,96 @@ def test_all_real_branches_excluded_makes_mechanism_inapplicable():
     assert len(plan.branches) == 1
     assert plan.branches[0].applicable is False
     assert applicability.applicable is False
+
+
+def test_disjunctive_mode_state_gates_produce_one_branch_not_cartesian():
+    """Twelve disjunctive predicates would previously expand to 2**12 = 4096
+    branches. They must now collapse to a single branch because each
+    disjunction is treated as an opaque boolean."""
+    # 12 simple disjunctive predicates — same shape as the PX4
+    # param-validity idiom: `param_invalid || fetch_failed`.
+    gates = [
+        f"_param_x{i} == PARAM_INVALID || param_get(_param_x{i}, &ret) != PX4_OK"
+        for i in range(12)
+    ]
+    candidate = MechanismCandidate(
+        name="Disjunction explosion smoke",
+        summary="",
+        source_refs=[],
+        mode_state_gates=gates,
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {},
+        "available_topics": [],
+        "topic_fields": {},
+    }
+    plan = compile_verification_plan(candidate, inventory, [], None)
+    # Was 4096 before this fix.
+    assert len(plan.branches) == 1
+
+
+def test_disjunctive_predicate_does_not_trigger_false_exclusion():
+    """A disjunction whose first alternative is a contradicted parameter
+    must not exclude the mechanism, because the second alternative could
+    be true at runtime."""
+    candidate = MechanismCandidate(
+        name="Disjunction exclusion smoke",
+        summary="",
+        source_refs=[],
+        # First alternative ("X == NEVER_MATCHES") is a parameter check
+        # that would be contradicted; second alternative is an opaque
+        # runtime expression. The mechanism must not be excluded.
+        mode_state_gates=["X == 999 || some_runtime_flag"],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {"X": 0},
+        "available_topics": [],
+        "topic_fields": {},
+    }
+    plan = compile_verification_plan(candidate, inventory, [], None)
+    assert len(plan.branches) == 1
+    assert plan.branches[0].excluded_by == []
+
+
+def test_disjunctive_predicate_text_preserved_in_resolved_predicates():
+    """Reports rely on the predicate text appearing in resolved_predicates
+    even when the predicate is treated as opaque."""
+    predicate = "_rtl_alt_min || global_position.alt < _destination.alt"
+    candidate = MechanismCandidate(
+        name="Disjunction text retention",
+        summary="",
+        source_refs=[],
+        mode_state_gates=[predicate],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {},
+        "available_topics": [],
+        "topic_fields": {},
+    }
+    plan = compile_verification_plan(candidate, inventory, [], None)
+    assert any(predicate in p for p in plan.branches[0].resolved_predicates)
+
+
+def test_branch_groups_still_produce_independent_branches():
+    """Genuine sub-mechanism variants emitted as branch_groups continue
+    to yield one branch per group, untouched by the disjunction fix."""
+    candidate = MechanismCandidate(
+        name="Branch groups still work",
+        summary="",
+        source_refs=[],
+        branch_groups=[
+            MechanismBranchGroup(name="grp_a", source_predicates=["alpha"]),
+            MechanismBranchGroup(name="grp_b", source_predicates=["beta"]),
+        ],
+    )
+    inventory = {
+        "duration_s": 1.0,
+        "parameters": {},
+        "available_topics": [],
+        "topic_fields": {},
+    }
+    plan = compile_verification_plan(candidate, inventory, [], None)
+    assert len(plan.branches) == 2
