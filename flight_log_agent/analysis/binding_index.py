@@ -436,13 +436,26 @@ class BindingIndex:
         assignments: list[dict[str, Any]],
         parameter_set: set[str],
     ) -> None:
-        """Resolve each assignment's RHS once.
+        """Resolve unconditional single-write targets' RHS once.
 
-        Stores the first resolution per normalized target. Multi-write
-        targets are handled at lookup time by the slicer's conditional
-        path; this table accelerates the single-write fast path.
+        Skipped:
+        - Multi-write targets — the slicer builds a conditional from the
+          per-write control_predicates.
+        - Single-write targets whose only write carries control_predicates
+          — the slicer wraps them in a ternary with the original symbol
+          as the fallback, which the materialized resolution would erase.
         """
         from flight_log_agent.analysis.source_slicer import slice_expression
+
+        writes_per_target: dict[str, int] = {}
+        for assignment in assignments:
+            target = assignment.get("target")
+            if not target:
+                continue
+            normalized_target = normalize_symbol(str(target))
+            if not normalized_target:
+                continue
+            writes_per_target[normalized_target] = writes_per_target.get(normalized_target, 0) + 1
 
         for assignment in assignments:
             target = assignment.get("target")
@@ -451,6 +464,10 @@ class BindingIndex:
             normalized_target = normalize_symbol(str(target))
             if not normalized_target or normalized_target in self.assignment_resolutions:
                 continue
+            if writes_per_target.get(normalized_target, 0) != 1:
+                continue  # multi-write — let the slicer build a conditional
+            if assignment.get("control_predicates"):
+                continue  # gated single write — slicer's ternary preserves the fallback
             rhs = assignment.get("expression")
             if not rhs or not isinstance(rhs, str):
                 continue

@@ -580,7 +580,12 @@ async def analyze_flight_log(
             source_output_bindings = list(source_candidate_set.output_bindings)
             source_helper_expressions = list(source_candidate_set.helper_expressions)
             source_assignments = list(source_candidate_set.source_assignments)
-            shared_binding_index = BindingIndex(inventory, source_output_bindings)
+            shared_binding_index = BindingIndex(
+                inventory,
+                source_output_bindings,
+                helper_expressions=source_helper_expressions,
+                source_assignments=source_assignments,
+            )
             candidate_set = source_mechanisms_to_candidates(
                 source_candidate_set,
                 output_bindings=source_output_bindings,
@@ -614,7 +619,12 @@ async def analyze_flight_log(
             mechanism_cache_summary["written_records"] = written_records
 
         if shared_binding_index is None:
-            shared_binding_index = BindingIndex(inventory, source_output_bindings)
+            shared_binding_index = BindingIndex(
+                inventory,
+                source_output_bindings,
+                helper_expressions=source_helper_expressions,
+                source_assignments=source_assignments,
+            )
         candidate_set.candidates = _audit_stage(
             audit_logger,
             "post_source.sanitize",

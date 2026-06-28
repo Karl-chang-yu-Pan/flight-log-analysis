@@ -226,6 +226,11 @@ def _slice_symbol(
         memo[canonical] = binding_result
         return binding_result
 
+    assignment_result = _resolve_via_assignment_resolutions(canonical, binding_index, path)
+    if assignment_result is not None:
+        memo[canonical] = assignment_result
+        return assignment_result
+
     writes = _find_writes(canonical, index)
     if not writes:
         result = _unbindable(canonical, "no_write_site", f"no assignment writes to {canonical}", path)
@@ -526,6 +531,48 @@ def _resolve_via_binding_index(
         status="resolved",
         expression=logged,
         trace=list(path) + [canonical, logged],
+    )
+
+
+def _resolve_via_assignment_resolutions(
+    canonical: str,
+    binding_index: Optional[Any],
+    path: tuple[str, ...],
+) -> Optional[SliceResult]:
+    """Return a SliceResult derived from a pre-materialized assignment resolution.
+
+    BindingIndex materializes each assignment's RHS into an
+    ExpressionSliceResult at construction time. When the canonical
+    symbol matches a materialized target, return that result as a single
+    SliceResult so the recursive walk does not redo the work.
+    """
+    if binding_index is None:
+        return None
+    resolutions = getattr(binding_index, "assignment_resolutions", None)
+    if not isinstance(resolutions, dict):
+        return None
+    pre = resolutions.get(canonical)
+    if pre is None:
+        return None
+    expression = getattr(pre, "expression", None)
+    if not isinstance(expression, str) or not expression:
+        return None
+    fully = bool(getattr(pre, "fully_resolved", False))
+    if fully:
+        return SliceResult(
+            status="resolved",
+            expression=expression,
+            trace=list(path) + [canonical],
+        )
+    return SliceResult(
+        status="unbindable",
+        blocker=SliceBlocker(
+            kind="unsupported_rhs",
+            symbol=canonical,
+            detail=f"partial pre-materialized resolution for {canonical}",
+            partial_expression=expression,
+        ),
+        trace=list(path) + [canonical],
     )
 
 

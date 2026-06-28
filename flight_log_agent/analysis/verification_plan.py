@@ -54,10 +54,15 @@ def compile_verification_plan(
     source_assignments: Iterable[dict[str, Any]] = (),
     binding_index: Optional[BindingIndex] = None,
 ) -> VerificationPlan:
-    helper_registry = HelperRegistry(list(helper_expressions))
     source_assignments_list = list(source_assignments)
     bindings_list = list(output_bindings)
-    index = binding_index if binding_index is not None else BindingIndex(inventory, bindings_list)
+    index = binding_index if binding_index is not None else BindingIndex(
+        inventory,
+        bindings_list,
+        helper_expressions=helper_expressions,
+        source_assignments=source_assignments_list,
+    )
+    helper_registry = HelperRegistry(_helpers_with_resolutions(helper_expressions, index))
     prefer = _prefer_signals_for_candidate(candidate, index)
     resolver = SignalResolver.from_index(index, prefer=prefer)
     mechanism_id = stable_id("mechanism", {
@@ -950,6 +955,37 @@ class SignalResolver:
 
     def resolve(self, reference: str) -> VerificationSignalResolution:
         return self._index.resolve(reference, prefer=self._prefer)
+
+
+def _helpers_with_resolutions(
+    helper_expressions: Iterable[Any],
+    index: BindingIndex,
+) -> list[dict[str, Any]]:
+    """Return helper records with lowered bodies replaced by resolutions.
+
+    When the BindingIndex has materialized a helper's resolved return
+    expression, swap the helper's ``lowered_return_expression`` with the
+    resolved form so ``substitute_helpers`` inlines the terminal-level
+    text (logged signals + parameters + safe math) in a single pass
+    rather than re-expanding nested helper bodies on every check.
+    """
+    resolutions = getattr(index, "helper_resolutions", {}) or {}
+    out: list[dict[str, Any]] = []
+    for helper in helper_expressions:
+        record = helper if isinstance(helper, dict) else (
+            helper.model_dump(exclude_none=True) if hasattr(helper, "model_dump")
+            else dict(vars(helper))
+        )
+        record = dict(record)
+        name = str(record.get("name") or "")
+        resolution = resolutions.get(name)
+        if resolution is None and "::" in name:
+            resolution = resolutions.get(name.split("::")[-1])
+        resolved_expression = getattr(resolution, "expression", None) if resolution is not None else None
+        if isinstance(resolved_expression, str) and resolved_expression:
+            record["lowered_return_expression"] = resolved_expression
+        out.append(record)
+    return out
 
 
 def _logged_signals_from_inventory(inventory: dict[str, Any]) -> set[str]:
