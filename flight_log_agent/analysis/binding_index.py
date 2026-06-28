@@ -63,6 +63,9 @@ class BindingIndex:
         self,
         inventory: dict[str, Any],
         output_bindings: Iterable[Any],
+        *,
+        helper_expressions: Iterable[Any] = (),
+        source_assignments: Iterable[Any] = (),
     ) -> None:
         schema = load_px4_msg_schema(source_from_inventory(inventory))
         topic_fields = inventory.get("topic_fields") or {}
@@ -147,6 +150,27 @@ class BindingIndex:
         self.unavailable_aliases = unavailable_aliases
         self.symbol_bindings = symbol_bindings
         self._bindings = bindings
+
+        # Resolved-chain tables: materialize each helper's lowered return
+        # expression and each assignment's RHS once, against this index.
+        # Downstream consumers (substitute_helpers, slicer) then look up
+        # the resolved form in O(1) instead of re-walking the chain per
+        # check / per candidate.
+        self.helper_resolutions: dict[str, Any] = {}
+        self.assignment_resolutions: dict[str, Any] = {}
+        parameter_set = set((inventory.get("parameters") or {}).keys())
+        helpers_list = list(helper_expressions)
+        assignments_list = [
+            self._assignment_as_dict(assignment) for assignment in source_assignments
+        ]
+        if helpers_list:
+            self._materialize_helper_resolutions(
+                helpers_list, assignments_list, parameter_set
+            )
+        if assignments_list:
+            self._materialize_assignment_resolutions(
+                assignments_list, parameter_set
+            )
 
     # ------------------------------------------------------------
     # Public API
@@ -291,8 +315,158 @@ class BindingIndex:
         return dict(vars(binding))
 
     @staticmethod
+    def _assignment_as_dict(assignment: Any) -> dict[str, Any]:
+        if isinstance(assignment, dict):
+            return dict(assignment)  # shallow copy so callers don't mutate
+        if hasattr(assignment, "model_dump"):
+            return assignment.model_dump(exclude_none=True)
+        return dict(vars(assignment))
+
+    @staticmethod
     def _source_expression_symbols(expression: str) -> list[str]:
         # Lazy import to avoid a circular dependency with verification_graph.
         from flight_log_agent.analysis.source_expression import source_expression_names
 
         return [normalize_symbol(name) for name in source_expression_names(expression)]
+
+    # ------------------------------------------------------------
+    # Chain-resolution materialization (Flavor 0 Phase A)
+    # ------------------------------------------------------------
+
+    def _materialize_helper_resolutions(
+        self,
+        helpers: list[Any],
+        assignments: list[dict[str, Any]],
+        parameter_set: set[str],
+    ) -> None:
+        """Resolve each helper's lowered body against the index once.
+
+        Runs in iterative passes: each pass resolves helpers whose
+        ``helper_calls`` are either external (not in the registry) or
+        already resolved in a previous pass, so deeply nested helpers
+        inline their callees' resolved forms instead of the unbounded
+        original bodies. After 8 passes (a safety bound), any remaining
+        helpers are resolved with whatever state is available — this is
+        the cycle / over-dependency fallback.
+        """
+        # Lazy imports — keeps the module-level import graph acyclic.
+        from flight_log_agent.analysis.helper_resolution import (
+            HelperRegistry,
+            substitute_helpers,
+        )
+        from flight_log_agent.analysis.source_slicer import slice_expression
+
+        working = [self._helper_as_dict(h) for h in helpers]
+        # Only consider entries with a name and a body to lower.
+        candidates = [
+            h for h in working
+            if h.get("name") and (
+                h.get("lowered_return_expression") or h.get("return_expression")
+            )
+        ]
+        registered_names: set[str] = set()
+        for helper in working:
+            name = helper.get("name")
+            if not name:
+                continue
+            registered_names.add(name)
+            short = name.split("::")[-1]
+            if short:
+                registered_names.add(short)
+
+        resolved: set[str] = set()
+
+        def resolve_one(helper: dict[str, Any]) -> None:
+            name = helper["name"]
+            body = helper.get("lowered_return_expression") or helper.get("return_expression")
+            registry = HelperRegistry(working)
+            substituted = substitute_helpers(str(body), registry=registry, env={})
+            result = slice_expression(
+                substituted,
+                source_assignments=assignments,
+                logged_signals=self.logged_signals,
+                parameters=parameter_set,
+                binding_index=self,
+            )
+            self.helper_resolutions[name] = result
+            short = name.split("::")[-1]
+            if short and short != name and short not in self.helper_resolutions:
+                self.helper_resolutions[short] = result
+            # Update working entry so subsequent passes substitute the
+            # resolved form (terminal-level expression) instead of the
+            # original nested body.
+            helper["lowered_return_expression"] = result.expression
+            resolved.add(name)
+            if short:
+                resolved.add(short)
+
+        for _pass in range(8):
+            progress = False
+            for helper in candidates:
+                name = helper["name"]
+                if name in resolved:
+                    continue
+                callees = helper.get("helper_calls") or []
+                deps_ready = True
+                for callee in callees:
+                    short = str(callee).split("::")[-1]
+                    in_registry = (callee in registered_names) or (short in registered_names)
+                    if not in_registry:
+                        continue  # external call — leave it for the slicer to flag
+                    if (callee not in resolved) and (short not in resolved):
+                        deps_ready = False
+                        break
+                if not deps_ready:
+                    continue
+                resolve_one(helper)
+                progress = True
+            if not progress:
+                break
+
+        # Cycle / over-dependency fallback: any helper not yet resolved
+        # is resolved now without waiting for dependency readiness. The
+        # result may carry blockers, which is the correct partial form.
+        for helper in candidates:
+            if helper["name"] in resolved:
+                continue
+            resolve_one(helper)
+
+    def _materialize_assignment_resolutions(
+        self,
+        assignments: list[dict[str, Any]],
+        parameter_set: set[str],
+    ) -> None:
+        """Resolve each assignment's RHS once.
+
+        Stores the first resolution per normalized target. Multi-write
+        targets are handled at lookup time by the slicer's conditional
+        path; this table accelerates the single-write fast path.
+        """
+        from flight_log_agent.analysis.source_slicer import slice_expression
+
+        for assignment in assignments:
+            target = assignment.get("target")
+            if not target:
+                continue
+            normalized_target = normalize_symbol(str(target))
+            if not normalized_target or normalized_target in self.assignment_resolutions:
+                continue
+            rhs = assignment.get("expression")
+            if not rhs or not isinstance(rhs, str):
+                continue
+            result = slice_expression(
+                rhs,
+                source_assignments=assignments,
+                logged_signals=self.logged_signals,
+                parameters=parameter_set,
+                binding_index=self,
+            )
+            self.assignment_resolutions[normalized_target] = result
+
+    @staticmethod
+    def _helper_as_dict(helper: Any) -> dict[str, Any]:
+        if isinstance(helper, dict):
+            return dict(helper)
+        if hasattr(helper, "model_dump"):
+            return helper.model_dump(exclude_none=True)
+        return dict(vars(helper))
