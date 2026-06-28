@@ -3,6 +3,7 @@ const state = {
   plotPayload: null,
   plotLoadToken: 0,
   plotTrackers: {},
+  sharedPlotTracker: null,
   hiddenPlotSeries: {},
   analysisRunId: null,
   analysisPollTimer: null,
@@ -102,6 +103,7 @@ async function preparseLog() {
     state.payload = result;
     state.plotPayload = null;
     state.plotTrackers = {};
+    state.sharedPlotTracker = null;
     state.hiddenPlotSeries = {};
     resetAnalysis();
     renderAll();
@@ -497,13 +499,20 @@ async function loadInteractivePlots() {
 }
 
 function initializePlotTrackers(plots) {
-  plots.forEach((plot) => {
-    if (state.plotTrackers[plot.id] !== undefined) return;
-    const [start, end] = plot.time_range_s || [0, 0];
-    state.plotTrackers[plot.id] = Number.isFinite(start) ? start : 0;
-    if (Number.isFinite(end) && end > state.plotTrackers[plot.id]) {
-      state.plotTrackers[plot.id] = start + (end - start) * 0.5;
+  if (state.sharedPlotTracker == null) {
+    const [payloadStart, payloadEnd] = state.plotPayload?.time_range_s || [];
+    if (Number.isFinite(payloadStart) && Number.isFinite(payloadEnd) && payloadEnd > payloadStart) {
+      state.sharedPlotTracker = payloadStart + (payloadEnd - payloadStart) * 0.5;
     }
+  }
+
+  plots.forEach((plot) => {
+    const [start, end] = plot.time_range_s || [0, 0];
+    if (state.plotTrackers[plot.id] !== undefined) return;
+    const initial = Number.isFinite(state.sharedPlotTracker)
+      ? state.sharedPlotTracker
+      : Number.isFinite(start) ? start : 0;
+    state.plotTrackers[plot.id] = clampTime(initial, start, end);
   });
 }
 
@@ -533,7 +542,9 @@ function renderInteractivePlots() {
 function renderInteractivePlot(plot) {
   const [start, end] = plot.time_range_s || [0, 0];
   const tracker = clampTracker(plot.id, start, end);
-  const sources = plot.kind === "local_position" ? (plot.traces || []) : (plot.series || []);
+  const sources = plot.kind === "local_position"
+    ? (plot.traces || [])
+    : plot.kind === "spectrogram" ? [] : (plot.series || []);
   const step = Math.max((end - start) / 1000, 0.001);
 
   return `
@@ -579,8 +590,7 @@ function bindInteractivePlots(plots) {
     const canvas = document.getElementById(`plotCanvas-${plot.id}`);
     if (slider) {
       slider.addEventListener("input", () => {
-        state.plotTrackers[plot.id] = Number(slider.value);
-        drawInteractivePlot(plot);
+        setSharedPlotTracker(Number(slider.value));
       });
     }
 
@@ -588,9 +598,7 @@ function bindInteractivePlots(plots) {
       canvas.addEventListener("click", (event) => {
         const time = canvasTimeFromEvent(canvas, plot, event);
         if (time == null) return;
-        state.plotTrackers[plot.id] = time;
-        if (slider) slider.value = String(time);
-        drawInteractivePlot(plot);
+        setSharedPlotTracker(time);
       });
     }
   });
@@ -607,6 +615,19 @@ function bindInteractivePlots(plots) {
   });
 }
 
+function setSharedPlotTracker(time) {
+  const plots = state.plotPayload?.plots || [];
+  state.sharedPlotTracker = time;
+  plots.forEach((plot) => {
+    const [start, end] = plot.time_range_s || [0, 0];
+    const tracker = clampTime(time, start, end);
+    state.plotTrackers[plot.id] = tracker;
+    const slider = document.getElementById(`plotTracker-${plot.id}`);
+    if (slider) slider.value = String(tracker);
+  });
+  drawInteractivePlots(plots);
+}
+
 function drawInteractivePlots(plots) {
   plots.forEach(drawInteractivePlot);
 }
@@ -621,6 +642,8 @@ function drawInteractivePlot(plot) {
 
   if (plot.kind === "local_position") {
     drawLocalPositionPlot(ctx, canvas, bounds, plot);
+  } else if (plot.kind === "spectrogram") {
+    drawSpectrogramPlot(ctx, canvas, bounds, plot);
   } else {
     drawTimeseriesPlot(ctx, canvas, bounds, plot);
   }
@@ -723,6 +746,50 @@ function drawLocalPositionPlot(ctx, canvas, bounds, plot) {
     );
   });
   updatePlotTime(plot.id, tracker);
+}
+
+function drawSpectrogramPlot(ctx, canvas, bounds, plot) {
+  const xRange = plot.time_range_s || numericRange(plot.time_s || []);
+  const yRange = plot.frequency_range_hz || numericRange(plot.frequencies_hz || []);
+  drawSpectrogramImage(ctx, bounds, plot, xRange, yRange);
+  drawGrid(ctx, bounds);
+
+  const tracker = clampTracker(plot.id, xRange[0], xRange[1]);
+  drawTimeTracker(ctx, bounds, tracker, xRange);
+  updatePlotTime(plot.id, tracker);
+}
+
+function drawSpectrogramImage(ctx, bounds, plot, xRange, yRange) {
+  const times = plot.time_s || [];
+  const frequencies = plot.frequencies_hz || [];
+  const values = plot.values_db || [];
+  if (!times.length || !frequencies.length || !values.length) return;
+
+  const [valueMin, valueMax] = plot.value_range_db || numericRange(values.flat());
+  ctx.save();
+  for (let timeIndex = 0; timeIndex < times.length; timeIndex += 1) {
+    const time0 = spectrogramCellLower(times, timeIndex, xRange);
+    const time1 = spectrogramCellUpper(times, timeIndex, xRange);
+    const x0 = xToCanvas(time0, bounds, xRange);
+    const x1 = xToCanvas(time1, bounds, xRange);
+    for (let frequencyIndex = 0; frequencyIndex < frequencies.length; frequencyIndex += 1) {
+      const row = values[frequencyIndex] || [];
+      const value = row[timeIndex];
+      if (!Number.isFinite(value)) continue;
+      const freq0 = spectrogramCellLower(frequencies, frequencyIndex, yRange);
+      const freq1 = spectrogramCellUpper(frequencies, frequencyIndex, yRange);
+      const y0 = yToCanvas(freq0, bounds, yRange);
+      const y1 = yToCanvas(freq1, bounds, yRange);
+      ctx.fillStyle = viridisColor(value, valueMin, valueMax);
+      ctx.fillRect(
+        Math.floor(Math.min(x0, x1)),
+        Math.floor(Math.min(y0, y1)),
+        Math.ceil(Math.abs(x1 - x0)) + 1,
+        Math.ceil(Math.abs(y1 - y0)) + 1,
+      );
+    }
+  }
+  ctx.restore();
 }
 
 function drawTimeOverlays(ctx, bounds, xRange, overlays) {
@@ -855,6 +922,8 @@ function updatePlotReadout(plot) {
 
   if (plot.kind === "local_position") {
     readout.innerHTML = localPositionReadout(plot, tracker);
+  } else if (plot.kind === "spectrogram") {
+    readout.innerHTML = spectrogramReadout(plot, tracker);
   } else {
     readout.innerHTML = timeseriesReadout(plot, tracker);
   }
@@ -900,6 +969,24 @@ function localPositionReadout(plot, tracker) {
   }
 
   return rows.length ? rows.join("") : readoutRow("Visible traces", "none");
+}
+
+function spectrogramReadout(plot, tracker) {
+  const timeIndex = nearestIndex(plot.time_s || [], tracker);
+  if (timeIndex < 0) return readoutRow("Top peaks", "n/a");
+
+  const peaks = spectrogramPeaksAt(plot, timeIndex);
+  const peakText = peaks.length
+    ? peaks.map((peak) => `${formatNumber(peak.frequency)} Hz (${formatNumber(peak.value)} dB)`).join(", ")
+    : "n/a";
+  const rows = [
+    readoutRow("Top peaks", peakText),
+    readoutRow("Spectrogram time", formatLogTime((plot.time_s || [])[timeIndex])),
+  ];
+  if (Number.isFinite(plot.sampling_frequency_hz)) {
+    rows.push(readoutRow("Sample rate", `${formatNumber(plot.sampling_frequency_hz)} Hz`));
+  }
+  return rows.join("");
 }
 
 function readoutRow(label, value) {
@@ -1017,6 +1104,84 @@ function localPositionRange(plot, visibleTraces, bounds) {
   };
 }
 
+function spectrogramCellLower(values, index, range) {
+  if (index <= 0) {
+    const width = values.length > 1 ? values[1] - values[0] : range[1] - range[0];
+    return Math.max(range[0], values[0] - width / 2);
+  }
+  return (values[index - 1] + values[index]) / 2;
+}
+
+function spectrogramCellUpper(values, index, range) {
+  if (index >= values.length - 1) {
+    const width = values.length > 1 ? values[index] - values[index - 1] : range[1] - range[0];
+    return Math.min(range[1], values[index] + width / 2);
+  }
+  return (values[index] + values[index + 1]) / 2;
+}
+
+function spectrogramPeaksAt(plot, timeIndex) {
+  const frequencies = plot.frequencies_hz || [];
+  const values = plot.values_db || [];
+  const candidates = [];
+  for (let index = 1; index < frequencies.length - 1; index += 1) {
+    const value = values[index]?.[timeIndex];
+    const previous = values[index - 1]?.[timeIndex];
+    const next = values[index + 1]?.[timeIndex];
+    if (!Number.isFinite(value) || !Number.isFinite(previous) || !Number.isFinite(next)) continue;
+    if (frequencies[index] <= 0) continue;
+    if (value >= previous && value >= next) {
+      candidates.push({ frequency: frequencies[index], value });
+    }
+  }
+
+  const fallback = candidates.length ? candidates : frequencies
+    .map((frequency, index) => ({ frequency, value: values[index]?.[timeIndex] }))
+    .filter((peak) => peak.frequency > 0 && Number.isFinite(peak.value));
+
+  return fallback
+    .sort((left, right) => right.value - left.value)
+    .slice(0, 3);
+}
+
+function nearestIndex(values, target) {
+  if (!values.length || !Number.isFinite(target)) return -1;
+  let bestIndex = 0;
+  let bestDistance = Math.abs(values[0] - target);
+  for (let index = 1; index < values.length; index += 1) {
+    const distance = Math.abs(values[index] - target);
+    if (distance < bestDistance) {
+      bestIndex = index;
+      bestDistance = distance;
+    }
+  }
+  return bestIndex;
+}
+
+function viridisColor(value, min, max) {
+  const stops = [
+    [0.0, [68, 1, 84]],
+    [0.25, [59, 82, 139]],
+    [0.5, [33, 145, 140]],
+    [0.75, [94, 201, 98]],
+    [1.0, [253, 231, 37]],
+  ];
+  const span = max - min || 1;
+  const ratio = Math.min(Math.max((value - min) / span, 0), 1);
+  for (let index = 1; index < stops.length; index += 1) {
+    const [stopRatio, stopColor] = stops[index];
+    const [previousRatio, previousColor] = stops[index - 1];
+    if (ratio <= stopRatio) {
+      const local = (ratio - previousRatio) / Math.max(stopRatio - previousRatio, 0.0001);
+      const color = stopColor.map((channel, channelIndex) => (
+        Math.round(previousColor[channelIndex] + (channel - previousColor[channelIndex]) * local)
+      ));
+      return `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+    }
+  }
+  return "rgb(253, 231, 37)";
+}
+
 function xToCanvas(value, bounds, range) {
   const span = range[1] - range[0] || 1;
   return bounds.left + ((value - range[0]) / span) * (bounds.right - bounds.left);
@@ -1033,13 +1198,18 @@ function isPlotSourceVisible(plotId, sourceKey) {
 
 function clampTracker(plotId, start, end) {
   const current = Number(state.plotTrackers[plotId]);
-  const fallback = Number.isFinite(start) ? start : 0;
+  const shared = Number(state.sharedPlotTracker);
+  const fallback = Number.isFinite(shared) ? shared : Number.isFinite(start) ? start : 0;
   const value = Number.isFinite(current) ? current : fallback;
-  const lower = Number.isFinite(start) ? start : 0;
-  const upper = Number.isFinite(end) ? end : lower;
-  const clamped = Math.min(Math.max(value, lower), upper);
+  const clamped = clampTime(value, start, end);
   state.plotTrackers[plotId] = clamped;
   return clamped;
+}
+
+function clampTime(value, start, end) {
+  const lower = Number.isFinite(start) ? start : 0;
+  const upper = Number.isFinite(end) ? end : lower;
+  return Math.min(Math.max(value, lower), upper);
 }
 
 function updatePlotTime(plotId, tracker) {

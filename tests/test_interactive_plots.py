@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 import flight_log_agent.ulog.interactive_plots as ulog_interactive_plots
@@ -148,6 +149,104 @@ def test_build_interactive_plot_payload_exposes_flight_review_fixed_y_ranges(mon
         ("mode_background", "Manual", "#cc0000", 0.09),
         ("vtol_background", "Transition", "#cc0000", 0.09),
     }
+
+
+def test_build_interactive_plot_payload_adds_fixed_wing_body_velocity_angles(monkeypatch):
+    ulog = _fake_ulog(
+        {
+            "vehicle_status": {
+                "timestamp": [0, 1_000_000],
+                "vehicle_type": [2, 2],
+            },
+            "vehicle_local_position": {
+                "timestamp": [0, 1_000_000],
+                "vx": [10.0, 10.0],
+                "vy": [0.0, 0.0],
+                "vz": [1.0, 1.0],
+            },
+            "vehicle_attitude": {
+                "timestamp": [0, 1_000_000],
+                "roll": [0.0, 0.0],
+                "pitch": [0.0, 0.0],
+                "yaw": [0.0, 0.0],
+            },
+        }
+    )
+    monkeypatch.setattr(ulog_interactive_plots, "ULog", lambda path: ulog)
+    monkeypatch.setattr(ulog_interactive_plots, "prepare_ulog_for_plotting", lambda parsed: parsed)
+
+    payload = ulog_interactive_plots.build_interactive_plot_payload("flight.ulg")
+
+    plot = next(plot for plot in payload["plots"] if plot["id"] == "fixed_wing_body_velocity_angles")
+    assert [series["label"] for series in plot["series"]] == ["AoA", "Sideslip"]
+    assert plot["series"][0]["unit"] == "deg"
+    assert math.isclose(
+        plot["series"][0]["values"][0],
+        math.degrees(math.atan2(1.0, 10.0)),
+        abs_tol=1e-6,
+    )
+    assert plot["series"][1]["values"] == [0.0, 0.0]
+
+
+def test_build_interactive_plot_payload_adds_multirotor_heading_velocity(monkeypatch):
+    ulog = _fake_ulog(
+        {
+            "vehicle_status": {
+                "timestamp": [0, 1_000_000],
+                "vehicle_type": [1, 1],
+            },
+            "vehicle_local_position": {
+                "timestamp": [0, 1_000_000],
+                "vx": [1.0, 1.0],
+                "vy": [0.0, 0.0],
+            },
+            "vehicle_attitude": {
+                "timestamp": [0, 1_000_000],
+                "yaw": [math.pi / 2.0, math.pi / 2.0],
+            },
+        }
+    )
+    monkeypatch.setattr(ulog_interactive_plots, "ULog", lambda path: ulog)
+    monkeypatch.setattr(ulog_interactive_plots, "prepare_ulog_for_plotting", lambda parsed: parsed)
+
+    payload = ulog_interactive_plots.build_interactive_plot_payload("flight.ulg")
+
+    plot = next(plot for plot in payload["plots"] if plot["id"] == "multirotor_heading_velocity")
+    forward = next(series for series in plot["series"] if series["label"] == "Forward")
+    right = next(series for series in plot["series"] if series["label"] == "Right")
+    assert all(math.isclose(value, 0.0, abs_tol=1e-6) for value in forward["values"])
+    assert all(math.isclose(value, -1.0, abs_tol=1e-6) for value in right["values"])
+
+
+def test_build_interactive_plot_payload_adds_high_rate_spectrogram(monkeypatch):
+    timestamps = [index * 1_000 for index in range(512)]
+    values = [
+        math.sin(2.0 * math.pi * 50.0 * (timestamp * 1.0e-6))
+        for timestamp in timestamps
+    ]
+    ulog = _fake_ulog(
+        {
+            "vehicle_angular_velocity": {
+                "timestamp_sample": timestamps,
+                "timestamp": timestamps,
+                "xyz[0]": values,
+                "xyz[1]": [0.0 for _ in timestamps],
+                "xyz[2]": [0.0 for _ in timestamps],
+            },
+        }
+    )
+    monkeypatch.setattr(ulog_interactive_plots, "ULog", lambda path: ulog)
+    monkeypatch.setattr(ulog_interactive_plots, "prepare_ulog_for_plotting", lambda parsed: parsed)
+
+    payload = ulog_interactive_plots.build_interactive_plot_payload("flight.ulg")
+
+    plot = next(plot for plot in payload["plots"] if plot["id"] == "angular_velocity_spectrogram")
+    assert plot["kind"] == "spectrogram"
+    assert plot["sampling_frequency_hz"] >= 100.0
+    assert plot["frequency_range_hz"][0] == 0.0
+    assert len(plot["time_s"]) > 0
+    assert len(plot["frequencies_hz"]) == len(plot["values_db"])
+    assert all(len(row) == len(plot["time_s"]) for row in plot["values_db"])
 
 
 def _fake_ulog(topic_data):

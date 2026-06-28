@@ -5,6 +5,7 @@ from bisect import bisect_left
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from pyulog import ULog
 
 from flight_log_agent.ulog.plots import (
@@ -58,6 +59,7 @@ VTOL_MODE_STYLES = {
     1: ("Transition", "#cc0000"),
     2: ("Fixed-Wing", "#eecc00"),
     3: ("Multicopter", "#0033cc"),
+    4: ("Fixed-Wing", "#eecc00"),
 }
 
 
@@ -343,6 +345,48 @@ TIMESERIES_PLOTS = [
 ]
 
 
+SPECTROGRAM_PLOTS = [
+    {
+        "id": "angular_velocity_spectrogram",
+        "title": "Angular Velocity Spectrogram",
+        "candidates": [
+            {
+                "topic": "vehicle_angular_velocity",
+                "fields": ["xyz[0]", "xyz[1]", "xyz[2]"],
+                "labels": ["Rollspeed", "Pitchspeed", "Yawspeed"],
+            },
+        ],
+    },
+    {
+        "id": "angular_acceleration_spectrogram",
+        "title": "Angular Acceleration Spectrogram",
+        "candidates": [
+            {
+                "topic": "vehicle_angular_acceleration",
+                "fields": ["xyz[0]", "xyz[1]", "xyz[2]"],
+                "labels": ["Roll accel", "Pitch accel", "Yaw accel"],
+            },
+        ],
+    },
+    {
+        "id": "actuator_controls_spectrogram",
+        "title": "Actuator Controls Spectrogram",
+        "candidates": [
+            {
+                "topic": "vehicle_torque_setpoint",
+                "fields": ["xyz[0]", "xyz[1]", "xyz[2]"],
+                "labels": ["Roll", "Pitch", "Yaw"],
+            },
+            {
+                "topic": "actuator_controls_0",
+                "fields": ["control[0]", "control[1]", "control[2]"],
+                "labels": ["Roll", "Pitch", "Yaw"],
+            },
+        ],
+    },
+]
+
+
 def build_interactive_plot_payload(
     log_path: str | Path,
     *,
@@ -366,8 +410,15 @@ def build_interactive_plot_payload(
     if local_plot is not None:
         plots.append(local_plot)
 
+    plots.extend(_build_velocity_frame_plots(ulog, start_s, end_s, max_points))
+
     for definition in TIMESERIES_PLOTS:
         plot = _build_timeseries_plot(definition, ulog, start_s, end_s, overlays, max_points)
+        if plot is not None:
+            plots.append(plot)
+
+    for definition in SPECTROGRAM_PLOTS:
+        plot = _build_spectrogram_plot(definition, ulog, start_s, end_s, max_points)
         if plot is not None:
             plots.append(plot)
 
@@ -610,6 +661,255 @@ def _build_position_setpoints_trace(
     }
 
 
+def _build_velocity_frame_plots(
+    ulog: Any,
+    start_s: float,
+    end_s: float,
+    max_points: int,
+) -> list[dict[str, Any]]:
+    styles = _flight_styles_present(ulog)
+    plots = []
+
+    if "fixed_wing" in styles:
+        plot = _build_fixed_wing_velocity_angle_plot(ulog, start_s, end_s, max_points)
+        if plot is not None:
+            plots.append(plot)
+
+    if "multirotor" in styles:
+        plot = _build_multirotor_heading_velocity_plot(ulog, start_s, end_s, max_points)
+        if plot is not None:
+            plots.append(plot)
+
+    return plots
+
+
+def _build_fixed_wing_velocity_angle_plot(
+    ulog: Any,
+    start_s: float,
+    end_s: float,
+    max_points: int,
+) -> dict[str, Any] | None:
+    velocity = _raw_field_series(ulog, "vehicle_local_position", ["vx", "vy", "vz"], start_s, end_s)
+    attitude = _raw_field_series(ulog, "vehicle_attitude", ["roll", "pitch", "yaw"], start_s, end_s)
+    if velocity is None or attitude is None:
+        return None
+
+    time_s = []
+    aoa = []
+    sideslip = []
+    for index, sample_time in enumerate(velocity["time_s"]):
+        roll = _interpolated_value(attitude["time_s"], attitude["roll"], sample_time)
+        pitch = _interpolated_value(attitude["time_s"], attitude["pitch"], sample_time)
+        yaw = _interpolated_value(attitude["time_s"], attitude["yaw"], sample_time)
+        if roll is None or pitch is None or yaw is None:
+            continue
+
+        body = _ned_velocity_to_body(
+            velocity["vx"][index],
+            velocity["vy"][index],
+            velocity["vz"][index],
+            roll,
+            pitch,
+            yaw,
+        )
+        forward, right, down = body
+        if not all(math.isfinite(value) for value in body):
+            continue
+
+        time_s.append(sample_time)
+        aoa.append(math.degrees(math.atan2(down, forward)))
+        sideslip.append(math.degrees(math.atan2(right, math.hypot(forward, down))))
+
+    if not time_s:
+        return None
+
+    time_s, aoa, sideslip = _downsample_multi(time_s, [aoa, sideslip], max_points)
+    return {
+        "id": "fixed_wing_body_velocity_angles",
+        "title": "Fixed-Wing Body Velocity Angles",
+        "kind": "timeseries",
+        "time_range_s": [_round_float(start_s), _round_float(end_s)],
+        "series": [
+            {
+                "key": "fixed_wing_body_velocity_angles_aoa",
+                "label": "AoA",
+                "signal": "derived.vehicle_body_velocity_aoa",
+                "unit": "deg",
+                "axis_label": "[deg]",
+                "color": COLORS2[0],
+                "time_s": time_s,
+                "values": aoa,
+            },
+            {
+                "key": "fixed_wing_body_velocity_angles_sideslip",
+                "label": "Sideslip",
+                "signal": "derived.vehicle_body_velocity_sideslip",
+                "unit": "deg",
+                "axis_label": "[deg]",
+                "color": COLORS2[1],
+                "time_s": time_s,
+                "values": sideslip,
+            },
+        ],
+        "overlays": [],
+        "warnings": [],
+    }
+
+
+def _build_multirotor_heading_velocity_plot(
+    ulog: Any,
+    start_s: float,
+    end_s: float,
+    max_points: int,
+) -> dict[str, Any] | None:
+    velocity = _raw_field_series(ulog, "vehicle_local_position", ["vx", "vy"], start_s, end_s)
+    attitude = _raw_field_series(ulog, "vehicle_attitude", ["yaw"], start_s, end_s)
+    if velocity is None or attitude is None:
+        return None
+
+    time_s = []
+    forward_values = []
+    right_values = []
+    for index, sample_time in enumerate(velocity["time_s"]):
+        yaw = _interpolated_value(attitude["time_s"], attitude["yaw"], sample_time)
+        if yaw is None:
+            continue
+
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        north = velocity["vx"][index]
+        east = velocity["vy"][index]
+        forward = cos_yaw * north + sin_yaw * east
+        right = -sin_yaw * north + cos_yaw * east
+        if not math.isfinite(forward) or not math.isfinite(right):
+            continue
+
+        time_s.append(sample_time)
+        forward_values.append(forward)
+        right_values.append(right)
+
+    if not time_s:
+        return None
+
+    time_s, forward_values, right_values = _downsample_multi(time_s, [forward_values, right_values], max_points)
+    return {
+        "id": "multirotor_heading_velocity",
+        "title": "Multirotor Heading-Frame Velocity",
+        "kind": "timeseries",
+        "time_range_s": [_round_float(start_s), _round_float(end_s)],
+        "series": [
+            {
+                "key": "multirotor_heading_velocity_forward",
+                "label": "Forward",
+                "signal": "derived.heading_velocity_forward",
+                "unit": "m/s",
+                "axis_label": "[m/s]",
+                "color": COLORS2[0],
+                "time_s": time_s,
+                "values": forward_values,
+            },
+            {
+                "key": "multirotor_heading_velocity_right",
+                "label": "Right",
+                "signal": "derived.heading_velocity_right",
+                "unit": "m/s",
+                "axis_label": "[m/s]",
+                "color": COLORS2[1],
+                "time_s": time_s,
+                "values": right_values,
+            },
+        ],
+        "overlays": [],
+        "warnings": [],
+    }
+
+
+def _build_spectrogram_plot(
+    definition: dict[str, Any],
+    ulog: Any,
+    start_s: float,
+    end_s: float,
+    max_points: int,
+) -> dict[str, Any] | None:
+    candidate = _first_spectrogram_candidate(ulog, definition["candidates"])
+    if candidate is None:
+        return None
+
+    dataset = candidate["dataset"]
+    data = getattr(dataset, "data", {}) or {}
+    timestamp_key = "timestamp_sample" if "timestamp_sample" in data else "timestamp"
+    timestamps = data.get(timestamp_key)
+    if timestamps is None:
+        return None
+
+    try:
+        data_len = len(timestamps)
+    except TypeError:
+        return None
+    if data_len < 256:
+        return None
+
+    try:
+        first_timestamp = float(_json_safe_value(timestamps[0]))
+        last_timestamp = float(_json_safe_value(timestamps[data_len - 1]))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    delta_t = ((last_timestamp - first_timestamp) * 1.0e-6) / data_len
+    if delta_t <= 0:
+        return None
+
+    sampling_frequency = 1.0 / delta_t
+    if sampling_frequency < 100 or sampling_frequency == float("inf"):
+        return None
+
+    arrays = []
+    for field in candidate["fields"]:
+        values = data.get(field)
+        if values is None:
+            return None
+        try:
+            array = np.asarray([float(_json_safe_value(value)) for value in values[:data_len]], dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if len(array) != data_len or not np.isfinite(array).any():
+            return None
+        arrays.append(np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0))
+
+    frequency, times, values_db = _spectrogram_sum(arrays, first_timestamp, delta_t)
+    if len(times) == 0:
+        return None
+
+    if len(times) > max_points:
+        step = max(1, math.ceil(len(times) / max_points))
+        times = times[::step]
+        values_db = values_db[:, ::step]
+
+    finite_values = values_db[np.isfinite(values_db)]
+    if finite_values.size == 0:
+        return None
+
+    return {
+        "id": definition["id"],
+        "title": definition["title"],
+        "kind": "spectrogram",
+        "time_range_s": [_round_float(start_s), _round_float(end_s)],
+        "frequency_range_hz": [_round_float(float(frequency[0])), _round_float(float(frequency[-1]))],
+        "time_s": _round_list([float(value) for value in times]),
+        "frequencies_hz": _round_list([float(value) for value in frequency]),
+        "values_db": [
+            _round_list([float(value) for value in row])
+            for row in values_db
+        ],
+        "value_range_db": [_round_float(float(np.min(finite_values))), _round_float(float(np.max(finite_values)))],
+        "sampling_frequency_hz": _round_float(sampling_frequency),
+        "source": candidate["topic"],
+        "fields": candidate["fields"],
+        "labels": candidate["labels"],
+        "warnings": [],
+    }
+
+
 def _resolve_first_available(
     ulog: Any,
     signals: list[str],
@@ -669,6 +969,195 @@ def _interpolated_value(times: list[float], values: list[float], target_time: fl
     return v0 + ratio * (v1 - v0)
 
 
+def _raw_field_series(
+    ulog: Any,
+    topic_name: str,
+    field_names: list[str],
+    start_s: float,
+    end_s: float,
+) -> dict[str, list[float]] | None:
+    dataset = _find_dataset(ulog, topic_name)
+    if dataset is None:
+        return None
+
+    data = getattr(dataset, "data", {}) or {}
+    timestamps = data.get("timestamp")
+    if timestamps is None:
+        return None
+
+    fields = {field_name: data.get(field_name) for field_name in field_names}
+    if any(values is None for values in fields.values()):
+        return None
+
+    result: dict[str, list[float]] = {"time_s": []}
+    for field_name in field_names:
+        result[field_name] = []
+
+    for index, timestamp in enumerate(timestamps):
+        try:
+            time_s = _timestamp_to_seconds(timestamp)
+        except (TypeError, ValueError):
+            continue
+        if time_s < start_s or time_s > end_s:
+            continue
+
+        row = {}
+        valid = True
+        for field_name, values in fields.items():
+            try:
+                value = float(_json_safe_value(values[index]))
+            except (TypeError, ValueError, IndexError):
+                valid = False
+                break
+            if not math.isfinite(value):
+                valid = False
+                break
+            row[field_name] = value
+        if not valid:
+            continue
+
+        result["time_s"].append(time_s)
+        for field_name, value in row.items():
+            result[field_name].append(value)
+
+    return result if result["time_s"] else None
+
+
+def _flight_styles_present(ulog: Any) -> set[str]:
+    styles: set[str] = set()
+
+    vehicle_type = _find_dataset(ulog, "vehicle_type")
+    if vehicle_type is not None:
+        data = getattr(vehicle_type, "data", {}) or {}
+        if _field_has_truthy_value(data.get("fixed_wing")):
+            styles.add("fixed_wing")
+        if _field_has_truthy_value(data.get("rotary_wing")):
+            styles.add("multirotor")
+
+    vehicle_status = _find_dataset(ulog, "vehicle_status")
+    if vehicle_status is not None:
+        for value in (getattr(vehicle_status, "data", {}) or {}).get("vehicle_type", []) or []:
+            parsed = _safe_int(value)
+            if parsed == 1:
+                styles.add("multirotor")
+            elif parsed == 2:
+                styles.add("fixed_wing")
+
+    vtol_status = _find_dataset(ulog, "vtol_vehicle_status")
+    if vtol_status is not None:
+        for value in (getattr(vtol_status, "data", {}) or {}).get("vehicle_vtol_state", []) or []:
+            parsed = _safe_int(value)
+            if parsed == 3:
+                styles.add("multirotor")
+            elif parsed in {2, 4}:
+                styles.add("fixed_wing")
+
+    return styles
+
+
+def _field_has_truthy_value(values: Any) -> bool:
+    if values is None:
+        return False
+    for value in values:
+        safe_value = _json_safe_value(value)
+        if isinstance(safe_value, bool) and safe_value:
+            return True
+        try:
+            if float(safe_value) != 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(_json_safe_value(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ned_velocity_to_body(
+    north: float,
+    east: float,
+    down: float,
+    roll: float,
+    pitch: float,
+    yaw: float,
+) -> tuple[float, float, float]:
+    cos_roll = math.cos(roll)
+    sin_roll = math.sin(roll)
+    cos_pitch = math.cos(pitch)
+    sin_pitch = math.sin(pitch)
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+
+    forward = cos_pitch * cos_yaw * north + cos_pitch * sin_yaw * east - sin_pitch * down
+    right = (
+        (sin_roll * sin_pitch * cos_yaw - cos_roll * sin_yaw) * north
+        + (sin_roll * sin_pitch * sin_yaw + cos_roll * cos_yaw) * east
+        + sin_roll * cos_pitch * down
+    )
+    body_down = (
+        (cos_roll * sin_pitch * cos_yaw + sin_roll * sin_yaw) * north
+        + (cos_roll * sin_pitch * sin_yaw - sin_roll * cos_yaw) * east
+        + cos_roll * cos_pitch * down
+    )
+    return forward, right, body_down
+
+
+def _first_spectrogram_candidate(ulog: Any, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for candidate in candidates:
+        dataset = _find_dataset(ulog, candidate["topic"])
+        if dataset is None:
+            continue
+        data = getattr(dataset, "data", {}) or {}
+        if all(field in data for field in candidate["fields"]):
+            return {**candidate, "dataset": dataset}
+    return None
+
+
+def _spectrogram_sum(
+    arrays: list[np.ndarray],
+    first_timestamp: float,
+    delta_t: float,
+    *,
+    window_length: int = 256,
+    noverlap: int = 128,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    step = window_length - noverlap
+    if step <= 0 or not arrays:
+        return np.asarray([]), np.asarray([]), np.asarray([[]])
+
+    data_len = min(len(array) for array in arrays)
+    if data_len < window_length:
+        return np.asarray([]), np.asarray([]), np.asarray([[]])
+
+    starts = np.arange(0, data_len - window_length + 1, step)
+    frequency = np.fft.rfftfreq(window_length, delta_t)
+    window = np.hanning(window_length)
+    window_power = float(np.sum(window * window)) or 1.0
+    sampling_frequency = 1.0 / delta_t
+    sum_psd = np.zeros((len(frequency), len(starts)))
+
+    for array in arrays:
+        trimmed = array[:data_len]
+        for column, start_index in enumerate(starts):
+            segment = np.asarray(trimmed[start_index:start_index + window_length], dtype=float)
+            segment = segment - np.mean(segment)
+            fft_values = np.fft.rfft(segment * window)
+            psd = (np.abs(fft_values) ** 2) / (sampling_frequency * window_power)
+            if len(psd) > 2:
+                psd[1:-1] *= 2.0
+            sum_psd[:, column] += psd
+
+    sum_psd = np.maximum(sum_psd, np.finfo(float).tiny)
+    values_db = 10.0 * np.log10(sum_psd)
+    time_offsets = (starts + window_length / 2.0) * delta_t
+    time_s = (first_timestamp * 1.0e-6) + time_offsets
+    return frequency, time_s, values_db
+
+
 def _downsample_pair(
     time_s: list[float],
     values: list[float],
@@ -685,6 +1174,28 @@ def _downsample_pair(
     return (
         [_round_float(time_s[index]) for index in indices],
         [_round_float(values[index]) for index in indices],
+    )
+
+
+def _downsample_multi(
+    time_s: list[float],
+    series_values: list[list[float]],
+    max_points: int,
+) -> tuple[list[float], ...]:
+    if len(time_s) <= max_points:
+        return (_round_list(time_s), *[_round_list(values) for values in series_values])
+
+    step = max(1, math.ceil(len(time_s) / max_points))
+    indices = list(range(0, len(time_s), step))
+    if indices[-1] != len(time_s) - 1:
+        indices.append(len(time_s) - 1)
+
+    return (
+        [_round_float(time_s[index]) for index in indices],
+        *[
+            [_round_float(values[index]) for index in indices]
+            for values in series_values
+        ],
     )
 
 
