@@ -1005,28 +1005,33 @@ void check(vehicle_status_s *vstatus, vehicle_global_position_s &gpos,
     assert ref_ref.struct == "vehicle_global_position_s"
 
 
-def test_helper_expression_translation_marks_complex_helpers_unresolved(tmp_path):
+def test_pointer_output_helper_writes_route_through_source_assignments(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
     (module_dir / "helpers.cpp").write_text(
         """
-void helper_with_output(float input, float *output)
+void mission_item_to_setpoint(const mission_item_s &item, position_setpoint_s *sp)
 {
-    *output = input;
+    sp->lat = item.lat;
+    sp->lon = item.lon;
+}
+
+void caller()
+{
+    mission_item_to_setpoint(item, &triplet.current);
 }
 """,
         encoding="utf-8",
     )
 
     profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
-    helpers = profiler.extract_helper_expressions_from_source(
-        ["src/modules/navigator/helpers.cpp"],
-        helper_names=["helper_with_output"],
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/navigator/helpers.cpp"]
     )
-
-    assert helpers[0].name == "helper_with_output"
-    assert helpers[0].unresolved_reason == "helper body mutates pointer output"
+    by_target = {a.target: a.expression for a in assignments}
+    assert by_target.get("triplet.current.lat") == "item.lat"
+    assert by_target.get("triplet.current.lon") == "item.lon"
 
 
 def test_helper_with_local_struct_writes_is_not_rejected(tmp_path):

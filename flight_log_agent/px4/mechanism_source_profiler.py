@@ -885,7 +885,134 @@ class MechanismSourceProfiler:
                     )
 
             refs.extend(self._extract_constant_definitions(text, rel_file))
+        refs.extend(self._extract_pointer_output_call_site_assignments(files))
         return self._dedupe_source_assignment_refs(refs)
+
+    def _extract_pointer_output_call_site_assignments(
+        self,
+        files: Sequence[Union[str, Path]],
+    ) -> List[SourceAssignmentRef]:
+        """For functions whose body writes through pointer params, emit the
+        body's writes as source_assignments at each call site with the
+        call-site arg substituted for the parameter.
+
+        Lets PX4 helpers like ``void mission_item_to_position_setpoint
+        (const mission_item_s &item, position_setpoint_s *sp)`` — which
+        deliver their result via an out-pointer instead of a return value —
+        feed the slicer through ``source_assignments`` instead of being
+        rejected as pointer-output mutations.
+        """
+        pointer_funcs: Dict[str, Dict[str, Any]] = {}
+        expanded_files = self._expand_companion_files(files)
+        for path in expanded_files:
+            text = self._read_text(path)
+            if text is None:
+                continue
+            rel_file = self._rel(path)
+            for definition in self._extract_function_definitions(text, rel_file):
+                pointer_params = self._function_pointer_params(definition)
+                if not pointer_params:
+                    continue
+                writes = self._pointer_output_writes(str(definition.get("body") or ""), pointer_params)
+                if not writes:
+                    continue
+                pointer_funcs[str(definition.get("name") or "")] = {
+                    "pointer_params": pointer_params,
+                    "writes": writes,
+                }
+
+        if not pointer_funcs:
+            return []
+
+        refs: List[SourceAssignmentRef] = []
+        function_calls = self.extract_function_calls_from_source(files)
+        for call in function_calls:
+            info = pointer_funcs.get(call.name) or pointer_funcs.get(call.name.split("::")[-1])
+            if info is None:
+                continue
+            for substituted in self._substitute_pointer_writes(
+                info["writes"], info["pointer_params"], call.args
+            ):
+                refs.append(
+                    SourceAssignmentRef(
+                        target=substituted["target"],
+                        expression=substituted["expression"],
+                        target_topic=None,
+                        target_field=None,
+                        function=None,
+                        function_parameters=[],
+                        assignment_operator="=",
+                        file=call.file,
+                        line=call.line,
+                        evidence=call.evidence,
+                        control_predicates=list(call.control_predicates or []),
+                        symbol_bindings={},
+                    )
+                )
+        return refs
+
+    @staticmethod
+    def _function_pointer_params(definition: Dict[str, Any]) -> Dict[str, int]:
+        """Map pointer parameter name → positional index for a function."""
+        names = definition.get("params") or []
+        evidence = str(definition.get("evidence") or "")
+        match = re.search(r"\(([^()]*)\)", evidence)
+        if not match:
+            return {}
+        raw_params = match.group(1).split(",")
+        out: Dict[str, int] = {}
+        for index, raw in enumerate(raw_params):
+            stripped = raw.strip()
+            if not stripped or stripped == "void":
+                continue
+            if "*" not in stripped:
+                continue
+            for name in names:
+                if re.search(rf"\*\s*{re.escape(name)}\b", stripped):
+                    out[name] = index
+                    break
+        return out
+
+    _POINTER_WRITE_PATTERN = re.compile(
+        r"(?P<param>[A-Za-z_][A-Za-z0-9_]*)\s*"
+        r"(?:->|\.)\s*"
+        r"(?P<field>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*"
+        r"=(?!=)\s*(?P<expr>[^;]+);"
+    )
+
+    def _pointer_output_writes(
+        self, body: str, pointer_params: Dict[str, int]
+    ) -> List[Dict[str, str]]:
+        writes: List[Dict[str, str]] = []
+        for match in self._POINTER_WRITE_PATTERN.finditer(body):
+            param = match.group("param")
+            if param not in pointer_params:
+                continue
+            writes.append({
+                "param": param,
+                "field": self._clean_field_path(match.group("field")),
+                "expression": self._normalize_source_expression(match.group("expr")),
+            })
+        return writes
+
+    @staticmethod
+    def _substitute_pointer_writes(
+        writes: List[Dict[str, str]],
+        pointer_params: Dict[str, int],
+        call_args: List[str],
+    ) -> List[Dict[str, str]]:
+        substituted: List[Dict[str, str]] = []
+        for write in writes:
+            param = write["param"]
+            index = pointer_params.get(param)
+            if index is None or index >= len(call_args):
+                continue
+            arg = call_args[index].strip().lstrip("&").strip()
+            if not arg:
+                continue
+            target = f"{arg}.{write['field']}"
+            substituted.append({"target": target, "expression": write["expression"]})
+        return substituted
 
     def _extract_constant_definitions(
         self,
@@ -2143,10 +2270,6 @@ class MechanismSourceProfiler:
     def _unsupported_helper_body_reason(self, body: str) -> Optional[str]:
         if re.search(r"\b(for|while|switch|case|goto)\b", body):
             return "helper body uses unsupported control flow"
-        if re.search(r"\breturn\s*;", body):
-            return "helper body returns void"
-        if re.search(r"\*[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)", body):
-            return "helper body mutates pointer output"
         local_vars = self._extract_helper_local_var_names(body)
         for match in re.finditer(
             r"\b(?P<root>[A-Za-z_][A-Za-z0-9_]*)(?:\.|->)[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)",
