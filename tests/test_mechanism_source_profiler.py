@@ -1029,6 +1029,104 @@ void helper_with_output(float input, float *output)
     assert helpers[0].unresolved_reason == "helper body mutates pointer output"
 
 
+def test_helper_with_local_struct_writes_is_not_rejected(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+position_setpoint_s build_default_setpoint(const mission_item_s &item)
+{
+    position_setpoint_s sp{};
+    sp.lat = item.lat;
+    sp.lon = item.lon;
+    sp.alt = item.altitude;
+    return sp;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["build_default_setpoint"],
+    )
+
+    assert helpers[0].name == "build_default_setpoint"
+    assert helpers[0].unresolved_reason is None
+
+
+def test_helper_writing_to_class_member_is_still_rejected(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float RTL::calculate_alt()
+{
+    _destination.alt = _home_position.alt;
+    return _destination.alt;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["calculate_alt"],
+    )
+    assert helpers[0].unresolved_reason == "helper body mutates object state"
+
+
+def test_helper_with_local_increment_is_not_rejected(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+int helper_with_local_counter(int n)
+{
+    int count = 0;
+    count++;
+    return count + n;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["helper_with_local_counter"],
+    )
+    assert helpers[0].unresolved_reason is None
+
+
+def test_helper_with_class_member_increment_is_still_rejected(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+int Counter::tick()
+{
+    _count++;
+    return _count;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["tick"],
+    )
+    assert helpers[0].unresolved_reason == "helper body mutates state"
+
+
 def test_parameter_feasibility_gate_uses_only_discovered_parameters():
     context = build_source_discovery_log_context(
         {

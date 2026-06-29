@@ -2140,22 +2140,59 @@ class MechanismSourceProfiler:
             )
         return substituted
 
-    @staticmethod
-    def _unsupported_helper_body_reason(body: str) -> Optional[str]:
-        unsupported_patterns = [
-            (r"\b(for|while|switch|case|goto)\b", "helper body uses unsupported control flow"),
-            (r"\breturn\s*;", "helper body returns void"),
-            (r"\*[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)", "helper body mutates pointer output"),
-            (
-                r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.|->)[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)",
-                "helper body mutates object state",
-            ),
-            (r"\+\+|--", "helper body mutates state"),
-        ]
-        for pattern, reason in unsupported_patterns:
-            if re.search(pattern, body):
-                return reason
+    def _unsupported_helper_body_reason(self, body: str) -> Optional[str]:
+        if re.search(r"\b(for|while|switch|case|goto)\b", body):
+            return "helper body uses unsupported control flow"
+        if re.search(r"\breturn\s*;", body):
+            return "helper body returns void"
+        if re.search(r"\*[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)", body):
+            return "helper body mutates pointer output"
+        local_vars = self._extract_helper_local_var_names(body)
+        for match in re.finditer(
+            r"\b(?P<root>[A-Za-z_][A-Za-z0-9_]*)(?:\.|->)[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)",
+            body,
+        ):
+            if match.group("root") not in local_vars:
+                return "helper body mutates object state"
+        for match in re.finditer(
+            r"(?:\+\+|--)\s*(?P<pre>[A-Za-z_][A-Za-z0-9_]*)"
+            r"|(?P<post>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\+\+|--)",
+            body,
+        ):
+            target = match.group("pre") or match.group("post")
+            if target and target not in local_vars:
+                return "helper body mutates state"
         return None
+
+    _HELPER_LOCAL_DECL_PATTERN: re.Pattern = re.compile(
+        r"(?:^|;|\{|\n)\s*"
+        r"(?:const\s+|static\s+|volatile\s+|constexpr\s+|inline\s+)*"
+        r"(?:auto|bool|char|short|int|long|float|double|void|size_t|ssize_t"
+        r"|u?int(?:8|16|32|64)_t|[A-Za-z_][A-Za-z0-9_:<>,\s]*?_s|"
+        r"[A-Za-z_][A-Za-z0-9_:<>,]*[A-Za-z0-9_])"
+        r"\s*[*&]*\s*"
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:=|\{|;|\(|\[)"
+    )
+
+    def _extract_helper_local_var_names(self, body: str) -> set[str]:
+        names: set[str] = set()
+        for match in self._HELPER_LOCAL_DECL_PATTERN.finditer(body):
+            name = match.group("name")
+            if not name or name in self._HELPER_LOCAL_DECL_RESERVED:
+                continue
+            leading = match.group(0).lstrip(";{ \t\n").split()
+            if leading and leading[0] in self._HELPER_LOCAL_DECL_RESERVED:
+                continue
+            names.add(name)
+        for var in self._extract_struct_variables(body):
+            names.add(var)
+        return names
+
+    _HELPER_LOCAL_DECL_RESERVED = frozenset({
+        "if", "else", "return", "for", "while", "switch", "case", "do",
+        "const", "static", "volatile", "constexpr", "inline", "auto",
+        "true", "false", "nullptr", "new", "delete", "this", "sizeof",
+    })
 
     def _helper_assignments(self, body: str) -> Dict[str, str]:
         assignments: Dict[str, str] = {}
