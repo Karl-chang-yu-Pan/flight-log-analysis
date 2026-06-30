@@ -1915,6 +1915,11 @@ class MechanismSourceProfiler:
                 if parsed_if:
                     statements.append(parsed_if)
                 continue
+            if self._keyword_at(text, index, "switch"):
+                parsed_switch, index = self._parse_helper_switch(text, index)
+                if parsed_switch:
+                    statements.append(parsed_switch)
+                continue
             semicolon = self._find_statement_semicolon(text, index)
             if semicolon is None:
                 break
@@ -1923,6 +1928,59 @@ class MechanismSourceProfiler:
                 statements.append(statement)
             index = semicolon + 1
         return statements
+
+    _SWITCH_LABEL_PATTERN = re.compile(r"\b(?P<kind>case\s+(?P<label>[^:]+?)|default)\s*:")
+
+    def _parse_helper_switch(self, text: str, index: int) -> Tuple[Optional[Dict[str, Any]], int]:
+        cursor = self._skip_helper_whitespace(text, index + 6)
+        if cursor >= len(text) or text[cursor] != "(":
+            return None, index + 6
+        close_paren = self._matching_delimiter(text, cursor, "(", ")")
+        if close_paren is None:
+            return None, index + 6
+        discriminant = self._normalize_helper_condition(text[cursor + 1:close_paren])
+        cursor = self._skip_helper_whitespace(text, close_paren + 1)
+        if cursor >= len(text) or text[cursor] != "{":
+            return None, cursor
+        close_brace = self._matching_delimiter(text, cursor, "{", "}")
+        if close_brace is None:
+            return None, cursor
+        body_text = text[cursor + 1:close_brace]
+        cases, default = self._parse_switch_cases(body_text)
+        return {
+            "kind": "switch",
+            "discriminant": discriminant,
+            "cases": cases,
+            "default": default,
+        }, close_brace + 1
+
+    def _parse_switch_cases(
+        self, body: str
+    ) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+        cases: List[Dict[str, Any]] = []
+        default: Optional[List[Dict[str, Any]]] = None
+        labels = list(self._SWITCH_LABEL_PATTERN.finditer(body))
+        if not labels:
+            return cases, default
+        pending_conditions: List[str] = []
+        for i, label in enumerate(labels):
+            is_default = label.group("kind").strip().startswith("default")
+            next_start = labels[i + 1].start() if i + 1 < len(labels) else len(body)
+            section = body[label.end():next_start]
+            has_terminator = bool(re.search(r"\b(?:break|return)\b", section))
+            stripped = re.sub(r"\bbreak\s*;\s*$", "", section.strip()).strip()
+            statements = self._parse_helper_statement_block(stripped)
+            if is_default:
+                default = statements
+                pending_conditions = []
+                continue
+            label_text = label.group("label").strip() if label.group("label") else ""
+            if label_text:
+                pending_conditions.append(label_text)
+            if has_terminator or stripped:
+                cases.append({"conditions": list(pending_conditions), "body": statements})
+                pending_conditions = []
+        return cases, default
 
     def _parse_helper_if(self, text: str, index: int) -> Tuple[Optional[Dict[str, Any]], int]:
         cursor = self._skip_helper_whitespace(text, index + 2)
@@ -2116,7 +2174,59 @@ class MechanismSourceProfiler:
                     else_expr = else_env.get(target, before)
                     if then_expr != before or else_expr != before:
                         env[target] = f"({then_expr} if {condition} else {else_expr})"
+            elif kind == "switch":
+                lowered = self._lower_switch_statement(statement, statements[index + 1:], env)
+                if lowered is not None:
+                    return lowered
         return None
+
+    def _lower_switch_statement(
+        self,
+        statement: Dict[str, Any],
+        continuation_statements: List[Dict[str, Any]],
+        env: Dict[str, str],
+    ) -> Optional[str]:
+        discriminant = self._substitute_helper_locals(
+            str(statement.get("discriminant") or ""), env
+        )
+        cases = list(statement.get("cases") or [])
+        default_statements = list(statement.get("default") or [])
+        if not cases:
+            return None
+        case_results: List[Tuple[List[str], Optional[str]]] = []
+        for case in cases:
+            case_env = dict(env)
+            case_return = self._lower_helper_statement_block(
+                list(case.get("body") or []), case_env
+            )
+            case_results.append((list(case.get("conditions") or []), case_return))
+        default_env = dict(env)
+        default_return = (
+            self._lower_helper_statement_block(default_statements, default_env)
+            if default_statements
+            else None
+        )
+        chain = default_return
+        if chain is None and default_statements:
+            return None
+        if chain is None:
+            chain = self._lower_helper_statement_block(
+                continuation_statements, dict(env)
+            )
+        if chain is None:
+            return None
+        for conditions, case_return in reversed(case_results):
+            if case_return is None or not conditions:
+                return None
+            condition_expr = self._switch_condition_expression(discriminant, conditions)
+            chain = f"({case_return} if {condition_expr} else {chain})"
+        return chain
+
+    @staticmethod
+    def _switch_condition_expression(discriminant: str, conditions: List[str]) -> str:
+        if len(conditions) == 1:
+            return f"{discriminant} == {conditions[0]}"
+        return " or ".join(f"({discriminant} == {c})" for c in conditions)
 
     def _compose_helper_expressions(
         self,
@@ -2268,7 +2378,7 @@ class MechanismSourceProfiler:
         return substituted
 
     def _unsupported_helper_body_reason(self, body: str) -> Optional[str]:
-        if re.search(r"\b(for|while|switch|case|goto)\b", body):
+        if re.search(r"\b(for|while|goto)\b", body):
             return "helper body uses unsupported control flow"
         local_vars = self._extract_helper_local_var_names(body)
         for match in re.finditer(

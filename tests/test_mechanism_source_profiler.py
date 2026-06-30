@@ -1109,6 +1109,74 @@ int helper_with_local_counter(int n)
     assert helpers[0].unresolved_reason is None
 
 
+def test_switch_helper_lowers_to_nested_ternary(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float pick_alt(int kind)
+{
+    switch (kind) {
+        case RTL_DESTINATION_HOME:
+            return home_alt;
+        case RTL_DESTINATION_MISSION:
+            return mission_alt;
+        default:
+            return current_alt;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["pick_alt"],
+    )
+    assert helpers[0].unresolved_reason is None
+    lowered = helpers[0].lowered_return_expression
+    assert lowered is not None
+    assert "kind == RTL_DESTINATION_HOME" in lowered
+    assert "home_alt" in lowered
+    assert "kind == RTL_DESTINATION_MISSION" in lowered
+    assert "mission_alt" in lowered
+    assert "current_alt" in lowered
+
+
+def test_switch_with_fallthrough_groups_conditions(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float pick(int kind)
+{
+    switch (kind) {
+        case A:
+        case B:
+            return va;
+        default:
+            return vd;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["pick"],
+    )
+    lowered = helpers[0].lowered_return_expression
+    assert lowered is not None
+    assert "kind == A" in lowered
+    assert "kind == B" in lowered
+    assert "or" in lowered
+
+
 def test_helper_with_class_member_increment_is_still_rejected(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
