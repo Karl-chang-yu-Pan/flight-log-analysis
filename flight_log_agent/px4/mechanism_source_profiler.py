@@ -2378,8 +2378,16 @@ class MechanismSourceProfiler:
         return substituted
 
     def _unsupported_helper_body_reason(self, body: str) -> Optional[str]:
-        if re.search(r"\b(for|while|goto)\b", body):
-            return "helper body uses unsupported control flow"
+        if re.search(r"\bgoto\b", body):
+            return "helper body uses goto"
+        if re.search(r"\bfor\s*\(\s*[^;]*:[^;]*\)", body):
+            return "helper body iterates over a runtime collection"
+        if re.search(r"\bfor\b", body):
+            return "for loop bound is not statically resolvable"
+        if re.search(r"\bdo\b[\s\S]*\bwhile\b", body):
+            return "do-while loop condition is not statically resolvable"
+        if re.search(r"\bwhile\b", body):
+            return "while loop condition is not statically resolvable"
         local_vars = self._extract_helper_local_var_names(body)
         for match in re.finditer(
             r"\b(?P<root>[A-Za-z_][A-Za-z0-9_]*)(?:\.|->)[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)",

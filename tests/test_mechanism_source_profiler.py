@@ -1177,6 +1177,74 @@ float pick(int kind)
     assert "or" in lowered
 
 
+def test_helper_with_for_loop_is_rejected_with_precise_reason(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float sum_n(int n)
+{
+    float total = 0;
+    for (int i = 0; i < n; i++) { total += i; }
+    return total;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["sum_n"],
+    )
+    assert helpers[0].unresolved_reason == "for loop bound is not statically resolvable"
+
+
+def test_helper_with_for_range_is_rejected_with_precise_reason(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float total(const std::vector<float> &xs)
+{
+    float t = 0;
+    for (const auto &x : xs) { t += x; }
+    return t;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["total"],
+    )
+    assert helpers[0].unresolved_reason == "helper body iterates over a runtime collection"
+
+
+def test_helper_with_while_loop_is_rejected_with_precise_reason(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float climb_until(float current, float target)
+{
+    while (current < target) { current += 1; }
+    return current;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["climb_until"],
+    )
+    assert helpers[0].unresolved_reason == "while loop condition is not statically resolvable"
+
+
 def test_helper_with_class_member_increment_is_still_rejected(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
