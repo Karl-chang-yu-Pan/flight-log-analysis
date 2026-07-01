@@ -179,6 +179,20 @@ class MechanismSourceProfile(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class _HelperLoweringFailed(Exception):
+    """Raised by a lowering step that decided the helper cannot be lowered.
+
+    The exception's ``reason`` carries the precise message the resolution
+    attempt produced (e.g. "for loop bound is not statically resolvable").
+    :meth:`_translate_helper_body` catches it and surfaces ``reason`` as
+    the helper's ``unresolved_reason``.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class MechanismSourceProfiler:
     """
     Deterministic PX4 source profiler.
@@ -1869,15 +1883,23 @@ class MechanismSourceProfiler:
         assignments = self._helper_assignments(cleaned_body)
         branches = self._helper_return_branches(cleaned_body)
         return_expression = self._helper_return_expression(cleaned_body)
-        lowered_return_expression = self._lower_helper_statements(statements) if unresolved is None else None
+        lowered_return_expression: Optional[str] = None
+        if unresolved is None:
+            try:
+                lowered_return_expression = self._lower_helper_statements(statements)
+            except _HelperLoweringFailed as exc:
+                unresolved = exc.reason
+                lowered_return_expression = None
         helper_calls = self._helper_body_calls(cleaned_body)
         symbol_bindings = self._helper_symbol_bindings(cleaned_body, member_to_param, member_to_struct)
         call_resolutions = self._helper_call_resolutions(cleaned_body, member_to_param)
 
         if unresolved is None and not return_expression and not lowered_return_expression and not branches:
-            unresolved = "helper body has no simple return expression"
+            pointer_params = self._function_pointer_params({"params": params, "evidence": evidence})
+            if not (pointer_params and self._pointer_output_writes(cleaned_body, pointer_params)):
+                unresolved = "helper has no return value and no pointer-output writes routable through source_assignments"
         if unresolved is None and len(re.findall(r"\breturn\b", cleaned_body)) > 1 and not branches and not lowered_return_expression:
-            unresolved = "helper body has multiple returns without translatable branch structure"
+            unresolved = "helper has multiple return paths that lowering could not combine into a single expression"
 
         return HelperExpressionRef(
             name=name,
@@ -1919,6 +1941,21 @@ class MechanismSourceProfiler:
                 parsed_switch, index = self._parse_helper_switch(text, index)
                 if parsed_switch:
                     statements.append(parsed_switch)
+                continue
+            if self._keyword_at(text, index, "for"):
+                parsed_for, index = self._parse_helper_for(text, index)
+                if parsed_for:
+                    statements.append(parsed_for)
+                continue
+            if self._keyword_at(text, index, "while"):
+                parsed_while, index = self._parse_helper_while(text, index)
+                if parsed_while:
+                    statements.append(parsed_while)
+                continue
+            if self._keyword_at(text, index, "do"):
+                parsed_do, index = self._parse_helper_do_while(text, index)
+                if parsed_do:
+                    statements.append(parsed_do)
                 continue
             semicolon = self._find_statement_semicolon(text, index)
             if semicolon is None:
@@ -2023,6 +2060,22 @@ class MechanismSourceProfiler:
     def _parse_helper_simple_statement(statement: str) -> Optional[Dict[str, Any]]:
         if not statement:
             return None
+        inc_dec_match = re.fullmatch(
+            r"\s*(?:(?P<pre_op>\+\+|--)\s*(?P<pre_var>[A-Za-z_][A-Za-z0-9_]*)"
+            r"|(?P<post_var>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<post_op>\+\+|--))\s*",
+            statement,
+        )
+        if inc_dec_match:
+            var = inc_dec_match.group("pre_var") or inc_dec_match.group("post_var")
+            op = inc_dec_match.group("pre_op") or inc_dec_match.group("post_op")
+            return {
+                "kind": "assign",
+                "target": var,
+                "operator": "+=" if op == "++" else "-=",
+                "expression": MechanismSourceProfiler._compound_assignment_expression(
+                    var, "+=" if op == "++" else "-=", "1"
+                ),
+            }
         return_match = re.match(r"\breturn\s+(?P<expr>.+)$", statement, flags=re.DOTALL)
         if return_match:
             return {
@@ -2178,6 +2231,168 @@ class MechanismSourceProfiler:
                 lowered = self._lower_switch_statement(statement, statements[index + 1:], env)
                 if lowered is not None:
                     return lowered
+            elif kind == "for":
+                early = self._lower_for_statement(statement, env)
+                if early is not None:
+                    return early
+            elif kind == "for_range":
+                header = str(statement.get("header") or "").strip()
+                collection = header.split(":", 1)[1].strip() if ":" in header else header
+                raise _HelperLoweringFailed(
+                    f"helper body uses range-based for over '{collection}' which cannot be enumerated statically"
+                )
+            elif kind == "while":
+                early = self._lower_while_statement(statement, env)
+                if early is not None:
+                    return early
+            elif kind == "do_while":
+                early = self._lower_do_while_statement(statement, env)
+                if early is not None:
+                    return early
+        return None
+
+    _WHILE_RUNAWAY = 65536
+
+    def _lower_while_statement(
+        self,
+        statement: Dict[str, Any],
+        env: Dict[str, str],
+    ) -> Optional[str]:
+        condition_text = str(statement.get("condition") or "").strip()
+        body = list(statement.get("body") or [])
+        if not condition_text:
+            raise _HelperLoweringFailed("while loop condition is empty")
+        for _ in range(self._WHILE_RUNAWAY):
+            cond_value = self._evaluate_condition(condition_text, env, "while loop condition")
+            if not cond_value:
+                return None
+            result = self._lower_helper_statement_block(body, env)
+            if result is not None:
+                return result
+        raise _HelperLoweringFailed(
+            f"while loop with condition '{condition_text}' did not terminate within {self._WHILE_RUNAWAY} iterations"
+        )
+
+    def _lower_do_while_statement(
+        self,
+        statement: Dict[str, Any],
+        env: Dict[str, str],
+    ) -> Optional[str]:
+        condition_text = str(statement.get("condition") or "").strip()
+        body = list(statement.get("body") or [])
+        if not condition_text:
+            raise _HelperLoweringFailed("do-while loop condition is empty")
+        for _ in range(self._WHILE_RUNAWAY):
+            result = self._lower_helper_statement_block(body, env)
+            if result is not None:
+                return result
+            cond_value = self._evaluate_condition(condition_text, env, "do-while loop condition")
+            if not cond_value:
+                return None
+        raise _HelperLoweringFailed(
+            f"do-while loop with condition '{condition_text}' did not terminate within {self._WHILE_RUNAWAY} iterations"
+        )
+
+    def _evaluate_condition(self, condition_text: str, env: Dict[str, str], context: str) -> bool:
+        from flight_log_agent.analysis.safe_eval import eval_const_expression
+
+        substituted = self._substitute_helper_locals(condition_text, env)
+        value = eval_const_expression(substituted)
+        if value is None:
+            raise _HelperLoweringFailed(
+                f"{context} '{condition_text}' is not statically resolvable"
+            )
+        return bool(value)
+
+    def _lower_for_statement(
+        self,
+        statement: Dict[str, Any],
+        env: Dict[str, str],
+    ) -> Optional[str]:
+        from flight_log_agent.analysis.safe_eval import eval_const_expression
+
+        init = statement.get("init") or {}
+        condition_text = str(statement.get("condition") or "").strip()
+        increment = statement.get("increment") or {}
+        init_text = str(statement.get("init_text") or "").strip()
+        inc_text = str(statement.get("increment_text") or "").strip()
+        body = list(statement.get("body") or [])
+
+        iter_var = init.get("target")
+        init_value_text = init.get("expression")
+        if not iter_var:
+            raise _HelperLoweringFailed(
+                f"for loop init '{init_text}' did not parse as a declaration"
+            )
+        if init_value_text is None:
+            raise _HelperLoweringFailed(
+                f"for loop init '{init_text}' has no initializer expression"
+            )
+        if not condition_text:
+            raise _HelperLoweringFailed("for loop condition is empty")
+        increment_target = increment.get("target")
+        if increment_target != iter_var:
+            # Real source doesn't infinite-loop; treat the loop as a no-op and let the outer block continue.
+            return None
+        step_text = str(increment.get("expression") or "1")
+        step_value = eval_const_expression(self._substitute_helper_locals(step_text, env))
+        if step_value is None:
+            raise _HelperLoweringFailed(
+                f"for loop increment '{inc_text}' is not statically resolvable"
+            )
+        step = int(step_value) * (-1 if increment.get("operator") == "-=" else 1)
+        if step == 0:
+            return None
+
+        start_value = eval_const_expression(self._substitute_helper_locals(str(init_value_text), env))
+        if start_value is None:
+            raise _HelperLoweringFailed(
+                f"for loop init expression '{init_value_text}' is not statically resolvable"
+            )
+        start = int(start_value)
+
+        cond_match = re.fullmatch(
+            rf"\s*{re.escape(iter_var)}\s*(?P<op><|<=|>|>=|!=)\s*(?P<bound>.+?)\s*",
+            self._substitute_helper_locals(condition_text, env),
+        )
+        if not cond_match:
+            raise _HelperLoweringFailed(
+                f"for loop condition '{condition_text}' does not have form '{iter_var} op literal'"
+            )
+        op = cond_match.group("op")
+        bound_expr = cond_match.group("bound").strip()
+        bound_value = eval_const_expression(bound_expr)
+        if bound_value is None:
+            raise _HelperLoweringFailed(
+                f"for loop bound '{bound_expr}' is not statically resolvable"
+            )
+        bound = int(bound_value)
+
+        # Iteration count is fully determined by literal init / cond / inc;
+        # walk every iteration the source actually requests.
+        values: List[int] = []
+        i = start
+        while True:
+            if op == "<" and not (i < bound):
+                break
+            if op == "<=" and not (i <= bound):
+                break
+            if op == ">" and not (i > bound):
+                break
+            if op == ">=" and not (i >= bound):
+                break
+            if op == "!=" and not (i != bound):
+                break
+            values.append(i)
+            i += step
+
+        for value in values:
+            env[iter_var] = str(value)
+            result = self._lower_helper_statement_block(body, env)
+            if result is not None:
+                env.pop(iter_var, None)
+                return result
+        env.pop(iter_var, None)
         return None
 
     def _lower_switch_statement(
@@ -2227,6 +2442,114 @@ class MechanismSourceProfiler:
         if len(conditions) == 1:
             return f"{discriminant} == {conditions[0]}"
         return " or ".join(f"({discriminant} == {c})" for c in conditions)
+
+    _FOR_INCREMENT_PATTERN = re.compile(
+        r"\s*(?:(?P<pre_op>\+\+|--)\s*(?P<pre_var>[A-Za-z_][A-Za-z0-9_]*)"
+        r"|(?P<post_var>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<post_op>\+\+|--))\s*"
+    )
+
+    def _parse_helper_for(self, text: str, index: int) -> Tuple[Optional[Dict[str, Any]], int]:
+        cursor = self._skip_helper_whitespace(text, index + 3)
+        if cursor >= len(text) or text[cursor] != "(":
+            return None, index + 3
+        close_paren = self._matching_delimiter(text, cursor, "(", ")")
+        if close_paren is None:
+            return None, index + 3
+        header = text[cursor + 1:close_paren]
+        if ":" in header and ";" not in header:
+            cursor = self._skip_helper_whitespace(text, close_paren + 1)
+            if cursor < len(text) and text[cursor] == "{":
+                close_brace = self._matching_delimiter(text, cursor, "{", "}")
+                if close_brace is not None:
+                    return {"kind": "for_range", "header": header.strip(), "body": []}, close_brace + 1
+            return {"kind": "for_range", "header": header.strip(), "body": []}, close_paren + 1
+        parts = header.split(";")
+        if len(parts) != 3:
+            return None, close_paren + 1
+        init_text, cond_text, inc_text = (p.strip() for p in parts)
+        init = self._parse_helper_simple_statement(init_text) if init_text else None
+        increment = self._parse_helper_increment(inc_text)
+        cursor = self._skip_helper_whitespace(text, close_paren + 1)
+        if cursor >= len(text) or text[cursor] != "{":
+            return None, cursor
+        close_brace = self._matching_delimiter(text, cursor, "{", "}")
+        if close_brace is None:
+            return None, cursor
+        body = self._parse_helper_statement_block(text[cursor + 1:close_brace])
+        return {
+            "kind": "for",
+            "init": init,
+            "init_text": init_text,
+            "condition": cond_text,
+            "increment": increment,
+            "increment_text": inc_text,
+            "body": body,
+        }, close_brace + 1
+
+    def _parse_helper_while(self, text: str, index: int) -> Tuple[Optional[Dict[str, Any]], int]:
+        cursor = self._skip_helper_whitespace(text, index + 5)
+        if cursor >= len(text) or text[cursor] != "(":
+            return None, index + 5
+        close_paren = self._matching_delimiter(text, cursor, "(", ")")
+        if close_paren is None:
+            return None, index + 5
+        condition = self._normalize_helper_condition(text[cursor + 1:close_paren])
+        cursor = self._skip_helper_whitespace(text, close_paren + 1)
+        if cursor >= len(text) or text[cursor] != "{":
+            return None, cursor
+        close_brace = self._matching_delimiter(text, cursor, "{", "}")
+        if close_brace is None:
+            return None, cursor
+        body = self._parse_helper_statement_block(text[cursor + 1:close_brace])
+        return {"kind": "while", "condition": condition, "body": body}, close_brace + 1
+
+    def _parse_helper_do_while(self, text: str, index: int) -> Tuple[Optional[Dict[str, Any]], int]:
+        cursor = self._skip_helper_whitespace(text, index + 2)
+        if cursor >= len(text) or text[cursor] != "{":
+            return None, cursor
+        close_brace = self._matching_delimiter(text, cursor, "{", "}")
+        if close_brace is None:
+            return None, cursor
+        body = self._parse_helper_statement_block(text[cursor + 1:close_brace])
+        cursor = self._skip_helper_whitespace(text, close_brace + 1)
+        if not self._keyword_at(text, cursor, "while"):
+            return None, cursor
+        cursor = self._skip_helper_whitespace(text, cursor + 5)
+        if cursor >= len(text) or text[cursor] != "(":
+            return None, cursor
+        close_paren = self._matching_delimiter(text, cursor, "(", ")")
+        if close_paren is None:
+            return None, cursor
+        condition = self._normalize_helper_condition(text[cursor + 1:close_paren])
+        cursor = close_paren + 1
+        semicolon = self._find_statement_semicolon(text, cursor)
+        end = (semicolon + 1) if semicolon is not None else cursor
+        return {"kind": "do_while", "condition": condition, "body": body}, end
+
+    def _parse_helper_increment(self, text: str) -> Optional[Dict[str, Any]]:
+        text = text.strip()
+        if not text:
+            return None
+        match = self._FOR_INCREMENT_PATTERN.fullmatch(text)
+        if match:
+            var = match.group("pre_var") or match.group("post_var")
+            op = match.group("pre_op") or match.group("post_op")
+            return {
+                "target": var,
+                "operator": "+=" if op == "++" else "-=",
+                "expression": "1",
+            }
+        compound_match = re.fullmatch(
+            r"\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<op>\+=|-=)\s*(?P<step>.+?)\s*",
+            text,
+        )
+        if compound_match:
+            return {
+                "target": compound_match.group("target"),
+                "operator": compound_match.group("op"),
+                "expression": self._normalize_helper_expression(compound_match.group("step")),
+            }
+        return self._parse_helper_simple_statement(text + ";")
 
     def _compose_helper_expressions(
         self,
@@ -2380,60 +2703,7 @@ class MechanismSourceProfiler:
     def _unsupported_helper_body_reason(self, body: str) -> Optional[str]:
         if re.search(r"\bgoto\b", body):
             return "helper body uses goto"
-        if re.search(r"\bfor\s*\(\s*[^;]*:[^;]*\)", body):
-            return "helper body iterates over a runtime collection"
-        if re.search(r"\bfor\b", body):
-            return "for loop bound is not statically resolvable"
-        if re.search(r"\bdo\b[\s\S]*\bwhile\b", body):
-            return "do-while loop condition is not statically resolvable"
-        if re.search(r"\bwhile\b", body):
-            return "while loop condition is not statically resolvable"
-        local_vars = self._extract_helper_local_var_names(body)
-        for match in re.finditer(
-            r"\b(?P<root>[A-Za-z_][A-Za-z0-9_]*)(?:\.|->)[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)",
-            body,
-        ):
-            if match.group("root") not in local_vars:
-                return "helper body mutates object state"
-        for match in re.finditer(
-            r"(?:\+\+|--)\s*(?P<pre>[A-Za-z_][A-Za-z0-9_]*)"
-            r"|(?P<post>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\+\+|--)",
-            body,
-        ):
-            target = match.group("pre") or match.group("post")
-            if target and target not in local_vars:
-                return "helper body mutates state"
         return None
-
-    _HELPER_LOCAL_DECL_PATTERN: re.Pattern = re.compile(
-        r"(?:^|;|\{|\n)\s*"
-        r"(?:const\s+|static\s+|volatile\s+|constexpr\s+|inline\s+)*"
-        r"(?:auto|bool|char|short|int|long|float|double|void|size_t|ssize_t"
-        r"|u?int(?:8|16|32|64)_t|[A-Za-z_][A-Za-z0-9_:<>,\s]*?_s|"
-        r"[A-Za-z_][A-Za-z0-9_:<>,]*[A-Za-z0-9_])"
-        r"\s*[*&]*\s*"
-        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:=|\{|;|\(|\[)"
-    )
-
-    def _extract_helper_local_var_names(self, body: str) -> set[str]:
-        names: set[str] = set()
-        for match in self._HELPER_LOCAL_DECL_PATTERN.finditer(body):
-            name = match.group("name")
-            if not name or name in self._HELPER_LOCAL_DECL_RESERVED:
-                continue
-            leading = match.group(0).lstrip(";{ \t\n").split()
-            if leading and leading[0] in self._HELPER_LOCAL_DECL_RESERVED:
-                continue
-            names.add(name)
-        for var in self._extract_struct_variables(body):
-            names.add(var)
-        return names
-
-    _HELPER_LOCAL_DECL_RESERVED = frozenset({
-        "if", "else", "return", "for", "while", "switch", "case", "do",
-        "const", "static", "volatile", "constexpr", "inline", "auto",
-        "true", "false", "nullptr", "new", "delete", "this", "sizeof",
-    })
 
     def _helper_assignments(self, body: str) -> Dict[str, str]:
         assignments: Dict[str, str] = {}

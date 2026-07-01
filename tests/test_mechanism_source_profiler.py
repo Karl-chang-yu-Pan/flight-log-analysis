@@ -1062,7 +1062,7 @@ position_setpoint_s build_default_setpoint(const mission_item_s &item)
     assert helpers[0].unresolved_reason is None
 
 
-def test_helper_writing_to_class_member_is_still_rejected(tmp_path):
+def test_helper_writing_to_class_member_forwards_to_assigned_expression(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1082,7 +1082,8 @@ float RTL::calculate_alt()
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["calculate_alt"],
     )
-    assert helpers[0].unresolved_reason == "helper body mutates object state"
+    assert helpers[0].unresolved_reason is None
+    assert helpers[0].lowered_return_expression == "(_home_position.alt)"
 
 
 def test_helper_with_local_increment_is_not_rejected(tmp_path):
@@ -1197,7 +1198,7 @@ float sum_n(int n)
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["sum_n"],
     )
-    assert helpers[0].unresolved_reason == "for loop bound is not statically resolvable"
+    assert helpers[0].unresolved_reason == "for loop bound 'n' is not statically resolvable"
 
 
 def test_helper_with_for_range_is_rejected_with_precise_reason(tmp_path):
@@ -1220,7 +1221,10 @@ float total(const std::vector<float> &xs)
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["total"],
     )
-    assert helpers[0].unresolved_reason == "helper body iterates over a runtime collection"
+    assert (
+        helpers[0].unresolved_reason
+        == "helper body uses range-based for over 'xs' which cannot be enumerated statically"
+    )
 
 
 def test_helper_with_while_loop_is_rejected_with_precise_reason(tmp_path):
@@ -1242,10 +1246,85 @@ float climb_until(float current, float target)
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["climb_until"],
     )
-    assert helpers[0].unresolved_reason == "while loop condition is not statically resolvable"
+    assert (
+        helpers[0].unresolved_reason
+        == "while loop condition 'current < target' is not statically resolvable"
+    )
 
 
-def test_helper_with_class_member_increment_is_still_rejected(tmp_path):
+def test_for_loop_with_literal_bound_unrolls(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float pick_iter()
+{
+    for (int i = 2; i < 3; i++) { return i; }
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["pick_iter"],
+    )
+    assert helpers[0].unresolved_reason is None
+    assert helpers[0].lowered_return_expression == "(2)"
+
+
+def test_while_with_literal_const_condition_returns_on_first_iter(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float pick_while()
+{
+    int x = 5;
+    while (x < 10) { return x; }
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["pick_while"],
+    )
+    assert helpers[0].unresolved_reason is None
+    assert helpers[0].lowered_return_expression == "(5)"
+
+
+def test_do_while_with_unresolved_condition_is_rejected(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float drain(float current)
+{
+    do { current -= 1; } while (current > 0);
+    return current;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["drain"],
+    )
+    assert (
+        helpers[0].unresolved_reason
+        == "do-while loop condition 'current > 0' is not statically resolvable"
+    )
+
+
+def test_helper_with_class_member_increment_forwards_to_lowered_expression(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1265,7 +1344,99 @@ int Counter::tick()
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["tick"],
     )
-    assert helpers[0].unresolved_reason == "helper body mutates state"
+    assert helpers[0].unresolved_reason is None
+    assert helpers[0].lowered_return_expression == "(_count + (1))"
+
+
+def test_for_loop_with_mismatched_increment_target_is_skipped(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float pick_after_loop()
+{
+    for (int i = 0; i < 3; ++j) { i = 1; }
+    return 7;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["pick_after_loop"],
+    )
+    assert helpers[0].unresolved_reason is None
+    assert helpers[0].lowered_return_expression == "7"
+
+
+def test_for_loop_with_zero_step_is_skipped(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float pick_after_zero_step()
+{
+    for (int i = 0; i < 3; i += 0) { i = 1; }
+    return 9;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["pick_after_zero_step"],
+    )
+    assert helpers[0].unresolved_reason is None
+    assert helpers[0].lowered_return_expression == "9"
+
+
+def test_void_helper_with_pointer_output_does_not_get_marked_unresolved(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+void compute(out_t *out, float input)
+{
+    out->field = input;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["compute"],
+    )
+    assert helpers[0].unresolved_reason is None
+
+
+def test_void_helper_without_any_output_is_marked_unresolved(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+void noop(int x)
+{
+    int unused = x + 1;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["noop"],
+    )
+    assert (
+        helpers[0].unresolved_reason
+        == "helper has no return value and no pointer-output writes routable through source_assignments"
+    )
 
 
 def test_parameter_feasibility_gate_uses_only_discovered_parameters():
