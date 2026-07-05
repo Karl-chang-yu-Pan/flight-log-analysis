@@ -698,6 +698,101 @@ def test_write_dag_to_cache_replaces_prior_entry_atomically(tmp_path):
     assert op.expression == "99"
 
 
+def test_symbol_bindings_resolve_source_form_to_logged_evidence(monkeypatch):
+    """When a branch predicate reads a source-form symbol like
+    ``_navigator.get_vstatus().vehicle_type`` that BindingIndex maps to a
+    logged signal, the DAG should emit ``evidence:logged_signal`` with the
+    canonical logged name — not opaque_symbol."""
+    predicate = "_navigator.get_vstatus().vehicle_type == 1"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    # Pretend the profiler emitted a source→logged binding via BindingIndex.
+    # source_expression_names truncates at the ``()`` so the key the
+    # builder actually looks up is the pre-call chain.
+    index.symbol_bindings["navigator.get_vstatus"] = "vehicle_status.vehicle_type"
+
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    logged = next(
+        (v for v in dag.vertices
+         if v.kind == "evidence" and v.sub_kind == "logged_signal"
+         and v.signal_name == "vehicle_status.vehicle_type"),
+        None,
+    )
+    assert logged is not None
+    assert logged.metadata.get("source_form")
+
+
+def test_source_enum_resolution_stores_value_on_constant_vertex():
+    """A predicate mentioning an enum defined in source (numeric value
+    resolved) should emit ``evidence:constant`` with the value in metadata."""
+    predicate = "x == RTL_TYPE_HOME_OR_RALLY"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    # normalize_symbol does not lowercase — it strips leading underscore
+    # and collapses ``::``/``->`` to ``.``. All-caps enum names stay as-is.
+    index.assignment_resolutions["RTL_TYPE_HOME_OR_RALLY"] = 0
+
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    const_vertex = next(
+        (v for v in dag.vertices
+         if v.kind == "evidence" and v.sub_kind == "constant"
+         and v.signal_name == "RTL_TYPE_HOME_OR_RALLY"),
+        None,
+    )
+    assert const_vertex is not None
+    assert const_vertex.metadata.get("value") == 0
+    assert const_vertex.metadata.get("source") == "enum"
+
+
+def test_cxx_stdlib_constant_stored_on_constant_vertex():
+    """A predicate mentioning ``FLT_EPSILON`` should emit an ``evidence:constant``
+    vertex with the standard IEEE 754 value from ``CXX_STDLIB_CONSTANTS``."""
+    predicate = "cruising_speed > FLT_EPSILON"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    const_vertex = next(
+        (v for v in dag.vertices
+         if v.kind == "evidence" and v.sub_kind == "constant"
+         and v.signal_name == "FLT_EPSILON"),
+        None,
+    )
+    assert const_vertex is not None
+    assert const_vertex.metadata.get("value") is not None
+    assert const_vertex.metadata.get("source") == "cxx_stdlib"
+
+
 def test_helper_call_arguments_wire_into_formal_parameter_vertices():
     """Caller's actual argument should be connected to the helper's
     formal-parameter vertex — the graph flows through parameter ports

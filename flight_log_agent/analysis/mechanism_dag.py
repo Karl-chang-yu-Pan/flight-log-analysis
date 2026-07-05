@@ -27,6 +27,7 @@ from typing import Any, Iterable, Literal, Optional, Sequence
 from pydantic import BaseModel, Field
 
 from flight_log_agent.analysis.binding_index import BindingIndex
+from flight_log_agent.analysis.parameter_lookup import CXX_STDLIB_CONSTANTS
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.symbols import (
     is_signal_reference,
@@ -154,6 +155,23 @@ class _DAGBuilder:
         self.logged_signals = {normalize_symbol(s) for s in logged_signals if s}
         self.parameter_names = {p for p in parameter_names if p}
         self.snippet_context_lines = snippet_context_lines
+
+        # Source→runtime bridging tables read from the profiler's facts.
+        # These populate evidence vertices at construction time with the
+        # canonical runtime handle (logged signal name, resolved constant
+        # value) so feasibility can walk graph edges without re-consulting
+        # any table. Sourced from the BindingIndex today; will migrate
+        # to direct profiler-fact consumption as the index retires.
+        self._source_to_logged: dict[str, str] = dict(
+            getattr(binding_index, "symbol_bindings", {}) or {}
+        )
+        self._enum_resolutions: dict[str, Any] = {
+            key: value
+            for key, value in (
+                getattr(binding_index, "assignment_resolutions", {}) or {}
+            ).items()
+            if isinstance(value, (int, float, bool))
+        }
 
         self.vertices: dict[str, DAGVertex] = {}
         self.edges: dict[tuple[str, str, str, str], DAGEdge] = {}
@@ -392,29 +410,77 @@ class _DAGBuilder:
         """Link a source-expression symbol to a producer vertex.
 
         If a prior operation produces ``symbol_norm``, connect to it. Otherwise
-        emit an evidence leaf classified by whether the symbol is logged,
-        a parameter, an enum constant, or an unresolved opaque reference.
+        emit an evidence leaf. Classification order (each consults a
+        profiler-emitted source-of-truth so the vertex carries the
+        resolved runtime handle rather than the raw source form):
 
-        ``symbol_raw`` preserves the pre-normalization form for display on
-        the evidence vertex.
+        1. Direct producer via ``_producers_by_symbol`` (in-DAG operation).
+        2. Source-symbol binding from profiler ``symbol_bindings`` (via
+           :class:`BindingIndex`) — the source form maps to a logged
+           signal; emit ``logged_signal`` with the canonical logged name
+           as ``signal_name`` and the source form on ``metadata['source_form']``.
+        3. Source enum resolution — the symbol is defined in source as a
+           numeric constant; emit ``constant`` with ``metadata['value']``.
+        4. C stdlib constant (``CXX_STDLIB_CONSTANTS``) — same shape.
+        5. Direct logged-signal set membership (fallback for canonical
+           references that don't need a binding).
+        6. Parameter accessor match — heuristic; will retire when we
+           consume profiler ``ReferencedParameterRef`` records directly.
+        7. Enum-shaped name (``looks_like_enum_constant``) — heuristic;
+           retires when source constant coverage is complete.
+        8. Otherwise: opaque symbol.
         """
         producers = self._producers_by_symbol.get(symbol_norm)
         if producers:
             return producers[-1]
 
-        # Evidence leaf classification. Uses the raw form for display.
+        # 2. Source→logged binding from profiler facts.
+        logged = self._source_to_logged.get(symbol_norm)
+        if logged:
+            return self._emit_evidence(
+                "logged_signal",
+                logged,
+                file=None,
+                line=None,
+                metadata={"source_form": symbol_raw},
+            )
+
+        # 3. Source enum / #define resolution.
+        enum_value = self._enum_resolutions.get(symbol_norm)
+        if enum_value is not None:
+            return self._emit_evidence(
+                "constant",
+                symbol_raw,
+                file=None,
+                line=None,
+                metadata={"value": enum_value, "source": "enum"},
+            )
+
+        # 4. C stdlib constant.
+        cxx_value = CXX_STDLIB_CONSTANTS.get(symbol_raw.upper())
+        if cxx_value is not None:
+            return self._emit_evidence(
+                "constant",
+                symbol_raw.upper(),
+                file=None,
+                line=None,
+                metadata={"value": cxx_value, "source": "cxx_stdlib"},
+            )
+
+        # 5. Canonical logged signal (direct set membership).
         if symbol_norm in self.logged_signals:
             return self._emit_evidence("logged_signal", symbol_raw, file=None, line=None)
 
+        # 6. Parameter accessor heuristic.
         parameter_alias = self._match_parameter(symbol_raw)
         if parameter_alias is not None:
             return self._emit_evidence("parameter", parameter_alias, file=None, line=None)
 
+        # 7. Enum-shaped name (no value known).
         if looks_like_enum_constant(symbol_raw):
             return self._emit_evidence("constant", symbol_raw, file=None, line=None)
 
-        # Unclassified. Emit as opaque symbol so downstream tools can see
-        # the reference but know it wasn't grounded.
+        # 8. Unclassified.
         self.unresolved_symbols.add(symbol_raw)
         return self._emit_evidence("opaque_symbol", symbol_raw, file=file, line=line)
 
@@ -425,6 +491,7 @@ class _DAGBuilder:
         *,
         file: Optional[str],
         line: Optional[int],
+        metadata: Optional[dict[str, Any]] = None,
     ) -> str:
         key = (sub_kind, signal)
         existing = self._evidence_by_signal.get(key)
@@ -439,6 +506,7 @@ class _DAGBuilder:
             line=line,
             snippet=self._snippet(file, line),
             signal_name=signal,
+            metadata=dict(metadata) if metadata else {},
         )
         self._evidence_by_signal[key] = vertex_id
         return vertex_id
