@@ -3,8 +3,11 @@ from __future__ import annotations
 import pytest
 
 from flight_log_agent.analysis.source_slicer import (
+    ForwardHop,
+    ForwardSliceResult,
     SliceBlocker,
     SliceResult,
+    forward_slice,
     slice_expression,
     slice_symbol,
 )
@@ -434,3 +437,120 @@ class TestAssignmentIndexAndMemo:
         )
         assert result.status == "resolved"
         assert result.expression == "vehicle_global_position.lat"
+
+
+class TestForwardSlice:
+    def test_pure_reassignment_is_classified(self):
+        result = forward_slice(
+            "_rtl_alt",
+            source_assignments=[
+                _write("_mission_item.altitude", "_rtl_alt", file="rtl.cpp", line=361),
+            ],
+        )
+        assert len(result.hops) == 1
+        assert result.hops[0].role == "pure_reassignment"
+        assert result.hops[0].target == "_mission_item.altitude"
+        assert result.hops[0].called_function is None
+
+    def test_call_argument_captures_function_name(self):
+        result = forward_slice(
+            "_mission_item",
+            source_assignments=[
+                _write(
+                    "pos_sp_triplet.current.alt",
+                    "get_absolute_altitude_for_item(_mission_item)",
+                    file="mission_block.cpp",
+                    line=669,
+                ),
+            ],
+        )
+        assert len(result.hops) == 1
+        hop = result.hops[0]
+        assert hop.role == "call_argument"
+        assert hop.called_function == "get_absolute_altitude_for_item"
+
+    def test_transformation_hits_are_returned_unless_pure_only(self):
+        assignments = [
+            _write("_rtl_alt", "_destination.alt + _param_rtl_return_alt.get()"),
+        ]
+        default = forward_slice("_destination.alt", source_assignments=assignments)
+        assert len(default.hops) == 1
+        assert default.hops[0].role == "transformation"
+
+        pure = forward_slice(
+            "_destination.alt", source_assignments=assignments, pure_only=True
+        )
+        assert pure.hops == []
+
+    def test_forward_slice_matches_exact_symbol_not_leaf_only(self):
+        """Two different dotted symbols that happen to share a leaf must not
+        match — ``pos_sp.altitude`` is unrelated to ``mission_item.altitude``.
+        Alias-aware matching is deferred to the discovery-loop wiring."""
+        result = forward_slice(
+            "_mission_item.altitude",
+            source_assignments=[
+                _write("sp.alt", "pos_sp.altitude"),
+                _write(
+                    "_mission_item.altitude",
+                    "_rtl_alt",
+                    file="rtl.cpp",
+                    line=361,
+                ),
+            ],
+        )
+        # pos_sp.altitude is a leaf-collision, not a real consumer.
+        assert result.hops == []
+
+    def test_intra_file_hops_come_first_when_origin_file_supplied(self):
+        result = forward_slice(
+            "_rtl_alt",
+            source_assignments=[
+                _write("outside.field", "_rtl_alt", file="other.cpp", line=10),
+                _write("_mission_item.altitude", "_rtl_alt", file="rtl.cpp", line=361),
+                _write("_mission_item.altitude", "_rtl_alt", file="rtl.cpp", line=399),
+            ],
+            origin_file="rtl.cpp",
+        )
+        assert [(hop.file, hop.line) for hop in result.hops] == [
+            ("rtl.cpp", 361),
+            ("rtl.cpp", 399),
+            ("other.cpp", 10),
+        ]
+
+    def test_call_argument_ignores_arguments_hidden_in_transformations(self):
+        # `foo(bar * X)` should classify as transformation — X is not a bare
+        # top-level argument.
+        result = forward_slice(
+            "_rtl_alt",
+            source_assignments=[
+                _write("target.x", "foo(bar * _rtl_alt)"),
+            ],
+        )
+        assert result.hops[0].role == "transformation"
+
+    def test_symbol_unreferenced_by_any_assignment_returns_empty(self):
+        result = forward_slice(
+            "_never_used",
+            source_assignments=[
+                _write("_rtl_alt", "42"),
+                _write("_destination.alt", "some_helper()"),
+            ],
+        )
+        assert result.hops == []
+
+    def test_forward_result_carries_control_predicates(self):
+        result = forward_slice(
+            "_rtl_alt",
+            source_assignments=[
+                _write(
+                    "_mission_item.altitude",
+                    "_rtl_alt",
+                    file="rtl.cpp",
+                    line=361,
+                    control_predicates=["_param_rtl_cone_half_angle_deg.get() > 0"],
+                ),
+            ],
+        )
+        assert result.hops[0].control_predicates == [
+            "_param_rtl_cone_half_angle_deg.get() > 0"
+        ]

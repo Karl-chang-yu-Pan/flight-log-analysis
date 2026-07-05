@@ -741,3 +741,183 @@ def _describe_slice_blocker(result: SliceResult) -> str:
 
 def _expression_symbols_iter(expression: str) -> Iterator[str]:
     yield from _expression_symbols(expression)
+
+
+# ----------------------------------------------------------------------
+# Forward slicer (task #70)
+# ----------------------------------------------------------------------
+
+
+HopRole = Literal["pure_reassignment", "call_argument", "transformation"]
+
+
+class ForwardHop(BaseModel):
+    """A downstream assignment that consumes a source symbol.
+
+    ``role`` classifies HOW the symbol is used, which lets the discovery
+    loop follow only the "identity-preserving" hops (pure re-assignment
+    or bare call argument) and treat transformations as terminal.
+    """
+
+    target: str
+    expression: str
+    file: str
+    line: int
+    control_predicates: list[str] = Field(default_factory=list)
+    role: HopRole
+    called_function: Optional[str] = None
+
+
+class ForwardSliceResult(BaseModel):
+    symbol: str
+    hops: list[ForwardHop] = Field(default_factory=list)
+
+
+# Recognizes ``func(args)`` — capture group 1 is the function name (possibly
+# scoped), group 2 is the raw argument string that ``_split_top_level_args``
+# then splits on top-level commas.
+_CALL_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_.:]*)\s*\((?P<args>.*)\)\s*$")
+
+
+def forward_slice(
+    symbol: str,
+    *,
+    source_assignments: Iterable[Any],
+    origin_file: Optional[str] = None,
+    pure_only: bool = False,
+) -> ForwardSliceResult:
+    """Forward-slice a symbol through source_assignments.
+
+    Returns every assignment whose right-hand side references ``symbol``
+    (exact canonical match or tail-suffix match to survive
+    parameter-alias renaming across function boundaries).
+
+    Hops are classified by role. Setting ``pure_only`` filters to
+    identity-preserving hops (``pure_reassignment`` and
+    ``call_argument``) — the shape the DAG discovery loop uses when it
+    needs to follow a value's identity through unprofiled files.
+
+    When ``origin_file`` is set, hops in that file appear first
+    (intra-file preference from the design memo).
+    """
+    symbol_canonical = normalize_symbol(symbol)
+    if not symbol_canonical:
+        return ForwardSliceResult(symbol=symbol, hops=[])
+
+    hops: list[ForwardHop] = []
+    for assignment in source_assignments:
+        expression = _get(assignment, "expression")
+        if not expression:
+            continue
+        expr_text = str(expression)
+        if not _references_symbol(expr_text, symbol_canonical):
+            continue
+        role, called = _classify_forward_hop(expr_text, symbol_canonical)
+        if pure_only and role == "transformation":
+            continue
+        target = _get(assignment, "target") or ""
+        file = _get(assignment, "file") or ""
+        line_raw = _get(assignment, "line")
+        try:
+            line = int(line_raw)
+        except (TypeError, ValueError):
+            line = 0
+        predicates = list(_get(assignment, "control_predicates") or [])
+        hops.append(
+            ForwardHop(
+                target=str(target),
+                expression=expr_text,
+                file=str(file),
+                line=line,
+                control_predicates=predicates,
+                role=role,
+                called_function=called,
+            )
+        )
+
+    if origin_file:
+        hops.sort(key=lambda hop: (hop.file != origin_file, hop.file, hop.line))
+    else:
+        hops.sort(key=lambda hop: (hop.file, hop.line))
+
+    return ForwardSliceResult(symbol=symbol, hops=hops)
+
+
+def _references_symbol(expression: str, symbol_canonical: str) -> bool:
+    """True when ``expression`` reads ``symbol_canonical`` exactly.
+
+    Parameter-alias renaming across function boundaries (e.g. the caller
+    writes ``_mission_item.altitude`` and the callee reads
+    ``item.altitude``) is deliberately NOT handled here: matching on the
+    dotted tail alone overmatches in real code (``pos_sp.altitude`` and
+    ``mission_item.altitude`` share ``.altitude`` but are unrelated).
+    Callers that need alias-aware forward slicing should pre-translate
+    the aliased name before invoking the slicer — a real alias map comes
+    in during discovery-loop wiring (task #73).
+    """
+    for candidate in _expression_symbols(expression):
+        if normalize_symbol(candidate) == symbol_canonical:
+            return True
+    return False
+
+
+def _classify_forward_hop(expression: str, symbol_canonical: str) -> tuple[HopRole, Optional[str]]:
+    """Return ``(role, called_function)`` for a hop that reads the symbol."""
+    stripped = expression.strip()
+    # Strip a single wrapping paren group so `(x)` classifies as `x`.
+    while stripped.startswith("(") and stripped.endswith(")") and _parens_balance(stripped[1:-1]):
+        stripped = stripped[1:-1].strip()
+
+    if normalize_symbol(stripped) == symbol_canonical:
+        return "pure_reassignment", None
+
+    match = _CALL_RE.match(stripped)
+    if match:
+        func_name = match.group(1)
+        args = _split_top_level_args(match.group("args"))
+        for arg in args:
+            if normalize_symbol(arg.strip()) == symbol_canonical:
+                return "call_argument", func_name
+
+    return "transformation", None
+
+
+def _parens_balance(text: str) -> bool:
+    """True when ``text`` has non-negative running paren depth throughout."""
+    depth = 0
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _split_top_level_args(args: str) -> list[str]:
+    """Split a comma-separated argument list at top-level commas only.
+
+    Nested parens (``foo(a, b)``) and angle brackets (``static_cast<int>``)
+    are treated as opaque groups; commas inside them stay put.
+    """
+    if not args.strip():
+        return []
+    result: list[str] = []
+    depth = 0
+    current = []
+    for char in args:
+        if char in "([<":
+            depth += 1
+            current.append(char)
+        elif char in ")]>":
+            depth = max(depth - 1, 0)
+            current.append(char)
+        elif char == "," and depth == 0:
+            result.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if current:
+        result.append("".join(current))
+    return [item.strip() for item in result if item.strip()]
