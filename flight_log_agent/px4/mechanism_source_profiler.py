@@ -1100,6 +1100,7 @@ class MechanismSourceProfiler:
         return refs
 
     _ELSE_BODY_PATTERN = re.compile(r"^else(?!\s*if\b)\s*\{")
+    _ELSE_IF_PATTERN = re.compile(r"^else\s+if\b")
 
     def _control_predicates_by_line(self, text: str) -> Dict[int, List[str]]:
         predicates_by_line: Dict[int, List[str]] = {}
@@ -1127,14 +1128,23 @@ class MechanismSourceProfiler:
                 brace_depth = depth_after
                 active = [(depth, predicate) for depth, predicate in active if depth < brace_depth]
 
-            # Detect ``else {`` (plain else — ``else if`` still routes
-            # through the shared branch match below) and push the
-            # negation of the matching if.
+            # Detect ``else {`` (plain else) and push the negation of the
+            # matching if. ``else if`` is picked up below so we can conjoin
+            # the negation with the new condition.
             remainder_pre = stripped[leading_closes:].lstrip()
             if self._ELSE_BODY_PATTERN.match(remainder_pre):
                 negated = last_closed_by_depth.pop(brace_depth, None)
                 if negated:
                     pending.append(f"!({negated})")
+
+            # If this line starts an ``else if`` chain, grab the negation
+            # of the just-closed branch so we can combine it with the
+            # incoming condition once the branch-condition regex extracts
+            # the new one. Nested-negation form: chained else-ifs build
+            # ``!(!(A) && B) && C`` rather than an accumulated disjunction.
+            else_if_negation: Optional[str] = None
+            if self._ELSE_IF_PATTERN.match(remainder_pre):
+                else_if_negation = last_closed_by_depth.pop(brace_depth, None)
 
             # Reconstruct multi-line if-conditions by joining continuation
             # lines until parens balance. Handles PX4's common:
@@ -1154,7 +1164,10 @@ class MechanismSourceProfiler:
             match = self._BRANCH_CONDITION_PATTERN.search(combined)
             branch_kind = " ".join(match.group("kind").split()) if match else ""
             if match and branch_kind in {"if", "else if"} and "{" in combined[match.end():]:
-                pending.append(match.group("condition").strip())
+                condition = match.group("condition").strip()
+                if branch_kind == "else if" and else_if_negation:
+                    condition = f"!({else_if_negation}) && ({condition})"
+                pending.append(condition)
 
             # Consume opens on THIS line: for each ``{``, pop a pending
             # predicate (if any) and push it as active at the current

@@ -713,6 +713,44 @@ void Cone::pick()
     ]
 
 
+def test_else_if_chain_conjoins_negation_with_new_condition(tmp_path):
+    """``if(A){} else if(B){}`` should attach ``!(A) && (B)`` to the
+    else-if body's assignments, and the trailing plain ``else`` should
+    get the negation of the else-if predicate."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "chain.cpp").write_text(
+        """
+void Cone::pick()
+{
+    if (A > 0) {
+        _rtl_alt = branch_a();
+    } else if (B > 0) {
+        _rtl_alt = branch_b();
+    } else if (C > 0) {
+        _rtl_alt = branch_c();
+    } else {
+        _rtl_alt = default_branch();
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/chain.cpp"]
+    )
+    by_line = {a.line: a for a in assignments if a.target == "_rtl_alt"}
+
+    assert by_line[5].control_predicates == ["A > 0"]
+    assert by_line[7].control_predicates == ["!(A > 0) && (B > 0)"]
+    assert by_line[9].control_predicates == ["!(!(A > 0) && (B > 0)) && (C > 0)"]
+    assert by_line[11].control_predicates == [
+        "!(!(!(A > 0) && (B > 0)) && (C > 0))"
+    ]
+
+
 def test_reference_alias_substitutes_target_in_source_assignment(tmp_path):
     """``Type &name = container.field;`` should rewrite subsequent
     ``name.X = Y;`` assignments so the recorded target carries the full
