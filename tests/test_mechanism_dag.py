@@ -698,6 +698,56 @@ def test_write_dag_to_cache_replaces_prior_entry_atomically(tmp_path):
     assert op.expression == "99"
 
 
+def test_struct_root_expansion_walks_through_bare_struct_argument():
+    """Backward walk landing on a bare ``_mission_item`` (no direct writer,
+    only field writes) should expand into ``_mission_item.*`` writes so
+    the chain closes at the field level."""
+    bindings = [
+        # Terminal: mission_item_altitude_amsl = get_absolute_altitude_for_item(_mission_item)
+        _fake_binding(
+            binding_id="terminal",
+            target="mission_item_altitude_amsl",
+            expression="get_absolute_altitude_for_item(_mission_item)",
+            file="mission_block.cpp",
+            line=190,
+        ),
+        # Two field writes on _mission_item — the walk would normally
+        # never see these because nothing writes _mission_item bare.
+        _fake_binding(
+            binding_id="field_altitude",
+            target="_mission_item.altitude",
+            expression="_rtl_alt",
+            file="rtl.cpp",
+            line=361,
+        ),
+        _fake_binding(
+            binding_id="field_lat",
+            target="_mission_item.lat",
+            expression="_destination.lat",
+            file="rtl.cpp",
+            line=360,
+        ),
+        # An upstream write for _rtl_alt so the walk continues past the
+        # field expansion.
+        _fake_binding(
+            binding_id="rtl_alt_write",
+            target="_rtl_alt",
+            expression="max(gpos.alt, _destination.alt + _param_rtl_return_alt.get())",
+            file="rtl.cpp",
+            line=248,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "mission_item_altitude_amsl")
+
+    variables = {v.variable for v in dag.vertices if v.kind == "operation"}
+    # All three field-level writes + the upstream _rtl_alt should be reachable.
+    assert "mission_item_altitude_amsl" in variables
+    assert "_mission_item.altitude" in variables
+    assert "_mission_item.lat" in variables
+    assert "_rtl_alt" in variables
+
+
 def test_dag_without_source_root_omits_snippets():
     bindings = [
         _fake_binding(

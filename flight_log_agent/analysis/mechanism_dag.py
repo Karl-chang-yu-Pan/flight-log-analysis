@@ -176,6 +176,7 @@ class _DAGBuilder:
 
     def build(self) -> MechanismDAG:
         reaching = self.binding_index.bindings_reaching(self.terminal)
+        reaching = self._expand_struct_roots(reaching)
 
         # Two-pass build. Pass 1 emits every operation vertex so
         # ``_producers_by_symbol`` is fully populated before any edge is
@@ -204,6 +205,64 @@ class _DAGBuilder:
             edges=[self.edges[key] for key in self.edges],
             unresolved_symbols=sorted(self.unresolved_symbols),
         )
+
+    # ------------------------------------------------------------
+    # Struct-root expansion
+    # ------------------------------------------------------------
+
+    def _expand_struct_roots(self, reaching: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Add field-level bindings for bare struct roots referenced but
+        not directly assigned.
+
+        A backward walk that lands on ``get_absolute_altitude_for_item(_mission_item)``
+        stops at ``_mission_item`` because nothing writes to the bare
+        struct. This pass fetches every ``_mission_item.*`` field write
+        via :meth:`BindingIndex.bindings_writing_prefix` and continues
+        the reach walk from each field. Fixpoint over any struct roots
+        the newly-added bindings introduce.
+        """
+        seen_ids = {id(binding) for binding in reaching}
+        result = list(reaching)
+        pending_roots: list[str] = []
+
+        def scan(binding: dict[str, Any]) -> None:
+            for name in source_expression_names(str(binding.get("source_symbol") or "")):
+                normalized = normalize_symbol(name)
+                if not normalized or "." in normalized:
+                    continue  # only bare roots — dotted names go through the normal walk
+                if normalized == self.terminal:
+                    continue
+                if normalized in self.logged_signals or self._match_parameter(name):
+                    continue
+                pending_roots.append(normalized)
+
+        for binding in reaching:
+            scan(binding)
+
+        seen_roots: set[str] = set()
+        while pending_roots:
+            root = pending_roots.pop()
+            if root in seen_roots:
+                continue
+            seen_roots.add(root)
+            for field_binding in self.binding_index.bindings_writing_prefix(root):
+                if id(field_binding) in seen_ids:
+                    continue
+                seen_ids.add(id(field_binding))
+                result.append(field_binding)
+                # Reaching further backward: walk the newly-added binding's
+                # own dependencies.
+                for reached in self.binding_index.bindings_reaching(
+                    str(field_binding.get("target_symbol") or "")
+                ):
+                    if id(reached) in seen_ids:
+                        continue
+                    seen_ids.add(id(reached))
+                    result.append(reached)
+                    scan(reached)
+                scan(field_binding)
+
+        return result
 
     # ------------------------------------------------------------
     # Vertex emission

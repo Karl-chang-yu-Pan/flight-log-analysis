@@ -347,6 +347,24 @@ class BindingIndex:
                 frontier.extend(self._by_target.get(symbol, []))
         return selected
 
+    def bindings_writing_prefix(self, prefix: str) -> list[dict[str, Any]]:
+        """Return every binding whose target begins with ``{prefix}.``.
+
+        Callers use this to walk struct field writes when a bare struct
+        root like ``_mission_item`` appears as an unresolved symbol —
+        no direct ``_mission_item = X`` write exists, but many
+        ``_mission_item.altitude = ...`` writes do.
+        """
+        prefix_norm = normalize_symbol(prefix)
+        if not prefix_norm:
+            return []
+        needle = f"{prefix_norm}."
+        matches: list[dict[str, Any]] = []
+        for target_key, bindings in self._by_target.items():
+            if target_key.startswith(needle):
+                matches.extend(bindings)
+        return matches
+
     # ------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------
