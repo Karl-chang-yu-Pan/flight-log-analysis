@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from flight_log_agent.analysis.binding_index import BindingIndex
-from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+from flight_log_agent.analysis.mechanism_dag import (
+    build_mechanism_dag,
+    evaluate_feasibility,
+)
 
 
 def _fake_binding(
@@ -304,6 +307,140 @@ def test_snippet_embedding_reads_from_source_root(tmp_path):
     assert "line 10" in op.snippet
     assert "line 8" in op.snippet
     assert "line 12" in op.snippet
+
+
+def test_feasibility_marks_always_true_for_satisfied_predicate():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=["_param_rtl_cone_half_angle_deg.get() > 0"],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        parameter_values={"RTL_CONE_HALF_ANGLE_DEG": 45},
+        prune_dead=False,
+    )
+    branch = next(v for v in reduced.vertices if v.kind == "branch")
+    assert branch.feasibility_verdict == "always_true"
+
+
+def test_feasibility_prunes_always_false_gated_operation():
+    predicate = "_param_rtl_cone_half_angle_deg.get() > 0"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="cone_result",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_rtl_alt",
+            expression="max(gpos.alt, _destination.alt + _param_rtl_return_alt.get())",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        parameter_values={"RTL_CONE_HALF_ANGLE_DEG": 0},   # cone disabled
+        prune_dead=True,
+    )
+    remaining_ops = [v for v in reduced.vertices if v.kind == "operation" and v.variable == "_rtl_alt"]
+    assert len(remaining_ops) == 1, "cone-gated write should be pruned when RTL_CONE_HALF_ANGLE_DEG=0"
+    assert "max" in (remaining_ops[0].expression or "")
+
+    # And the always_false branch should be gone.
+    assert not any(v.kind == "branch" for v in reduced.vertices)
+
+
+def test_feasibility_leaves_unknown_when_predicate_references_unresolved_signal():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=["vehicle_status.vehicle_type == 1"],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        parameter_values={},
+        prune_dead=False,
+    )
+    branch = next(v for v in reduced.vertices if v.kind == "branch")
+    assert branch.feasibility_verdict == "unknown"
+
+
+def test_feasibility_reduces_compound_predicate_with_enum_value():
+    predicate = "_param_rtl_type.get() != RTL_TYPE_HOME_OR_RALLY"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_destination.alt",
+            expression="mission_landing_alt",
+            file="src/modules/navigator/rtl.cpp",
+            line=163,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_destination.alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        parameter_values={"RTL_TYPE": 1},
+        enum_values={"RTL_TYPE_HOME_OR_RALLY": 0},
+        prune_dead=False,
+    )
+    branch = next(v for v in reduced.vertices if v.kind == "branch")
+    assert branch.feasibility_verdict == "always_true"
+
+
+def test_feasibility_preserves_always_true_gate_without_pruning():
+    predicate = "_param_rtl_return_alt.get() > 0"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="_destination.alt + _param_rtl_return_alt.get()",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        parameter_values={"RTL_RETURN_ALT": 10},
+        prune_dead=True,
+    )
+    # Always-true branches survive (they gate live operations); only
+    # always_false subgraphs get pruned.
+    branch = next(v for v in reduced.vertices if v.kind == "branch")
+    assert branch.feasibility_verdict == "always_true"
+    op = next(v for v in reduced.vertices if v.kind == "operation" and v.variable == "_rtl_alt")
+    assert op is not None
 
 
 def test_dag_without_source_root_omits_snippets():

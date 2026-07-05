@@ -651,3 +651,123 @@ def _canonical_predicate(predicate: str) -> str:
     canonical = " ".join(predicate.split())
     canonical = canonical.strip("(){} ;")
     return canonical
+
+
+# ---------------------------------------------------------------------------
+# Feasibility pre-evaluation (Milestone 2)
+# ---------------------------------------------------------------------------
+
+
+_PARAM_ACCESSOR_RE = re.compile(r"_param_(?P<name>[A-Za-z0-9_]+)\.get\(\s*\)")
+
+
+def evaluate_feasibility(
+    dag: MechanismDAG,
+    *,
+    parameter_values: Optional[dict[str, Any]] = None,
+    enum_values: Optional[dict[str, Any]] = None,
+    prune_dead: bool = True,
+) -> MechanismDAG:
+    """Pre-evaluate each ``branch`` vertex against known constants.
+
+    For every branch, tries to reduce its predicate to a boolean using
+    ``parameter_values`` and ``enum_values``. Successful reductions set
+    ``feasibility_verdict`` to ``always_true`` or ``always_false``;
+    failed reductions stay ``unknown``.
+
+    Returns a new :class:`MechanismDAG` with updated feasibility. If
+    ``prune_dead`` is set, operations whose only gating branches all
+    resolve to ``always_false`` are removed along with the branches
+    themselves (and their orphaned edges).
+    """
+    params = {k.upper(): v for k, v in (parameter_values or {}).items()}
+    enums = dict(enum_values or {})
+
+    updated_vertices: list[DAGVertex] = []
+    verdicts: dict[str, str] = {}
+    for vertex in dag.vertices:
+        if vertex.kind != "branch":
+            updated_vertices.append(vertex)
+            continue
+        verdict = _reduce_predicate(vertex.predicate_raw or vertex.predicate_lowered or "", params, enums)
+        verdicts[vertex.id] = verdict
+        updated_vertices.append(vertex.model_copy(update={"feasibility_verdict": verdict}))
+
+    updated_edges = list(dag.edges)
+    kept_ids = {v.id for v in updated_vertices}
+
+    if prune_dead:
+        # Find operations whose incoming control edges are ALL always_false.
+        control_by_op: dict[str, list[str]] = {}
+        for edge in updated_edges:
+            if edge.kind == "control":
+                control_by_op.setdefault(edge.target_id, []).append(edge.source_id)
+
+        dead_op_ids: set[str] = set()
+        for op_id, branch_ids in control_by_op.items():
+            if branch_ids and all(verdicts.get(bid) == "always_false" for bid in branch_ids):
+                dead_op_ids.add(op_id)
+
+        # Also mark always_false branches as dead once every operation
+        # they gate is gone (which is by definition here).
+        dead_branch_ids = {bid for bid, verdict in verdicts.items() if verdict == "always_false"}
+
+        kept_ids -= dead_op_ids | dead_branch_ids
+        updated_vertices = [v for v in updated_vertices if v.id in kept_ids]
+        updated_edges = [
+            e for e in updated_edges
+            if e.source_id in kept_ids and e.target_id in kept_ids
+        ]
+
+    return MechanismDAG(
+        dag_id=dag.dag_id,
+        terminal=dag.terminal,
+        vertices=updated_vertices,
+        edges=updated_edges,
+        unresolved_symbols=dag.unresolved_symbols,
+    )
+
+
+def _reduce_predicate(
+    predicate: str,
+    parameter_values: dict[str, Any],
+    enum_values: dict[str, Any],
+) -> str:
+    """Attempt to reduce ``predicate`` to ``always_true`` / ``always_false``.
+
+    Returns ``"unknown"`` when the predicate cannot be reduced (missing
+    values, unsupported syntax, method calls, etc.).
+    """
+    if not predicate.strip():
+        return "unknown"
+
+    from flight_log_agent.analysis.safe_eval import (
+        ExpressionEvaluationError,
+        eval_expression,
+    )
+
+    # Substitute PX4 parameter accessors: `_param_rtl_cone_ang.get()` →
+    # bare identifier `RTL_CONE_ANG` that the eval env can bind.
+    text = _PARAM_ACCESSOR_RE.sub(lambda m: m.group("name").upper(), predicate)
+    # C++ boolean operators → Python.
+    text = text.replace("&&", " and ").replace("||", " or ")
+    # Unary not, but NOT `!=`.
+    text = re.sub(r"!(?!=)", " not ", text)
+    # C++ member access.
+    text = text.replace("->", ".")
+
+    env: dict[str, Any] = {}
+    env.update(parameter_values)
+    env.update(enum_values)
+
+    try:
+        result = eval_expression(text, env)
+    except (ExpressionEvaluationError, TypeError, ValueError, ZeroDivisionError):
+        return "unknown"
+
+    if isinstance(result, bool):
+        return "always_true" if result else "always_false"
+    if isinstance(result, (int, float)):
+        # C-style truthiness: non-zero is true.
+        return "always_true" if result != 0 else "always_false"
+    return "unknown"
