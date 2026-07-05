@@ -1748,3 +1748,54 @@ static const vehicle_status_s * Example::get_status()
     assert "vehicle_status_s" in return_type
     assert "static" not in return_type
     assert "const" not in return_type
+
+
+def test_struct_variables_populate_on_helper_expression_ref(tmp_path):
+    """Local struct variable declarations inside a helper body should
+    surface as ``struct_variables`` so the DAG can derive
+    ``var.field → topic.field`` graph-natively."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "example.cpp").write_text(
+        """
+float Example::check_status()
+{
+    vehicle_status_s vstatus{};
+    return vstatus.vehicle_type == 1 ? 1.0f : 0.0f;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/example/example.cpp"],
+        helper_names=["check_status"],
+    )
+    assert helpers
+    assert helpers[0].struct_variables.get("vstatus") == "vehicle_status_s"
+
+
+def test_struct_variables_populate_on_source_assignment_ref(tmp_path):
+    """Struct variable declarations visible at a source_assignment's site
+    should surface so the DAG can resolve struct-var references in the
+    assignment's expression or control predicates."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "example.cpp").write_text(
+        """
+void Example::update()
+{
+    vehicle_status_s vstatus{};
+    _out_alt = vstatus.vehicle_type;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/example.cpp"]
+    )
+    out = next(a for a in assignments if a.target == "_out_alt")
+    assert out.struct_variables.get("vstatus") == "vehicle_status_s"

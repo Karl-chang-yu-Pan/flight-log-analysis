@@ -698,11 +698,20 @@ def test_write_dag_to_cache_replaces_prior_entry_atomically(tmp_path):
     assert op.expression == "99"
 
 
-def test_symbol_bindings_resolve_source_form_to_logged_evidence(monkeypatch):
-    """When a branch predicate reads a source-form symbol like
-    ``_navigator.get_vstatus().vehicle_type`` that BindingIndex maps to a
-    logged signal, the DAG should emit ``evidence:logged_signal`` with the
-    canonical logged name — not opaque_symbol."""
+def test_helper_chain_source_form_resolves_to_logged_evidence():
+    """A branch predicate reading a helper-chain source form like
+    ``_navigator.get_vstatus().vehicle_type`` should emit
+    ``evidence:logged_signal`` with the canonical logged name — resolved
+    graph-natively via the helper's ``return_type`` and the PX4 msg schema."""
+    helper = _fake_helper(
+        name="Navigator::get_vstatus",
+        file="navigator.cpp",
+        line=100,
+        evidence="vehicle_status_s * Navigator::get_vstatus()",
+        assignments={},
+        return_expression="_vehicle_status",
+    )
+    helper["return_type"] = "vehicle_status_s *"
     predicate = "_navigator.get_vstatus().vehicle_type == 1"
     bindings = [
         _fake_binding(
@@ -714,13 +723,10 @@ def test_symbol_bindings_resolve_source_form_to_logged_evidence(monkeypatch):
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    # Pretend the profiler emitted a source→logged binding via BindingIndex.
-    # source_expression_names truncates at the ``()`` so the key the
-    # builder actually looks up is the pre-call chain.
-    index.symbol_bindings["navigator.get_vstatus"] = "vehicle_status.vehicle_type"
-
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    index = BindingIndex(
+        _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
+    )
+    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
 
     logged = next(
         (v for v in dag.vertices
@@ -730,6 +736,7 @@ def test_symbol_bindings_resolve_source_form_to_logged_evidence(monkeypatch):
     )
     assert logged is not None
     assert logged.metadata.get("source_form")
+    assert logged.metadata.get("derivation") == "helper_return_type"
 
 
 def test_source_enum_resolution_stores_value_on_constant_vertex():
@@ -1082,11 +1089,12 @@ def test_parameter_values_populate_resolved_value_on_evidence_constant():
     assert const_vertex.metadata.get("source") == "parameter"
 
 
-def test_symbol_bindings_self_mapping_refused_falls_through_to_opaque():
-    """A polluted ``symbol_bindings`` entry mapping a source symbol to
-    itself must not emit a phantom ``evidence:logged_signal`` — the
-    classifier should fall through so downstream steps can handle it."""
-    predicate = "dist_squared > 100"
+def test_symbol_bindings_flat_dict_no_longer_consumed():
+    """The DAG builder no longer reads ``binding_index.symbol_bindings``.
+    Even a well-formed entry present in the flat dict must not produce an
+    ``evidence:logged_signal`` vertex — the only paths are graph-native
+    (helper chain, struct variable)."""
+    predicate = "_navigator.get_vstatus().vehicle_type == 1"
     bindings = [
         _fake_binding(
             binding_id="b1",
@@ -1098,22 +1106,34 @@ def test_symbol_bindings_self_mapping_refused_falls_through_to_opaque():
         ),
     ]
     index = BindingIndex(_fake_inventory(), bindings)
-    index.symbol_bindings["dist_squared"] = "dist_squared"
+    # Well-formed flat entry. The retired path would have used it; the
+    # graph-native path ignores it because no helper record supplies the
+    # return_type and no struct-variable info is available.
+    index.symbol_bindings["_navigator.get_vstatus"] = "vehicle_status.vehicle_type"
 
     dag = build_mechanism_dag(index, "_rtl_alt")
 
     phantom = [
         v for v in dag.vertices
         if v.kind == "evidence" and v.sub_kind == "logged_signal"
-        and v.signal_name == "dist_squared"
+        and v.signal_name == "vehicle_status.vehicle_type"
     ]
-    assert not phantom, "polluted self-mapping produced a phantom logged_signal vertex"
+    assert not phantom, "flat symbol_bindings should no longer produce evidence vertices"
 
 
-def test_predicate_lowering_substitutes_enum_and_logged_signal():
-    """Branch ``predicate_lowered`` should reflect enum resolution and
-    validated source→logged substitution — the DAG owns the lowering
-    that used to live in ``lower_control_predicates``."""
+def test_predicate_lowering_substitutes_enum_and_helper_chain_derivation():
+    """Branch ``predicate_lowered`` should reflect enum resolution AND
+    graph-native helper-chain substitution — no flat symbol_bindings
+    entry required."""
+    helper = _fake_helper(
+        name="Navigator::get_vstatus",
+        file="navigator.cpp",
+        line=100,
+        evidence="vehicle_status_s * Navigator::get_vstatus()",
+        assignments={},
+        return_expression="_vehicle_status",
+    )
+    helper["return_type"] = "vehicle_status_s *"
     predicate = "_navigator.get_vstatus().vehicle_type == VEHICLE_TYPE_ROTARY_WING"
     bindings = [
         _fake_binding(
@@ -1128,21 +1148,19 @@ def test_predicate_lowering_substitutes_enum_and_logged_signal():
     index = BindingIndex(
         _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
     )
-    # Profiler emits both the raw and normalized source-form keys — the
-    # DAG builder consumes both to catch the dotted form as it appears in
-    # the predicate text.
-    index.symbol_bindings["_navigator.get_vstatus"] = "vehicle_status.vehicle_type"
-    index.symbol_bindings["navigator.get_vstatus"] = "vehicle_status.vehicle_type"
     # Enum-shaped constant → resolved value.
     index.assignment_resolutions["VEHICLE_TYPE_ROTARY_WING"] = 1
 
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
     assert "VEHICLE_TYPE_ROTARY_WING" not in (branch.predicate_lowered or "")
     variables = branch.metadata.get("variables") or {}
-    assert variables.get("_navigator.get_vstatus") == "vehicle_status.vehicle_type"
+    assert any(
+        "get_vstatus" in key and value == "vehicle_status.vehicle_type"
+        for key, value in variables.items()
+    )
 
 
 def test_derive_pointer_output_bindings_shared_by_profiler_and_dag():
@@ -1299,3 +1317,90 @@ def test_derive_topic_from_return_type_variants():
     assert _derive_topic_from_return_type("float") is None
     assert _derive_topic_from_return_type("") is None
     assert _derive_topic_from_return_type(None) is None
+
+
+def test_struct_var_field_resolves_via_return_type_convention():
+    """A ``vstatus.vehicle_type`` predicate should resolve graph-natively
+    when ``vstatus`` is struct-typed — same ``foo_s`` → topic convention
+    as helper return types, no flat symbol_bindings entry required."""
+    helper = _fake_helper(
+        name="Example::check",
+        file="example.cpp",
+        line=100,
+        evidence="float Example::check()",
+        assignments={},
+        return_expression="1.0",
+    )
+    helper["struct_variables"] = {"vstatus": "vehicle_status_s"}
+    predicate = "vstatus.vehicle_type == 1"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(
+        _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
+    )
+    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+
+    branch = next(v for v in dag.vertices if v.kind == "branch")
+    assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
+
+
+def test_struct_var_from_source_assignment_reaches_dag():
+    """Struct-variable maps arriving via SourceAssignmentRef.struct_variables
+    (not just helper records) should also be aggregated by the DAG builder."""
+    predicate = "vstatus.vehicle_type == 1"
+    binding = _fake_binding(
+        binding_id="b1",
+        target="_rtl_alt",
+        expression="42",
+        file="rtl.cpp",
+        line=1,
+        control_predicates=[predicate],
+    )
+    # Carry the struct-variable map on the binding dict as if it came
+    # from a SourceAssignmentRef.
+    binding["struct_variables"] = {"vstatus": "vehicle_status_s"}
+    index = BindingIndex(
+        _fake_inventory({"vehicle_status": ["vehicle_type"]}), [binding]
+    )
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    branch = next(v for v in dag.vertices if v.kind == "branch")
+    assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
+
+
+def test_struct_var_field_skipped_when_topic_unknown():
+    """When ``var.field`` derives a topic that isn't in the trusted signal
+    catalogue, the predicate should stay unlowered — no phantom binding."""
+    helper = _fake_helper(
+        name="Example::check",
+        file="example.cpp",
+        line=100,
+        evidence="float Example::check()",
+        assignments={},
+        return_expression="1.0",
+    )
+    helper["struct_variables"] = {"mystery": "mystery_topic_s"}
+    predicate = "mystery.value == 1"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+
+    branch = next(v for v in dag.vertices if v.kind == "branch")
+    assert "mystery" in (branch.predicate_lowered or "")

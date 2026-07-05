@@ -196,15 +196,10 @@ class _DAGBuilder:
                     _canonical_predicate(predicate), entry
                 )
 
-        # Source→runtime bridging tables read from the profiler's facts.
-        # These populate evidence vertices at construction time with the
-        # canonical runtime handle (logged signal name, resolved constant
-        # value) so feasibility can walk graph edges without re-consulting
-        # any table. Sourced from the BindingIndex today; will migrate
-        # to direct profiler-fact consumption as the index retires.
-        self._source_to_logged: dict[str, str] = dict(
-            getattr(binding_index, "symbol_bindings", {}) or {}
-        )
+        # Enum-resolved constants — profiler pre-resolves ``NAME = VALUE``
+        # entries from enum blocks and object-like ``#define`` macros; the
+        # DAG consumes numeric values to lower predicates and resolve
+        # symbolic mask/threshold references.
         self._enum_resolutions: dict[str, Any] = {
             key: value
             for key, value in (
@@ -212,6 +207,22 @@ class _DAGBuilder:
             ).items()
             if isinstance(value, (int, float, bool))
         }
+
+        # Struct-typed variable → struct type map, aggregated from every
+        # source_assignment binding and helper record that reaches the
+        # builder. Used by :meth:`_resolve_struct_var_field` to derive
+        # ``var.field → topic.field`` graph-natively via
+        # :func:`_derive_topic_from_return_type` (same PX4 ``foo_s``
+        # convention as helper return types).
+        self._struct_variables: dict[str, str] = {}
+        for helper in helper_index.values():
+            for name, struct_type in (helper.get("struct_variables") or {}).items():
+                if name and struct_type:
+                    self._struct_variables.setdefault(str(name), str(struct_type))
+        for binding in getattr(binding_index, "_bindings", []) or []:
+            for name, struct_type in (binding.get("struct_variables") or {}).items():
+                if name and struct_type:
+                    self._struct_variables.setdefault(str(name), str(struct_type))
 
         self.vertices: dict[str, DAGVertex] = {}
         self.edges: dict[tuple[str, str, str, str], DAGEdge] = {}
@@ -573,10 +584,7 @@ class _DAGBuilder:
 
         # 2a. Graph-native derivation: if ``source_expression`` contains a
         # ``symbol_raw().field`` chain, resolve it via the helper's
-        # ``return_type`` and the PX4 msg schema. This is the retirement
-        # path for the flat ``symbol_bindings`` table — the derivation
-        # walks the graph (helper subgraph → return_type → topic) instead
-        # of consulting a pre-baked side dict.
+        # ``return_type`` and the PX4 msg schema.
         chain_resolved = self._resolve_symbol_via_chain(symbol_raw, source_expression)
         if chain_resolved is not None:
             return self._emit_evidence(
@@ -587,19 +595,18 @@ class _DAGBuilder:
                 metadata={"source_form": symbol_raw, "derivation": "helper_return_type"},
             )
 
-        # 2b. Flat ``symbol_bindings`` fallback for cases the chain
-        # derivation didn't cover — subscription-copy aliases, member
-        # bindings the profiler pre-computed by direct pattern matching.
-        # Validated against the trusted catalogues so self-mappings and
-        # other polluted entries fall through instead of emitting phantoms.
-        logged = self._source_to_logged.get(symbol_norm)
-        if logged and self._is_valid_logged_target(logged, symbol_norm):
+        # 2b. Graph-native struct-variable derivation: ``var.field`` where
+        # ``var`` is struct-typed (local declaration or class member).
+        # Same PX4 ``foo_s`` convention as helper return types; no flat
+        # side-table.
+        struct_resolved = self._resolve_symbol_via_struct_var(symbol_raw, source_expression)
+        if struct_resolved is not None:
             return self._emit_evidence(
                 "logged_signal",
-                logged,
+                struct_resolved,
                 file=None,
                 line=None,
-                metadata={"source_form": symbol_raw},
+                metadata={"source_form": symbol_raw, "derivation": "struct_variable"},
             )
 
         # 3. Source enum / #define resolution.
@@ -659,21 +666,18 @@ class _DAGBuilder:
     ) -> tuple[str, dict[str, str]]:
         """Return ``(lowered_expression, variables)`` for a canonical predicate.
 
-        Absorbs the semantics that used to live in
-        :func:`lower_control_predicates`. Three passes:
+        Fully graph-native — no flat ``symbol_bindings`` table anywhere.
+        Three passes:
 
-        1. **Helper-chain resolution** — patterns like
-           ``_navigator.get_vstatus().vehicle_type`` get replaced with
-           ``vehicle_status.vehicle_type`` by looking up the helper's
-           ``return_type`` and cross-referencing the PX4 msg schema; this
-           is the graph-native replacement for the profiler's flat
-           ``symbol_bindings`` table.
-        2. **Enum-shaped constants** → resolved values from source
+        1. **Helper-chain resolution** — ``chain().field`` gets replaced with
+           ``topic.field`` by looking up the helper's ``return_type`` and
+           cross-referencing the PX4 msg schema.
+        2. **Struct-variable resolution** — ``var.field`` gets replaced when
+           ``var`` was declared struct-typed (local or class-member); the
+           topic is derived via the same PX4 ``foo_s`` convention.
+        3. **Enum-shaped constants** → resolved values from source
            (``assignment_resolutions`` covers enum entries and object-like
            ``#define``) or the C-stdlib table.
-        3. **Flat symbol_bindings** — validated fallback for source-form
-           symbols the helper-chain pass couldn't cover (subscription
-           copies, member-alias bindings the profiler pre-computed).
 
         The ``variables`` dict records each source-form → logged
         substitution so downstream evaluators share one lowering owner
@@ -688,7 +692,13 @@ class _DAGBuilder:
         lowered, chain_variables = self._substitute_helper_chains(lowered)
         variables.update(chain_variables)
 
-        # Pass 2: enum-shaped constants → resolved values.
+        # Pass 2: struct-variable field access — same derivation as helper
+        # chains but for ``var.field`` patterns where var is struct-typed.
+        lowered, struct_variables = self._substitute_struct_var_fields(lowered)
+        for key, value in struct_variables.items():
+            variables.setdefault(key, value)
+
+        # Pass 3: enum-shaped constants → resolved values.
         for token in sorted(
             set(re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", lowered)),
             key=len,
@@ -704,19 +714,38 @@ class _DAGBuilder:
                     lowered,
                 )
 
-        # Pass 3: flat symbol_bindings (validated fallback). Substitutes
-        # the longest source keys first so a prefix doesn't overwrite a
-        # more specific match.
-        for source in sorted(self._source_to_logged, key=len, reverse=True):
-            logged = self._source_to_logged.get(source)
-            if not logged or not self._is_valid_logged_target(logged, source):
-                continue
-            pattern = rf"(?<![A-Za-z0-9_\.]){re.escape(source)}(?![A-Za-z0-9_\.])"
-            if not re.search(pattern, lowered):
-                continue
-            lowered = re.sub(pattern, logged, lowered)
-            variables.setdefault(source, logged)
         return lowered, variables
+
+    def _substitute_struct_var_fields(self, text: str) -> tuple[str, dict[str, str]]:
+        """Replace ``var.field`` occurrences whose ``var`` is struct-typed.
+
+        Same derivation path as :meth:`_substitute_helper_chains`. Uses a
+        text-level ``\\bvar.field`` scan against the aggregated
+        struct-variables map; substitutes when the topic resolves via
+        the PX4 ``foo_s`` convention AND ``topic.field`` is in the
+        trusted signal catalogue. Longest var names go first so a prefix
+        doesn't overwrite a more specific match.
+        """
+        variables: dict[str, str] = {}
+        if not self._struct_variables:
+            return text, variables
+
+        for var in sorted(self._struct_variables, key=len, reverse=True):
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9_])(?:_?)({re.escape(var)})\s*(?:\.|->)\s*"
+                rf"(?P<field>[A-Za-z_][A-Za-z0-9_]*)"
+            )
+            def make_replacement(matched_var: str):
+                def replace(match: re.Match) -> str:
+                    field = match.group("field")
+                    resolved = self._resolve_struct_var_field(matched_var, field)
+                    if resolved is None:
+                        return match.group(0)
+                    variables[f"{matched_var}.{field}"] = resolved
+                    return resolved
+                return replace
+            text = pattern.sub(make_replacement(var), text)
+        return text, variables
 
     def _substitute_helper_chains(self, text: str) -> tuple[str, dict[str, str]]:
         """Replace ``chain().field`` occurrences with ``topic.field``.
@@ -742,6 +771,38 @@ class _DAGBuilder:
         substituted = _HELPER_CHAIN_RE.sub(replace, text)
         return substituted, variables
 
+    def _resolve_symbol_via_struct_var(
+        self, symbol_raw: str, source_expression: str
+    ) -> Optional[str]:
+        """Try to graph-derive a ``topic.field`` binding for ``symbol_raw``
+        via the struct-variable map.
+
+        ``source_expression_names`` returns the dotted ``var.field`` intact
+        when there's no intervening ``()``. If the whole symbol matches a
+        ``struct_var.field`` shape, this routes directly to
+        :meth:`_resolve_struct_var_field`. Otherwise falls back to
+        scanning the source expression for the pattern.
+        """
+        if not symbol_raw:
+            return None
+        # Fast path: the symbol itself is already the ``var.field`` form.
+        parts = symbol_raw.rsplit(".", 1)
+        if len(parts) == 2:
+            var_candidate, field = parts
+            resolved = self._resolve_struct_var_field(var_candidate, field)
+            if resolved is not None:
+                return resolved
+        if not source_expression:
+            return None
+        # Slow path: find ``symbol_raw.field`` in the surrounding expression.
+        pattern = re.compile(
+            rf"{re.escape(symbol_raw)}\s*(?:\.|->)\s*(?P<field>[A-Za-z_][A-Za-z0-9_]*)"
+        )
+        match = pattern.search(source_expression)
+        if not match:
+            return None
+        return self._resolve_struct_var_field(symbol_raw, match.group("field"))
+
     def _resolve_symbol_via_chain(
         self, symbol_raw: str, source_expression: str
     ) -> Optional[str]:
@@ -766,6 +827,31 @@ class _DAGBuilder:
         if not match:
             return None
         return self._resolve_helper_chain(symbol_raw, match.group("field"))
+
+    def _resolve_struct_var_field(self, var: str, field: str) -> Optional[str]:
+        """Return ``topic.field`` when ``var.field`` is graph-derivable.
+
+        Looks up ``var`` in the aggregated struct-variables map, derives the
+        topic from the struct type via :func:`_derive_topic_from_return_type`
+        (identical convention to helper return types), and validates the
+        resulting ``topic.field`` against the trusted signal catalogue.
+        Returns ``None`` when ``var`` isn't struct-typed, when the type
+        doesn't follow the ``foo_s`` convention, or when the topic.field
+        isn't in the catalogue.
+        """
+        struct_type = self._struct_variables.get(var)
+        if not struct_type:
+            struct_type = self._struct_variables.get(var.lstrip("_"))
+        if not struct_type:
+            return None
+        topic = _derive_topic_from_return_type(struct_type)
+        if not topic:
+            return None
+        signal = f"{topic}.{field}"
+        schema_signals = getattr(self.binding_index, "schema_signals", None) or set()
+        if signal in self.logged_signals or signal in schema_signals:
+            return signal
+        return None
 
     def _resolve_helper_chain(self, chain: str, field: str) -> Optional[str]:
         """Return ``topic.field`` when ``chain().field`` is graph-derivable.
@@ -795,24 +881,6 @@ class _DAGBuilder:
         if signal in self.logged_signals or signal in schema_signals:
             return signal
         return None
-
-    def _is_valid_logged_target(self, logged: str, source_norm: str) -> bool:
-        """Refuse polluted or self-referential ``symbol_bindings`` entries.
-
-        A binding is trusted only when the RHS is (a) different from the
-        source (no ``dist_squared → dist_squared`` no-op), and (b) resolves
-        to a real logged signal or a schema-known topic field via the
-        binding index. Everything else is treated as no-binding so the
-        classifier falls through to the next step instead of emitting a
-        phantom ``evidence:logged_signal`` vertex.
-        """
-        logged_norm = normalize_symbol(str(logged))
-        if not logged_norm or logged_norm == source_norm:
-            return False
-        if logged_norm in self.logged_signals:
-            return True
-        schema_signals = getattr(self.binding_index, "schema_signals", None) or set()
-        return logged_norm in schema_signals
 
     def _branch_metadata_from_parameter_predicate(self, canonical: str) -> dict[str, Any]:
         """Return branch metadata sourced from a ``ParameterPredicateRef``.

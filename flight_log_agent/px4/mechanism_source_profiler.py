@@ -118,6 +118,11 @@ class SourceAssignmentRef(BaseModel):
     assignment_operator: Optional[str] = None
     control_predicates: List[str] = Field(default_factory=list)
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
+    # Struct-typed variable → C++ struct type in scope at this assignment's
+    # site. Lets the DAG derive ``var.field → topic.field`` bindings
+    # graph-natively via :func:`_derive_topic_from_return_type` instead of
+    # depending on the pre-baked ``symbol_bindings`` dict.
+    struct_variables: Dict[str, str] = Field(default_factory=dict)
 
 
 class HelperExpressionRef(BaseModel):
@@ -144,6 +149,12 @@ class HelperExpressionRef(BaseModel):
     # table. Preserves pointer/reference qualifiers (``vehicle_status_s *``)
     # so downstream can distinguish struct-return helpers from scalar ones.
     return_type: Optional[str] = None
+    # Struct-typed variable name → C++ struct type in scope of this helper
+    # (both local variables declared in the body and class-member fields
+    # visible via ``this->``). Lets the DAG derive ``var.field →
+    # topic.field`` bindings graph-natively using the same
+    # :func:`_derive_topic_from_return_type` utility as helper return types.
+    struct_variables: Dict[str, str] = Field(default_factory=dict)
     unresolved_reason: Optional[str] = None
 
 
@@ -872,6 +883,7 @@ class MechanismSourceProfiler:
                                 " ".join([target, expression, *predicates]),
                                 var_to_struct,
                             ),
+                            struct_variables=dict(var_to_struct),
                         )
                     )
                 for match in self._SOURCE_COMPOUND_ASSIGNMENT_PATTERN.finditer(line):
@@ -905,6 +917,7 @@ class MechanismSourceProfiler:
                                 " ".join([target, expression, *predicates]),
                                 var_to_struct,
                             ),
+                            struct_variables=dict(var_to_struct),
                         )
                     )
 
@@ -2018,6 +2031,11 @@ class MechanismSourceProfiler:
 
         pointer_params = self._function_pointer_params({"params": params, "evidence": evidence})
         pointer_writes = self._pointer_output_writes(cleaned_body, pointer_params) if pointer_params else []
+        # Class-member struct types + locals declared in the body — both
+        # get surfaced on the record so the DAG can derive
+        # ``var.field → topic.field`` graph-natively.
+        struct_variables: Dict[str, str] = dict(member_to_struct or {})
+        struct_variables.update(self._extract_struct_variables(cleaned_body))
         if unresolved is None and not return_expression and not lowered_return_expression and not branches:
             if not pointer_writes:
                 unresolved = "helper has no return value and no pointer-output writes routable through source_assignments"
@@ -2040,6 +2058,7 @@ class MechanismSourceProfiler:
             helper_calls=helper_calls,
             pointer_output_writes=pointer_writes if unresolved is None else [],
             return_type=return_type,
+            struct_variables=struct_variables if unresolved is None else {},
             unresolved_reason=unresolved,
         )
 
