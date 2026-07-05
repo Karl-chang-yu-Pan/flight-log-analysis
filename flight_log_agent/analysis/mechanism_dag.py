@@ -6,11 +6,16 @@ graph reaching a given terminal symbol. Three vertex kinds
 (``data`` / ``control``). See ``memory/dag_design.md`` for the design
 rationale.
 
-Milestone 1 scope: backward slice from a terminal, per-intermediate
-vertices with no collapsing, helper subgraph nesting memoized by
-``(helper_name, class_context)``, optional per-vertex source snippets.
-Feasibility pre-evaluation, active windows, and disk persistence are
-deferred to later milestones.
+Sections:
+
+* Milestone 1 — DAG models and ``build_mechanism_dag`` (backward slice
+  from a terminal, no-collapse helper nesting, snippet embedding).
+* Milestone 2 — ``evaluate_feasibility`` with constant reduction and
+  optional dead-subgraph pruning.
+* Milestone 3 — interval evaluation over ULog signal samples,
+  populating ``active_windows`` per branch.
+* Milestone 4 — disk cache (Layer 2/3) and ``split_by_terminal``
+  subgraph partitioning for downstream LLM presentation.
 """
 
 from __future__ import annotations
@@ -920,3 +925,145 @@ def _evaluate_predicate_intervals(
     if current_start is not None:
         intervals.append((current_start, ts_sorted[-1]))
     return intervals
+
+
+# ---------------------------------------------------------------------------
+# Milestone 4 — subgraph slicing and disk cache
+# ---------------------------------------------------------------------------
+
+
+def split_by_terminal(dag: MechanismDAG) -> list[MechanismDAG]:
+    """Split a DAG into one subgraph per terminal operation.
+
+    A terminal operation is any ``operation`` vertex whose
+    ``metadata['is_terminal']`` is truthy — the DAG builder marks these
+    when the operation's target matches the requested terminal symbol.
+
+    Each returned subgraph contains the terminal operation and every
+    vertex reachable backward from it via any edge kind. Vertices
+    shared by multiple terminals (helper subgraph reuse, common
+    parameters) appear in each subgraph.
+
+    If no operation is marked terminal, returns ``[dag]`` unchanged so
+    callers don't need to special-case that.
+    """
+    terminal_ops = [
+        v for v in dag.vertices
+        if v.kind == "operation" and v.metadata.get("is_terminal")
+    ]
+    if len(terminal_ops) <= 1:
+        return [dag]
+
+    from collections import defaultdict as _defaultdict
+
+    edges_by_target: dict[str, list[DAGEdge]] = _defaultdict(list)
+    for edge in dag.edges:
+        edges_by_target[edge.target_id].append(edge)
+
+    vertices_by_id = {v.id: v for v in dag.vertices}
+
+    subgraphs: list[MechanismDAG] = []
+    for index, terminal_op in enumerate(terminal_ops):
+        reachable = _backward_reachable(terminal_op.id, edges_by_target)
+        selected_vertices = [vertices_by_id[vid] for vid in reachable if vid in vertices_by_id]
+        selected_edges = [
+            edge for edge in dag.edges
+            if edge.source_id in reachable and edge.target_id in reachable
+        ]
+        # Unresolved symbols surfaced only if any selected evidence vertex
+        # references them — keeps subgraph payloads tight.
+        surviving_symbols = {
+            v.signal_name for v in selected_vertices
+            if v.kind == "evidence" and v.sub_kind == "opaque_symbol" and v.signal_name
+        }
+        subgraphs.append(
+            MechanismDAG(
+                dag_id=f"{dag.dag_id}_sub{index}",
+                terminal=dag.terminal,
+                vertices=selected_vertices,
+                edges=selected_edges,
+                unresolved_symbols=sorted(surviving_symbols),
+            )
+        )
+    return subgraphs
+
+
+def _backward_reachable(
+    start_id: str,
+    edges_by_target: dict[str, list[DAGEdge]],
+) -> set[str]:
+    """Return every vertex id reachable backward from ``start_id`` via any edge."""
+    seen = {start_id}
+    frontier = [start_id]
+    while frontier:
+        current = frontier.pop()
+        for edge in edges_by_target.get(current, []):
+            if edge.source_id not in seen:
+                seen.add(edge.source_id)
+                frontier.append(edge.source_id)
+    return seen
+
+
+# --- Disk cache -----------------------------------------------------------
+
+
+_FS_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _terminal_slug(terminal: str) -> str:
+    """Filesystem-safe slug for a terminal symbol.
+
+    ``position_setpoint_triplet.current.alt`` → ``position_setpoint_triplet__current__alt``.
+    """
+    slug = terminal.strip().strip(".").replace(".", "__")
+    slug = _FS_SANITIZE_RE.sub("_", slug)
+    return slug or "unknown"
+
+
+def layer2_cache_path(cache_root: Path, source_hash: str, terminal: str) -> Path:
+    """Layer 2 (unresolved DAG) path: keyed by source + terminal."""
+    return Path(cache_root) / "dag" / source_hash / f"{_terminal_slug(terminal)}.json"
+
+
+def layer3_cache_path(
+    cache_root: Path,
+    source_hash: str,
+    ulog_hash: str,
+    terminal: str,
+) -> Path:
+    """Layer 3 (flight-annotated DAG) path: keyed by source + ulog + terminal."""
+    return (
+        Path(cache_root)
+        / "dag_annotated"
+        / source_hash
+        / ulog_hash
+        / f"{_terminal_slug(terminal)}.json"
+    )
+
+
+def write_dag_to_cache(dag: MechanismDAG, path: Path) -> None:
+    """Serialize ``dag`` to ``path`` atomically.
+
+    Writes to ``path.tmp`` first, then renames over ``path`` so a
+    partial write can't corrupt an existing cache entry.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(dag.model_dump_json(), encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_dag_from_cache(path: Path) -> Optional[MechanismDAG]:
+    """Deserialize a DAG from ``path``.
+
+    Returns ``None`` on missing file or unparseable payload. Callers
+    treat that as a cache miss and rebuild.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return MechanismDAG.model_validate_json(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None

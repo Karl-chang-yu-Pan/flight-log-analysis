@@ -4,6 +4,11 @@ from flight_log_agent.analysis.binding_index import BindingIndex
 from flight_log_agent.analysis.mechanism_dag import (
     build_mechanism_dag,
     evaluate_feasibility,
+    layer2_cache_path,
+    layer3_cache_path,
+    read_dag_from_cache,
+    split_by_terminal,
+    write_dag_to_cache,
 )
 
 
@@ -566,6 +571,131 @@ def test_signal_samples_combine_with_parameter_substitution():
     )
     branch = next(v for v in reduced.vertices if v.kind == "branch")
     assert branch.active_windows == [(0.0, 10.0), (20.0, 20.0)]
+
+
+def test_split_by_terminal_returns_singleton_when_one_terminal_op():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    subgraphs = split_by_terminal(dag)
+    assert len(subgraphs) == 1
+    assert subgraphs[0] is dag
+
+
+def test_split_by_terminal_produces_one_subgraph_per_terminal_op():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="cone_helper()",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_rtl_alt",
+            expression="max(gpos_alt, _destination_alt)",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    # Both operations write to the terminal → each is is_terminal.
+    terminal_ops = [v for v in dag.vertices if v.kind == "operation" and v.metadata.get("is_terminal")]
+    assert len(terminal_ops) == 2
+
+    subgraphs = split_by_terminal(dag)
+    assert len(subgraphs) == 2
+    for subgraph in subgraphs:
+        terminal_count = sum(
+            1 for v in subgraph.vertices
+            if v.kind == "operation" and v.metadata.get("is_terminal")
+        )
+        assert terminal_count == 1
+
+
+def test_layer2_cache_roundtrip(tmp_path):
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    path = layer2_cache_path(tmp_path, "abcdef", "position_setpoint_triplet.current.alt")
+    assert not path.exists()
+    write_dag_to_cache(dag, path)
+    assert path.exists()
+    assert path.name == "position_setpoint_triplet__current__alt.json"
+
+    restored = read_dag_from_cache(path)
+    assert restored is not None
+    assert restored.dag_id == dag.dag_id
+    assert restored.terminal == dag.terminal
+    assert len(restored.vertices) == len(dag.vertices)
+
+
+def test_layer3_cache_path_composes_with_ulog_hash(tmp_path):
+    path = layer3_cache_path(tmp_path, "abcdef", "0123456", "_mission_item.altitude")
+    assert path.parent.name == "0123456"
+    assert path.parent.parent.name == "abcdef"
+    assert path.name == "_mission_item__altitude.json"
+
+
+def test_read_dag_from_cache_returns_none_on_missing_or_corrupt(tmp_path):
+    missing = tmp_path / "does_not_exist.json"
+    assert read_dag_from_cache(missing) is None
+
+    corrupt = tmp_path / "bad.json"
+    corrupt.write_text("not valid json {", encoding="utf-8")
+    assert read_dag_from_cache(corrupt) is None
+
+
+def test_write_dag_to_cache_replaces_prior_entry_atomically(tmp_path):
+    bindings1 = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+        ),
+    ]
+    bindings2 = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="99",
+            file="rtl.cpp",
+            line=1,
+        ),
+    ]
+    path = layer2_cache_path(tmp_path, "hash", "_rtl_alt")
+
+    write_dag_to_cache(build_mechanism_dag(BindingIndex(_fake_inventory(), bindings1), "_rtl_alt"), path)
+    write_dag_to_cache(build_mechanism_dag(BindingIndex(_fake_inventory(), bindings2), "_rtl_alt"), path)
+
+    restored = read_dag_from_cache(path)
+    assert restored is not None
+    # Latest write wins; expression should be "99".
+    op = next(v for v in restored.vertices if v.kind == "operation")
+    assert op.expression == "99"
 
 
 def test_dag_without_source_root_omits_snippets():
