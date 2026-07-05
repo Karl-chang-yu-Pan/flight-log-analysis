@@ -1009,6 +1009,15 @@ class MechanismSourceProfiler:
             })
         return writes
 
+    # Matches a leading C++ type declaration like ``const struct position_setpoint_s *``
+    # so we can strip it from an argument text extracted from a function
+    # definition line that the call-scanner misidentified as a call.
+    _CXX_TYPE_PREFIX_RE = re.compile(
+        r"^\s*(?:const\s+|volatile\s+|struct\s+|class\s+|enum\s+|unsigned\s+|signed\s+)*"
+        r"[A-Za-z_][A-Za-z0-9_:<>]*"
+        r"\s*[*&]\s*"
+    )
+
     @staticmethod
     def _substitute_pointer_writes(
         writes: List[Dict[str, str]],
@@ -1022,6 +1031,7 @@ class MechanismSourceProfiler:
             if index is None or index >= len(call_args):
                 continue
             arg = call_args[index].strip().lstrip("&").strip()
+            arg = MechanismSourceProfiler._CXX_TYPE_PREFIX_RE.sub("", arg).strip()
             if not arg:
                 continue
             target = f"{arg}.{write['field']}"

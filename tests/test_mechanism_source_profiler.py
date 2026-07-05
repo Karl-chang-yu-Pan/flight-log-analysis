@@ -713,6 +713,33 @@ void Cone::pick()
     ]
 
 
+def test_pointer_output_routing_strips_cxx_type_prefix_from_arg(tmp_path):
+    """When a function-definition line is misidentified as a call site,
+    the pointer-output arg substitution should still strip the C++ type
+    declaration prefix so the routed target isn't malformed."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "block.cpp").write_text(
+        """
+bool
+MissionBlock::mission_item_to_position_setpoint(const mission_item_s &item, position_setpoint_s *sp)
+{
+    sp->alt = get_absolute_altitude_for_item(item);
+    return true;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/block.cpp"]
+    )
+    targets = {a.target for a in assignments}
+    # No malformed target with type prefix leaking through.
+    assert not any(" *" in t or "position_setpoint_s" in t or "mission_item_s" in t for t in targets)
+
+
 def test_else_if_chain_conjoins_negation_with_new_condition(tmp_path):
     """``if(A){} else if(B){}`` should attach ``!(A) && (B)`` to the
     else-if body's assignments, and the trailing plain ``else`` should
