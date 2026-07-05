@@ -650,6 +650,38 @@ bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
     assert by_target["sp.alt"].expression == "get_absolute_altitude_for_item(item)"
 
 
+def test_multi_line_if_condition_attaches_predicate_to_body_assignment(tmp_path):
+    """PX4's common ``if (long_a\n    && long_b) {`` pattern must attach
+    the full multi-line condition as a control_predicate on assignments
+    inside the body."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "cone.cpp").write_text(
+        """
+void Cone::pick_altitude()
+{
+    if (_param_rtl_cone_half_angle_deg.get() > 0
+        && _navigator->get_vstatus()->vehicle_type == VEHICLE_TYPE_ROTARY_WING) {
+        _rtl_alt = calculate_from_cone((float)_param_rtl_cone_half_angle_deg.get());
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/cone.cpp"]
+    )
+    by_target = {a.target: a for a in assignments}
+    predicate = by_target["_rtl_alt"].control_predicates
+    assert predicate == [
+        "_param_rtl_cone_half_angle_deg.get() > 0 "
+        "&& _navigator->get_vstatus()->vehicle_type == VEHICLE_TYPE_ROTARY_WING"
+    ]
+
+
 def test_reference_alias_substitutes_target_in_source_assignment(tmp_path):
     """``Type &name = container.field;`` should rewrite subsequent
     ``name.X = Y;`` assignments so the recorded target carries the full

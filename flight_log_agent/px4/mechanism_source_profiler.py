@@ -1102,23 +1102,55 @@ class MechanismSourceProfiler:
     def _control_predicates_by_line(self, text: str) -> Dict[int, List[str]]:
         predicates_by_line: Dict[int, List[str]] = {}
         active: List[Tuple[int, str]] = []
+        # Predicates whose ``{`` hasn't been seen yet — first-in first-out
+        # so multiple pending ifs pop in the same order the parser saw them.
+        pending: List[str] = []
         brace_depth = 0
-        for line_no, line in self._iter_code_lines(text):
+        lines = list(self._iter_code_lines(text))
+        for index, (line_no, line) in enumerate(lines):
             stripped = line.strip()
             leading_closes = len(stripped) - len(stripped.lstrip("}"))
             if leading_closes:
                 brace_depth = max(brace_depth - leading_closes, 0)
                 active = [(depth, predicate) for depth, predicate in active if depth < brace_depth]
 
-            match = self._BRANCH_CONDITION_PATTERN.search(line)
-            branch_kind = " ".join(match.group("kind").split()) if match else ""
-            if match and branch_kind in {"if", "else if"} and "{" in line[match.end():]:
-                predicate = match.group("condition").strip()
-                active.append((brace_depth, predicate))
+            # Reconstruct multi-line if-conditions by joining continuation
+            # lines until parens balance. Handles PX4's common:
+            #     if (long_a
+            #         && long_b) {
+            # Without this, the regex's ``[^;\n]*`` condition class stops
+            # at the first newline and the predicate is dropped.
+            combined = line
+            paren_balance = line.count("(") - line.count(")")
+            peek = index + 1
+            while paren_balance > 0 and peek < len(lines):
+                _, next_line = lines[peek]
+                combined += " " + next_line.strip()
+                paren_balance += next_line.count("(") - next_line.count(")")
+                peek += 1
 
-            predicates_by_line[line_no] = [predicate for _, predicate in active]
+            match = self._BRANCH_CONDITION_PATTERN.search(combined)
+            branch_kind = " ".join(match.group("kind").split()) if match else ""
+            if match and branch_kind in {"if", "else if"} and "{" in combined[match.end():]:
+                pending.append(match.group("condition").strip())
+
+            # Consume opens on THIS line: for each ``{``, pop a pending
+            # predicate (if any) and push it as active at the current
+            # brace_depth. Deferring the push until we see the ``{`` keeps
+            # multi-line if-conditions from being filtered out at their
+            # own end-of-line before the body has opened.
             remainder = stripped[leading_closes:]
-            brace_depth += remainder.count("{") - remainder.count("}")
+            opens_here = remainder.count("{")
+            for _ in range(opens_here):
+                if pending:
+                    active.append((brace_depth, pending.pop(0)))
+                brace_depth += 1
+            brace_depth = max(brace_depth - remainder.count("}"), 0)
+
+            # Snapshot AFTER remainder processing so assignments on the
+            # same line as the ``{`` see the predicate.
+            predicates_by_line[line_no] = [predicate for _, predicate in active]
+
             active = [(depth, predicate) for depth, predicate in active if depth < brace_depth]
         return predicates_by_line
 

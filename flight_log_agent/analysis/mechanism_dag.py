@@ -753,8 +753,8 @@ def _reduce_predicate(
     text = text.replace("&&", " and ").replace("||", " or ")
     # Unary not, but NOT `!=`.
     text = re.sub(r"!(?!=)", " not ", text)
-    # C++ member access.
-    text = text.replace("->", ".")
+    # C++ member and scope access → Python attribute.
+    text = text.replace("->", ".").replace("::", ".")
 
     env: dict[str, Any] = {}
     env.update(parameter_values)
