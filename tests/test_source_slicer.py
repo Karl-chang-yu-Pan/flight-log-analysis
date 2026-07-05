@@ -7,6 +7,7 @@ from flight_log_agent.analysis.source_slicer import (
     ForwardSliceResult,
     SliceBlocker,
     SliceResult,
+    alias_map_for_call_site,
     forward_slice,
     slice_expression,
     slice_symbol,
@@ -537,6 +538,77 @@ class TestForwardSlice:
             ],
         )
         assert result.hops == []
+
+    def test_alias_map_bridges_parameter_rename_across_boundaries(self):
+        """When the discovery loop knows a helper's formal parameter maps
+        to a caller-side name, forward-slicing on the caller-side symbol
+        should still match callee-side reads through the alias map."""
+        result = forward_slice(
+            "_mission_item.altitude",
+            source_assignments=[
+                _write("sp.alt", "item.altitude", file="mission_block.cpp", line=669),
+                _write("other.field", "unrelated.altitude"),
+            ],
+            aliases={"item": "mission_item"},
+        )
+        assert len(result.hops) == 1
+        assert result.hops[0].role == "pure_reassignment"
+        assert result.hops[0].file == "mission_block.cpp"
+
+    def test_alias_translation_survives_call_argument_classification(self):
+        """Symbol matching via alias should still classify a bare-arg call
+        as ``call_argument`` (not fall through to ``transformation``)."""
+        result = forward_slice(
+            "_mission_item",
+            source_assignments=[
+                _write("target.x", "compute(item)", file="mission_block.cpp", line=190),
+            ],
+            aliases={"item": "mission_item"},
+        )
+        assert len(result.hops) == 1
+        assert result.hops[0].role == "call_argument"
+        assert result.hops[0].called_function == "compute"
+
+    def test_alias_map_for_call_site_pairs_formals_with_bare_actuals(self):
+        aliases = alias_map_for_call_site(
+            ["item", "sp"],
+            ["_mission_item", "&pos_sp_triplet->current"],
+        )
+        assert aliases == {
+            "item": "mission_item",
+            "sp": "pos_sp_triplet.current",
+        }
+
+    def test_alias_map_skips_transformations_and_calls(self):
+        """Non-identity args contribute no alias — the callee's read of
+        that formal can't be linked back to a single caller-side symbol."""
+        aliases = alias_map_for_call_site(
+            ["a", "b", "c", "d"],
+            ["_x", "x + 1", "foo(_x)", "(float)_x"],
+        )
+        # Only the bare-reference arg maps.
+        assert aliases == {"a": "x"}
+
+    def test_alias_map_ignores_extra_formals_or_actuals(self):
+        assert alias_map_for_call_site(["a", "b"], ["_x"]) == {"a": "x"}
+        assert alias_map_for_call_site(["a"], ["_x", "_y"]) == {"a": "x"}
+
+    def test_alias_map_composes_with_forward_slice(self):
+        """End-to-end: build the alias map from a call site, then hand it
+        to forward_slice to cross a parameter boundary."""
+        aliases = alias_map_for_call_site(
+            ["item"],  # callee formal
+            ["_mission_item"],  # caller actual
+        )
+        result = forward_slice(
+            "_mission_item.altitude",
+            source_assignments=[
+                _write("sp.alt", "item.altitude", file="mission_block.cpp", line=669),
+            ],
+            aliases=aliases,
+        )
+        assert len(result.hops) == 1
+        assert result.hops[0].role == "pure_reassignment"
 
     def test_forward_result_carries_control_predicates(self):
         result = forward_slice(

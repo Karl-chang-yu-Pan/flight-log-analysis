@@ -785,12 +785,13 @@ def forward_slice(
     source_assignments: Iterable[Any],
     origin_file: Optional[str] = None,
     pure_only: bool = False,
+    aliases: Optional[dict[str, str]] = None,
 ) -> ForwardSliceResult:
     """Forward-slice a symbol through source_assignments.
 
     Returns every assignment whose right-hand side references ``symbol``
-    (exact canonical match or tail-suffix match to survive
-    parameter-alias renaming across function boundaries).
+    (exact canonical match, or root-aliased match when ``aliases`` is
+    supplied — see below).
 
     Hops are classified by role. Setting ``pure_only`` filters to
     identity-preserving hops (``pure_reassignment`` and
@@ -799,10 +800,18 @@ def forward_slice(
 
     When ``origin_file`` is set, hops in that file appear first
     (intra-file preference from the design memo).
+
+    ``aliases`` maps normalized alias root → normalized canonical root.
+    A candidate symbol whose root is in ``aliases`` gets its root
+    rewritten before the match. Use this to bridge parameter renames
+    across function boundaries (``item.altitude`` in a callee ↔
+    ``_mission_item.altitude`` in the caller) — the discovery loop
+    populates the map from function signatures at profile time.
     """
     symbol_canonical = normalize_symbol(symbol)
     if not symbol_canonical:
         return ForwardSliceResult(symbol=symbol, hops=[])
+    alias_map = {k: v for k, v in (aliases or {}).items() if k and v}
 
     hops: list[ForwardHop] = []
     for assignment in source_assignments:
@@ -810,9 +819,9 @@ def forward_slice(
         if not expression:
             continue
         expr_text = str(expression)
-        if not _references_symbol(expr_text, symbol_canonical):
+        if not _references_symbol(expr_text, symbol_canonical, alias_map):
             continue
-        role, called = _classify_forward_hop(expr_text, symbol_canonical)
+        role, called = _classify_forward_hop(expr_text, symbol_canonical, alias_map)
         if pure_only and role == "transformation":
             continue
         target = _get(assignment, "target") or ""
@@ -843,32 +852,34 @@ def forward_slice(
     return ForwardSliceResult(symbol=symbol, hops=hops)
 
 
-def _references_symbol(expression: str, symbol_canonical: str) -> bool:
-    """True when ``expression`` reads ``symbol_canonical`` exactly.
-
-    Parameter-alias renaming across function boundaries (e.g. the caller
-    writes ``_mission_item.altitude`` and the callee reads
-    ``item.altitude``) is deliberately NOT handled here: matching on the
-    dotted tail alone overmatches in real code (``pos_sp.altitude`` and
-    ``mission_item.altitude`` share ``.altitude`` but are unrelated).
-    Callers that need alias-aware forward slicing should pre-translate
-    the aliased name before invoking the slicer — a real alias map comes
-    in during discovery-loop wiring (task #73).
-    """
+def _references_symbol(
+    expression: str,
+    symbol_canonical: str,
+    aliases: Optional[dict[str, str]] = None,
+) -> bool:
+    """True when ``expression`` reads ``symbol_canonical`` — exact match
+    or root-aliased match via ``aliases`` (both canonical form)."""
     for candidate in _expression_symbols(expression):
-        if normalize_symbol(candidate) == symbol_canonical:
+        canonical = normalize_symbol(candidate)
+        if canonical == symbol_canonical:
+            return True
+        if aliases and _apply_root_alias(canonical, aliases) == symbol_canonical:
             return True
     return False
 
 
-def _classify_forward_hop(expression: str, symbol_canonical: str) -> tuple[HopRole, Optional[str]]:
+def _classify_forward_hop(
+    expression: str,
+    symbol_canonical: str,
+    aliases: Optional[dict[str, str]] = None,
+) -> tuple[HopRole, Optional[str]]:
     """Return ``(role, called_function)`` for a hop that reads the symbol."""
     stripped = expression.strip()
     # Strip a single wrapping paren group so `(x)` classifies as `x`.
     while stripped.startswith("(") and stripped.endswith(")") and _parens_balance(stripped[1:-1]):
         stripped = stripped[1:-1].strip()
 
-    if normalize_symbol(stripped) == symbol_canonical:
+    if _matches_with_aliases(normalize_symbol(stripped), symbol_canonical, aliases):
         return "pure_reassignment", None
 
     match = _CALL_RE.match(stripped)
@@ -876,10 +887,82 @@ def _classify_forward_hop(expression: str, symbol_canonical: str) -> tuple[HopRo
         func_name = match.group(1)
         args = _split_top_level_args(match.group("args"))
         for arg in args:
-            if normalize_symbol(arg.strip()) == symbol_canonical:
+            if _matches_with_aliases(normalize_symbol(arg.strip()), symbol_canonical, aliases):
                 return "call_argument", func_name
 
     return "transformation", None
+
+
+def _apply_root_alias(canonical: str, aliases: dict[str, str]) -> str:
+    """Rewrite the leading dot-segment of ``canonical`` via ``aliases``.
+
+    ``item.altitude`` with ``{"item": "mission_item"}`` becomes
+    ``mission_item.altitude``. Bare (dotless) symbols also translate.
+    """
+    if not canonical:
+        return canonical
+    if "." not in canonical:
+        return aliases.get(canonical, canonical)
+    root, rest = canonical.split(".", 1)
+    if root in aliases:
+        return f"{aliases[root]}.{rest}"
+    return canonical
+
+
+def _matches_with_aliases(
+    candidate: str,
+    symbol_canonical: str,
+    aliases: Optional[dict[str, str]],
+) -> bool:
+    if candidate == symbol_canonical:
+        return True
+    if aliases and _apply_root_alias(candidate, aliases) == symbol_canonical:
+        return True
+    return False
+
+
+# ``x``, ``x.y``, ``x->y.z`` — everything else (calls, arithmetic, cast
+# expressions) fails to match, so those args contribute no alias entry.
+_BARE_REFERENCE_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*"
+    r"$"
+)
+
+
+def alias_map_for_call_site(
+    formal_parameters: Iterable[str],
+    actual_args: Iterable[str],
+) -> dict[str, str]:
+    """Zip formal parameter names with actual argument canonical forms
+    to produce an alias map suitable for :func:`forward_slice`.
+
+    Each formal maps to the normalized form of the actual argument at
+    that position, stripping leading ``&`` / ``*`` decorators. Arguments
+    that aren't identifier references (calls, transformations, casts)
+    contribute nothing to the map — those callee reads can't be reliably
+    linked back to a caller-side symbol.
+
+    The map's *value* is the whole normalized argument, not just its
+    root: passing ``_mission_item`` yields ``{"formal": "mission_item"}``
+    (struct-passed case), while passing ``&pos_sp->current`` yields
+    ``{"formal": "pos_sp.current"}`` (pointer-to-field case). Both apply
+    correctly via :func:`_apply_root_alias`.
+    """
+    aliases: dict[str, str] = {}
+    for formal, actual in zip(formal_parameters, actual_args):
+        formal_str = str(formal or "").strip()
+        actual_str = str(actual or "").strip()
+        if not formal_str or not actual_str:
+            continue
+        bare = actual_str.lstrip("&*").strip()
+        if not _BARE_REFERENCE_RE.match(bare):
+            continue
+        formal_norm = normalize_symbol(formal_str)
+        actual_norm = normalize_symbol(bare)
+        if formal_norm and actual_norm:
+            aliases[formal_norm] = actual_norm
+    return aliases
 
 
 def _parens_balance(text: str) -> bool:
