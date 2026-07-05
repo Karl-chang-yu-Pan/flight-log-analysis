@@ -197,6 +197,47 @@ def _file_unchanged_between(
     return result.returncode == 0
 
 
+def get_or_extract_facts(
+    profiler: MechanismSourceProfiler,
+    cache_root: Union[str, Path],
+    file_path: str,
+    source_hash: str,
+    *,
+    source_root: Optional[Union[str, Path]] = None,
+    git_path: str = "git",
+) -> SourceFileFacts:
+    """Layer 1 read-path: cache hit if available, extract and write on miss.
+
+    First calls :func:`get_source_facts_for_file`, which tries the direct
+    hit under ``source_hash`` and falls back to git-diff-based cross-hash
+    reuse. On genuine miss, runs :func:`extract_facts_for_file` and
+    writes the result to Layer 1 for next time.
+
+    **Cross-file joins are NOT covered.** ``SourceFileFacts.source_assignments``
+    contains only what falls out of ``extract_source_assignments_from_source([file])``
+    for a single-file input — pointer-output routing across caller/callee
+    files, recursive helper resolution across files, and any other
+    cross-file pass must be reapplied by the caller on the union of loaded
+    Layer 1 entries. The discovery loop is the intended owner of that
+    reassembly.
+    """
+    facts = get_source_facts_for_file(
+        cache_root,
+        file_path,
+        source_hash,
+        source_root=source_root,
+        git_path=git_path,
+    )
+    if facts is not None:
+        return facts
+    facts = extract_facts_for_file(profiler, file_path, source_hash)
+    write_source_facts(
+        facts,
+        layer1_cache_path(cache_root, source_hash, file_path),
+    )
+    return facts
+
+
 def extract_facts_for_file(
     profiler: MechanismSourceProfiler,
     file_path: str,

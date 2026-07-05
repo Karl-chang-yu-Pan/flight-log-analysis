@@ -9,6 +9,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
 from flight_log_agent.px4.source_facts_cache import (
     SourceFileFacts,
     extract_facts_for_file,
+    get_or_extract_facts,
     get_source_facts_for_file,
     layer1_cache_path,
     read_source_facts,
@@ -190,6 +191,58 @@ def test_new_write_does_not_touch_old_hash_entry(tmp_path):
     new = read_source_facts(new_path)
     assert old is not None and old.source_hash == "old"
     assert new is not None and new.source_hash == "new"
+
+
+def test_get_or_extract_facts_populates_cache_on_miss(tmp_path):
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helper.cpp").write_text(
+        """
+void Cone::pick()
+{
+    _rtl_alt = fallback();
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+
+    cache_root = tmp_path / "cache"
+    path = layer1_cache_path(cache_root, "hash", "src/modules/example/helper.cpp")
+    assert not path.exists()
+
+    facts = get_or_extract_facts(
+        profiler,
+        cache_root,
+        "src/modules/example/helper.cpp",
+        source_hash="hash",
+    )
+    assert path.exists()
+    assert facts.file == "src/modules/example/helper.cpp"
+    assert facts.source_hash == "hash"
+    assert any(a.target == "_rtl_alt" for a in facts.source_assignments)
+
+
+def test_get_or_extract_facts_uses_cache_on_hit(tmp_path):
+    """Second call under the same hash should read from disk, not re-parse."""
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    file_rel = "src/modules/example/helper.cpp"
+    file_abs = tmp_path / "PX4-Autopilot" / file_rel
+    file_abs.write_text("void foo() { _x = 1; }\n", encoding="utf-8")
+
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+    cache_root = tmp_path / "cache"
+    first = get_or_extract_facts(profiler, cache_root, file_rel, "hash")
+    assert first.file == file_rel
+
+    # Rewrite the file. If Layer 1 caching works, the second call should
+    # NOT reflect the rewrite because we're still on the same hash.
+    file_abs.write_text("void bar() { _y = 2; }\n", encoding="utf-8")
+    second = get_or_extract_facts(profiler, cache_root, file_rel, "hash")
+    # Same as the cached version — targets do not include _y.
+    targets = {a.target for a in second.source_assignments}
+    assert "_y" not in targets
 
 
 def test_extract_facts_for_file_populates_from_profiler(tmp_path):
