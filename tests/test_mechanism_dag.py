@@ -698,6 +698,58 @@ def test_write_dag_to_cache_replaces_prior_entry_atomically(tmp_path):
     assert op.expression == "99"
 
 
+def test_helper_call_arguments_wire_into_formal_parameter_vertices():
+    """Caller's actual argument should be connected to the helper's
+    formal-parameter vertex — the graph flows through parameter ports
+    instead of leaving the formal name unresolved."""
+    helper = _fake_helper(
+        name="scale_alt",
+        file="rtl.cpp",
+        line=800,
+        evidence="float scale_alt(float base) {",
+        assignments={},
+        return_expression="base * 2",
+    )
+    helper["parameters"] = ["base"]
+
+    bindings = [
+        _fake_binding(
+            binding_id="caller",
+            target="_rtl_alt",
+            expression="scale_alt(_destination.alt)",
+            file="rtl.cpp",
+            line=500,
+        ),
+        _fake_binding(
+            binding_id="alt_write",
+            target="_destination.alt",
+            expression="home.alt",
+            file="rtl.cpp",
+            line=200,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(
+        index,
+        "_rtl_alt",
+        helper_expressions=[helper],
+    )
+
+    # Formal-parameter vertex emitted?
+    formal = next(
+        (v for v in dag.vertices if v.kind == "evidence" and v.sub_kind == "helper_parameter"),
+        None,
+    )
+    assert formal is not None, "helper_parameter vertex missing"
+    assert formal.signal_name == "base"
+
+    # A data edge should feed the argument into the formal-parameter vertex.
+    incoming = [e for e in dag.edges if e.target_id == formal.id and e.kind == "data"]
+    assert incoming, "no data edge feeding the helper formal parameter"
+    # The role should reference the formal name so LLM presentation stays useful.
+    assert any(e.role == "arg:base" for e in incoming)
+
+
 def test_struct_root_expansion_walks_through_bare_struct_argument():
     """Backward walk landing on a bare ``_mission_item`` (no direct writer,
     only field writes) should expand into ``_mission_item.*`` writes so

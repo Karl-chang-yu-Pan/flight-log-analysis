@@ -163,6 +163,13 @@ class _DAGBuilder:
         self._evidence_by_signal: dict[tuple[str, str], str] = {}
         self._branch_by_predicate: dict[str, str] = {}
         self._helper_subgraph_return_id: dict[tuple[str, str], str] = {}
+        # helper_key -> ordered list of (formal_name, param_vertex_id).
+        # Callers wire their i-th argument's producer to the i-th formal
+        # vertex; helper body operations that reference the formal look
+        # it up in this map (scoped to the helper).
+        self._helper_parameter_vertices: dict[
+            tuple[str, str], list[tuple[str, str]]
+        ] = {}
         # Assignment-target index: normalized target symbol → list of vertex ids
         # that produce it. Used to link consumers back to producing operations.
         self._producers_by_symbol: dict[str, list[str]] = {}
@@ -317,7 +324,10 @@ class _DAGBuilder:
 
         # Helper-call inputs.
         for helper_call in self._find_helper_calls(expression):
-            helper_return_id = self._helper_subgraph_return_id.get(self._pick_helper_key(helper_call) or ("", ""))
+            helper_key = self._pick_helper_key(helper_call)
+            if helper_key is None:
+                continue
+            helper_return_id = self._helper_subgraph_return_id.get(helper_key)
             if helper_return_id:
                 self._add_edge(
                     helper_return_id,
@@ -326,6 +336,50 @@ class _DAGBuilder:
                     role=f"call:{helper_call}",
                     via=helper_call,
                 )
+            # Wire the caller's actual arguments to the helper's formal
+            # parameter vertices — one edge per positional match.
+            self._wire_helper_call_arguments(helper_call, expression, file, line)
+
+    def _wire_helper_call_arguments(
+        self,
+        helper_call: str,
+        caller_expression: str,
+        file: Optional[str],
+        line: Optional[int],
+    ) -> None:
+        """Parse the ``helper_call(...)`` in ``caller_expression`` and wire
+        each positional argument to the helper's matching formal parameter
+        vertex.
+
+        Uses the first occurrence of ``helper_call(...)`` in the expression.
+        Multiple invocations in one expression get handled if they appear
+        as separate entries in the ``_find_helper_calls`` result — the
+        function is invoked once per name; a limitation on today's parser,
+        good enough for the RTL/airspeed cases.
+        """
+        helper_key = self._pick_helper_key(helper_call)
+        if helper_key is None:
+            return
+        formals = self._helper_parameter_vertices.get(helper_key)
+        if not formals:
+            return
+        args = _extract_call_arguments(helper_call, caller_expression)
+        for (formal_name, formal_vertex_id), arg_text in zip(formals, args):
+            for symbol in dedupe_keep_order(source_expression_names(arg_text)):
+                normalized = normalize_symbol(symbol)
+                if not normalized:
+                    continue
+                producer_id = self._resolve_symbol_producer(
+                    normalized, symbol, arg_text, file, line
+                )
+                if producer_id is not None:
+                    self._add_edge(
+                        producer_id,
+                        formal_vertex_id,
+                        kind="data",
+                        role=f"arg:{formal_name}",
+                        via=helper_call,
+                    )
 
     def _resolve_symbol_producer(
         self,
@@ -464,6 +518,28 @@ class _DAGBuilder:
         file = helper.get("file")
         line = helper.get("line")
 
+        # Emit a helper_parameter vertex for each formal so callers can
+        # wire their actual arguments into shared entry points and helper
+        # body operations can resolve references to formals against them.
+        formals: list[tuple[str, str]] = []
+        for formal in helper.get("parameters") or []:
+            formal_str = str(formal)
+            if not formal_str:
+                continue
+            param_id = self._make_id("ev", ("helper_param", helper_key[0], helper_key[1], formal_str))
+            if param_id not in self.vertices:
+                self.vertices[param_id] = DAGVertex(
+                    id=param_id,
+                    kind="evidence",
+                    sub_kind="helper_parameter",
+                    file=file,
+                    line=line,
+                    signal_name=formal_str,
+                    metadata={"helper": f"{helper_key[0]}@{helper_key[1]}"},
+                )
+            formals.append((formal_str, param_id))
+        self._helper_parameter_vertices[helper_key] = formals
+
         for var, expression in (helper.get("assignments") or {}).items():
             var_norm = normalize_symbol(var)
             op_id = self._make_id("op", (helper_key[0], helper_key[1], var_norm, expression))
@@ -519,6 +595,15 @@ class _DAGBuilder:
         file = helper.get("file")
         line = helper.get("line")
 
+        # Helper-scoped local resolver: formal parameter names bind to
+        # their formal-parameter vertex before falling back to the global
+        # producer index. This preserves helper-local scoping when two
+        # helpers happen to share a formal name (``float x``).
+        local_scope = {
+            normalize_symbol(formal): vertex_id
+            for formal, vertex_id in self._helper_parameter_vertices.get(helper_key, ())
+        }
+
         for var, expression in (helper.get("assignments") or {}).items():
             var_norm = normalize_symbol(var)
             op_id = self._make_id("op", (helper_key[0], helper_key[1], var_norm, expression))
@@ -526,7 +611,9 @@ class _DAGBuilder:
                 normalized = normalize_symbol(symbol)
                 if not normalized or normalized == var_norm:
                     continue
-                producer_id = self._resolve_symbol_producer(normalized, symbol, str(expression), file, line)
+                producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
+                    normalized, symbol, str(expression), file, line
+                )
                 if producer_id is not None:
                     self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
@@ -549,7 +636,9 @@ class _DAGBuilder:
             normalized = normalize_symbol(symbol)
             if not normalized:
                 continue
-            producer_id = self._resolve_symbol_producer(normalized, symbol, str(return_expression), file, line)
+            producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
+                normalized, symbol, str(return_expression), file, line
+            )
             if producer_id is not None:
                 self._add_edge(producer_id, terminal_id, kind="data", role=symbol)
 
@@ -594,6 +683,11 @@ class _DAGBuilder:
     @staticmethod
     def _make_id(prefix: str, key: Any) -> str:
         return stable_id(prefix, key)
+
+    # ------------------------------------------------------------
+    # Argument parsing
+    # ------------------------------------------------------------
+
 
     # ------------------------------------------------------------
     # Classification and snippets
@@ -1126,3 +1220,58 @@ def read_dag_from_cache(path: Path) -> Optional[MechanismDAG]:
         return MechanismDAG.model_validate_json(path.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing for helper call sites
+# ---------------------------------------------------------------------------
+
+
+def _extract_call_arguments(func_name: str, expression: str) -> list[str]:
+    """Return the top-level, comma-separated arguments of the first
+    ``func_name(...)`` occurrence in ``expression``.
+
+    Nested parens count toward depth so commas inside sub-calls stay
+    grouped. Returns an empty list when the call cannot be located or
+    has no arguments.
+    """
+    index = expression.find(func_name)
+    while index >= 0:
+        after = index + len(func_name)
+        # Skip whitespace; must land on `(`.
+        cursor = after
+        while cursor < len(expression) and expression[cursor].isspace():
+            cursor += 1
+        if cursor < len(expression) and expression[cursor] == "(":
+            # Boundary check on the left so ``get_absolute_altitude_for_item``
+            # doesn't match inside ``suffix_get_absolute_altitude_for_item``.
+            left_char = expression[index - 1] if index > 0 else ""
+            if left_char.isalnum() or left_char == "_":
+                index = expression.find(func_name, after)
+                continue
+            depth = 0
+            args: list[str] = []
+            current: list[str] = []
+            for char in expression[cursor:]:
+                if char == "(":
+                    depth += 1
+                    if depth > 1:
+                        current.append(char)
+                    continue
+                if char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        text = "".join(current).strip()
+                        if text:
+                            args.append(text)
+                        return args
+                    current.append(char)
+                    continue
+                if char == "," and depth == 1:
+                    args.append("".join(current).strip())
+                    current = []
+                    continue
+                current.append(char)
+            return args
+        index = expression.find(func_name, after)
+    return []
