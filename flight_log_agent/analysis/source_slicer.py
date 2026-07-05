@@ -24,6 +24,7 @@ the original symbol. That gives the caller both a more-useful expression
 from __future__ import annotations
 
 import re
+from collections import deque
 from typing import Any, Iterable, Iterator, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -773,6 +774,31 @@ class ForwardSliceResult(BaseModel):
     hops: list[ForwardHop] = Field(default_factory=list)
 
 
+class ForwardReachResult(BaseModel):
+    """Transitive forward reachability from a seed symbol.
+
+    Symmetric counterpart to :meth:`BindingIndex.bindings_reaching` (the
+    backward walk): starting from ``seed``, follow every downstream hop
+    transitively over ``source_assignments`` until no new target is
+    reached or ``max_depth`` is hit.
+
+    * ``hops`` — every distinct hop reached across the whole forward cone
+      (deduped by target/file/line), each carrying its role so a caller
+      can tell identity-preserving flow from transformation.
+    * ``visited`` — the canonical symbols the walk expanded (the identity
+      chain plus every transformed target it kept following).
+    * ``terminal_candidates`` — the forward-cone *sinks*: targets reached
+      that are never themselves consumed by a further hop. These are the
+      mechanism outputs the seed ultimately flows into, i.e. the terminals
+      a DAG would be built backward from during discovery.
+    """
+
+    seed: str
+    hops: list[ForwardHop] = Field(default_factory=list)
+    visited: list[str] = Field(default_factory=list)
+    terminal_candidates: list[str] = Field(default_factory=list)
+
+
 # Recognizes ``func(args)`` — capture group 1 is the function name (possibly
 # scoped), group 2 is the raw argument string that ``_split_top_level_args``
 # then splits on top-level commas.
@@ -850,6 +876,99 @@ def forward_slice(
         hops.sort(key=lambda hop: (hop.file, hop.line))
 
     return ForwardSliceResult(symbol=symbol, hops=hops)
+
+
+def forward_reachable(
+    seed: str,
+    *,
+    source_assignments: Iterable[Any],
+    aliases: Optional[dict[str, str]] = None,
+    origin_file: Optional[str] = None,
+    pure_only: bool = False,
+    max_depth: int = 8,
+) -> ForwardReachResult:
+    """Transitive forward walk from ``seed`` — symmetric to the backward
+    :meth:`BindingIndex.bindings_reaching`.
+
+    Repeatedly applies :func:`forward_slice`: each hop's target becomes the
+    next frontier symbol, so a value is followed through renames, call
+    arguments, and transformations until the forward cone closes (no new
+    target) or ``max_depth`` is reached. A visited-set guards against
+    assignment cycles (``a = b; b = a``).
+
+    ``pure_only`` restricts propagation to identity-preserving hops
+    (``pure_reassignment`` / ``call_argument``), which traces where the
+    *same* value ends up; the default follows transformations too, giving
+    the full forward dependency cone.
+
+    ``aliases`` is a single canonical alias map applied at every hop (same
+    contract as :func:`forward_slice`). Per-call-site alias composition
+    across function boundaries is left to the caller, which can merge maps
+    from :func:`alias_map_for_call_site` before invoking.
+
+    The re-scan of ``source_assignments`` per frontier symbol is O(symbols
+    x assignments); discovery file sets are bounded (the resolver caps the
+    visited-file count), so this stays cheap in practice.
+    """
+    seed_canonical = normalize_symbol(seed)
+    if not seed_canonical:
+        return ForwardReachResult(seed=seed)
+
+    # Materialize once so each frontier symbol re-scans the same list.
+    assignments = list(source_assignments)
+
+    all_hops: list[ForwardHop] = []
+    seen_hops: set[tuple[str, str, int]] = set()
+    visited: set[str] = set()
+    produced_targets: set[str] = set()
+    consumed_symbols: set[str] = set()
+    # Canonical target key → original target text (first seen), so the
+    # cone-sink output presents the same string form as ``hop.target``
+    # even though the set arithmetic runs on canonical keys.
+    target_display: dict[str, str] = {}
+
+    frontier: deque[tuple[str, int]] = deque([(seed_canonical, 0)])
+    while frontier:
+        current, depth = frontier.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+        if depth >= max_depth:
+            continue
+
+        result = forward_slice(
+            current,
+            source_assignments=assignments,
+            origin_file=origin_file,
+            pure_only=pure_only,
+            aliases=aliases,
+        )
+        for hop in result.hops:
+            consumed_symbols.add(current)
+            target_norm = normalize_symbol(hop.target)
+            if target_norm:
+                produced_targets.add(target_norm)
+                target_display.setdefault(target_norm, hop.target)
+            key = (hop.target, hop.file, hop.line)
+            if key not in seen_hops:
+                seen_hops.add(key)
+                all_hops.append(hop)
+            if target_norm and target_norm not in visited:
+                frontier.append((target_norm, depth + 1))
+
+    # Sinks of the forward cone: targets reached that never served as a
+    # source for a further hop within this walk — the mechanism outputs.
+    terminal_candidates = [
+        target_display[key]
+        for key in sorted(produced_targets - consumed_symbols)
+    ]
+
+    return ForwardReachResult(
+        seed=seed,
+        hops=all_hops,
+        visited=sorted(visited),
+        terminal_candidates=terminal_candidates,
+    )
 
 
 def _references_symbol(

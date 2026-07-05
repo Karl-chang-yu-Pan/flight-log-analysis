@@ -4,10 +4,12 @@ import pytest
 
 from flight_log_agent.analysis.source_slicer import (
     ForwardHop,
+    ForwardReachResult,
     ForwardSliceResult,
     SliceBlocker,
     SliceResult,
     alias_map_for_call_site,
+    forward_reachable,
     forward_slice,
     slice_expression,
     slice_symbol,
@@ -626,3 +628,115 @@ class TestForwardSlice:
         assert result.hops[0].control_predicates == [
             "_param_rtl_cone_half_angle_deg.get() > 0"
         ]
+
+
+class TestForwardReachable:
+    def test_transitive_walk_follows_chain_of_reassignments(self):
+        """seed flows a -> b -> c through pure reassignments; all three
+        targets should appear as hops and the walk should visit each link."""
+        assignments = [
+            _write("b", "a", file="f.cpp", line=1),
+            _write("c", "b", file="f.cpp", line=2),
+            _write("d", "c", file="f.cpp", line=3),
+        ]
+        result = forward_reachable("a", source_assignments=assignments)
+        targets = {hop.target for hop in result.hops}
+        assert targets == {"b", "c", "d"}
+        # Every intermediate symbol was expanded.
+        assert {"a", "b", "c"}.issubset(set(result.visited))
+
+    def test_terminal_candidates_are_forward_cone_sinks(self):
+        """The value flows a -> b -> _rtl_alt; _rtl_alt is written nowhere
+        else's source, so it's the sole terminal candidate."""
+        assignments = [
+            _write("b", "a", file="f.cpp", line=1),
+            _write("_rtl_alt", "b + offset", file="f.cpp", line=2),
+        ]
+        result = forward_reachable("a", source_assignments=assignments)
+        assert result.terminal_candidates == ["_rtl_alt"]
+
+    def test_multiple_sinks_are_all_reported(self):
+        """A fan-out (a feeds two independent transformations) yields two
+        terminal candidates."""
+        assignments = [
+            _write("_out_a", "a * 2", file="f.cpp", line=1),
+            _write("_out_b", "a + 3", file="f.cpp", line=2),
+        ]
+        result = forward_reachable("a", source_assignments=assignments)
+        assert result.terminal_candidates == ["_out_a", "_out_b"]
+
+    def test_pure_only_stops_at_first_transformation(self):
+        """With pure_only, the walk follows identity hops but does not
+        cross a transformation, so a value transformed at the first hop
+        produces no reachable targets."""
+        assignments = [
+            _write("_rtl_alt", "a + offset", file="f.cpp", line=1),
+            _write("downstream", "_rtl_alt", file="f.cpp", line=2),
+        ]
+        pure = forward_reachable("a", source_assignments=assignments, pure_only=True)
+        assert pure.hops == []
+        assert pure.terminal_candidates == []
+        # Default (follow transformations) does reach both.
+        full = forward_reachable("a", source_assignments=assignments)
+        assert {hop.target for hop in full.hops} == {"_rtl_alt", "downstream"}
+
+    def test_cycle_is_guarded(self):
+        """a = b; b = a must not loop forever; the visited-set bounds it."""
+        assignments = [
+            _write("b", "a", file="f.cpp", line=1),
+            _write("a", "b", file="f.cpp", line=2),
+        ]
+        result = forward_reachable("a", source_assignments=assignments)
+        assert set(result.visited) == {"a", "b"}
+        # Both are consumed as sources, so neither is a leaf sink.
+        assert result.terminal_candidates == []
+
+    def test_max_depth_bounds_the_walk(self):
+        """A long chain truncates at max_depth expansions."""
+        assignments = [_write(f"s{i+1}", f"s{i}", file="f.cpp", line=i + 1) for i in range(6)]
+        # seed s0 -> s1 -> ... -> s6; depth 2 expands s0 and s1 only.
+        result = forward_reachable(
+            "s0", source_assignments=assignments, max_depth=2
+        )
+        # Hops recorded from s0 (->s1) and s1 (->s2); s2 enqueued but not expanded.
+        targets = {hop.target for hop in result.hops}
+        assert "s1" in targets
+        assert "s2" in targets
+        assert "s4" not in targets
+
+    def test_alias_map_bridges_boundary_in_transitive_walk(self):
+        """The caller-supplied alias map applies at every hop, so a callee
+        read through a renamed formal continues the forward chain."""
+        assignments = [
+            # Caller-side value passed as `item` into a callee that writes sp.alt.
+            _write("sp.alt", "item.altitude", file="mission_block.cpp", line=669),
+            _write("_final", "sp.alt", file="mission_block.cpp", line=670),
+        ]
+        result = forward_reachable(
+            "_mission_item.altitude",
+            source_assignments=assignments,
+            aliases={"item": "mission_item"},
+        )
+        targets = {hop.target for hop in result.hops}
+        assert "sp.alt" in targets
+        assert "_final" in targets
+        assert result.terminal_candidates == ["_final"]
+
+    def test_empty_seed_returns_empty_result(self):
+        result = forward_reachable("", source_assignments=[_write("x", "y")])
+        assert isinstance(result, ForwardReachResult)
+        assert result.hops == []
+        assert result.terminal_candidates == []
+
+    def test_hops_dedupe_across_frontier_revisits(self):
+        """A diamond (a->b, a->c, b->d, c->d) should record the d-writes
+        once each, not multiply as the frontier converges."""
+        assignments = [
+            _write("b", "a", file="f.cpp", line=1),
+            _write("c", "a", file="f.cpp", line=2),
+            _write("d", "b + c", file="f.cpp", line=3),
+        ]
+        result = forward_reachable("a", source_assignments=assignments)
+        d_hops = [hop for hop in result.hops if hop.target == "d"]
+        assert len(d_hops) == 1
+        assert result.terminal_candidates == ["d"]
