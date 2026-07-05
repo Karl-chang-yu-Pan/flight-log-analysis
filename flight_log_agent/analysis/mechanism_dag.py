@@ -563,10 +563,13 @@ class _DAGBuilder:
         resolved runtime handle rather than the raw source form):
 
         1. Direct producer via ``_producers_by_symbol`` (in-DAG operation).
-        2. Source-symbol binding from profiler ``symbol_bindings`` (via
-           :class:`BindingIndex`) — the source form maps to a logged
-           signal; emit ``logged_signal`` with the canonical logged name
-           as ``signal_name`` and the source form on ``metadata['source_form']``.
+        2a. Graph-native helper-chain derivation — a ``symbol().field``
+           chain resolves via the helper's ``return_type`` and the PX4 msg
+           schema; emit ``logged_signal`` with the derived ``topic.field``
+           and the source form on ``metadata['source_form']``.
+        2b. Graph-native struct-variable derivation — ``var.field`` where
+           ``var`` is struct-typed (local or class-member) resolves via the
+           same ``foo_s`` topic convention; emit ``logged_signal``.
         3. Source enum resolution — the symbol is defined in source as a
            numeric constant; emit ``constant`` with ``metadata['value']``.
         4. C stdlib constant (``CXX_STDLIB_CONSTANTS``) — same shape.
@@ -577,6 +580,9 @@ class _DAGBuilder:
         7. Enum-shaped name (``looks_like_enum_constant``) — heuristic;
            retires when source constant coverage is complete.
         8. Otherwise: opaque symbol.
+
+        No flat ``symbol_bindings`` table is consulted anywhere — every
+        source→logged mapping is derived from graph structure.
         """
         producers = self._producers_by_symbol.get(symbol_norm)
         if producers:
