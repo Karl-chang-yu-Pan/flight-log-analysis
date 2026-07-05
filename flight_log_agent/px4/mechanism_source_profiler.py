@@ -134,6 +134,11 @@ class HelperExpressionRef(BaseModel):
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
     call_resolutions: List[Dict[str, Any]] = Field(default_factory=list)
     helper_calls: List[str] = Field(default_factory=list)
+    # Pointer-output writes carried on the helper record so the DAG builder
+    # can emit graph-native operations at each call site (target derived
+    # from the caller's actual arg). Each entry is
+    # ``{"param": <formal>, "field": <dotted field>, "expression": <RHS>}``.
+    pointer_output_writes: List[Dict[str, str]] = Field(default_factory=list)
     unresolved_reason: Optional[str] = None
 
 
@@ -1971,9 +1976,10 @@ class MechanismSourceProfiler:
         symbol_bindings = self._helper_symbol_bindings(cleaned_body, member_to_param, member_to_struct)
         call_resolutions = self._helper_call_resolutions(cleaned_body, member_to_param)
 
+        pointer_params = self._function_pointer_params({"params": params, "evidence": evidence})
+        pointer_writes = self._pointer_output_writes(cleaned_body, pointer_params) if pointer_params else []
         if unresolved is None and not return_expression and not lowered_return_expression and not branches:
-            pointer_params = self._function_pointer_params({"params": params, "evidence": evidence})
-            if not (pointer_params and self._pointer_output_writes(cleaned_body, pointer_params)):
+            if not pointer_writes:
                 unresolved = "helper has no return value and no pointer-output writes routable through source_assignments"
         if unresolved is None and len(re.findall(r"\breturn\b", cleaned_body)) > 1 and not branches and not lowered_return_expression:
             unresolved = "helper has multiple return paths that lowering could not combine into a single expression"
@@ -1992,6 +1998,7 @@ class MechanismSourceProfiler:
             symbol_bindings=symbol_bindings if unresolved is None else {},
             call_resolutions=call_resolutions,
             helper_calls=helper_calls,
+            pointer_output_writes=pointer_writes if unresolved is None else [],
             unresolved_reason=unresolved,
         )
 

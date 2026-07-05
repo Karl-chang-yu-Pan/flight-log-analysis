@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Iterable, Literal, Optional, Sequence
+from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
 from flight_log_agent.analysis.binding_index import BindingIndex
-from flight_log_agent.analysis.parameter_lookup import CXX_STDLIB_CONSTANTS
+from flight_log_agent.analysis.parameter_lookup import (
+    CXX_STDLIB_CONSTANTS,
+    is_px4_parameter_name,
+)
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.symbols import (
     is_signal_reference,
@@ -105,6 +108,9 @@ def build_mechanism_dag(
     terminal: str,
     *,
     helper_expressions: Sequence[Any] = (),
+    helper_body_provider: Optional[Callable[[str], Any]] = None,
+    parameter_predicates: Sequence[Any] = (),
+    parameter_values: Optional[dict[str, Any]] = None,
     source_root: Optional[str | Path] = None,
     logged_signals: Optional[Iterable[str]] = None,
     parameter_names: Optional[Iterable[str]] = None,
@@ -115,13 +121,27 @@ def build_mechanism_dag(
     ``binding_index`` supplies the backward walk over materialized
     source assignments. ``helper_expressions`` are the profiler's
     ``HelperExpressionRef`` records used to expand helper subgraphs
-    without collapsing intermediates. ``source_root`` enables per-vertex
-    snippet embedding — omit to keep tests hermetic.
+    without collapsing intermediates. ``helper_body_provider`` (optional)
+    is invoked lazily when the builder encounters a helper call whose
+    body isn't in ``helper_expressions``, so cross-file helper resolution
+    happens on-demand instead of requiring pre-flattening via
+    ``extract_helper_expressions_recursive``. ``parameter_predicates``
+    are the profiler's ``ParameterPredicateRef`` records — the builder
+    consults them at branch emission to attach operator/threshold
+    metadata so downstream evaluators don't re-run
+    ``parse_parameter_predicate``. ``parameter_values`` (from the
+    ULog inventory) let evidence:constant vertices carry the resolved
+    numeric value when the source references a PX4 parameter name as a
+    literal. ``source_root`` enables per-vertex snippet embedding —
+    omit to keep tests hermetic.
     """
     builder = _DAGBuilder(
         binding_index=binding_index,
         terminal=terminal,
         helper_index=_index_helpers(helper_expressions),
+        helper_body_provider=helper_body_provider,
+        parameter_predicates=list(parameter_predicates),
+        parameter_values=dict(parameter_values or {}),
         source_root=Path(source_root) if source_root else None,
         logged_signals=set(logged_signals or ()) | set(binding_index.logged_signals),
         parameter_names=set(parameter_names or ()),
@@ -142,6 +162,9 @@ class _DAGBuilder:
         binding_index: BindingIndex,
         terminal: str,
         helper_index: dict[tuple[str, str], dict[str, Any]],
+        helper_body_provider: Optional[Callable[[str], Any]],
+        parameter_predicates: list[Any],
+        parameter_values: dict[str, Any],
         source_root: Optional[Path],
         logged_signals: set[str],
         parameter_names: set[str],
@@ -151,10 +174,27 @@ class _DAGBuilder:
         self.terminal_raw = terminal
         self.terminal = normalize_symbol(terminal)
         self.helper_index = helper_index
+        self.helper_body_provider = helper_body_provider
+        # Helpers already probed via the provider so a repeated call for an
+        # unknown name doesn't re-fetch on every backward-walk pass.
+        self._helper_provider_probed: set[str] = set()
         self.source_root = source_root
         self.logged_signals = {normalize_symbol(s) for s in logged_signals if s}
         self.parameter_names = {p for p in parameter_names if p}
         self.snippet_context_lines = snippet_context_lines
+        self._parameter_values = {
+            str(k).upper(): v for k, v in (parameter_values or {}).items()
+        }
+        self._parameter_predicate_by_predicate: dict[str, dict[str, Any]] = {}
+        for record in parameter_predicates or []:
+            entry = record if isinstance(record, dict) else (
+                record.model_dump(exclude_none=True) if hasattr(record, "model_dump") else dict(vars(record))
+            )
+            predicate = str(entry.get("predicate") or "").strip()
+            if predicate:
+                self._parameter_predicate_by_predicate.setdefault(
+                    _canonical_predicate(predicate), entry
+                )
 
         # Source→runtime bridging tables read from the profiler's facts.
         # These populate evidence vertices at construction time with the
@@ -211,11 +251,42 @@ class _DAGBuilder:
             self._emit_operation_vertex(binding, is_terminal=self._binding_reaches_terminal(binding))
         # Pass 1b: pre-emit every helper subgraph referenced anywhere so
         # helper-body intermediates land in the producer index before
-        # edges are wired.
+        # edges are wired. Fixpoints over nested calls so a helper A →
+        # helper B chain materializes both when B is only reachable via
+        # A's body — including cross-file callees fetched on-demand via
+        # ``helper_body_provider``.
+        seen_helper_names: set[str] = set()
+        pending: list[str] = []
         for binding in reaching:
             expression = str(binding.get("source_symbol") or "")
             for helper_name in self._find_helper_calls(expression):
-                self._materialize_helper_subgraph(helper_name, wire_edges=False)
+                if helper_name not in seen_helper_names:
+                    seen_helper_names.add(helper_name)
+                    pending.append(helper_name)
+        while pending:
+            helper_name = pending.pop()
+            self._materialize_helper_subgraph(helper_name, wire_edges=False)
+            helper_key = self._pick_helper_key(helper_name)
+            if helper_key is None:
+                continue
+            helper = self.helper_index.get(helper_key)
+            if not helper:
+                continue
+            body_expressions: list[str] = []
+            for value in (helper.get("assignments") or {}).values():
+                body_expressions.append(str(value))
+            return_expression = (
+                helper.get("lowered_return_expression")
+                or helper.get("return_expression")
+                or ""
+            )
+            if return_expression:
+                body_expressions.append(str(return_expression))
+            for expression in body_expressions:
+                for nested in self._find_helper_calls(expression):
+                    if nested not in seen_helper_names:
+                        seen_helper_names.add(nested)
+                        pending.append(nested)
 
         # Pass 2: wire edges now that every producer is known.
         for binding in reaching:
@@ -357,6 +428,79 @@ class _DAGBuilder:
             # Wire the caller's actual arguments to the helper's formal
             # parameter vertices — one edge per positional match.
             self._wire_helper_call_arguments(helper_call, expression, file, line)
+            # Emit pointer-output writes from the helper as ops with the
+            # caller's actual arg substituted for the pointer formal. Ops
+            # dedupe with any source_assignments-derived vertex that
+            # already covers the same call site.
+            self._emit_helper_pointer_output_writes(
+                helper_call, expression, file=file, line=line
+            )
+
+    def _emit_helper_pointer_output_writes(
+        self,
+        helper_call: str,
+        caller_expression: str,
+        *,
+        file: Optional[str],
+        line: Optional[int],
+    ) -> None:
+        """Graph-native equivalent of the profiler's pointer-output routing.
+
+        For each ``pointer_output_writes`` entry on the resolved helper, emit
+        an operation vertex whose target is ``{caller_actual_arg}.{field}``
+        with the write's RHS as the expression. Wires RHS symbols as data
+        edges. Ops share the (target, expression, file, line) identity used
+        by :meth:`_emit_operation_vertex` so a source_assignments-derived
+        binding for the same call site does not double-emit.
+        """
+        helper_key = self._pick_helper_key(helper_call)
+        if helper_key is None:
+            return
+        helper = self.helper_index.get(helper_key)
+        if not helper:
+            return
+        pointer_writes = helper.get("pointer_output_writes") or []
+        if not pointer_writes:
+            return
+        pointer_params = _pointer_param_positions(helper)
+        if not pointer_params:
+            return
+        args = _extract_call_arguments(helper_call, caller_expression)
+        for write in pointer_writes:
+            param = str(write.get("param") or "")
+            field = str(write.get("field") or "")
+            expression = str(write.get("expression") or "")
+            index = pointer_params.get(param)
+            if index is None or index >= len(args) or not field or not expression:
+                continue
+            arg = args[index].strip().lstrip("&").strip()
+            if not arg:
+                continue
+            target = f"{arg}.{field}"
+            target_norm = normalize_symbol(target)
+            op_id = self._make_id("op", (target_norm, expression, file or "", line or 0))
+            if op_id not in self.vertices:
+                self.vertices[op_id] = DAGVertex(
+                    id=op_id,
+                    kind="operation",
+                    sub_kind=self._classify_operation(expression),
+                    file=file,
+                    line=line,
+                    snippet=self._snippet(file, line),
+                    variable=target,
+                    expression=expression,
+                    provenance=f"pointer_output:{helper_key[0]}@{helper_key[1]}",
+                )
+                self._producers_by_symbol.setdefault(target_norm, []).append(op_id)
+            for symbol in dedupe_keep_order(source_expression_names(expression)):
+                normalized = normalize_symbol(symbol)
+                if not normalized or normalized == target_norm:
+                    continue
+                producer_id = self._resolve_symbol_producer(
+                    normalized, symbol, expression, file, line
+                )
+                if producer_id is not None:
+                    self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
     def _wire_helper_call_arguments(
         self,
@@ -434,9 +578,13 @@ class _DAGBuilder:
         if producers:
             return producers[-1]
 
-        # 2. Source→logged binding from profiler facts.
+        # 2. Source→logged binding from profiler facts. Validated against
+        # the trusted catalogues (logged signals from ULog + schema signals
+        # from PX4 topics) before use — self-mappings (``dist_squared →
+        # dist_squared``) and other polluted entries get refused here so
+        # only bindings that actually resolve to a real topic field survive.
         logged = self._source_to_logged.get(symbol_norm)
-        if logged:
+        if logged and self._is_valid_logged_target(logged, symbol_norm):
             return self._emit_evidence(
                 "logged_signal",
                 logged,
@@ -476,13 +624,120 @@ class _DAGBuilder:
         if parameter_alias is not None:
             return self._emit_evidence("parameter", parameter_alias, file=None, line=None)
 
-        # 7. Enum-shaped name (no value known).
+        # 7a. Bare PX4-parameter-shaped name resolved through the ULog
+        # parameter inventory. Handles source RHSes like ``FW_AIRSPD_TRIM``
+        # that aren't dotted (so ``looks_like_enum_constant`` skips them).
+        parameter_value = self._parameter_values.get(symbol_raw.upper())
+        if parameter_value is not None and is_px4_parameter_name(symbol_raw.upper()):
+            return self._emit_evidence(
+                "constant",
+                symbol_raw,
+                file=None,
+                line=None,
+                metadata={"value": parameter_value, "source": "parameter"},
+            )
+
+        # 7b. Enum-shaped name (no value known).
         if looks_like_enum_constant(symbol_raw):
             return self._emit_evidence("constant", symbol_raw, file=None, line=None)
 
         # 8. Unclassified.
         self.unresolved_symbols.add(symbol_raw)
         return self._emit_evidence("opaque_symbol", symbol_raw, file=file, line=line)
+
+    def _lower_predicate(
+        self, canonical: str
+    ) -> tuple[str, dict[str, str]]:
+        """Return ``(lowered_expression, variables)`` for a canonical predicate.
+
+        Absorbs the semantics that used to live in
+        :func:`lower_control_predicates`: enum-shaped names get replaced
+        with their resolved numeric value where known, and source-form
+        symbols that map to a validated logged signal get substituted for
+        that logged name. The ``variables`` dict records source→logged
+        substitutions so downstream evaluators (feasibility, verification
+        graph) share one lowering owner instead of re-running
+        ``lower_control_predicates`` on the raw predicate.
+        """
+        if not canonical:
+            return canonical, {}
+        lowered = canonical
+        # Enum-shaped constants → resolved values from source (assignment
+        # resolutions cover enum entries and object-like #defines) or the
+        # C-stdlib table.
+        for token in sorted(
+            set(re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", lowered)),
+            key=len,
+            reverse=True,
+        ):
+            value = self._enum_resolutions.get(normalize_symbol(token))
+            if value is None:
+                value = CXX_STDLIB_CONSTANTS.get(token)
+            if isinstance(value, (int, float, bool)):
+                lowered = re.sub(
+                    rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])",
+                    _format_lowered_value(value),
+                    lowered,
+                )
+        # Source-form symbols → validated logged signals. Substitutes the
+        # longest source keys first so a prefix doesn't overwrite a more
+        # specific match.
+        variables: dict[str, str] = {}
+        for source in sorted(self._source_to_logged, key=len, reverse=True):
+            logged = self._source_to_logged.get(source)
+            if not logged or not self._is_valid_logged_target(logged, source):
+                continue
+            pattern = rf"(?<![A-Za-z0-9_\.]){re.escape(source)}(?![A-Za-z0-9_\.])"
+            if not re.search(pattern, lowered):
+                continue
+            lowered = re.sub(pattern, logged, lowered)
+            variables[source] = logged
+        return lowered, variables
+
+    def _is_valid_logged_target(self, logged: str, source_norm: str) -> bool:
+        """Refuse polluted or self-referential ``symbol_bindings`` entries.
+
+        A binding is trusted only when the RHS is (a) different from the
+        source (no ``dist_squared → dist_squared`` no-op), and (b) resolves
+        to a real logged signal or a schema-known topic field via the
+        binding index. Everything else is treated as no-binding so the
+        classifier falls through to the next step instead of emitting a
+        phantom ``evidence:logged_signal`` vertex.
+        """
+        logged_norm = normalize_symbol(str(logged))
+        if not logged_norm or logged_norm == source_norm:
+            return False
+        if logged_norm in self.logged_signals:
+            return True
+        schema_signals = getattr(self.binding_index, "schema_signals", None) or set()
+        return logged_norm in schema_signals
+
+    def _branch_metadata_from_parameter_predicate(self, canonical: str) -> dict[str, Any]:
+        """Return branch metadata sourced from a ``ParameterPredicateRef``.
+
+        The profiler already extracts operator + compared_value at profile
+        time; consuming that record here means downstream evaluators don't
+        re-parse the predicate to recover the same structure. Absent match
+        returns an empty dict — the branch stays a plain source-predicate
+        node whose feasibility path handles evaluation.
+        """
+        record = self._parameter_predicate_by_predicate.get(canonical)
+        if not record:
+            return {}
+        metadata: dict[str, Any] = {}
+        parameter = record.get("name") or record.get("parameter")
+        if parameter:
+            metadata["parameter"] = str(parameter)
+        operator = record.get("operator")
+        if operator:
+            metadata["operator"] = str(operator)
+        compared = record.get("compared_value")
+        if compared is not None and compared != "":
+            metadata["compared_value"] = compared
+        member = record.get("member")
+        if member:
+            metadata["member"] = str(member)
+        return metadata
 
     def _emit_evidence(
         self,
@@ -523,6 +778,10 @@ class _DAGBuilder:
         if existing is not None:
             return existing
         vertex_id = self._make_id("br", canonical)
+        metadata = self._branch_metadata_from_parameter_predicate(canonical)
+        lowered, variables = self._lower_predicate(canonical)
+        if variables:
+            metadata["variables"] = variables
         self.vertices[vertex_id] = DAGVertex(
             id=vertex_id,
             kind="branch",
@@ -530,8 +789,9 @@ class _DAGBuilder:
             line=line,
             snippet=self._snippet(file, line),
             predicate_raw=predicate,
-            predicate_lowered=canonical,
+            predicate_lowered=lowered,
             feasibility_verdict="unknown",
+            metadata=metadata,
         )
         self._branch_by_predicate[canonical] = vertex_id
 
@@ -555,16 +815,18 @@ class _DAGBuilder:
     def _find_helper_calls(self, expression: str) -> list[str]:
         """Return helper names invoked in ``expression`` that we can expand.
 
-        Only names that appear in ``helper_index`` under some class
-        context — otherwise there's no body to inline.
+        A name is expandable when it appears in ``helper_index`` under some
+        class context, or when the on-demand provider can fetch it — the
+        latter check invokes :meth:`_pick_helper_key` which memoizes probes
+        so an unknown name is asked at most once per build.
         """
         matches: list[str] = []
-        for candidate in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression):
-            for name, _class_ctx in self.helper_index:
-                if name == candidate:
-                    matches.append(candidate)
-                    break
-        return dedupe_keep_order(matches)
+        for candidate in dedupe_keep_order(
+            re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression)
+        ):
+            if self._pick_helper_key(candidate) is not None:
+                matches.append(candidate)
+        return matches
 
     def _materialize_helper_subgraph(self, helper_name: str, *, wire_edges: bool = True) -> Optional[str]:
         """Emit the helper's body as nested vertices, return its output vertex id.
@@ -716,7 +978,23 @@ class _DAGBuilder:
         Milestone 1: if multiple class contexts define ``foo``, pick the
         first deterministically. Multi-context disambiguation via the
         caller's class scope is Milestone 2 work.
+
+        On miss, consult the on-demand helper provider (if any) — the
+        cross-file callee isn't in the pre-flattened helper set but the
+        provider can locate and lower it. Result gets merged into
+        ``helper_index`` so subsequent lookups skip the provider call.
         """
+        matches = [key for key in self.helper_index if key[0] == helper_name]
+        if matches:
+            return sorted(matches)[0]
+        if self.helper_body_provider is None or helper_name in self._helper_provider_probed:
+            return None
+        self._helper_provider_probed.add(helper_name)
+        fetched = self.helper_body_provider(helper_name)
+        for helper in _coerce_helpers(fetched):
+            key_iter = _index_helpers([helper])
+            for key, value in key_iter.items():
+                self.helper_index.setdefault(key, value)
         matches = [key for key in self.helper_index if key[0] == helper_name]
         if not matches:
             return None
@@ -846,6 +1124,19 @@ def _helper_to_dict(value: Any) -> dict[str, Any]:
     return dict(vars(value))
 
 
+def _coerce_helpers(fetched: Any) -> list[Any]:
+    """Normalize helper-provider return values into an iterable of helpers.
+
+    Providers may return a single ``HelperExpressionRef`` / dict, an
+    iterable of them, or ``None`` when the name has no body.
+    """
+    if fetched is None:
+        return []
+    if isinstance(fetched, (list, tuple, set)):
+        return [item for item in fetched if item is not None]
+    return [fetched]
+
+
 _CLASS_CONTEXT_RE = re.compile(r"(?P<klass>[A-Za-z_][A-Za-z0-9_]*)::(?P<fn>[A-Za-z_][A-Za-z0-9_]*)")
 
 
@@ -865,6 +1156,18 @@ def _class_context_from_name_or_evidence(name: str, evidence: str) -> str:
 # ---------------------------------------------------------------------------
 # Predicate canonicalization
 # ---------------------------------------------------------------------------
+
+
+def _format_lowered_value(value: Any) -> str:
+    """Render a resolved constant into a predicate-embeddable string.
+
+    Booleans render as ``True``/``False`` (Python-shaped so the safe-eval
+    branch consumers can parse them without extra substitution); numbers
+    render via ``str`` so the safe-eval numeric path handles them.
+    """
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return str(value)
 
 
 def _canonical_predicate(predicate: str) -> str:
@@ -1293,6 +1596,25 @@ def read_dag_from_cache(path: Path) -> Optional[MechanismDAG]:
 # ---------------------------------------------------------------------------
 # Argument parsing for helper call sites
 # ---------------------------------------------------------------------------
+
+
+def _pointer_param_positions(helper: dict[str, Any]) -> dict[str, int]:
+    """Return {formal_name → positional index} for pointer parameters.
+
+    The profiler stamps ``pointer_output_writes`` with the FORMAL name; the
+    DAG builder needs the positional index to look up the caller's actual
+    argument. Positions are inferred from ``parameters`` order; type info
+    ``*`` vs ``&`` is dropped since the profiler already gated on it when
+    it decided the write was routable.
+    """
+    positions: dict[str, int] = {}
+    formals = helper.get("parameters") or []
+    referenced = {str(write.get("param") or "") for write in (helper.get("pointer_output_writes") or [])}
+    for index, formal in enumerate(formals):
+        name = str(formal).strip()
+        if name and name in referenced:
+            positions[name] = index
+    return positions
 
 
 def _extract_call_arguments(func_name: str, expression: str) -> list[str]:

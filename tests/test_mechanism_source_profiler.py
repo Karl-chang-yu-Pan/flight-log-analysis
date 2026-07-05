@@ -1661,3 +1661,33 @@ def test_define_macros_extracted_as_source_assignments(tmp_path):
     assert by_target["COMPLEX_CONST"] == "(1 << 5)"
     # Function-like macros are intentionally skipped.
     assert "MAX_MACRO" not in by_target
+
+
+def test_pointer_output_writes_populate_helper_expression_ref(tmp_path):
+    """The helper record should surface its pointer-output writes so the
+    DAG builder can emit graph-native ops at each call site without
+    depending on the profiler's flattened source_assignments path."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+void mission_item_to_setpoint(const mission_item_s &item, position_setpoint_s *sp)
+{
+    sp->lat = item.lat;
+    sp->alt = item.altitude;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["mission_item_to_setpoint"],
+    )
+    assert helpers, "profiler returned no helper record"
+    helper = helpers[0]
+    writes = {(w["param"], w["field"]): w["expression"] for w in helper.pointer_output_writes}
+    assert writes.get(("sp", "lat")) == "item.lat"
+    assert writes.get(("sp", "alt")) == "item.altitude"

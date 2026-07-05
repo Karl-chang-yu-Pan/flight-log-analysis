@@ -909,3 +909,237 @@ def test_dag_without_source_root_omits_snippets():
 
     dag = build_mechanism_dag(index, "_rtl_alt")
     assert all(v.snippet is None for v in dag.vertices)
+
+
+def test_helper_pointer_output_writes_emit_ops_at_call_site():
+    """When a helper record carries ``pointer_output_writes``, the DAG
+    builder should emit an operation vertex per write at the call site,
+    with the caller's actual arg substituted for the pointer formal."""
+    helper = _fake_helper(
+        name="RTL::compute_setpoint",
+        file="rtl.cpp",
+        line=100,
+        evidence="void RTL::compute_setpoint(position_setpoint_s *sp)",
+        assignments={},
+        return_expression="",
+    )
+    helper["parameters"] = ["sp"]
+    helper["pointer_output_writes"] = [
+        {"param": "sp", "field": "alt", "expression": "_rtl_alt"},
+    ]
+    # Caller writes _navigator.get_position_setpoint_triplet().current via
+    # the helper call; the DAG should emit an op targeting
+    # <arg>.alt = _rtl_alt at the caller site.
+    bindings = [
+        _fake_binding(
+            binding_id="caller",
+            target="_rtl_alt",
+            expression="compute_setpoint(&_pos_sp)",
+            file="rtl.cpp",
+            line=500,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+
+    ops = [v for v in dag.vertices if v.kind == "operation"]
+    variables = {v.variable for v in ops}
+    assert "_pos_sp.alt" in variables
+    pointer_op = next(v for v in ops if v.variable == "_pos_sp.alt")
+    assert pointer_op.expression == "_rtl_alt"
+    assert (pointer_op.provenance or "").startswith("pointer_output:")
+
+
+def test_helper_body_provider_lazily_supplies_missing_helper():
+    """When the initial helper set does not contain a called helper name,
+    the DAG builder should invoke ``helper_body_provider`` to fetch it.
+    Cross-file callee then materializes and its return feeds the caller."""
+    provided_helper = _fake_helper(
+        name="geo::haversine_distance",
+        file="lib/geo/geo.cpp",
+        line=42,
+        evidence="float haversine_distance(...)",
+        assignments={},
+        return_expression="R * atan2(sqrt(a), sqrt(1 - a))",
+    )
+    fetches: list[str] = []
+
+    def provider(name: str):
+        fetches.append(name)
+        if name == "haversine_distance":
+            return provided_helper
+        return None
+
+    bindings = [
+        _fake_binding(
+            binding_id="caller",
+            target="dist_squared",
+            expression="haversine_distance(a, b)",
+            file="rtl.cpp",
+            line=300,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(
+        index,
+        "dist_squared",
+        helper_expressions=[],
+        helper_body_provider=provider,
+    )
+
+    assert "haversine_distance" in fetches
+    return_ops = [
+        v for v in dag.vertices
+        if v.kind == "operation" and v.sub_kind == "helper_call"
+    ]
+    assert return_ops, "helper subgraph terminal not emitted"
+
+
+def test_helper_body_provider_probes_each_name_at_most_once():
+    calls: list[str] = []
+
+    def provider(name: str):
+        calls.append(name)
+        return None
+
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="x",
+            expression="mystery(a) + mystery(b) + mystery(c)",
+            file="rtl.cpp",
+            line=10,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    build_mechanism_dag(index, "x", helper_body_provider=provider)
+    assert calls.count("mystery") == 1
+
+
+def test_parameter_predicate_metadata_surfaces_on_branch_vertex():
+    """A branch predicate matching a ``ParameterPredicateRef`` should carry
+    the operator + compared_value on the branch vertex metadata so
+    downstream evaluators don't re-run ``parse_parameter_predicate``."""
+    predicate = "_param_rtl_type.get() != RTL_TYPE_HOME_OR_RALLY"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+    ]
+    parameter_predicate = {
+        "name": "RTL_TYPE",
+        "predicate": predicate,
+        "file": "rtl.cpp",
+        "line": 245,
+        "evidence": predicate,
+        "member": None,
+        "operator": "!=",
+        "compared_value": "RTL_TYPE_HOME_OR_RALLY",
+    }
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(
+        index, "_rtl_alt", parameter_predicates=[parameter_predicate]
+    )
+
+    branch = next(v for v in dag.vertices if v.kind == "branch")
+    assert branch.metadata.get("parameter") == "RTL_TYPE"
+    assert branch.metadata.get("operator") == "!="
+    assert branch.metadata.get("compared_value") == "RTL_TYPE_HOME_OR_RALLY"
+
+
+def test_parameter_values_populate_resolved_value_on_evidence_constant():
+    """A bare PX4-parameter-shaped name mentioned in source should carry
+    the runtime value on the constant vertex metadata when the parameter
+    is present in ``parameter_values``."""
+    predicate = "cruising_speed > FW_AIRSPD_TRIM"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(
+        index,
+        "_rtl_alt",
+        parameter_values={"FW_AIRSPD_TRIM": 15.0},
+    )
+    const_vertex = next(
+        v for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "constant"
+        and v.signal_name == "FW_AIRSPD_TRIM"
+    )
+    assert const_vertex.metadata.get("value") == 15.0
+    assert const_vertex.metadata.get("source") == "parameter"
+
+
+def test_symbol_bindings_self_mapping_refused_falls_through_to_opaque():
+    """A polluted ``symbol_bindings`` entry mapping a source symbol to
+    itself must not emit a phantom ``evidence:logged_signal`` — the
+    classifier should fall through so downstream steps can handle it."""
+    predicate = "dist_squared > 100"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    index.symbol_bindings["dist_squared"] = "dist_squared"
+
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    phantom = [
+        v for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "logged_signal"
+        and v.signal_name == "dist_squared"
+    ]
+    assert not phantom, "polluted self-mapping produced a phantom logged_signal vertex"
+
+
+def test_predicate_lowering_substitutes_enum_and_logged_signal():
+    """Branch ``predicate_lowered`` should reflect enum resolution and
+    validated source→logged substitution — the DAG owns the lowering
+    that used to live in ``lower_control_predicates``."""
+    predicate = "_navigator.get_vstatus().vehicle_type == VEHICLE_TYPE_ROTARY_WING"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(
+        _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
+    )
+    # Profiler emits both the raw and normalized source-form keys — the
+    # DAG builder consumes both to catch the dotted form as it appears in
+    # the predicate text.
+    index.symbol_bindings["_navigator.get_vstatus"] = "vehicle_status.vehicle_type"
+    index.symbol_bindings["navigator.get_vstatus"] = "vehicle_status.vehicle_type"
+    # Enum-shaped constant → resolved value.
+    index.assignment_resolutions["VEHICLE_TYPE_ROTARY_WING"] = 1
+
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    branch = next(v for v in dag.vertices if v.kind == "branch")
+    assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
+    assert "VEHICLE_TYPE_ROTARY_WING" not in (branch.predicate_lowered or "")
+    variables = branch.metadata.get("variables") or {}
+    assert variables.get("_navigator.get_vstatus") == "vehicle_status.vehicle_type"
