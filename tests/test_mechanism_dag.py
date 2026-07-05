@@ -1143,3 +1143,32 @@ def test_predicate_lowering_substitutes_enum_and_logged_signal():
     assert "VEHICLE_TYPE_ROTARY_WING" not in (branch.predicate_lowered or "")
     variables = branch.metadata.get("variables") or {}
     assert variables.get("_navigator.get_vstatus") == "vehicle_status.vehicle_type"
+
+
+def test_derive_pointer_output_bindings_shared_by_profiler_and_dag():
+    """Both the profiler's flatten and the DAG builder's graph-native
+    emission route through :func:`derive_pointer_output_bindings`, so
+    every call site (however discovered) produces the same target/expression
+    entries. Test the shared function directly."""
+    from flight_log_agent.analysis.mechanism_dag import derive_pointer_output_bindings
+
+    pointer_writes = [
+        {"param": "sp", "field": "alt", "expression": "_rtl_alt"},
+        {"param": "sp", "field": "lat", "expression": "_destination.lat"},
+    ]
+    pointer_params = {"sp": 1}
+    call_args = ["item", "&triplet.current"]
+    bindings = derive_pointer_output_bindings(pointer_writes, pointer_params, call_args)
+
+    targets = {(b["target"], b["expression"]) for b in bindings}
+    assert ("triplet.current.alt", "_rtl_alt") in targets
+    assert ("triplet.current.lat", "_destination.lat") in targets
+
+
+def test_derive_pointer_output_bindings_skips_missing_arg_position():
+    from flight_log_agent.analysis.mechanism_dag import derive_pointer_output_bindings
+
+    pointer_writes = [{"param": "sp", "field": "alt", "expression": "_rtl_alt"}]
+    pointer_params = {"sp": 3}  # Position exceeds call_args length.
+    call_args = ["item"]
+    assert derive_pointer_output_bindings(pointer_writes, pointer_params, call_args) == []

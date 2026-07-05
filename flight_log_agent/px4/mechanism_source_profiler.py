@@ -1029,19 +1029,31 @@ class MechanismSourceProfiler:
         pointer_params: Dict[str, int],
         call_args: List[str],
     ) -> List[Dict[str, str]]:
-        substituted: List[Dict[str, str]] = []
-        for write in writes:
-            param = write["param"]
-            index = pointer_params.get(param)
-            if index is None or index >= len(call_args):
-                continue
-            arg = call_args[index].strip().lstrip("&").strip()
-            arg = MechanismSourceProfiler._CXX_TYPE_PREFIX_RE.sub("", arg).strip()
-            if not arg:
-                continue
-            target = f"{arg}.{write['field']}"
-            substituted.append({"target": target, "expression": write["expression"]})
-        return substituted
+        """Strip C++ type prefixes from ``call_args`` then delegate to the
+        DAG-owned :func:`derive_pointer_output_bindings`.
+
+        Kept in the profiler as a thin adapter — the semantic ownership of
+        pointer-output substitution lives in the DAG module so a helper
+        called from many sites produces identical per-site bindings
+        regardless of whether the flatten was driven by profiler
+        extraction or by DAG graph-native emission.
+        """
+        # Lazy import so ``mechanism_source_profiler`` stays free of an
+        # analysis-layer import at module load; the flatten path only
+        # runs when a real call site is encountered.
+        from flight_log_agent.analysis.mechanism_dag import (
+            derive_pointer_output_bindings,
+        )
+
+        stripped_args: List[str] = []
+        for arg in call_args:
+            cleaned = str(arg).strip().lstrip("&").strip()
+            cleaned = MechanismSourceProfiler._CXX_TYPE_PREFIX_RE.sub("", cleaned).strip()
+            stripped_args.append(cleaned)
+        return [
+            {"target": entry["target"], "expression": entry["expression"]}
+            for entry in derive_pointer_output_bindings(writes, pointer_params, stripped_args)
+        ]
 
     def _extract_constant_definitions(
         self,

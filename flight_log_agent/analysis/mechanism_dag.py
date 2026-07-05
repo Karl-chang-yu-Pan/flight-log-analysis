@@ -466,17 +466,10 @@ class _DAGBuilder:
         if not pointer_params:
             return
         args = _extract_call_arguments(helper_call, caller_expression)
-        for write in pointer_writes:
-            param = str(write.get("param") or "")
-            field = str(write.get("field") or "")
-            expression = str(write.get("expression") or "")
-            index = pointer_params.get(param)
-            if index is None or index >= len(args) or not field or not expression:
-                continue
-            arg = args[index].strip().lstrip("&").strip()
-            if not arg:
-                continue
-            target = f"{arg}.{field}"
+        substituted = derive_pointer_output_bindings(pointer_writes, pointer_params, args)
+        for entry in substituted:
+            target = entry["target"]
+            expression = entry["expression"]
             target_norm = normalize_symbol(target)
             op_id = self._make_id("op", (target_norm, expression, file or "", line or 0))
             if op_id not in self.vertices:
@@ -1615,6 +1608,49 @@ def _pointer_param_positions(helper: dict[str, Any]) -> dict[str, int]:
         if name and name in referenced:
             positions[name] = index
     return positions
+
+
+def derive_pointer_output_bindings(
+    pointer_writes: Sequence[dict[str, str]],
+    pointer_params: dict[str, int],
+    call_args: Sequence[str],
+) -> list[dict[str, str]]:
+    """Substitute call-site arguments into a helper's pointer-output writes.
+
+    Returns entries ``{"param": <formal>, "target": <arg.field>,
+    "expression": <RHS>}`` suitable for emission as either DAG operation
+    vertices or profiler ``SourceAssignmentRef`` records. Single semantic
+    owner for the substitution — both the profiler's flatten pass and
+    the DAG builder's graph-native emission call this function, so a
+    helper called from multiple sites produces the same per-site
+    bindings regardless of which caller drove the derivation.
+
+    ``call_args`` are treated as already stripped of language-specific
+    prefixes (C++ type declarations, ``&`` address-of). Callers that
+    receive raw text from source (the profiler when it scans function
+    definitions) preprocess before invoking; callers with pre-extracted
+    argument expressions (the DAG builder over caller binding
+    ``source_symbol``) pass args unmodified.
+    """
+    if not pointer_writes or not pointer_params:
+        return []
+    results: list[dict[str, str]] = []
+    for write in pointer_writes:
+        param = str(write.get("param") or "")
+        field = str(write.get("field") or "")
+        expression = str(write.get("expression") or "")
+        index = pointer_params.get(param)
+        if index is None or index >= len(call_args) or not field or not expression:
+            continue
+        arg = str(call_args[index]).strip().lstrip("&").strip()
+        if not arg:
+            continue
+        results.append({
+            "param": param,
+            "target": f"{arg}.{field}",
+            "expression": expression,
+        })
+    return results
 
 
 def _extract_call_arguments(func_name: str, expression: str) -> list[str]:
