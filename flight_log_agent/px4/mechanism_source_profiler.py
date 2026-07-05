@@ -1099,20 +1099,42 @@ class MechanismSourceProfiler:
 
         return refs
 
+    _ELSE_BODY_PATTERN = re.compile(r"^else(?!\s*if\b)\s*\{")
+
     def _control_predicates_by_line(self, text: str) -> Dict[int, List[str]]:
         predicates_by_line: Dict[int, List[str]] = {}
         active: List[Tuple[int, str]] = []
         # Predicates whose ``{`` hasn't been seen yet — first-in first-out
         # so multiple pending ifs pop in the same order the parser saw them.
         pending: List[str] = []
+        # Predicate whose ``}`` we just closed, keyed by the depth we're
+        # now back at. Used to synthesize ``!(...)`` for the matching
+        # ``else`` body.
+        last_closed_by_depth: Dict[int, str] = {}
         brace_depth = 0
         lines = list(self._iter_code_lines(text))
         for index, (line_no, line) in enumerate(lines):
             stripped = line.strip()
             leading_closes = len(stripped) - len(stripped.lstrip("}"))
             if leading_closes:
-                brace_depth = max(brace_depth - leading_closes, 0)
+                depth_after = max(brace_depth - leading_closes, 0)
+                # Capture the outermost predicate about to be dropped so
+                # a following ``else`` can push its negation.
+                filtered = [(d, p) for d, p in active if d >= depth_after]
+                if filtered:
+                    outermost = min(filtered, key=lambda item: item[0])
+                    last_closed_by_depth[depth_after] = outermost[1]
+                brace_depth = depth_after
                 active = [(depth, predicate) for depth, predicate in active if depth < brace_depth]
+
+            # Detect ``else {`` (plain else — ``else if`` still routes
+            # through the shared branch match below) and push the
+            # negation of the matching if.
+            remainder_pre = stripped[leading_closes:].lstrip()
+            if self._ELSE_BODY_PATTERN.match(remainder_pre):
+                negated = last_closed_by_depth.pop(brace_depth, None)
+                if negated:
+                    pending.append(f"!({negated})")
 
             # Reconstruct multi-line if-conditions by joining continuation
             # lines until parens balance. Handles PX4's common:

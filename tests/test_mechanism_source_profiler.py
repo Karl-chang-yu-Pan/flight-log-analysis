@@ -682,6 +682,37 @@ void Cone::pick_altitude()
     ]
 
 
+def test_else_branch_carries_negated_if_predicate(tmp_path):
+    """The else body should carry ``!(if_predicate)`` so downstream
+    feasibility can prune either arm."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "branch.cpp").write_text(
+        """
+void Cone::pick()
+{
+    if (_param_rtl_cone_half_angle_deg.get() > 0) {
+        _rtl_alt = calculate_from_cone();
+    } else {
+        _rtl_alt = simple_max();
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/branch.cpp"]
+    )
+    by_line = {a.line: a for a in assignments if a.target == "_rtl_alt"}
+    assert by_line[5].control_predicates == ["_param_rtl_cone_half_angle_deg.get() > 0"]
+    assert by_line[7].control_predicates == [
+        "!(_param_rtl_cone_half_angle_deg.get() > 0)"
+    ]
+
+
 def test_reference_alias_substitutes_target_in_source_assignment(tmp_path):
     """``Type &name = container.field;`` should rewrite subsequent
     ``name.X = Y;`` assignments so the recorded target carries the full
