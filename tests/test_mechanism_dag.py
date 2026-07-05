@@ -1,0 +1,322 @@
+from __future__ import annotations
+
+from flight_log_agent.analysis.binding_index import BindingIndex
+from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+
+def _fake_binding(
+    *,
+    binding_id: str,
+    target: str,
+    expression: str,
+    file: str,
+    line: int,
+    logged_signal: str | None = None,
+    control_predicates: list[str] | None = None,
+) -> dict:
+    """A binding with ``logged_signal`` defaulted to the target — the
+    BindingIndex backward walk starts from ``logged_signal``, so tests
+    seed it explicitly."""
+    return {
+        "binding_id": binding_id,
+        "source_symbol": expression,
+        "target_symbol": target,
+        "logged_signal": target if logged_signal is None else logged_signal,
+        "assignment_path": [{"file": file, "line": line, "expression": expression}],
+        "control_predicates": control_predicates or [],
+    }
+
+
+def _fake_inventory(topics: dict[str, list[str]] | None = None) -> dict:
+    return {
+        "topic_fields": topics or {},
+        "available_topics": list((topics or {}).keys()),
+    }
+
+
+def _fake_helper(
+    *,
+    name: str,
+    file: str,
+    line: int,
+    evidence: str,
+    assignments: dict[str, str],
+    return_expression: str,
+    branches: list[dict] | None = None,
+) -> dict:
+    return {
+        "name": name,
+        "file": file,
+        "line": line,
+        "evidence": evidence,
+        "assignments": assignments,
+        "return_expression": return_expression,
+        "lowered_return_expression": return_expression,
+        "branches": branches or [],
+        "helper_calls": [],
+        "call_resolutions": [],
+        "statements": [],
+        "symbol_bindings": {},
+        "parameters": [],
+    }
+
+
+def test_backward_slice_emits_vertices_for_reaching_bindings():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="max(global_position.alt, _destination.alt + _param_rtl_return_alt.get())",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_destination.alt",
+            expression="home_landing_position.alt",
+            file="src/modules/navigator/rtl.cpp",
+            line=127,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(
+        index,
+        "_rtl_alt",
+        logged_signals={"vehicle_global_position.alt"},
+        parameter_names={"RTL_RETURN_ALT"},
+    )
+
+    kinds = {v.kind for v in dag.vertices}
+    assert "operation" in kinds
+    assert "evidence" in kinds
+
+    operations = [v for v in dag.vertices if v.kind == "operation"]
+    op_targets = {v.variable for v in operations}
+    assert "_rtl_alt" in op_targets
+    assert "_destination.alt" in op_targets
+
+
+def test_branch_deduplicates_by_predicate():
+    predicate = "_param_rtl_type.get() != RTL_TYPE_HOME_OR_RALLY"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_destination.alt",
+            expression="mission_landing_alt",
+            file="src/modules/navigator/rtl.cpp",
+            line=163,
+            control_predicates=[predicate],
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_destination.alt",
+            expression="mission_landing_alt",
+            file="src/modules/navigator/rtl.cpp",
+            line=172,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(index, "_destination.alt")
+
+    branches = [v for v in dag.vertices if v.kind == "branch"]
+    assert len(branches) == 1
+    assert branches[0].predicate_raw == predicate
+
+
+def test_two_writes_at_different_lines_produce_two_operation_vertices():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_destination.alt",
+            expression="mission_landing_alt",
+            file="src/modules/navigator/rtl.cpp",
+            line=163,
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_destination.alt",
+            expression="closest_safe_point.alt",
+            file="src/modules/navigator/rtl.cpp",
+            line=224,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(index, "_destination.alt")
+
+    operations = [v for v in dag.vertices if v.kind == "operation" and v.variable == "_destination.alt"]
+    assert len(operations) == 2
+    assert {v.line for v in operations} == {163, 224}
+
+
+def test_evidence_leaf_classification_covers_logged_and_parameter():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="max(gpos_alt, _destination_alt + _param_rtl_return_alt.get())",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory({"vehicle_global_position": ["alt"]}), bindings)
+
+    dag = build_mechanism_dag(
+        index,
+        "_rtl_alt",
+        logged_signals={"gpos_alt"},
+        parameter_names={"RTL_RETURN_ALT"},
+    )
+
+    evidence_by_kind = {v.sub_kind: v for v in dag.vertices if v.kind == "evidence"}
+    assert "logged_signal" in evidence_by_kind
+    assert evidence_by_kind["logged_signal"].signal_name == "gpos_alt"
+    assert "parameter" in evidence_by_kind
+    assert evidence_by_kind["parameter"].signal_name == "RTL_RETURN_ALT"
+
+
+def test_unresolved_symbol_becomes_opaque_evidence():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="magic_helper(some_unresolved_thing)",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    opaque = [v for v in dag.vertices if v.kind == "evidence" and v.sub_kind == "opaque_symbol"]
+    assert opaque, "expected at least one opaque_symbol leaf for an unresolved reference"
+    assert "some_unresolved_thing" in dag.unresolved_symbols
+
+
+def test_helper_body_preserves_intermediates_and_reuses_subgraph():
+    helper = _fake_helper(
+        name="RTL::calc_cone_alt",
+        file="src/modules/navigator/rtl.cpp",
+        line=696,
+        evidence="float RTL::calc_cone_alt(float half_angle) {",
+        assignments={
+            "destination_dist": "get_distance_to_next_waypoint(_destination.lat, gpos.lat)",
+            "return_altitude_amsl": "_destination.alt + _param_rtl_return_alt.get()",
+        },
+        return_expression="max(return_altitude_amsl, gpos.alt)",
+    )
+    bindings = [
+        # Common downstream terminal that reaches both callers.
+        _fake_binding(
+            binding_id="downstream",
+            target="combined_alt",
+            expression="max(_rtl_alt, _alt_snapshot)",
+            file="src/modules/navigator/rtl.cpp",
+            line=999,
+        ),
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="calc_cone_alt(_param_rtl_cone_half_angle_deg.get())",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_alt_snapshot",
+            expression="calc_cone_alt(_param_rtl_cone_half_angle_deg.get())",
+            file="src/modules/navigator/rtl.cpp",
+            line=311,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(
+        index,
+        "combined_alt",
+        helper_expressions=[helper],
+        parameter_names={"RTL_CONE_HALF_ANGLE_DEG", "RTL_RETURN_ALT"},
+    )
+
+    intermediates = {
+        v.variable: v
+        for v in dag.vertices
+        if v.kind == "operation" and v.provenance and v.provenance.startswith("helper_body")
+    }
+    assert "destination_dist" in intermediates
+    assert "return_altitude_amsl" in intermediates
+
+    helper_terminals = [
+        v
+        for v in dag.vertices
+        if v.provenance and v.provenance.startswith("helper_return")
+    ]
+    assert len(helper_terminals) == 1, "helper subgraph should be reused across callers"
+
+    caller_op_ids = {
+        v.id for v in dag.vertices if v.variable in {"_rtl_alt", "_alt_snapshot"}
+    }
+    via_edges = [e for e in dag.edges if e.via == "calc_cone_alt" and e.target_id in caller_op_ids]
+    assert len(via_edges) == 2
+
+
+def test_dag_terminal_is_recorded():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(index, "_rtl_alt")
+    assert dag.terminal == "_rtl_alt"
+    assert dag.dag_id.startswith("dag_")
+
+
+def test_snippet_embedding_reads_from_source_root(tmp_path):
+    file_rel = "src/modules/navigator/rtl.cpp"
+    file_path = tmp_path / file_rel
+    file_path.parent.mkdir(parents=True)
+    file_path.write_text("\n".join([f"line {i}" for i in range(1, 21)]), encoding="utf-8")
+
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file=file_rel,
+            line=10,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(index, "_rtl_alt", source_root=tmp_path, snippet_context_lines=2)
+    op = next(v for v in dag.vertices if v.kind == "operation")
+    assert op.snippet is not None
+    assert "line 10" in op.snippet
+    assert "line 8" in op.snippet
+    assert "line 12" in op.snippet
+
+
+def test_dag_without_source_root_omits_snippets():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="src/modules/navigator/rtl.cpp",
+            line=10,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+
+    dag = build_mechanism_dag(index, "_rtl_alt")
+    assert all(v.snippet is None for v in dag.vertices)
