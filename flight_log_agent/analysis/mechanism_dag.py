@@ -666,22 +666,33 @@ def evaluate_feasibility(
     *,
     parameter_values: Optional[dict[str, Any]] = None,
     enum_values: Optional[dict[str, Any]] = None,
+    signal_samples: Optional[dict[str, list[tuple[float, Any]]]] = None,
     prune_dead: bool = True,
 ) -> MechanismDAG:
-    """Pre-evaluate each ``branch`` vertex against known constants.
+    """Pre-evaluate each ``branch`` vertex against known constants and
+    optionally against time-varying signal samples.
 
-    For every branch, tries to reduce its predicate to a boolean using
-    ``parameter_values`` and ``enum_values``. Successful reductions set
-    ``feasibility_verdict`` to ``always_true`` or ``always_false``;
-    failed reductions stay ``unknown``.
+    Constants come from ``parameter_values`` and ``enum_values`` and are
+    handled the same way as Milestone 2.
 
-    Returns a new :class:`MechanismDAG` with updated feasibility. If
-    ``prune_dead`` is set, operations whose only gating branches all
+    When ``signal_samples`` is provided, branches whose predicates
+    reference time-varying logged signals are additionally evaluated
+    over the union of sample timestamps (hold-last policy between
+    samples). The resulting True-intervals populate the vertex's
+    ``active_windows``. Verdict semantics:
+
+    * empty windows → ``always_false``
+    * windows cover the entire sample span → ``always_true``
+    * mixed → verdict stays ``unknown`` with populated ``active_windows``
+
+    If ``prune_dead`` is set, operations whose only gating branches all
     resolve to ``always_false`` are removed along with the branches
     themselves (and their orphaned edges).
     """
     params = {k.upper(): v for k, v in (parameter_values or {}).items()}
     enums = dict(enum_values or {})
+    samples = signal_samples or {}
+    full_span = _sample_span(samples)
 
     updated_vertices: list[DAGVertex] = []
     verdicts: dict[str, str] = {}
@@ -689,9 +700,24 @@ def evaluate_feasibility(
         if vertex.kind != "branch":
             updated_vertices.append(vertex)
             continue
-        verdict = _reduce_predicate(vertex.predicate_raw or vertex.predicate_lowered or "", params, enums)
+
+        predicate = vertex.predicate_raw or vertex.predicate_lowered or ""
+        verdict = _reduce_predicate(predicate, params, enums)
+        windows: list[tuple[float, float]] = []
+
+        if verdict == "unknown" and samples:
+            evaluated = _evaluate_predicate_intervals(predicate, params, enums, samples)
+            if evaluated is not None:
+                windows = evaluated
+                if not windows:
+                    verdict = "always_false"
+                elif full_span is not None and _covers_span(windows, full_span):
+                    verdict = "always_true"
+
         verdicts[vertex.id] = verdict
-        updated_vertices.append(vertex.model_copy(update={"feasibility_verdict": verdict}))
+        updated_vertices.append(
+            vertex.model_copy(update={"feasibility_verdict": verdict, "active_windows": windows})
+        )
 
     updated_edges = list(dag.edges)
     kept_ids = {v.id for v in updated_vertices}
@@ -771,3 +797,126 @@ def _reduce_predicate(
         # C-style truthiness: non-zero is true.
         return "always_true" if result != 0 else "always_false"
     return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Interval evaluation over signal time-series (Milestone 3)
+# ---------------------------------------------------------------------------
+
+
+def _sample_span(
+    signal_samples: dict[str, list[tuple[float, Any]]],
+) -> Optional[tuple[float, float]]:
+    """Return ``(min_ts, max_ts)`` across every signal, or None if empty."""
+    all_ts: list[float] = []
+    for samples in signal_samples.values():
+        for ts, _ in samples:
+            all_ts.append(ts)
+    if not all_ts:
+        return None
+    return min(all_ts), max(all_ts)
+
+
+def _covers_span(
+    windows: list[tuple[float, float]],
+    span: tuple[float, float],
+) -> bool:
+    """True when the windows contain the whole span (single interval, aligned)."""
+    if len(windows) != 1:
+        return False
+    start, end = windows[0]
+    return start <= span[0] and end >= span[1]
+
+
+def _substitute_predicate_syntax(predicate: str) -> str:
+    """Apply the same C++ → Python substitutions used by ``_reduce_predicate``."""
+    text = _PARAM_ACCESSOR_RE.sub(lambda m: m.group("name").upper(), predicate)
+    text = text.replace("&&", " and ").replace("||", " or ")
+    text = re.sub(r"!(?!=)", " not ", text)
+    return text.replace("->", ".").replace("::", ".")
+
+
+def _evaluate_predicate_intervals(
+    predicate: str,
+    parameter_values: dict[str, Any],
+    enum_values: dict[str, Any],
+    signal_samples: dict[str, list[tuple[float, Any]]],
+) -> Optional[list[tuple[float, float]]]:
+    """Evaluate ``predicate`` per timestamp, return True-intervals.
+
+    Uses hold-last policy: each signal's value between samples is the
+    last-observed value. Returns None when no referenced signal has any
+    sample or when the predicate fails to evaluate at every timestamp.
+    """
+    if not predicate.strip():
+        return None
+
+    from flight_log_agent.analysis.safe_eval import (
+        ExpressionEvaluationError,
+        eval_expression,
+    )
+
+    text = _substitute_predicate_syntax(predicate)
+
+    # Rewrite ``topic.field`` → ``topic__field`` so ``safe_eval`` can bind
+    # against a flat env key (attribute nodes are unsupported).
+    signal_key_map: dict[str, str] = {}
+    referenced: list[str] = []
+    for signal in signal_samples:
+        if signal in text:
+            flat = signal.replace(".", "__")
+            text = text.replace(signal, flat)
+            signal_key_map[signal] = flat
+            referenced.append(signal)
+
+    if not referenced:
+        return None
+
+    # Union of timestamps from referenced signals.
+    all_ts: set[float] = set()
+    for signal in referenced:
+        for ts, _ in signal_samples[signal]:
+            all_ts.add(ts)
+    if not all_ts:
+        return None
+    ts_sorted = sorted(all_ts)
+
+    # Hold-last cursors per signal.
+    cursor: dict[str, int] = {signal: 0 for signal in referenced}
+    hold_last: dict[str, Any] = {}
+
+    intervals: list[tuple[float, float]] = []
+    current_start: Optional[float] = None
+    ever_evaluated = False
+
+    for t in ts_sorted:
+        for signal in referenced:
+            samples = signal_samples[signal]
+            while cursor[signal] < len(samples) and samples[cursor[signal]][0] <= t:
+                hold_last[signal_key_map[signal]] = samples[cursor[signal]][1]
+                cursor[signal] += 1
+
+        # Skip timestamps before we have any value for a referenced signal.
+        if any(signal_key_map[s] not in hold_last for s in referenced):
+            continue
+
+        env = {**parameter_values, **enum_values, **hold_last}
+        try:
+            result = eval_expression(text, env)
+        except (ExpressionEvaluationError, TypeError, ValueError, ZeroDivisionError):
+            return None
+
+        ever_evaluated = True
+        truthy = bool(result) if isinstance(result, (bool, int, float)) else False
+
+        if truthy and current_start is None:
+            current_start = t
+        elif not truthy and current_start is not None:
+            intervals.append((current_start, t))
+            current_start = None
+
+    if not ever_evaluated:
+        return None
+    if current_start is not None:
+        intervals.append((current_start, ts_sorted[-1]))
+    return intervals

@@ -443,6 +443,131 @@ def test_feasibility_preserves_always_true_gate_without_pruning():
     assert op is not None
 
 
+def test_signal_samples_compute_active_windows_for_partial_true_predicate():
+    predicate = "nav_state == 5"  # 5 = AUTO_RTL in this fake enum
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        signal_samples={
+            "nav_state": [
+                (0.0, 1),   # MANUAL
+                (5.0, 5),   # AUTO_RTL starts
+                (12.0, 3),  # AUTO_LOITER
+                (20.0, 5),  # AUTO_RTL again
+                (25.0, 1),  # back to MANUAL
+            ],
+        },
+        prune_dead=False,
+    )
+    branch = next(v for v in reduced.vertices if v.kind == "branch")
+    assert branch.active_windows == [(5.0, 12.0), (20.0, 25.0)]
+    assert branch.feasibility_verdict == "unknown"  # partial
+
+
+def test_signal_samples_mark_always_true_when_predicate_covers_whole_span():
+    predicate = "vehicle_type == 1"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        signal_samples={
+            "vehicle_type": [(0.0, 1), (10.0, 1), (20.0, 1)],
+        },
+        prune_dead=False,
+    )
+    branch = next(v for v in reduced.vertices if v.kind == "branch")
+    assert branch.feasibility_verdict == "always_true"
+
+
+def test_signal_samples_prune_branch_when_predicate_never_true():
+    predicate = "vehicle_type == 2"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="cone_result",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_rtl_alt",
+            expression="max(gpos.alt, _destination.alt)",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        signal_samples={
+            "vehicle_type": [(0.0, 1), (10.0, 1), (20.0, 1)],  # never 2
+        },
+        prune_dead=True,
+    )
+    # Cone-gated write pruned; else write survives.
+    remaining_ops = [v for v in reduced.vertices if v.kind == "operation" and v.variable == "_rtl_alt"]
+    assert len(remaining_ops) == 1
+    assert remaining_ops[0].line == 248
+
+
+def test_signal_samples_combine_with_parameter_substitution():
+    predicate = "_param_rtl_cone_half_angle_deg.get() > 0 && vehicle_type == 1"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="cone_result",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt")
+
+    reduced = evaluate_feasibility(
+        dag,
+        parameter_values={"RTL_CONE_HALF_ANGLE_DEG": 45},
+        signal_samples={
+            "vehicle_type": [
+                (0.0, 1),   # ROTARY_WING
+                (10.0, 2),  # FIXED_WING
+                (20.0, 1),  # back to ROTARY_WING
+            ],
+        },
+        prune_dead=False,
+    )
+    branch = next(v for v in reduced.vertices if v.kind == "branch")
+    assert branch.active_windows == [(0.0, 10.0), (20.0, 20.0)]
+
+
 def test_dag_without_source_root_omits_snippets():
     bindings = [
         _fake_binding(
