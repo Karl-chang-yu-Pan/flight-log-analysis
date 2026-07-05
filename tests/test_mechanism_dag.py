@@ -1172,3 +1172,130 @@ def test_derive_pointer_output_bindings_skips_missing_arg_position():
     pointer_params = {"sp": 3}  # Position exceeds call_args length.
     call_args = ["item"]
     assert derive_pointer_output_bindings(pointer_writes, pointer_params, call_args) == []
+
+
+def test_helper_chain_resolves_via_return_type_and_schema():
+    """A chain like ``_navigator.get_vstatus().vehicle_type`` should
+    resolve to ``vehicle_status.vehicle_type`` purely from the helper's
+    return_type + PX4 msg schema — without any entry in the flat
+    symbol_bindings dict."""
+    helper = _fake_helper(
+        name="Navigator::get_vstatus",
+        file="navigator.cpp",
+        line=100,
+        evidence="vehicle_status_s *Navigator::get_vstatus()",
+        assignments={},
+        return_expression="_vehicle_status",
+    )
+    helper["return_type"] = "vehicle_status_s *"
+    predicate = "_navigator.get_vstatus().vehicle_type == 1"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+            control_predicates=[predicate],
+        ),
+    ]
+    # Inventory doesn't need to list the topic; the schema-signals side
+    # of BindingIndex picks up vehicle_status.vehicle_type from the PX4
+    # msg schema, and that's what the derivation validates against.
+    index = BindingIndex(
+        _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
+    )
+    # No entry for the helper chain in symbol_bindings — the mapping
+    # must come from graph derivation (helper's return_type + schema
+    # lookup), not the flat side-table.
+    assert "navigator.get_vstatus" not in index.symbol_bindings
+    assert "_navigator.get_vstatus" not in index.symbol_bindings
+
+    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+
+    branch = next(v for v in dag.vertices if v.kind == "branch")
+    assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
+    variables = branch.metadata.get("variables") or {}
+    # Each substitution keys on the original chain-with-field text.
+    assert any(
+        "get_vstatus" in key and value == "vehicle_status.vehicle_type"
+        for key, value in variables.items()
+    )
+
+
+def test_helper_chain_skipped_when_return_type_not_struct():
+    """A helper returning a scalar (``float``) should not produce any
+    graph-derived source→logged binding — the derivation returns None
+    and the predicate stays unlowered for that chain."""
+    helper = _fake_helper(
+        name="RTL::calc_alt",
+        file="rtl.cpp",
+        line=100,
+        evidence="float RTL::calc_alt()",
+        assignments={},
+        return_expression="42.0",
+    )
+    helper["return_type"] = "float"
+    predicate = "calc_alt().value > 0"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+
+    branch = next(v for v in dag.vertices if v.kind == "branch")
+    # No substitution should have occurred — the predicate text stays as-is.
+    assert "calc_alt" in (branch.predicate_lowered or "")
+
+
+def test_helper_chain_skipped_when_topic_not_in_schema():
+    """A helper returning ``mystery_topic_s`` where ``mystery_topic`` is
+    not in the PX4 schema/logged catalogue should not silently produce
+    a phantom binding — the derivation returns None."""
+    helper = _fake_helper(
+        name="Mystery::get_thing",
+        file="mystery.cpp",
+        line=1,
+        evidence="mystery_topic_s *Mystery::get_thing()",
+        assignments={},
+        return_expression="_thing",
+    )
+    helper["return_type"] = "mystery_topic_s *"
+    predicate = "_navigator.get_thing().value > 0"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=1,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+
+    branch = next(v for v in dag.vertices if v.kind == "branch")
+    # Nothing was substituted; the branch predicate keeps its source form.
+    assert "get_thing" in (branch.predicate_lowered or "")
+
+
+def test_derive_topic_from_return_type_variants():
+    """The topic derivation should handle pointer, reference, namespaced,
+    and bare-struct return types — and return None for scalars."""
+    from flight_log_agent.analysis.mechanism_dag import _derive_topic_from_return_type
+
+    assert _derive_topic_from_return_type("vehicle_status_s *") == "vehicle_status"
+    assert _derive_topic_from_return_type("vehicle_status_s&") == "vehicle_status"
+    assert _derive_topic_from_return_type("vehicle_status_s") == "vehicle_status"
+    assert _derive_topic_from_return_type("px4::vehicle_status_s *") == "vehicle_status"
+    assert _derive_topic_from_return_type("float") is None
+    assert _derive_topic_from_return_type("") is None
+    assert _derive_topic_from_return_type(None) is None

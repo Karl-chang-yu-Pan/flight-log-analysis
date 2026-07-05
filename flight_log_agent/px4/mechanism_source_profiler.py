@@ -139,6 +139,11 @@ class HelperExpressionRef(BaseModel):
     # from the caller's actual arg). Each entry is
     # ``{"param": <formal>, "field": <dotted field>, "expression": <RHS>}``.
     pointer_output_writes: List[Dict[str, str]] = Field(default_factory=list)
+    # Raw C++ return type extracted from the function signature so the DAG
+    # can derive source→logged bindings without the flat ``symbol_bindings``
+    # table. Preserves pointer/reference qualifiers (``vehicle_status_s *``)
+    # so downstream can distinguish struct-return helpers from scalar ones.
+    return_type: Optional[str] = None
     unresolved_reason: Optional[str] = None
 
 
@@ -1314,6 +1319,7 @@ class MechanismSourceProfiler:
                     evidence=definition["evidence"],
                     member_to_param=member_to_param,
                     member_to_struct=member_to_struct,
+                    return_type=definition.get("return_type"),
                 )
                 all_refs.append(translated)
                 if not helper_name_set or name in helper_name_set or short_name in helper_name_set:
@@ -1874,9 +1880,30 @@ class MechanismSourceProfiler:
                     "body": text[open_brace + 1:close_brace],
                     "evidence": f"{signature} {{",
                     "file": rel_file,
+                    "return_type": self._normalize_return_type(match.group("prefix")),
                 }
             )
         return definitions
+
+    # Storage / access qualifiers we drop before the actual return type.
+    _RETURN_TYPE_QUALIFIERS = re.compile(
+        r"\b(?:inline|static|virtual|explicit|constexpr|const|volatile|"
+        r"__attribute__\s*\(\([^)]*\)\)|extern|friend|typename)\b"
+    )
+
+    @staticmethod
+    def _normalize_return_type(prefix: str) -> Optional[str]:
+        """Strip C++ storage qualifiers from a signature prefix to expose
+        the raw return type.
+
+        Given ``"static const vehicle_status_s *"`` returns
+        ``"vehicle_status_s *"``. Preserves pointer/reference marks and
+        template angle brackets so downstream pattern matching (``foo_s *``
+        as a topic reference) can recover the topic name unambiguously.
+        """
+        cleaned = MechanismSourceProfiler._RETURN_TYPE_QUALIFIERS.sub("", prefix or "")
+        cleaned = " ".join(cleaned.split())
+        return cleaned or None
 
     @staticmethod
     def _strip_block_comments_preserve_lines(text: str) -> str:
@@ -1970,6 +1997,7 @@ class MechanismSourceProfiler:
         evidence: str,
         member_to_param: Dict[str, str],
         member_to_struct: Dict[str, str],
+        return_type: Optional[str] = None,
     ) -> HelperExpressionRef:
         cleaned_body = self._strip_line_comments(body)
         unresolved = self._unsupported_helper_body_reason(cleaned_body)
@@ -2011,6 +2039,7 @@ class MechanismSourceProfiler:
             call_resolutions=call_resolutions,
             helper_calls=helper_calls,
             pointer_output_writes=pointer_writes if unresolved is None else [],
+            return_type=return_type,
             unresolved_reason=unresolved,
         )
 

@@ -571,11 +571,27 @@ class _DAGBuilder:
         if producers:
             return producers[-1]
 
-        # 2. Source→logged binding from profiler facts. Validated against
-        # the trusted catalogues (logged signals from ULog + schema signals
-        # from PX4 topics) before use — self-mappings (``dist_squared →
-        # dist_squared``) and other polluted entries get refused here so
-        # only bindings that actually resolve to a real topic field survive.
+        # 2a. Graph-native derivation: if ``source_expression`` contains a
+        # ``symbol_raw().field`` chain, resolve it via the helper's
+        # ``return_type`` and the PX4 msg schema. This is the retirement
+        # path for the flat ``symbol_bindings`` table — the derivation
+        # walks the graph (helper subgraph → return_type → topic) instead
+        # of consulting a pre-baked side dict.
+        chain_resolved = self._resolve_symbol_via_chain(symbol_raw, source_expression)
+        if chain_resolved is not None:
+            return self._emit_evidence(
+                "logged_signal",
+                chain_resolved,
+                file=None,
+                line=None,
+                metadata={"source_form": symbol_raw, "derivation": "helper_return_type"},
+            )
+
+        # 2b. Flat ``symbol_bindings`` fallback for cases the chain
+        # derivation didn't cover — subscription-copy aliases, member
+        # bindings the profiler pre-computed by direct pattern matching.
+        # Validated against the trusted catalogues so self-mappings and
+        # other polluted entries fall through instead of emitting phantoms.
         logged = self._source_to_logged.get(symbol_norm)
         if logged and self._is_valid_logged_target(logged, symbol_norm):
             return self._emit_evidence(
@@ -644,20 +660,35 @@ class _DAGBuilder:
         """Return ``(lowered_expression, variables)`` for a canonical predicate.
 
         Absorbs the semantics that used to live in
-        :func:`lower_control_predicates`: enum-shaped names get replaced
-        with their resolved numeric value where known, and source-form
-        symbols that map to a validated logged signal get substituted for
-        that logged name. The ``variables`` dict records source→logged
-        substitutions so downstream evaluators (feasibility, verification
-        graph) share one lowering owner instead of re-running
-        ``lower_control_predicates`` on the raw predicate.
+        :func:`lower_control_predicates`. Three passes:
+
+        1. **Helper-chain resolution** — patterns like
+           ``_navigator.get_vstatus().vehicle_type`` get replaced with
+           ``vehicle_status.vehicle_type`` by looking up the helper's
+           ``return_type`` and cross-referencing the PX4 msg schema; this
+           is the graph-native replacement for the profiler's flat
+           ``symbol_bindings`` table.
+        2. **Enum-shaped constants** → resolved values from source
+           (``assignment_resolutions`` covers enum entries and object-like
+           ``#define``) or the C-stdlib table.
+        3. **Flat symbol_bindings** — validated fallback for source-form
+           symbols the helper-chain pass couldn't cover (subscription
+           copies, member-alias bindings the profiler pre-computed).
+
+        The ``variables`` dict records each source-form → logged
+        substitution so downstream evaluators share one lowering owner
+        instead of re-running ``lower_control_predicates``.
         """
         if not canonical:
             return canonical, {}
         lowered = canonical
-        # Enum-shaped constants → resolved values from source (assignment
-        # resolutions cover enum entries and object-like #defines) or the
-        # C-stdlib table.
+        variables: dict[str, str] = {}
+
+        # Pass 1: helper-chain resolution via return_type + msg schema.
+        lowered, chain_variables = self._substitute_helper_chains(lowered)
+        variables.update(chain_variables)
+
+        # Pass 2: enum-shaped constants → resolved values.
         for token in sorted(
             set(re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", lowered)),
             key=len,
@@ -672,10 +703,10 @@ class _DAGBuilder:
                     _format_lowered_value(value),
                     lowered,
                 )
-        # Source-form symbols → validated logged signals. Substitutes the
-        # longest source keys first so a prefix doesn't overwrite a more
-        # specific match.
-        variables: dict[str, str] = {}
+
+        # Pass 3: flat symbol_bindings (validated fallback). Substitutes
+        # the longest source keys first so a prefix doesn't overwrite a
+        # more specific match.
         for source in sorted(self._source_to_logged, key=len, reverse=True):
             logged = self._source_to_logged.get(source)
             if not logged or not self._is_valid_logged_target(logged, source):
@@ -684,8 +715,86 @@ class _DAGBuilder:
             if not re.search(pattern, lowered):
                 continue
             lowered = re.sub(pattern, logged, lowered)
-            variables[source] = logged
+            variables.setdefault(source, logged)
         return lowered, variables
+
+    def _substitute_helper_chains(self, text: str) -> tuple[str, dict[str, str]]:
+        """Replace ``chain().field`` occurrences with ``topic.field``.
+
+        For each match, walks the helper subgraph to recover the return
+        type and derives the topic through the PX4 struct-``_s``
+        convention. Cross-checked against the trusted signal catalogue
+        (``schema_signals`` ∪ ``logged_signals``) before substitution so
+        an unknown topic silently falls through instead of producing a
+        phantom binding.
+        """
+        variables: dict[str, str] = {}
+
+        def replace(match: re.Match) -> str:
+            chain = match.group("chain").strip()
+            field = match.group("field").strip()
+            resolved = self._resolve_helper_chain(chain, field)
+            if resolved is None:
+                return match.group(0)
+            variables[match.group(0)] = resolved
+            return resolved
+
+        substituted = _HELPER_CHAIN_RE.sub(replace, text)
+        return substituted, variables
+
+    def _resolve_symbol_via_chain(
+        self, symbol_raw: str, source_expression: str
+    ) -> Optional[str]:
+        """Try to graph-derive a ``topic.field`` binding for ``symbol_raw``.
+
+        ``source_expression_names`` truncates at ``()``, so a symbol like
+        ``_navigator.get_vstatus`` reaches classification without its
+        trailing ``.vehicle_type``. This helper walks the surrounding
+        ``source_expression`` for the ``symbol_raw().field`` chain, then
+        delegates to :meth:`_resolve_helper_chain` for the actual
+        return-type + msg-schema lookup. Returns ``None`` when no chain
+        pattern matches, when the helper isn't in the index, or when the
+        resulting topic.field isn't in the trusted signal catalogue.
+        """
+        if not symbol_raw or not source_expression:
+            return None
+        # Find ``symbol_raw().field`` in the surrounding expression.
+        pattern = re.compile(
+            rf"{re.escape(symbol_raw)}\s*\(\s*\)\s*(?:\.|->)\s*(?P<field>[A-Za-z_][A-Za-z0-9_]*)"
+        )
+        match = pattern.search(source_expression)
+        if not match:
+            return None
+        return self._resolve_helper_chain(symbol_raw, match.group("field"))
+
+    def _resolve_helper_chain(self, chain: str, field: str) -> Optional[str]:
+        """Return ``topic.field`` when ``chain().field`` is graph-derivable.
+
+        Splits the chain on ``.``/``->``, takes the final segment as the
+        helper's short name, looks up the helper in ``helper_index``, and
+        derives the topic from :func:`_derive_topic_from_return_type`.
+        Returns ``None`` when the helper isn't in the index, the return
+        type doesn't follow the ``foo_s`` convention, or the resulting
+        ``topic.field`` isn't in the trusted signal catalogue.
+        """
+        segments = [seg for seg in re.split(r"[.>]+", chain) if seg]
+        if not segments:
+            return None
+        helper_name = segments[-1]
+        helper_key = self._pick_helper_key(helper_name)
+        if helper_key is None:
+            return None
+        helper = self.helper_index.get(helper_key)
+        if not helper:
+            return None
+        topic = _derive_topic_from_return_type(helper.get("return_type"))
+        if not topic:
+            return None
+        signal = f"{topic}.{field}"
+        schema_signals = getattr(self.binding_index, "schema_signals", None) or set()
+        if signal in self.logged_signals or signal in schema_signals:
+            return signal
+        return None
 
     def _is_valid_logged_target(self, logged: str, source_norm: str) -> bool:
         """Refuse polluted or self-referential ``symbol_bindings`` entries.
@@ -1149,6 +1258,38 @@ def _class_context_from_name_or_evidence(name: str, evidence: str) -> str:
 # ---------------------------------------------------------------------------
 # Predicate canonicalization
 # ---------------------------------------------------------------------------
+
+
+# Matches ``chain().field`` and ``chain()->field`` where ``chain`` is a
+# dotted / arrow-separated identifier path (``_navigator.get_vstatus``,
+# ``_navigator->get_vstatus``). Group ``chain`` captures the accessor path
+# without the trailing ``()``; ``field`` captures the single trailing field.
+_HELPER_CHAIN_RE = re.compile(
+    r"(?P<chain>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"\s*\(\s*\)\s*(?:\.|->)\s*(?P<field>[A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _derive_topic_from_return_type(return_type: Optional[str]) -> Optional[str]:
+    """Derive a PX4 topic name from a C++ return-type expression.
+
+    PX4 convention: struct types corresponding to uORB topics end in
+    ``_s``, with the topic name being the struct name without the
+    suffix. Pointer/reference marks and nested namespaces are stripped.
+    ``vehicle_status_s *`` → ``vehicle_status``; ``float`` → ``None``.
+    Returns ``None`` when the type doesn't fit the convention so
+    callers know to skip graph-native binding derivation for this helper.
+    """
+    if not return_type:
+        return None
+    text = return_type.replace("*", "").replace("&", "").strip()
+    text = text.rstrip(";").strip()
+    if not text:
+        return None
+    text = text.rsplit("::", 1)[-1].strip()
+    if text.endswith("_s") and len(text) > 2:
+        return text[:-2]
+    return None
 
 
 def _format_lowered_value(value: Any) -> str:

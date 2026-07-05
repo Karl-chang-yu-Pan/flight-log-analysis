@@ -1691,3 +1691,60 @@ void mission_item_to_setpoint(const mission_item_s &item, position_setpoint_s *s
     writes = {(w["param"], w["field"]): w["expression"] for w in helper.pointer_output_writes}
     assert writes.get(("sp", "lat")) == "item.lat"
     assert writes.get(("sp", "alt")) == "item.altitude"
+
+
+def test_helper_return_type_extracted_from_signature(tmp_path):
+    """HelperExpressionRef should carry the raw C++ return type so the
+    DAG builder can derive source→logged bindings graphically without a
+    flat symbol_bindings side-table."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "navigator.cpp").write_text(
+        """
+vehicle_status_s * Navigator::get_vstatus()
+{
+    return &_vehicle_status;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/navigator.cpp"],
+        helper_names=["get_vstatus"],
+    )
+    assert helpers, "profiler emitted no helper record"
+    helper = helpers[0]
+    assert helper.return_type is not None
+    assert "vehicle_status_s" in helper.return_type
+    assert "*" in helper.return_type
+
+
+def test_helper_return_type_strips_storage_qualifiers(tmp_path):
+    """Storage qualifiers (static, const, virtual, etc.) don't belong on
+    the return type — they should be stripped before the type reaches
+    the DAG builder."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "example.cpp").write_text(
+        """
+static const vehicle_status_s * Example::get_status()
+{
+    return &_status;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/example/example.cpp"],
+        helper_names=["get_status"],
+    )
+    assert helpers
+    return_type = helpers[0].return_type or ""
+    assert "vehicle_status_s" in return_type
+    assert "static" not in return_type
+    assert "const" not in return_type
