@@ -253,3 +253,41 @@ float32 yaw                 # in radians NED -PI..+PI
         pol = load_px4_signal_policies(tmp_path / "PX4-Autopilot")
         assert pol["vehicle_status.vehicle_type"].method == "discrete_hold"
         assert pol["vehicle_status.yaw"].method == "angle_wrap"
+
+
+def test_px4_namespace_prefix_on_nested_type_is_stripped(tmp_path):
+    """PX4 v1.12/v1.13 wrote nested message references with a ``px4/``
+    package prefix (``px4/position_setpoint current``). The schema must
+    strip it so nested expansion still resolves current.alt etc., instead
+    of collapsing the triplet to just its timestamp field."""
+    # v1.12/v1.13 used lowercase snake_case filenames, which is exactly why
+    # the ``px4/position_setpoint`` nested reference resolves against the
+    # ``position_setpoint`` file stem.
+    msg_dir = tmp_path / "PX4-Autopilot" / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "position_setpoint.msg").write_text(
+        """
+float64 lat        # latitude, (degrees)
+float32 alt        # altitude AMSL, (metres)
+bool valid         # true if setpoint is valid
+""",
+        encoding="utf-8",
+    )
+    (msg_dir / "position_setpoint_triplet.msg").write_text(
+        """
+uint64 timestamp
+px4/position_setpoint previous
+px4/position_setpoint current
+px4/position_setpoint next
+""",
+        encoding="utf-8",
+    )
+
+    schema = load_px4_msg_schema(tmp_path / "PX4-Autopilot")
+    fields = schema["position_setpoint_triplet"]
+    assert "current.alt" in fields
+    assert "previous.valid" in fields
+
+    policies = load_px4_signal_policies(tmp_path / "PX4-Autopilot")
+    assert policies["position_setpoint_triplet.current.alt"].method == "linear"
+    assert policies["position_setpoint_triplet.current.valid"].method == "discrete_hold"

@@ -25,7 +25,13 @@ PRIMITIVE_TYPES = {
     "uint32",
     "uint64",
 }
-FIELD_RE = re.compile(r"^(?P<type>[A-Za-z][A-Za-z0-9_]*(?:\[[0-9]*\])?)\s+(?P<name>[A-Za-z][A-Za-z0-9_]*)")
+# The type may carry a package prefix (``px4/position_setpoint``) — PX4 used
+# this in v1.12/v1.13 nested-message references before dropping it in v1.14.
+# The prefix is captured and stripped so nested expansion still resolves.
+FIELD_RE = re.compile(
+    r"^(?P<type>(?:[A-Za-z][A-Za-z0-9_]*/)?[A-Za-z][A-Za-z0-9_]*(?:\[[0-9]*\])?)\s+"
+    r"(?P<name>[A-Za-z][A-Za-z0-9_]*)"
+)
 CONSTANT_RE = re.compile(
     r"^(?P<type>[A-Za-z][A-Za-z0-9_]*(?:\[[0-9]*\])?)\s+"
     r"(?P<name>[A-Z][A-Z0-9_]*)\s*=\s*(?P<value>-?(?:0x[0-9A-Fa-f]+|\d+))\b"
@@ -423,7 +429,9 @@ def _parse_msg_text(text: str) -> dict[str, Any]:
         match = FIELD_RE.match(line)
         if not match:
             continue
-        raw_type = match.group("type")
+        # Strip any ``package/`` prefix (e.g. ``px4/position_setpoint``) so
+        # the bare message-type name matches the schema's message keys.
+        raw_type = match.group("type").rsplit("/", 1)[-1]
         field_type = raw_type.split("[", 1)[0]
         arity_match = re.search(r"\[(\d+)\]", raw_type)
         array_size = int(arity_match.group(1)) if arity_match else None
