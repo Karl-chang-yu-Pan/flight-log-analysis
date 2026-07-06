@@ -1828,3 +1828,42 @@ vehicle_global_position_s *get_global_position() { return &_global_pos; }
     assert by["get_global_position"].return_type == "vehicle_global_position_s"
     # value getters still work
     assert by["get_loiter_radius"].return_type == "float"
+
+
+def test_param_member_map_discovered_by_grep_survives_moves_and_whitespace(tmp_path):
+    """Param member→name must survive across PX4 versions, where BOTH the
+    ``DEFINE_PARAMETERS`` whitespace changes (v1.12 single space vs v1.14+
+    aligned) AND the declaring file moves (v1.15/16 relocated RTL params).
+
+    So the file is placed at an arbitrary path and *discovered by grep*
+    (``search_related_source_files``) rather than named — mirroring the
+    real pipeline. That's what makes the guarantee version-robust: we look
+    the param up by ``px4::params::NAME``, not by a hard-coded path."""
+    # Deliberately NOT rtl.h, and not the navigator dir, to prove the
+    # extraction doesn't depend on where the param happens to live.
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "relocated"
+    module_dir.mkdir(parents=True)
+    (module_dir / "some_other_file.h").write_text(
+        """
+class RTL {
+    DEFINE_PARAMETERS(
+        (ParamFloat<px4::params::RTL_RETURN_ALT>) _param_rtl_return_alt,
+        (ParamInt<px4::params::RTL_CONE_ANG>)      _param_rtl_cone_half_angle_deg
+    )
+};
+""",
+        encoding="utf-8",
+    )
+    # rg_path missing → the profiler falls back to its in-Python grep.
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+
+    hits = profiler.search_related_source_files(["px4::params::RTL_CONE_ANG"], max_files=5)
+    discovered = [h.file for h in hits]
+    assert discovered, "grep did not discover the declaring file"
+    assert any("some_other_file.h" in f for f in discovered)
+
+    params = profiler.extract_params_from_source(discovered)
+    aliases = {p.member: p.name for p in params if p.member and p.name}
+    # tight single-space form (v1.12) and aligned multi-space form (v1.14+)
+    assert aliases.get("_param_rtl_return_alt") == "RTL_RETURN_ALT"
+    assert aliases.get("_param_rtl_cone_half_angle_deg") == "RTL_CONE_ANG"
