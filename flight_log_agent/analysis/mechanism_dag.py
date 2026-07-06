@@ -114,6 +114,7 @@ def build_mechanism_dag(
     source_root: Optional[str | Path] = None,
     logged_signals: Optional[Iterable[str]] = None,
     parameter_names: Optional[Iterable[str]] = None,
+    parameter_aliases: Optional[dict[str, str]] = None,
     snippet_context_lines: int = 3,
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
@@ -132,7 +133,13 @@ def build_mechanism_dag(
     ``parse_parameter_predicate``. ``parameter_values`` (from the
     ULog inventory) let evidence:constant vertices carry the resolved
     numeric value when the source references a PX4 parameter name as a
-    literal. ``source_root`` enables per-vertex snippet embedding —
+    literal. ``parameter_aliases`` maps a PX4 parameter *member*
+    (``_param_rtl_cone_half_angle_deg``) to its canonical name
+    (``RTL_CONE_ANG``) — built from ``ParameterRef.member`` / ``.name``
+    (the ``DEFINE_PARAMETERS`` map). Without it the builder can only
+    resolve params whose member name equals the param name; PX4 members
+    routinely drop the module prefix, so the alias map is what resolves
+    the rest. ``source_root`` enables per-vertex snippet embedding —
     omit to keep tests hermetic.
     """
     builder = _DAGBuilder(
@@ -145,6 +152,7 @@ def build_mechanism_dag(
         source_root=Path(source_root) if source_root else None,
         logged_signals=set(logged_signals or ()) | set(binding_index.logged_signals),
         parameter_names=set(parameter_names or ()),
+        parameter_aliases=dict(parameter_aliases or {}),
         snippet_context_lines=snippet_context_lines,
     )
     return builder.build()
@@ -168,6 +176,7 @@ class _DAGBuilder:
         source_root: Optional[Path],
         logged_signals: set[str],
         parameter_names: set[str],
+        parameter_aliases: dict[str, str],
         snippet_context_lines: int,
     ) -> None:
         self.binding_index = binding_index
@@ -181,6 +190,17 @@ class _DAGBuilder:
         self.source_root = source_root
         self.logged_signals = {normalize_symbol(s) for s in logged_signals if s}
         self.parameter_names = {p for p in parameter_names if p}
+        # PX4 parameter member → canonical name (DEFINE_PARAMETERS map).
+        # Keyed by both the raw member and its normalized form so
+        # ``_match_parameter`` can look up either. Param names imply an
+        # identity alias so alias lookup alone covers every known param.
+        self._parameter_aliases: dict[str, str] = {}
+        for member, name in (parameter_aliases or {}).items():
+            if not member or not name:
+                continue
+            self._parameter_aliases[member] = name
+            self._parameter_aliases[normalize_symbol(member)] = name
+            self.parameter_names.add(name)
         self.snippet_context_lines = snippet_context_lines
         self._parameter_values = {
             str(k).upper(): v for k, v in (parameter_values or {}).items()
@@ -973,12 +993,15 @@ class _DAGBuilder:
 
         # A branch's own predicate depends on the symbols it reads. Wire
         # data edges from those producers so pre-evaluation later has
-        # every input in the graph.
-        for symbol in dedupe_keep_order(source_expression_names(predicate)):
+        # every input in the graph. Normalize C++ operators/casts first so
+        # ``&&``/``->``/``::`` predicates yield their symbols (parameters,
+        # accessor chains) instead of failing ast extraction wholesale.
+        symbol_source = _normalize_cpp_expression(predicate)
+        for symbol in dedupe_keep_order(source_expression_names(symbol_source)):
             normalized = normalize_symbol(symbol)
             if not normalized:
                 continue
-            producer_id = self._resolve_symbol_producer(normalized, symbol, predicate, file, line)
+            producer_id = self._resolve_symbol_producer(normalized, symbol, symbol_source, file, line)
             if producer_id is not None:
                 self._add_edge(producer_id, vertex_id, kind="data", role=symbol)
 
@@ -1231,15 +1254,29 @@ class _DAGBuilder:
 
         Accepts both the pre-normalized form (`_param_rtl_return_alt`) and
         normalized (`param_rtl_return_alt`), and strips a trailing
-        ``.get()`` / ``.get`` accessor before matching.
+        ``.get()`` / ``.get`` accessor before matching. Resolution order:
+
+        1. ``parameter_aliases`` (the ``DEFINE_PARAMETERS`` member→name map)
+           — the only path that resolves members whose name differs from the
+           param name (``_param_rtl_cone_half_angle_deg`` → ``RTL_CONE_ANG``).
+        2. Direct membership / the ``_param_<snake>→UPPER`` heuristic, which
+           only works when member name equals param name.
         """
+        raw = symbol.replace(".get()", "").replace(".get", "")
+
+        # 1. Member → canonical name via the DEFINE_PARAMETERS alias map.
+        aliased = self._parameter_aliases.get(raw) or self._parameter_aliases.get(
+            normalize_symbol(raw)
+        )
+        if aliased is not None:
+            return aliased
+
         if not self.parameter_names:
             return None
-        raw = symbol.replace(".get()", "").replace(".get", "")
         upper = raw.upper()
         if upper in self.parameter_names:
             return upper
-        # PX4-style: `_param_rtl_return_alt` or `param_rtl_return_alt` → `RTL_RETURN_ALT`.
+        # 2. PX4-style: `_param_rtl_return_alt` → `RTL_RETURN_ALT` (member==name).
         match = re.fullmatch(r"_?param_([a-zA-Z0-9_]+)", raw)
         if match:
             candidate = match.group(1).upper()
@@ -1376,6 +1413,31 @@ def _format_lowered_value(value: Any) -> str:
     if isinstance(value, bool):
         return "True" if value else "False"
     return str(value)
+
+
+# C-style casts (``(float)x``, ``(int32_t)x``) that break ast parsing.
+_CAST_RE = re.compile(
+    r"\(\s*(?:const\s+)?(?:unsigned\s+|signed\s+)?"
+    r"(?:float|double|bool|char|short|int|long|u?int(?:8|16|32|64)_t|size_t)"
+    r"\s*\)"
+)
+
+
+def _normalize_cpp_expression(text: str) -> str:
+    """Rewrite C++ operators/casts into a form ``source_expression_names``
+    can ast-parse, so symbols inside branch predicates and cast-wrapped
+    arguments are extractable.
+
+    ``&&``/``||``/``!`` → Python boolean ops, ``->`` and ``::`` collapsed to
+    ``.``, and C-style casts stripped. Without this a predicate like
+    ``_param_x.get() > 0 && a->b == C::D`` yields no symbols at all (the
+    ``&&`` fails ``ast.parse``), so no evidence edges — including the
+    parameters and logged signals the branch reads.
+    """
+    result = text.replace("&&", " and ").replace("||", " or ")
+    result = re.sub(r"!(?!=)", " not ", result)
+    result = result.replace("->", ".").replace("::", ".")
+    return _CAST_RE.sub(" ", result)
 
 
 def _canonical_predicate(predicate: str) -> str:

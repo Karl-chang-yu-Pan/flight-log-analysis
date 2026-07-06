@@ -414,8 +414,13 @@ class MechanismSourceProfiler:
         r"^\s*#\s*define\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<value>[^/\n]+?)(?:\s*//.*)?\s*$",
         re.MULTILINE,
     )
+    # The separator before the name is ``[\s*&]+`` (not just ``\s+``) so a
+    # pointer/reference that hugs the name is accepted — PX4 writes uORB
+    # accessors as ``vehicle_status_s *get_vstatus()`` with the ``*`` against
+    # the name. The non-greedy prefix leaves the ``*``/``&`` in the separator,
+    # so ``return_type`` stays the clean struct name.
     _FUNCTION_SIGNATURE_PATTERN = re.compile(
-        r"(?P<prefix>[A-Za-z_][A-Za-z0-9_:<>,~*&\s]*?)\s+"
+        r"(?P<prefix>[A-Za-z_][A-Za-z0-9_:<>,~*&\s]*?)[\s*&]+"
         r"(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)"
         r"\s*\((?P<params>[^()]*)\)\s*(?:const\s*)?$"
     )

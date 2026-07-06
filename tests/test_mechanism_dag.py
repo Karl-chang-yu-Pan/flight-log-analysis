@@ -1404,3 +1404,97 @@ def test_struct_var_field_skipped_when_topic_unknown():
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     assert "mystery" in (branch.predicate_lowered or "")
+
+
+def test_parameter_alias_resolves_member_differing_from_param_name():
+    """A PX4 param whose member name differs from the param name
+    (`_param_rtl_cone_half_angle_deg` ↔ RTL_CONE_ANG) resolves only via the
+    parameter_aliases map (the DEFINE_PARAMETERS member→name mapping), not
+    the `_param_<snake>→UPPER` heuristic."""
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="_param_rtl_cone_half_angle_deg.get()",
+            file="rtl.cpp",
+            line=245,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(
+        index,
+        "_rtl_alt",
+        parameter_names={"RTL_CONE_ANG"},
+        parameter_aliases={"_param_rtl_cone_half_angle_deg": "RTL_CONE_ANG"},
+    )
+    params = {
+        v.signal_name for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "parameter"
+    }
+    assert "RTL_CONE_ANG" in params
+
+
+def test_parameter_alias_not_resolved_without_map():
+    """Without the alias map, the same member is NOT resolvable (the
+    heuristic would produce RTL_CONE_HALF_ANGLE_DEG, which isn't the param)."""
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="_param_rtl_cone_half_angle_deg.get()",
+            file="rtl.cpp",
+            line=245,
+        ),
+    ]
+    index = BindingIndex(_fake_inventory(), bindings)
+    dag = build_mechanism_dag(index, "_rtl_alt", parameter_names={"RTL_CONE_ANG"})
+    params = {
+        v.signal_name for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "parameter"
+    }
+    assert "RTL_CONE_ANG" not in params
+
+
+def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
+    """A C++ branch predicate with `&&`, `->`, `::` and a cast must still
+    yield its symbols: the aliased parameter resolves and the accessor
+    chain lowers — previously the `&&` made ast extraction return nothing,
+    so no evidence edges at all."""
+    predicate = (
+        "_param_rtl_cone_half_angle_deg.get() > 0 "
+        "&& _navigator->get_vstatus()->vehicle_type "
+        "== vehicle_status_s::VEHICLE_TYPE_ROTARY_WING"
+    )
+    helper = _fake_helper(
+        name="Navigator::get_vstatus",
+        file="navigator.h",
+        line=10,
+        evidence="vehicle_status_s *Navigator::get_vstatus()",
+        assignments={},
+        return_expression="_vstatus",
+    )
+    helper["return_type"] = "vehicle_status_s"
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="42",
+            file="rtl.cpp",
+            line=245,
+            control_predicates=[predicate],
+        ),
+    ]
+    index = BindingIndex(_fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings)
+    dag = build_mechanism_dag(
+        index,
+        "_rtl_alt",
+        helper_expressions=[helper],
+        parameter_names={"RTL_CONE_ANG"},
+        parameter_aliases={"_param_rtl_cone_half_angle_deg": "RTL_CONE_ANG"},
+    )
+    params = {v.signal_name for v in dag.vertices
+              if v.kind == "evidence" and v.sub_kind == "parameter"}
+    logged = {v.signal_name for v in dag.vertices
+              if v.kind == "evidence" and v.sub_kind == "logged_signal"}
+    assert "RTL_CONE_ANG" in params
+    assert "vehicle_status.vehicle_type" in logged

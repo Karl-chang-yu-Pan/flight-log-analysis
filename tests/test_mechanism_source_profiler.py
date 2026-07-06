@@ -1717,9 +1717,9 @@ vehicle_status_s * Navigator::get_vstatus()
     )
     assert helpers, "profiler emitted no helper record"
     helper = helpers[0]
-    assert helper.return_type is not None
-    assert "vehicle_status_s" in helper.return_type
-    assert "*" in helper.return_type
+    # The pointer decorator lands in the separator, so return_type is the
+    # clean struct name (what _derive_topic_from_return_type wants).
+    assert helper.return_type == "vehicle_status_s"
 
 
 def test_helper_return_type_strips_storage_qualifiers(tmp_path):
@@ -1799,3 +1799,32 @@ void Example::update()
     )
     out = next(a for a in assignments if a.target == "_out_alt")
     assert out.struct_variables.get("vstatus") == "vehicle_status_s"
+
+
+def test_pointer_to_member_getter_extracted_with_clean_return_type(tmp_path):
+    """The uORB accessor form ``Type *get(){ return &_member; }`` — with the
+    ``*`` hugging the name and no space — must be extracted with a clean
+    ``return_type`` so the DAG's chain resolver can map get()->field to a
+    topic. Previously the signature regex required whitespace before the
+    name and skipped this shape entirely."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "navigator.h").write_text(
+        """
+float get_loiter_radius() { return _loiter_radius; }
+vehicle_status_s *get_vstatus() { return &_vstatus; }
+vehicle_global_position_s *get_global_position() { return &_global_pos; }
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/navigator.h"]
+    )
+    by = {h.name.split("::")[-1]: h for h in helpers}
+    assert "get_vstatus" in by
+    assert by["get_vstatus"].return_type == "vehicle_status_s"
+    assert by["get_global_position"].return_type == "vehicle_global_position_s"
+    # value getters still work
+    assert by["get_loiter_radius"].return_type == "float"
