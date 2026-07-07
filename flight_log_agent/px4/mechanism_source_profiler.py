@@ -2339,7 +2339,7 @@ class MechanismSourceProfiler:
                 target = str(statement.get("target") or "")
                 expression = self._substitute_helper_locals(str(statement.get("expression") or ""), env)
                 if target:
-                    env[target] = expression
+                    self._guarded_env_write(env, target, expression)
             elif kind == "return":
                 return self._substitute_helper_locals(str(statement.get("expression") or ""), env)
             elif kind == "if":
@@ -2375,7 +2375,11 @@ class MechanismSourceProfiler:
                     then_expr = then_env.get(target, before)
                     else_expr = else_env.get(target, before)
                     if then_expr != before or else_expr != before:
-                        env[target] = f"({then_expr} if {condition} else {else_expr})"
+                        self._guarded_env_write(
+                            env,
+                            target,
+                            f"({then_expr} if {condition} else {else_expr})",
+                        )
             elif kind == "switch":
                 lowered = self._lower_switch_statement(statement, statements[index + 1:], env)
                 if lowered is not None:
@@ -2401,6 +2405,23 @@ class MechanismSourceProfiler:
         return None
 
     _WHILE_RUNAWAY = 65536
+    # Hard ceiling on any single lowered expression. The if-merge embeds the
+    # running value into BOTH ternary branches, so state accumulated across
+    # unrolled loop iterations grows ~2^N (mission.cpp read_mission_item's
+    # DO_JUMP loop reached hundreds of MB before the process died). Lowering
+    # ABORTS via _HelperLoweringFailed — the helper stays opaque with a
+    # reason — rather than continuing with a truncated/capped result, which
+    # would be semantically wrong for loops that advance per-iteration state.
+    _LOWERED_EXPRESSION_LIMIT = 32768
+
+    def _guarded_env_write(self, env: Dict[str, str], target: str, expression: str) -> None:
+        if len(expression) > self._LOWERED_EXPRESSION_LIMIT:
+            raise _HelperLoweringFailed(
+                f"lowered expression for '{target}' exceeded "
+                f"{self._LOWERED_EXPRESSION_LIMIT} characters; accumulated "
+                "per-iteration state cannot be flattened statically"
+            )
+        env[target] = expression
 
     def _lower_while_statement(
         self,

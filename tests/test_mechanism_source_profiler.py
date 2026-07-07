@@ -1867,3 +1867,38 @@ class RTL {
     # tight single-space form (v1.12) and aligned multi-space form (v1.14+)
     assert aliases.get("_param_rtl_return_alt") == "RTL_RETURN_ALT"
     assert aliases.get("_param_rtl_cone_half_angle_deg") == "RTL_CONE_ANG"
+
+
+def test_loop_unroll_expression_growth_aborts_lowering(tmp_path):
+    """mission.cpp DO_JUMP regression shape: an unrolled loop whose if-merge
+    doubles the running value each iteration grows ~2^N and previously ran
+    to MemoryError. Lowering must ABORT via _HelperLoweringFailed (helper
+    opaque, reason recorded) — not cap or truncate."""
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "mission.cpp").write_text(
+        """
+float Mission::walk_items()
+{
+    float acc = base_value;
+    for (int i = 0; i < 40; i++) {
+        if (acc > 0.0f) {
+            acc = acc + acc;
+        }
+    }
+    return acc;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+
+    helpers = profiler.extract_helper_expressions_from_source(
+        ["src/modules/example/mission.cpp"], helper_names=["walk_items"]
+    )
+
+    walk = next(h for h in helpers if h.name.endswith("walk_items"))
+    assert walk.lowered_return_expression is None
+    assert walk.unresolved_reason is not None
+    assert "exceeded" in walk.unresolved_reason
+    assert "acc" in walk.unresolved_reason
