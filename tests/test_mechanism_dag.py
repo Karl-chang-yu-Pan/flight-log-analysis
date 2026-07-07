@@ -1480,3 +1480,77 @@ def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
               if v.kind == "evidence" and v.sub_kind == "logged_signal"}
     assert "RTL_CONE_ANG" in params
     assert "vehicle_status.vehicle_type" in logged
+
+
+def test_helper_branch_gates_return_with_control_edge_not_orphan():
+    """A helper with a conditional return (``branches``) must wire a control
+    edge from the branch vertex to the helper return op — the branch gates
+    the return instead of floating disconnected, and the branch's alternate
+    return value's producers feed the return."""
+    helper = _fake_helper(
+        name="RTL::calc",
+        file="rtl.cpp",
+        line=10,
+        evidence="float RTL::calc()",
+        assignments={},
+        return_expression="fallback_alt",
+        branches=[{"condition": "cond_flag > 0", "expression": "early_alt"}],
+    )
+    bindings = [
+        _fake_binding(
+            binding_id="caller",
+            target="_rtl_alt",
+            expression="calc()",
+            file="rtl.cpp",
+            line=1,
+        ),
+        # producers for the fallback and the branch's alternate value
+        _fake_binding(binding_id="fb", target="fallback_alt", expression="home.alt",
+                      file="rtl.cpp", line=2),
+        _fake_binding(binding_id="ea", target="early_alt", expression="mission.alt",
+                      file="rtl.cpp", line=3),
+    ]
+    dag = build_mechanism_dag(bindings, "_rtl_alt", helper_expressions=[helper])
+
+    branch = next((v for v in dag.vertices if v.kind == "branch"), None)
+    assert branch is not None, "no branch vertex emitted from helper.branches"
+    control_out = [
+        e for e in dag.edges if e.source_id == branch.id and e.kind == "control"
+    ]
+    assert control_out, "branch vertex is orphaned (no outgoing control edge to the return)"
+
+    # the branch's alternate return value's producer feeds the return op
+    return_op = next(v for v in dag.vertices if v.kind == "operation"
+                     and "__return__" in str(v.variable))
+    assert any(e.target_id == return_op.id for e in control_out), \
+        "control edge does not gate the helper return op"
+
+
+def test_shared_producer_vertex_reused_across_two_consumers():
+    """A symbol written once but read by two distinct consumers must resolve
+    to a SINGLE producer operation vertex (graph-native reuse), with one data
+    edge from that shared producer into each consumer — not a duplicated
+    producer per consumer (the flattened-BindingIndex failure mode)."""
+    bindings = [
+        _fake_binding(binding_id="t", target="terminal",
+                      expression="consumer_a + consumer_b",
+                      file="rtl.cpp", line=1),
+        _fake_binding(binding_id="a", target="consumer_a", expression="shared * 2",
+                      file="rtl.cpp", line=2),
+        _fake_binding(binding_id="b", target="consumer_b", expression="shared + 3",
+                      file="rtl.cpp", line=3),
+        _fake_binding(binding_id="s", target="shared", expression="gpos.alt",
+                      file="rtl.cpp", line=4),
+    ]
+    dag = build_mechanism_dag(bindings, "terminal")
+
+    shared_ops = [v for v in dag.vertices
+                  if v.kind == "operation" and v.variable == "shared"]
+    assert len(shared_ops) == 1, "shared producer duplicated instead of reused"
+    shared_id = shared_ops[0].id
+
+    consumer_ids = {v.id for v in dag.vertices
+                    if v.kind == "operation" and v.variable in {"consumer_a", "consumer_b"}}
+    fanout = [e for e in dag.edges
+              if e.source_id == shared_id and e.target_id in consumer_ids and e.kind == "data"]
+    assert len(fanout) == 2, "shared producer must fan out to both consumers"

@@ -1261,30 +1261,51 @@ class _DAGBuilder:
                 if producer_id is not None:
                     self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
-        for branch in helper.get("branches") or []:
-            condition = str(branch.get("condition") or "").strip()
-            if condition:
-                self._emit_branch(condition, file=file, line=line)
-
+        # Helper return operation, and its data inputs.
         return_expression = (
             helper.get("lowered_return_expression")
             or helper.get("return_expression")
         )
-        if not return_expression:
-            return
-        terminal_id = self._make_id(
-            "op",
-            (helper_key[0], helper_key[1], "__return__", return_expression),
-        )
-        for symbol in dedupe_keep_order(source_expression_names(str(return_expression))):
-            normalized = normalize_symbol(symbol)
-            if not normalized:
-                continue
-            producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
-                normalized, symbol, str(return_expression), file, line
+        terminal_id: Optional[str] = None
+        if return_expression:
+            terminal_id = self._make_id(
+                "op",
+                (helper_key[0], helper_key[1], "__return__", return_expression),
             )
-            if producer_id is not None:
-                self._add_edge(producer_id, terminal_id, kind="data", role=symbol)
+            for symbol in dedupe_keep_order(source_expression_names(str(return_expression))):
+                normalized = normalize_symbol(symbol)
+                if not normalized:
+                    continue
+                producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
+                    normalized, symbol, str(return_expression), file, line
+                )
+                if producer_id is not None:
+                    self._add_edge(producer_id, terminal_id, kind="data", role=symbol)
+
+        # Conditional returns: each branch GATES the helper return. Wire a
+        # control edge from the branch vertex to the return op (so it isn't
+        # an orphan) and the branch's return-value symbols as data inputs of
+        # the return (so the alternate value's producers are in the graph
+        # even when the lowered expression didn't capture them).
+        for branch in helper.get("branches") or []:
+            condition = str(branch.get("condition") or "").strip()
+            if not condition:
+                continue
+            branch_id = self._emit_branch(condition, file=file, line=line)
+            if terminal_id is not None:
+                self._add_edge(branch_id, terminal_id, kind="control")
+            value_expression = str(branch.get("expression") or "")
+            if terminal_id is None or not value_expression:
+                continue
+            for symbol in dedupe_keep_order(source_expression_names(value_expression)):
+                normalized = normalize_symbol(symbol)
+                if not normalized:
+                    continue
+                producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
+                    normalized, symbol, value_expression, file, line
+                )
+                if producer_id is not None:
+                    self._add_edge(producer_id, terminal_id, kind="data", role=f"branch:{symbol}")
 
     def _pick_helper_key(self, helper_name: str) -> Optional[tuple[str, str]]:
         """Choose one ``(name, class_context)`` for a call like ``foo(...)``.
