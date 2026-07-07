@@ -202,6 +202,43 @@ def _definition_queries(symbol: str) -> list[str]:
     return [f"{root} ="]
 
 
+def _gap_definition_files(
+    profiler: MechanismSourceProfiler,
+    symbols: Iterable[str],
+    *,
+    max_files_per_gap: int = 2,
+    max_matched_files: int = 10,
+    max_total: int = 16,
+) -> list[str]:
+    """Candidate definition files for unresolved symbols, noise-guarded.
+
+    One ranked search per gap so a single gap can never monopolize the
+    round's file budget (``max_files_per_gap``). A query matching more
+    than ``max_matched_files`` distinct files is *ungreppable* — a generic
+    name like ``scale`` matches half the tree — and is dropped entirely:
+    loading its top hits would pull unrelated modules whose bindings then
+    collide with slice-local names (measured on RTL: rotation.h/Dual.hpp
+    contributed ~⅓ of the DAG before this guard). Specificity is decided
+    by measured hit count, not name shape.
+    """
+    files: list[str] = []
+    for symbol in sorted({str(s) for s in symbols if s}):
+        if len(files) >= max_total:
+            break
+        for query in _definition_queries(symbol):
+            hits = profiler.search_related_source_files(
+                [query], max_files=max_matched_files + 1
+            )
+            if len(hits) > max_matched_files:
+                continue
+            # The ranker penalizes test/vendored paths below zero but
+            # still returns them when nothing else matches — a negative
+            # score means "known junk", never load it.
+            positive = [hit for hit in hits if hit.score > 0]
+            files.extend(hit.file for hit in positive[:max_files_per_gap])
+    return dedupe_keep_order(files)[:max_total]
+
+
 def make_helper_body_provider(
     profiler: MechanismSourceProfiler,
     fetched_files: list[str],
@@ -216,19 +253,22 @@ def make_helper_body_provider(
     ``fetched_files`` so the discovery loop can load their full facts in
     the next round. The DAG builder memoizes probes, so an unknown name
     costs at most one search per build.
+
+    Noise control differs from :func:`_gap_definition_files` on purpose:
+    hits with a non-positive ranking score (test/vendored paths) are never
+    extracted from, but there is NO hit-count ambiguity guard here — a
+    real mechanism helper (``get_distance_to_next_waypoint``) is *called*
+    from dozens of files, and extraction already filters to definitions
+    of the requested name, so caller-heavy hits are harmless while the
+    guard measurably severed the RTL→geo.cpp haversine subgraph.
     """
 
     def provider(helper_name: str) -> Any:
-        # Same rationale as _definition_queries: a too-short name
-        # (``get``, ``max``, ``sin``) matches half the tree and only
-        # drags in junk definitions.
-        if len(helper_name) < 4:
-            return []
         hits = profiler.search_related_source_files(
             [f"::{helper_name}(", f"{helper_name}("],
             max_files=max_files_per_helper,
         )
-        files = [hit.file for hit in hits]
+        files = [hit.file for hit in hits if hit.score > 0]
         if not files:
             return []
         for file_path in files:
@@ -357,21 +397,13 @@ def discover_mechanism_dag(
             break
         previous_unresolved = unresolved
 
-        gap_queries = dedupe_keep_order(
-            query
-            for symbol in sorted(unresolved)
-            for query in _definition_queries(symbol)
+        gap_files = _gap_definition_files(
+            profiler,
+            unresolved,
+            max_files_per_gap=2,
+            max_total=max_files_per_round * 2,
         )
-        gap_hits = (
-            profiler.search_related_source_files(
-                gap_queries, max_files=max_files_per_round
-            )
-            if gap_queries
-            else []
-        )
-        pending = dedupe_keep_order(
-            [hit.file for hit in gap_hits] + fetched_files
-        )
+        pending = dedupe_keep_order(gap_files + fetched_files)
 
     return DiscoveryResult(
         dag=dag,

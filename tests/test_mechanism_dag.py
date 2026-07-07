@@ -1638,3 +1638,49 @@ def test_symbol_producer_prefers_same_file_writer():
                 and e.source_id in producers]
     assert len(incoming) == 1
     assert producers[incoming[0].source_id].file == "a.cpp"
+
+
+def test_short_helper_names_do_not_claim_calls():
+    """A helper literally named ``get`` (extracted from some loaded file)
+    must not claim every ``.get()`` call in the slice, and stdlib-shaped
+    short heads must not materialize helper subgraphs."""
+    helper = _fake_helper(
+        name="get",
+        file="unrelated.hpp",
+        line=5,
+        evidence="uint8_t UserModeIntention::get()",
+        assignments={},
+        return_expression="_intended_mode",
+    )
+    bindings = [
+        _fake_binding(binding_id="b1", target="_out",
+                      expression="_param_thing.get() + max(a_value, b_value)",
+                      file="rtl.cpp", line=1),
+    ]
+    dag = build_mechanism_dag(bindings, "_out", helper_expressions=[helper])
+
+    assert not [v for v in dag.vertices
+                if v.provenance and v.provenance.startswith("helper_return")], \
+        "short-named helper was materialized"
+
+
+def test_bare_short_helper_still_expands():
+    """The dotted-short guard must not block a short helper called BARE
+    (implicit this) — only ``.name(`` / ``->name(`` accessor heads."""
+    helper = _fake_helper(
+        name="gen",
+        file="rtl.cpp",
+        line=5,
+        evidence="float Rtl::gen()",
+        assignments={},
+        return_expression="base_value * 2.0",
+    )
+    bindings = [
+        _fake_binding(binding_id="b1", target="_out", expression="gen() + 1.0",
+                      file="rtl.cpp", line=1),
+    ]
+    dag = build_mechanism_dag(bindings, "_out", helper_expressions=[helper])
+
+    assert [v for v in dag.vertices
+            if v.provenance and v.provenance.startswith("helper_return")], \
+        "bare short helper was not expanded"

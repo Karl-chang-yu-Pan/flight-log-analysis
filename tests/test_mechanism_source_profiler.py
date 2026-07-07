@@ -1902,3 +1902,17 @@ float Mission::walk_items()
     assert walk.unresolved_reason is not None
     assert "exceeded" in walk.unresolved_reason
     assert "acc" in walk.unresolved_reason
+
+
+def test_file_path_boost_penalizes_camelcase_test_files(tmp_path):
+    """FeasibilityCheckerTest.cpp lowercases to a bare 'test' suffix the
+    underscore/dir patterns miss; latest.cpp must NOT be penalized."""
+    (tmp_path / "PX4-Autopilot").mkdir()
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+
+    penalized = profiler._file_path_boost(
+        "src/modules/navigator/MissionFeasibility/FeasibilityCheckerTest.cpp"
+    )
+    legit = profiler._file_path_boost("src/modules/navigator/latest.cpp")
+    assert penalized < 0
+    assert legit > 0

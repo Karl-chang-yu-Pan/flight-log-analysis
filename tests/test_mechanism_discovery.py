@@ -325,3 +325,82 @@ void Rtl::pick_altitude()
 
     op_targets = {v.variable for v in result.dag.vertices if v.kind == "operation"}
     assert "_lone_terminal" in op_targets
+
+
+def test_gap_search_drops_ungreppable_queries(tmp_path):
+    """A gap whose definition query matches more files than the threshold
+    is generic noise ('scale =' matches half the tree) — it must load
+    nothing, while a specific gap still resolves to its defining file."""
+    from flight_log_agent.analysis.mechanism_discovery import _gap_definition_files
+
+    files = {
+        f"src/modules/junk{i}/mod{i}.cpp": f"void f{i}() {{ scale = {i}.0f; }}\n"
+        for i in range(12)
+    }
+    files["src/modules/example/dest.cpp"] = "void g() { _dest_val = gspeed; }\n"
+    profiler = _mini_tree(tmp_path, files)
+
+    out = _gap_definition_files(profiler, ["scale", "_dest_val"])
+
+    assert out == ["src/modules/example/dest.cpp"]
+
+
+def test_gap_search_caps_files_per_gap(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import _gap_definition_files
+
+    files = {
+        f"src/modules/example/w{i}.cpp": f"void f{i}() {{ _multi_writer = {i}.0f; }}\n"
+        for i in range(4)
+    }
+    profiler = _mini_tree(tmp_path, files)
+
+    out = _gap_definition_files(profiler, ["_multi_writer"], max_files_per_gap=2)
+
+    assert len(out) == 2
+
+
+def test_gap_search_never_loads_negatively_scored_files(tmp_path):
+    """A gap whose only definition lives in a test/vendored path (negative
+    path boost) must load nothing rather than the junk file."""
+    from flight_log_agent.analysis.mechanism_discovery import _gap_definition_files
+
+    profiler = _mini_tree(tmp_path, {
+        "test/catch2/catch.hpp": "void f() { _only_in_test = 1; }\n",
+    })
+
+    assert _gap_definition_files(profiler, ["_only_in_test"]) == []
+
+
+def test_provider_never_extracts_from_negatively_scored_files(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import make_helper_body_provider
+
+    profiler = _mini_tree(tmp_path, {
+        "test/catch2/catch.hpp": "float Rtl::junk_helper(float x) { return x; }\n",
+    })
+    fetched: list[str] = []
+    provider = make_helper_body_provider(profiler, fetched)
+
+    assert provider("junk_helper") == []
+    assert fetched == []
+
+
+def test_provider_resolves_definition_despite_many_callers(tmp_path):
+    """A real helper is *called* from many files (geo.cpp's
+    get_distance_to_next_waypoint). The provider must still resolve its
+    definition — the definition file matches both the ``::name(`` and
+    bare queries and outranks bare-call hits, and extraction filters to
+    the requested name — rather than treating caller count as ambiguity."""
+    from flight_log_agent.analysis.mechanism_discovery import make_helper_body_provider
+
+    files = {
+        f"src/modules/caller{i}/mod{i}.cpp": f"void f{i}() {{ _x{i} = calc_gain({i}.0f); }}\n"
+        for i in range(11)
+    }
+    files["src/lib/gain/gain.cpp"] = "float Rtl::calc_gain(float x) { return x * 2.0f; }\n"
+    profiler = _mini_tree(tmp_path, files)
+    fetched: list[str] = []
+    provider = make_helper_body_provider(profiler, fetched)
+
+    found = provider("calc_gain")
+    assert found and found[0].name.endswith("calc_gain")
+    assert "src/lib/gain/gain.cpp" in fetched

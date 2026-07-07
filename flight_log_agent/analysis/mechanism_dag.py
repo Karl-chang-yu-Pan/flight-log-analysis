@@ -32,6 +32,7 @@ from flight_log_agent.analysis.parameter_lookup import (
     is_px4_parameter_name,
 )
 from flight_log_agent.analysis.source_expression import source_expression_names
+from flight_log_agent.expression_math import is_safe_math_function_name
 from flight_log_agent.symbols import (
     is_signal_reference,
     looks_like_enum_constant,
@@ -1190,11 +1191,35 @@ class _DAGBuilder:
         class context, or when the on-demand provider can fetch it — the
         latter check invokes :meth:`_pick_helper_key` which memoizes probes
         so an unknown name is asked at most once per build.
+
+        Two guards:
+
+        * Math-function names (the ``expression_math`` vocabulary) never
+          expand — they're evaluator-native, and a template-math overload
+          (``Dual<S,N> sqrt(...)``) is not the mechanism's helper.
+        * A **dotted short** head (``.get(``, ``->dot(``) is a method on
+          another object — a param/uORB accessor or vector op — and a
+          bare-name match against the whole loaded helper set would let a
+          getter literally named ``get`` from an unrelated class claim
+          it. Long dotted heads (``_mission.get_landing_alt()``) stay
+          eligible, as do short *bare* heads; full receiver-class vs
+          ``class_context`` disambiguation is the Milestone 2 work noted
+          on :meth:`_pick_helper_key`.
         """
         matches: list[str] = []
-        for candidate in dedupe_keep_order(
-            re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression)
-        ):
+        seen: set[str] = set()
+        for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression):
+            candidate = match.group(1)
+            if candidate in seen:
+                continue
+            if is_safe_math_function_name(candidate):
+                continue
+            preceding = expression[max(0, match.start() - 2):match.start()]
+            if len(candidate) < 4 and (
+                preceding.endswith(".") or preceding.endswith("->")
+            ):
+                continue
+            seen.add(candidate)
             if self._pick_helper_key(candidate) is not None:
                 matches.append(candidate)
         return matches

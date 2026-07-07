@@ -1688,6 +1688,10 @@ class MechanismSourceProfiler:
             or "/test" in path_l
             or "_test" in path_l
             or "/unit" in path_l
+            # CamelCase test files (FeasibilityCheckerTest.cpp) that the
+            # lowercase patterns above miss. Matched on the original case
+            # so e.g. "latest.cpp" doesn't false-positive.
+            or re.search(r"Tests?\.(?:cpp|hpp|h)$", rel_file)
         ):
             boost -= 100.0
         if any(
