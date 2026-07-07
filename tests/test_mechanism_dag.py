@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from flight_log_agent.analysis.binding_index import BindingIndex
 from flight_log_agent.analysis.mechanism_dag import (
     build_mechanism_dag,
     evaluate_feasibility,
@@ -86,10 +85,9 @@ def test_backward_slice_emits_vertices_for_reaching_bindings():
             line=127,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
     dag = build_mechanism_dag(
-        index,
+        bindings,
         "_rtl_alt",
         logged_signals={"vehicle_global_position.alt"},
         parameter_names={"RTL_RETURN_ALT"},
@@ -125,9 +123,8 @@ def test_branch_deduplicates_by_predicate():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
-    dag = build_mechanism_dag(index, "_destination.alt")
+    dag = build_mechanism_dag(bindings, "_destination.alt")
 
     branches = [v for v in dag.vertices if v.kind == "branch"]
     assert len(branches) == 1
@@ -151,9 +148,8 @@ def test_two_writes_at_different_lines_produce_two_operation_vertices():
             line=224,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
-    dag = build_mechanism_dag(index, "_destination.alt")
+    dag = build_mechanism_dag(bindings, "_destination.alt")
 
     operations = [v for v in dag.vertices if v.kind == "operation" and v.variable == "_destination.alt"]
     assert len(operations) == 2
@@ -170,10 +166,8 @@ def test_evidence_leaf_classification_covers_logged_and_parameter():
             line=248,
         ),
     ]
-    index = BindingIndex(_fake_inventory({"vehicle_global_position": ["alt"]}), bindings)
-
     dag = build_mechanism_dag(
-        index,
+        bindings,
         "_rtl_alt",
         logged_signals={"gpos_alt"},
         parameter_names={"RTL_RETURN_ALT"},
@@ -196,9 +190,8 @@ def test_unresolved_symbol_becomes_opaque_evidence():
             line=245,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     opaque = [v for v in dag.vertices if v.kind == "evidence" and v.sub_kind == "opaque_symbol"]
     assert opaque, "expected at least one opaque_symbol leaf for an unresolved reference"
@@ -241,10 +234,9 @@ def test_helper_body_preserves_intermediates_and_reuses_subgraph():
             line=311,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
     dag = build_mechanism_dag(
-        index,
+        bindings,
         "combined_alt",
         helper_expressions=[helper],
         parameter_names={"RTL_CONE_HALF_ANGLE_DEG", "RTL_RETURN_ALT"},
@@ -282,9 +274,8 @@ def test_dag_terminal_is_recorded():
             line=248,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
     assert dag.terminal == "_rtl_alt"
     assert dag.dag_id.startswith("dag_")
 
@@ -304,9 +295,8 @@ def test_snippet_embedding_reads_from_source_root(tmp_path):
             line=10,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
-    dag = build_mechanism_dag(index, "_rtl_alt", source_root=tmp_path, snippet_context_lines=2)
+    dag = build_mechanism_dag(bindings, "_rtl_alt", source_root=tmp_path, snippet_context_lines=2)
     op = next(v for v in dag.vertices if v.kind == "operation")
     assert op.snippet is not None
     assert "line 10" in op.snippet
@@ -325,8 +315,7 @@ def test_feasibility_marks_always_true_for_satisfied_predicate():
             control_predicates=["_param_rtl_cone_half_angle_deg.get() > 0"],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -356,8 +345,7 @@ def test_feasibility_prunes_always_false_gated_operation():
             line=248,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -383,8 +371,7 @@ def test_feasibility_leaves_unknown_when_predicate_references_unresolved_signal(
             control_predicates=["vehicle_status.vehicle_type == 1"],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -407,8 +394,7 @@ def test_feasibility_reduces_compound_predicate_with_enum_value():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_destination.alt")
+    dag = build_mechanism_dag(bindings, "_destination.alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -432,8 +418,7 @@ def test_feasibility_preserves_always_true_gate_without_pruning():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -460,8 +445,7 @@ def test_signal_samples_compute_active_windows_for_partial_true_predicate():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -493,8 +477,7 @@ def test_signal_samples_mark_always_true_when_predicate_covers_whole_span():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -526,8 +509,7 @@ def test_signal_samples_prune_branch_when_predicate_never_true():
             line=248,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -554,8 +536,7 @@ def test_signal_samples_combine_with_parameter_substitution():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     reduced = evaluate_feasibility(
         dag,
@@ -583,8 +564,7 @@ def test_split_by_terminal_returns_singleton_when_one_terminal_op():
             line=245,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     subgraphs = split_by_terminal(dag)
     assert len(subgraphs) == 1
@@ -608,8 +588,7 @@ def test_split_by_terminal_produces_one_subgraph_per_terminal_op():
             line=248,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     # Both operations write to the terminal → each is is_terminal.
     terminal_ops = [v for v in dag.vertices if v.kind == "operation" and v.metadata.get("is_terminal")]
@@ -635,8 +614,7 @@ def test_layer2_cache_roundtrip(tmp_path):
             line=245,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     path = layer2_cache_path(tmp_path, "abcdef", "position_setpoint_triplet.current.alt")
     assert not path.exists()
@@ -688,8 +666,8 @@ def test_write_dag_to_cache_replaces_prior_entry_atomically(tmp_path):
     ]
     path = layer2_cache_path(tmp_path, "hash", "_rtl_alt")
 
-    write_dag_to_cache(build_mechanism_dag(BindingIndex(_fake_inventory(), bindings1), "_rtl_alt"), path)
-    write_dag_to_cache(build_mechanism_dag(BindingIndex(_fake_inventory(), bindings2), "_rtl_alt"), path)
+    write_dag_to_cache(build_mechanism_dag(bindings1, "_rtl_alt"), path)
+    write_dag_to_cache(build_mechanism_dag(bindings2, "_rtl_alt"), path)
 
     restored = read_dag_from_cache(path)
     assert restored is not None
@@ -723,10 +701,12 @@ def test_helper_chain_source_form_resolves_to_logged_evidence():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(
-        _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
+    dag = build_mechanism_dag(
+        bindings,
+        "_rtl_alt",
+        inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
+        helper_expressions=[helper],
     )
-    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
 
     logged = next(
         (v for v in dag.vertices
@@ -753,12 +733,22 @@ def test_source_enum_resolution_stores_value_on_constant_vertex():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    # normalize_symbol does not lowercase — it strips leading underscore
-    # and collapses ``::``/``->`` to ``.``. All-caps enum names stay as-is.
-    index.assignment_resolutions["RTL_TYPE_HOME_OR_RALLY"] = 0
+    # RTL_TYPE_HOME_OR_RALLY is defined in source as a numeric constant.
+    # The DAG resolves it natively from the source binding
+    # (target=NAME, expression=<numeric>) — not an injected
+    # assignment_resolutions entry, which is what previously masked the
+    # SliceResult type mismatch.
+    bindings.append(
+        _fake_binding(
+            binding_id="const",
+            target="RTL_TYPE_HOME_OR_RALLY",
+            expression="0",
+            file="rtl.cpp",
+            line=1,
+        )
+    )
 
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     const_vertex = next(
         (v for v in dag.vertices
@@ -785,9 +775,8 @@ def test_cxx_stdlib_constant_stored_on_constant_vertex():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     const_vertex = next(
         (v for v in dag.vertices
@@ -830,9 +819,8 @@ def test_helper_call_arguments_wire_into_formal_parameter_vertices():
             line=200,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
     dag = build_mechanism_dag(
-        index,
+        bindings,
         "_rtl_alt",
         helper_expressions=[helper],
     )
@@ -891,8 +879,7 @@ def test_struct_root_expansion_walks_through_bare_struct_argument():
             line=248,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "mission_item_altitude_amsl")
+    dag = build_mechanism_dag(bindings, "mission_item_altitude_amsl")
 
     variables = {v.variable for v in dag.vertices if v.kind == "operation"}
     # All three field-level writes + the upstream _rtl_alt should be reachable.
@@ -912,9 +899,8 @@ def test_dag_without_source_root_omits_snippets():
             line=10,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
 
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
     assert all(v.snippet is None for v in dag.vertices)
 
 
@@ -946,8 +932,7 @@ def test_helper_pointer_output_writes_emit_ops_at_call_site():
             line=500,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+    dag = build_mechanism_dag(bindings, "_rtl_alt", helper_expressions=[helper])
 
     ops = [v for v in dag.vertices if v.kind == "operation"]
     variables = {v.variable for v in ops}
@@ -986,9 +971,8 @@ def test_helper_body_provider_lazily_supplies_missing_helper():
             line=300,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
     dag = build_mechanism_dag(
-        index,
+        bindings,
         "dist_squared",
         helper_expressions=[],
         helper_body_provider=provider,
@@ -1018,8 +1002,7 @@ def test_helper_body_provider_probes_each_name_at_most_once():
             line=10,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    build_mechanism_dag(index, "x", helper_body_provider=provider)
+    build_mechanism_dag(bindings, "x", helper_body_provider=provider)
     assert calls.count("mystery") == 1
 
 
@@ -1048,9 +1031,8 @@ def test_parameter_predicate_metadata_surfaces_on_branch_vertex():
         "operator": "!=",
         "compared_value": "RTL_TYPE_HOME_OR_RALLY",
     }
-    index = BindingIndex(_fake_inventory(), bindings)
     dag = build_mechanism_dag(
-        index, "_rtl_alt", parameter_predicates=[parameter_predicate]
+        bindings, "_rtl_alt", parameter_predicates=[parameter_predicate]
     )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
@@ -1074,9 +1056,8 @@ def test_parameter_values_populate_resolved_value_on_evidence_constant():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
     dag = build_mechanism_dag(
-        index,
+        bindings,
         "_rtl_alt",
         parameter_values={"FW_AIRSPD_TRIM": 15.0},
     )
@@ -1105,13 +1086,11 @@ def test_symbol_bindings_flat_dict_no_longer_consumed():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    # Well-formed flat entry. The retired path would have used it; the
-    # graph-native path ignores it because no helper record supplies the
-    # return_type and no struct-variable info is available.
-    index.symbol_bindings["_navigator.get_vstatus"] = "vehicle_status.vehicle_type"
-
-    dag = build_mechanism_dag(index, "_rtl_alt")
+    # The DAG never consulted a flat symbol_bindings table (it's gone from
+    # the builder entirely now), so there is nothing to inject: with no
+    # helper return_type and no struct-variable info, the chain simply
+    # doesn't resolve to a logged signal.
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
 
     phantom = [
         v for v in dag.vertices
@@ -1145,13 +1124,23 @@ def test_predicate_lowering_substitutes_enum_and_helper_chain_derivation():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(
-        _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
+    # Enum-shaped constant → resolved value, from a real source binding.
+    bindings.append(
+        _fake_binding(
+            binding_id="const",
+            target="VEHICLE_TYPE_ROTARY_WING",
+            expression="1",
+            file="rtl.cpp",
+            line=1,
+        )
     )
-    # Enum-shaped constant → resolved value.
-    index.assignment_resolutions["VEHICLE_TYPE_ROTARY_WING"] = 1
 
-    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+    dag = build_mechanism_dag(
+        bindings,
+        "_rtl_alt",
+        inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
+        helper_expressions=[helper],
+    )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
@@ -1217,19 +1206,14 @@ def test_helper_chain_resolves_via_return_type_and_schema():
             control_predicates=[predicate],
         ),
     ]
-    # Inventory doesn't need to list the topic; the schema-signals side
-    # of BindingIndex picks up vehicle_status.vehicle_type from the PX4
-    # msg schema, and that's what the derivation validates against.
-    index = BindingIndex(
-        _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
+    # The chain resolves purely from graph derivation (helper return_type
+    # + schema lookup); the DAG has no flat symbol_bindings table at all.
+    dag = build_mechanism_dag(
+        bindings,
+        "_rtl_alt",
+        inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
+        helper_expressions=[helper],
     )
-    # No entry for the helper chain in symbol_bindings — the mapping
-    # must come from graph derivation (helper's return_type + schema
-    # lookup), not the flat side-table.
-    assert "navigator.get_vstatus" not in index.symbol_bindings
-    assert "_navigator.get_vstatus" not in index.symbol_bindings
-
-    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
@@ -1265,8 +1249,7 @@ def test_helper_chain_skipped_when_return_type_not_struct():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+    dag = build_mechanism_dag(bindings, "_rtl_alt", helper_expressions=[helper])
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     # No substitution should have occurred — the predicate text stays as-is.
@@ -1297,8 +1280,7 @@ def test_helper_chain_skipped_when_topic_not_in_schema():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+    dag = build_mechanism_dag(bindings, "_rtl_alt", helper_expressions=[helper])
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     # Nothing was substituted; the branch predicate keeps its source form.
@@ -1343,10 +1325,12 @@ def test_struct_var_field_resolves_via_return_type_convention():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(
-        _fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings
+    dag = build_mechanism_dag(
+        bindings,
+        "_rtl_alt",
+        inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
+        helper_expressions=[helper],
     )
-    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
@@ -1367,10 +1351,11 @@ def test_struct_var_from_source_assignment_reaches_dag():
     # Carry the struct-variable map on the binding dict as if it came
     # from a SourceAssignmentRef.
     binding["struct_variables"] = {"vstatus": "vehicle_status_s"}
-    index = BindingIndex(
-        _fake_inventory({"vehicle_status": ["vehicle_type"]}), [binding]
+    dag = build_mechanism_dag(
+        [binding],
+        "_rtl_alt",
+        inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
     )
-    dag = build_mechanism_dag(index, "_rtl_alt")
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
@@ -1399,8 +1384,7 @@ def test_struct_var_field_skipped_when_topic_unknown():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt", helper_expressions=[helper])
+    dag = build_mechanism_dag(bindings, "_rtl_alt", helper_expressions=[helper])
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     assert "mystery" in (branch.predicate_lowered or "")
@@ -1420,9 +1404,8 @@ def test_parameter_alias_resolves_member_differing_from_param_name():
             line=245,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
     dag = build_mechanism_dag(
-        index,
+        bindings,
         "_rtl_alt",
         parameter_names={"RTL_CONE_ANG"},
         parameter_aliases={"_param_rtl_cone_half_angle_deg": "RTL_CONE_ANG"},
@@ -1446,8 +1429,7 @@ def test_parameter_alias_not_resolved_without_map():
             line=245,
         ),
     ]
-    index = BindingIndex(_fake_inventory(), bindings)
-    dag = build_mechanism_dag(index, "_rtl_alt", parameter_names={"RTL_CONE_ANG"})
+    dag = build_mechanism_dag(bindings, "_rtl_alt", parameter_names={"RTL_CONE_ANG"})
     params = {
         v.signal_name for v in dag.vertices
         if v.kind == "evidence" and v.sub_kind == "parameter"
@@ -1484,10 +1466,10 @@ def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
             control_predicates=[predicate],
         ),
     ]
-    index = BindingIndex(_fake_inventory({"vehicle_status": ["vehicle_type"]}), bindings)
     dag = build_mechanism_dag(
-        index,
+        bindings,
         "_rtl_alt",
+        inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
         helper_expressions=[helper],
         parameter_names={"RTL_CONE_ANG"},
         parameter_aliases={"_param_rtl_cone_half_angle_deg": "RTL_CONE_ANG"},

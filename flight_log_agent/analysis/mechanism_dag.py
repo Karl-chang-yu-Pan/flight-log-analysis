@@ -21,12 +21,12 @@ Sections:
 from __future__ import annotations
 
 import re
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
-from flight_log_agent.analysis.binding_index import BindingIndex
 from flight_log_agent.analysis.parameter_lookup import (
     CXX_STDLIB_CONSTANTS,
     is_px4_parameter_name,
@@ -103,10 +103,69 @@ class MechanismDAG(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _as_binding_dict(binding: Any) -> dict[str, Any]:
+    if isinstance(binding, dict):
+        return binding
+    if hasattr(binding, "model_dump"):
+        return binding.model_dump(exclude_none=True)
+    return dict(vars(binding))
+
+
+def _logged_signals_from_inventory(inventory: Optional[dict[str, Any]]) -> set[str]:
+    """Derive the ``topic.field`` logged-signal set from an inventory.
+
+    Reimplemented here (not imported from BindingIndex) so the DAG builder
+    has no dependency on that module.
+    """
+    out: set[str] = set()
+    for topic, fields in ((inventory or {}).get("topic_fields") or {}).items():
+        if not isinstance(topic, str):
+            continue
+        for field in fields or []:
+            if isinstance(field, str) and field:
+                out.add(f"{topic}.{field}")
+    return out
+
+
+def _parse_numeric_literal(expression: str) -> Optional[Any]:
+    """Return the numeric value of a compile-time-constant expression, else None.
+
+    Handles bare int/float/hex literals and simple constant arithmetic
+    (``(1 << 5)``) via the restricted evaluator. References to other names
+    fail (empty env), so only genuine literals resolve — which is exactly
+    what a source-defined constant (enum entry / ``#define`` / ``constexpr``)
+    should be.
+    """
+    text = (expression or "").strip().rstrip(";").strip()
+    if not text:
+        return None
+    # Strip a trailing C float suffix (6371000.0f -> 6371000.0).
+    text = re.sub(r"(?<=[0-9.])[fFuUlL]+\b", "", text)
+    try:
+        return int(text, 0)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        pass
+    from flight_log_agent.analysis.safe_eval import (
+        ExpressionEvaluationError,
+        eval_expression,
+    )
+    try:
+        value = eval_expression(text, {})
+    except (ExpressionEvaluationError, TypeError, ValueError, ZeroDivisionError, SyntaxError):
+        return None
+    return value if isinstance(value, (int, float, bool)) else None
+
+
 def build_mechanism_dag(
-    binding_index: BindingIndex,
+    source_bindings: Sequence[Any],
     terminal: str,
     *,
+    inventory: Optional[dict[str, Any]] = None,
+    schema_signals: Optional[Iterable[str]] = None,
     helper_expressions: Sequence[Any] = (),
     helper_body_provider: Optional[Callable[[str], Any]] = None,
     parameter_predicates: Sequence[Any] = (),
@@ -119,8 +178,16 @@ def build_mechanism_dag(
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
 
-    ``binding_index`` supplies the backward walk over materialized
-    source assignments. ``helper_expressions`` are the profiler's
+    ``source_bindings`` are the profiler's source-assignment records
+    (``target_symbol``, ``source_symbol``, ``control_predicates``,
+    ``assignment_path``, ``struct_variables``, optional ``logged_signal``).
+    The builder walks them backward from ``terminal`` **natively** — it
+    indexes and traverses them itself rather than delegating to
+    ``BindingIndex`` — so the graph is built by one interleaved fixpoint
+    rather than re-nesting a flattened reach list. ``inventory`` supplies
+    the logged-signal catalogue (``topic.field``); ``schema_signals`` is
+    the optional msg-schema catalogue used to validate derived
+    ``topic.field`` references. ``helper_expressions`` are the profiler's
     ``HelperExpressionRef`` records used to expand helper subgraphs
     without collapsing intermediates. ``helper_body_provider`` (optional)
     is invoked lazily when the builder encounters a helper call whose
@@ -143,14 +210,15 @@ def build_mechanism_dag(
     omit to keep tests hermetic.
     """
     builder = _DAGBuilder(
-        binding_index=binding_index,
+        source_bindings=[_as_binding_dict(b) for b in source_bindings],
         terminal=terminal,
         helper_index=_index_helpers(helper_expressions),
         helper_body_provider=helper_body_provider,
         parameter_predicates=list(parameter_predicates),
         parameter_values=dict(parameter_values or {}),
         source_root=Path(source_root) if source_root else None,
-        logged_signals=set(logged_signals or ()) | set(binding_index.logged_signals),
+        logged_signals=set(logged_signals or ()) | _logged_signals_from_inventory(inventory),
+        schema_signals=set(schema_signals or ()),
         parameter_names=set(parameter_names or ()),
         parameter_aliases=dict(parameter_aliases or {}),
         snippet_context_lines=snippet_context_lines,
@@ -167,7 +235,7 @@ class _DAGBuilder:
     def __init__(
         self,
         *,
-        binding_index: BindingIndex,
+        source_bindings: list[dict[str, Any]],
         terminal: str,
         helper_index: dict[tuple[str, str], dict[str, Any]],
         helper_body_provider: Optional[Callable[[str], Any]],
@@ -175,11 +243,11 @@ class _DAGBuilder:
         parameter_values: dict[str, Any],
         source_root: Optional[Path],
         logged_signals: set[str],
+        schema_signals: set[str],
         parameter_names: set[str],
         parameter_aliases: dict[str, str],
         snippet_context_lines: int,
     ) -> None:
-        self.binding_index = binding_index
         self.terminal_raw = terminal
         self.terminal = normalize_symbol(terminal)
         self.helper_index = helper_index
@@ -216,30 +284,58 @@ class _DAGBuilder:
                     _canonical_predicate(predicate), entry
                 )
 
-        # Enum-resolved constants — profiler pre-resolves ``NAME = VALUE``
-        # entries from enum blocks and object-like ``#define`` macros; the
-        # DAG consumes numeric values to lower predicates and resolve
-        # symbolic mask/threshold references.
-        self._enum_resolutions: dict[str, Any] = {
-            key: value
-            for key, value in (
-                getattr(binding_index, "assignment_resolutions", {}) or {}
-            ).items()
-            if isinstance(value, (int, float, bool))
-        }
+        self._schema_signals = {normalize_symbol(s) for s in schema_signals if s}
+
+        # Native backward-walk indexes over the source bindings — the DAG
+        # owns the walk rather than delegating to BindingIndex. ``_by_output``
+        # keys on the resolved logged signal, ``_by_target`` on the written
+        # symbol; the interleaved build in :meth:`build` traverses them.
+        self._all_bindings: list[dict[str, Any]] = list(source_bindings)
+        self._by_output: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        writes_per_target: dict[str, int] = defaultdict(int)
+        for binding in self._all_bindings:
+            logged = normalize_symbol(str(binding.get("logged_signal") or ""))
+            target = normalize_symbol(
+                str(binding.get("target_symbol") or binding.get("target") or "")
+            )
+            if logged:
+                self._by_output[logged].append(binding)
+            if target:
+                self._by_target[target].append(binding)
+                writes_per_target[target] += 1
+
+        # Source-defined numeric constants (enum entry / ``#define`` /
+        # ``constexpr``), resolved natively from the bindings: a single
+        # unconditional write whose RHS is a compile-time numeric literal.
+        # Replaces the old dependency on ``BindingIndex.assignment_resolutions``
+        # (which stored SliceResult objects the DAG mis-typed).
+        self._source_constants: dict[str, Any] = {}
+        for binding in self._all_bindings:
+            target = normalize_symbol(
+                str(binding.get("target_symbol") or binding.get("target") or "")
+            )
+            if not target or writes_per_target[target] != 1:
+                continue
+            if binding.get("control_predicates"):
+                continue
+            value = _parse_numeric_literal(
+                str(binding.get("source_symbol") or binding.get("expression") or "")
+            )
+            if value is not None:
+                self._source_constants.setdefault(target, value)
 
         # Struct-typed variable → struct type map, aggregated from every
-        # source_assignment binding and helper record that reaches the
-        # builder. Used by :meth:`_resolve_struct_var_field` to derive
-        # ``var.field → topic.field`` graph-natively via
-        # :func:`_derive_topic_from_return_type` (same PX4 ``foo_s``
-        # convention as helper return types).
+        # source binding and helper record. Used by
+        # :meth:`_resolve_struct_var_field` to derive ``var.field →
+        # topic.field`` graph-natively via
+        # :func:`_derive_topic_from_return_type`.
         self._struct_variables: dict[str, str] = {}
         for helper in helper_index.values():
             for name, struct_type in (helper.get("struct_variables") or {}).items():
                 if name and struct_type:
                     self._struct_variables.setdefault(str(name), str(struct_type))
-        for binding in getattr(binding_index, "_bindings", []) or []:
+        for binding in self._all_bindings:
             for name, struct_type in (binding.get("struct_variables") or {}).items():
                 if name and struct_type:
                     self._struct_variables.setdefault(str(name), str(struct_type))
@@ -271,56 +367,93 @@ class _DAGBuilder:
     # ------------------------------------------------------------
 
     def build(self) -> MechanismDAG:
-        reaching = self.binding_index.bindings_reaching(self.terminal)
-        reaching = self._expand_struct_roots(reaching)
+        """Build the DAG via one interleaved backward fixpoint.
 
-        # Two-pass build. Pass 1 emits every operation vertex so
-        # ``_producers_by_symbol`` is fully populated before any edge is
-        # wired. Otherwise consumers processed before their producers
-        # fall through to opaque-symbol leaves.
-        for binding in reaching:
-            self._emit_operation_vertex(binding, is_terminal=self._binding_reaches_terminal(binding))
-        # Pass 1b: pre-emit every helper subgraph referenced anywhere so
-        # helper-body intermediates land in the producer index before
-        # edges are wired. Fixpoints over nested calls so a helper A →
-        # helper B chain materializes both when B is only reachable via
-        # A's body — including cross-file callees fetched on-demand via
-        # ``helper_body_provider``.
-        seen_helper_names: set[str] = set()
-        pending: list[str] = []
-        for binding in reaching:
-            expression = str(binding.get("source_symbol") or "")
+        Starting from the terminal, we emit operation vertices and helper
+        subgraphs *as we discover them*, driving a single frontier of
+        symbols. Crucially, when a helper subgraph is materialized, the
+        symbols in its body are fed back into the same frontier — so a
+        writer that is only referenced *inside* a helper (e.g.
+        ``_destination.lat`` inside a distance helper) still gets pulled
+        in. There is no flattened intermediate reach list; the graph is
+        constructed directly, and struct-root field expansion is folded
+        into the same walk.
+        """
+        frontier: deque[tuple[str, str]] = deque([("symbol", self.terminal)])
+        walked_symbols: set[str] = set()
+        materialized_helpers: set[str] = set()
+        self._emitted_ids: set[int] = set()
+        self._emitted_bindings: list[dict[str, Any]] = []
+
+        def enqueue_expression(expression: str) -> None:
+            for symbol in self._walk_symbols(expression):
+                if symbol and symbol not in walked_symbols:
+                    frontier.append(("symbol", symbol))
             for helper_name in self._find_helper_calls(expression):
-                if helper_name not in seen_helper_names:
-                    seen_helper_names.add(helper_name)
-                    pending.append(helper_name)
-        while pending:
-            helper_name = pending.pop()
-            self._materialize_helper_subgraph(helper_name, wire_edges=False)
-            helper_key = self._pick_helper_key(helper_name)
-            if helper_key is None:
-                continue
-            helper = self.helper_index.get(helper_key)
-            if not helper:
-                continue
-            body_expressions: list[str] = []
-            for value in (helper.get("assignments") or {}).values():
-                body_expressions.append(str(value))
-            return_expression = (
-                helper.get("lowered_return_expression")
-                or helper.get("return_expression")
-                or ""
-            )
-            if return_expression:
-                body_expressions.append(str(return_expression))
-            for expression in body_expressions:
-                for nested in self._find_helper_calls(expression):
-                    if nested not in seen_helper_names:
-                        seen_helper_names.add(nested)
-                        pending.append(nested)
+                if helper_name not in materialized_helpers:
+                    frontier.append(("helper", helper_name))
 
-        # Pass 2: wire edges now that every producer is known.
-        for binding in reaching:
+        while frontier:
+            kind, payload = frontier.popleft()
+            if kind == "symbol":
+                sym = payload
+                if sym in walked_symbols:
+                    continue
+                walked_symbols.add(sym)
+                writers = self._writers_of(sym)
+                if writers:
+                    for binding in writers:
+                        if id(binding) not in self._emitted_ids:
+                            self._emitted_ids.add(id(binding))
+                            self._emitted_bindings.append(binding)
+                            self._emit_operation_vertex(
+                                binding,
+                                is_terminal=self._binding_reaches_terminal(binding),
+                            )
+                        enqueue_expression(
+                            str(binding.get("source_symbol") or binding.get("expression") or "")
+                        )
+                elif (
+                    "." not in sym
+                    and sym != self.terminal
+                    and sym not in self.logged_signals
+                    and self._match_parameter(sym) is None
+                ):
+                    # Bare struct root with no direct writer — pull its
+                    # field writes (``_mission_item`` → ``_mission_item.*``).
+                    for field_binding in self._field_writers_of(sym):
+                        field_target = normalize_symbol(
+                            str(field_binding.get("target_symbol") or field_binding.get("target") or "")
+                        )
+                        if field_target and field_target not in walked_symbols:
+                            frontier.append(("symbol", field_target))
+            else:  # helper
+                helper_name = payload
+                if helper_name in materialized_helpers:
+                    continue
+                materialized_helpers.add(helper_name)
+                self._materialize_helper_subgraph(helper_name, wire_edges=False)
+                helper_key = self._pick_helper_key(helper_name)
+                helper = self.helper_index.get(helper_key) if helper_key else None
+                if not helper:
+                    continue
+                body_expressions = [str(v) for v in (helper.get("assignments") or {}).values()]
+                return_expression = (
+                    helper.get("lowered_return_expression")
+                    or helper.get("return_expression")
+                    or ""
+                )
+                if return_expression:
+                    body_expressions.append(str(return_expression))
+                for pointer_write in helper.get("pointer_output_writes") or []:
+                    body_expressions.append(str(pointer_write.get("expression") or ""))
+                for expression in body_expressions:
+                    # The (b) fix: helper-body symbols drive the same frontier,
+                    # so their writers get emitted instead of going opaque.
+                    enqueue_expression(expression)
+
+        # Wire edges now that every producer vertex has been emitted.
+        for binding in self._emitted_bindings:
             self._wire_binding_edges(binding)
         for helper_key in list(self._helper_subgraph_return_id.keys()):
             self._wire_helper_subgraph_edges(helper_key)
@@ -334,62 +467,44 @@ class _DAGBuilder:
         )
 
     # ------------------------------------------------------------
-    # Struct-root expansion
+    # Native backward-walk helpers
     # ------------------------------------------------------------
 
-    def _expand_struct_roots(self, reaching: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Add field-level bindings for bare struct roots referenced but
-        not directly assigned.
+    def _walk_symbols(self, expression: str) -> list[str]:
+        """Normalized symbols referenced by ``expression``.
 
-        A backward walk that lands on ``get_absolute_altitude_for_item(_mission_item)``
-        stops at ``_mission_item`` because nothing writes to the bare
-        struct. This pass fetches every ``_mission_item.*`` field write
-        via :meth:`BindingIndex.bindings_writing_prefix` and continues
-        the reach walk from each field. Fixpoint over any struct roots
-        the newly-added bindings introduce.
+        C++ operators/casts are normalized first so ``&&`` / ``->`` / ``::``
+        and cast-wrapped arguments still yield their symbols.
         """
-        seen_ids = {id(binding) for binding in reaching}
-        result = list(reaching)
-        pending_roots: list[str] = []
+        if not expression:
+            return []
+        normalized = _normalize_cpp_expression(str(expression))
+        return dedupe_keep_order(
+            normalize_symbol(name) for name in source_expression_names(normalized)
+        )
 
-        def scan(binding: dict[str, Any]) -> None:
-            for name in source_expression_names(str(binding.get("source_symbol") or "")):
-                normalized = normalize_symbol(name)
-                if not normalized or "." in normalized:
-                    continue  # only bare roots — dotted names go through the normal walk
-                if normalized == self.terminal:
-                    continue
-                if normalized in self.logged_signals or self._match_parameter(name):
-                    continue
-                pending_roots.append(normalized)
+    def _writers_of(self, symbol_norm: str) -> list[dict[str, Any]]:
+        """Bindings that write ``symbol_norm`` (as a logged output or a
+        source target). Union of both indexes, de-duplicated by identity."""
+        seen: set[int] = set()
+        out: list[dict[str, Any]] = []
+        for binding in list(self._by_output.get(symbol_norm, [])) + list(
+            self._by_target.get(symbol_norm, [])
+        ):
+            if id(binding) not in seen:
+                seen.add(id(binding))
+                out.append(binding)
+        return out
 
-        for binding in reaching:
-            scan(binding)
-
-        seen_roots: set[str] = set()
-        while pending_roots:
-            root = pending_roots.pop()
-            if root in seen_roots:
-                continue
-            seen_roots.add(root)
-            for field_binding in self.binding_index.bindings_writing_prefix(root):
-                if id(field_binding) in seen_ids:
-                    continue
-                seen_ids.add(id(field_binding))
-                result.append(field_binding)
-                # Reaching further backward: walk the newly-added binding's
-                # own dependencies.
-                for reached in self.binding_index.bindings_reaching(
-                    str(field_binding.get("target_symbol") or "")
-                ):
-                    if id(reached) in seen_ids:
-                        continue
-                    seen_ids.add(id(reached))
-                    result.append(reached)
-                    scan(reached)
-                scan(field_binding)
-
-        return result
+    def _field_writers_of(self, root_norm: str) -> list[dict[str, Any]]:
+        """Every binding whose target begins with ``{root_norm}.`` — the
+        field writes of a bare struct root."""
+        needle = f"{root_norm}."
+        out: list[dict[str, Any]] = []
+        for target_key, bindings in self._by_target.items():
+            if target_key.startswith(needle):
+                out.extend(bindings)
+        return out
 
     # ------------------------------------------------------------
     # Vertex emission
@@ -636,7 +751,7 @@ class _DAGBuilder:
             )
 
         # 3. Source enum / #define resolution.
-        enum_value = self._enum_resolutions.get(symbol_norm)
+        enum_value = self._source_constants.get(symbol_norm)
         if enum_value is not None:
             return self._emit_evidence(
                 "constant",
@@ -730,7 +845,7 @@ class _DAGBuilder:
             key=len,
             reverse=True,
         ):
-            value = self._enum_resolutions.get(normalize_symbol(token))
+            value = self._source_constants.get(normalize_symbol(token))
             if value is None:
                 value = CXX_STDLIB_CONSTANTS.get(token)
             if isinstance(value, (int, float, bool)):
@@ -874,7 +989,7 @@ class _DAGBuilder:
         if not topic:
             return None
         signal = f"{topic}.{field}"
-        schema_signals = getattr(self.binding_index, "schema_signals", None) or set()
+        schema_signals = self._schema_signals
         if signal in self.logged_signals or signal in schema_signals:
             return signal
         return None
@@ -903,7 +1018,7 @@ class _DAGBuilder:
         if not topic:
             return None
         signal = f"{topic}.{field}"
-        schema_signals = getattr(self.binding_index, "schema_signals", None) or set()
+        schema_signals = self._schema_signals
         if signal in self.logged_signals or signal in schema_signals:
             return signal
         return None
