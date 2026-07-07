@@ -1554,3 +1554,36 @@ def test_shared_producer_vertex_reused_across_two_consumers():
     fanout = [e for e in dag.edges
               if e.source_id == shared_id and e.target_id in consumer_ids and e.kind == "data"]
     assert len(fanout) == 2, "shared producer must fan out to both consumers"
+
+
+def test_cpp_qualified_expression_wires_inner_logged_signal_not_dropped():
+    """An operation whose RHS is a ``::``-qualified call must still wire the
+    logged signal referenced inside it. Regression for the weathervane
+    ``R_yaw = matrix::Eulerf(0, 0, -vehicle_local_position.heading)`` case:
+    edge-wiring extracted symbols from the raw ``::`` expression, which
+    source_expression_names returns [] for, so the valid logged signal was
+    silently dropped — not wired, not even marked unresolved."""
+    bindings = [
+        _fake_binding(
+            binding_id="ry",
+            target="R_yaw",
+            expression="matrix::Eulerf(0.0f, 0.0f, -vehicle_local_position.heading)",
+            file="wv.cpp",
+            line=1,
+        ),
+    ]
+    dag = build_mechanism_dag(
+        bindings, "R_yaw", logged_signals={"vehicle_local_position.heading"}
+    )
+
+    ev = [
+        v for v in dag.vertices
+        if v.kind == "evidence"
+        and v.sub_kind == "logged_signal"
+        and v.signal_name == "vehicle_local_position.heading"
+    ]
+    assert ev, "logged signal inside a :: expression was dropped from wiring"
+    ryaw = next(v for v in dag.vertices if v.variable == "R_yaw")
+    assert any(
+        e.source_id == ev[0].id and e.target_id == ryaw.id for e in dag.edges
+    ), "logged signal not connected to the operation that references it"

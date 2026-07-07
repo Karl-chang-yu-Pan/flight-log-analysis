@@ -483,6 +483,25 @@ class _DAGBuilder:
             normalize_symbol(name) for name in source_expression_names(normalized)
         )
 
+    def _wire_symbols(self, expression: str) -> list[str]:
+        """Raw symbol names referenced by ``expression``, extracted after
+        normalizing C++ syntax.
+
+        The edge-wiring paths need the *raw* name (for edge ``role`` and for
+        :meth:`_resolve_symbol_producer`, which matches accessor chains /
+        struct vars / parameters on the un-normalized form). But extraction
+        must run on the C++-normalized expression, or a ``::``-qualified RHS
+        like ``matrix::Eulerf(-vehicle_local_position.heading)`` yields no
+        names at all and the operation's real inputs — including logged
+        signals — are silently dropped from the graph. Mirrors the
+        normalization :meth:`_walk_symbols` already applies during the walk.
+        """
+        if not expression:
+            return []
+        return dedupe_keep_order(
+            source_expression_names(_normalize_cpp_expression(str(expression)))
+        )
+
     def _writers_of(self, symbol_norm: str) -> list[dict[str, Any]]:
         """Bindings that write ``symbol_norm`` (as a logged output or a
         source target). Union of both indexes, de-duplicated by identity."""
@@ -549,7 +568,7 @@ class _DAGBuilder:
             self._add_edge(branch_id, op_id, kind="control")
 
         # Wire each source-expression symbol as an incoming data edge.
-        for symbol in dedupe_keep_order(source_expression_names(expression)):
+        for symbol in self._wire_symbols(expression):
             normalized = normalize_symbol(symbol)
             if not normalized or normalized == target_norm:
                 continue
@@ -631,7 +650,7 @@ class _DAGBuilder:
                     provenance=f"pointer_output:{helper_key[0]}@{helper_key[1]}",
                 )
                 self._producers_by_symbol.setdefault(target_norm, []).append(op_id)
-            for symbol in dedupe_keep_order(source_expression_names(expression)):
+            for symbol in self._wire_symbols(expression):
                 normalized = normalize_symbol(symbol)
                 if not normalized or normalized == target_norm:
                     continue
@@ -666,7 +685,7 @@ class _DAGBuilder:
             return
         args = _extract_call_arguments(helper_call, caller_expression)
         for (formal_name, formal_vertex_id), arg_text in zip(formals, args):
-            for symbol in dedupe_keep_order(source_expression_names(arg_text)):
+            for symbol in self._wire_symbols(arg_text):
                 normalized = normalize_symbol(symbol)
                 if not normalized:
                     continue
@@ -1251,7 +1270,7 @@ class _DAGBuilder:
         for var, expression in (helper.get("assignments") or {}).items():
             var_norm = normalize_symbol(var)
             op_id = self._make_id("op", (helper_key[0], helper_key[1], var_norm, expression))
-            for symbol in dedupe_keep_order(source_expression_names(str(expression))):
+            for symbol in self._wire_symbols(str(expression)):
                 normalized = normalize_symbol(symbol)
                 if not normalized or normalized == var_norm:
                     continue
@@ -1272,7 +1291,7 @@ class _DAGBuilder:
                 "op",
                 (helper_key[0], helper_key[1], "__return__", return_expression),
             )
-            for symbol in dedupe_keep_order(source_expression_names(str(return_expression))):
+            for symbol in self._wire_symbols(str(return_expression)):
                 normalized = normalize_symbol(symbol)
                 if not normalized:
                     continue
@@ -1297,7 +1316,7 @@ class _DAGBuilder:
             value_expression = str(branch.get("expression") or "")
             if terminal_id is None or not value_expression:
                 continue
-            for symbol in dedupe_keep_order(source_expression_names(value_expression)):
+            for symbol in self._wire_symbols(value_expression):
                 normalized = normalize_symbol(symbol)
                 if not normalized:
                     continue
