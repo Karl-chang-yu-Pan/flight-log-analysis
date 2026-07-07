@@ -183,3 +183,145 @@ void Rtl::pick()
         if v.kind == "evidence" and v.sub_kind == "logged_signal"
     }
     assert "gpos_alt" in logged
+
+
+def _mini_tree(tmp_path, files: dict[str, str]):
+    root = tmp_path / "PX4-Autopilot"
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return MechanismSourceProfiler(root, rg_path="missing-rg")
+
+
+def test_fixpoint_resolves_symbol_across_files_in_second_round(tmp_path):
+    """Round 0 loads only the seeded file and leaves ``_dest_val``
+    unresolved; the gap's definition search pulls the second file in
+    round 1 and the slice completes — the DAG's own gaps drive discovery."""
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/rtl.cpp": """
+void Rtl::pick_altitude()
+{
+    _final_out = _dest_val + 1.0f;
+}
+""",
+        "src/modules/example/dest.cpp": """
+void Rtl::update()
+{
+    _dest_val = gspeed;
+}
+""",
+    })
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=["pick_altitude"],
+        terminal="_final_out",
+        source_hash="hash",
+        logged_signals={"gspeed"},
+    )
+
+    assert len(result.rounds) == 2
+    assert result.rounds[0].new_files == ["src/modules/example/rtl.cpp"]
+    assert "_dest_val" in result.rounds[0].unresolved_symbols
+    assert "src/modules/example/dest.cpp" in result.rounds[1].new_files
+
+    op_targets = {v.variable for v in result.dag.vertices if v.kind == "operation"}
+    assert {"_final_out", "_dest_val"} <= op_targets
+    logged = {v.signal_name for v in result.dag.vertices
+              if v.kind == "evidence" and v.sub_kind == "logged_signal"}
+    assert "gspeed" in logged
+    assert result.dag.unresolved_symbols == []
+
+
+def test_fixpoint_stops_at_round_budget(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/rtl.cpp": """
+void Rtl::pick_altitude()
+{
+    _final_out = _dest_val + 1.0f;
+}
+""",
+        "src/modules/example/dest.cpp": """
+void Rtl::update()
+{
+    _dest_val = gspeed;
+}
+""",
+    })
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=["pick_altitude"],
+        terminal="_final_out",
+        source_hash="hash",
+        max_rounds=1,
+    )
+
+    assert len(result.rounds) == 1
+    assert "_dest_val" in result.dag.unresolved_symbols
+
+
+def test_fixpoint_provider_expands_cross_file_helper(tmp_path):
+    """A helper defined in a file discovery never seeded still expands:
+    the on-demand provider finds ``Class::name(`` within the round, and
+    the fetched file's facts join the next round."""
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/rtl.cpp": """
+void Rtl::pick_altitude()
+{
+    _alt_out = calc_gain(base_in);
+}
+""",
+        "src/lib/gain/gain.cpp": """
+float Rtl::calc_gain(float base_in)
+{
+    return base_in * 2.0f;
+}
+""",
+    })
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=["pick_altitude"],
+        terminal="_alt_out",
+        source_hash="hash",
+    )
+
+    helper_returns = [v for v in result.dag.vertices
+                      if v.provenance and v.provenance.startswith("helper_return")]
+    assert helper_returns, "cross-file helper did not expand via provider"
+    assert "src/lib/gain/gain.cpp" in result.files_loaded
+
+
+def test_fixpoint_bootstraps_from_terminal_without_seeds(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/rtl.cpp": """
+void Rtl::pick_altitude()
+{
+    _lone_terminal = 42.0f;
+}
+""",
+    })
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=[],
+        terminal="_lone_terminal",
+        source_hash="hash",
+    )
+
+    op_targets = {v.variable for v in result.dag.vertices if v.kind == "operation"}
+    assert "_lone_terminal" in op_targets

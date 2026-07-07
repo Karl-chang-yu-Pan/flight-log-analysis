@@ -18,13 +18,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence, Union
+from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
+from flight_log_agent.analysis.mechanism_dag import MechanismDAG, build_mechanism_dag
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.px4.source_facts_cache import (
     SourceFileFacts,
     get_or_extract_facts,
 )
+from flight_log_agent.utils import dedupe_keep_order
 
 
 def _as_dict(ref: Any) -> dict[str, Any]:
@@ -178,3 +180,202 @@ def load_facts(
             )
         )
     return facts
+
+
+# ---------------------------------------------------------------------------
+# Deterministic discovery fixpoint
+# ---------------------------------------------------------------------------
+
+
+def _definition_queries(symbol: str) -> list[str]:
+    """Search queries likely to hit the file that *defines* ``symbol``.
+
+    Unresolved entries can be dotted accessor chains
+    (``_scale_check_groundspeed.isAllFinite``); the writable entity is the
+    root, so query on an assignment-shaped root pattern. Empty for roots
+    too short to search meaningfully (a two-letter root matches half the
+    tree and only burns the round's file budget).
+    """
+    root = symbol.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
+    if len(root) < 4:
+        return []
+    return [f"{root} ="]
+
+
+def make_helper_body_provider(
+    profiler: MechanismSourceProfiler,
+    fetched_files: list[str],
+    *,
+    max_files_per_helper: int = 2,
+) -> Callable[[str], Any]:
+    """On-demand cross-file helper loader for :func:`build_mechanism_dag`.
+
+    Searches for the callee's definition (PX4 methods define as
+    ``Class::name(``; the bare ``name(`` form catches free functions),
+    extracts helper records from the top hits, and appends those files to
+    ``fetched_files`` so the discovery loop can load their full facts in
+    the next round. The DAG builder memoizes probes, so an unknown name
+    costs at most one search per build.
+    """
+
+    def provider(helper_name: str) -> Any:
+        # Same rationale as _definition_queries: a too-short name
+        # (``get``, ``max``, ``sin``) matches half the tree and only
+        # drags in junk definitions.
+        if len(helper_name) < 4:
+            return []
+        hits = profiler.search_related_source_files(
+            [f"::{helper_name}(", f"{helper_name}("],
+            max_files=max_files_per_helper,
+        )
+        files = [hit.file for hit in hits]
+        if not files:
+            return []
+        for file_path in files:
+            if file_path not in fetched_files:
+                fetched_files.append(file_path)
+        return profiler.extract_helper_expressions_from_source(
+            files, helper_names=[helper_name]
+        )
+
+    return provider
+
+
+@dataclass
+class DiscoveryRound:
+    """Per-round trace of the fixpoint, kept for judge/debug consumption."""
+
+    index: int
+    new_files: list[str]
+    unresolved_symbols: list[str]
+    vertices: int
+    edges: int
+
+
+@dataclass
+class DiscoveryResult:
+    dag: Optional[MechanismDAG]
+    inputs: DAGInputs
+    files_loaded: list[str]
+    rounds: list[DiscoveryRound]
+
+
+def discover_mechanism_dag(
+    profiler: MechanismSourceProfiler,
+    cache_root: Union[str, Path],
+    seeds: Sequence[str],
+    terminal: str,
+    source_hash: str,
+    *,
+    source_root: Optional[Union[str, Path]] = None,
+    terminal_file: Optional[str] = None,
+    max_rounds: int = 3,
+    max_files_per_round: int = 8,
+    max_files_total: int = 24,
+    inventory: Optional[dict[str, Any]] = None,
+    schema_signals: Optional[Iterable[str]] = None,
+    logged_signals: Optional[Iterable[str]] = None,
+    parameter_values: Optional[dict[str, Any]] = None,
+) -> DiscoveryResult:
+    """Deterministic discovery fixpoint: the DAG's own gaps drive the search.
+
+    Round 0 seeds the file set from ``seeds`` (+ the terminal itself, so
+    an empty seed list can still bootstrap). Every round loads new files
+    through Layer 1, rebuilds the DAG from the union of facts, then turns
+    the DAG's ``unresolved_symbols`` into definition searches for the next
+    round's files. Cross-file helpers resolve *within* a round via the
+    on-demand provider; the provider's fetched files join the next round
+    so their assignments bind too.
+
+    Stops when: nothing is unresolved, a round makes no progress (same
+    gap set and no provider fetches), no new files remain, or budgets run
+    out. No LLM anywhere — seed selection and sufficiency judgment are
+    the caller's problem (the judge stage).
+    """
+    seed_queries = dedupe_keep_order([*(str(s) for s in seeds if s), terminal])
+    hits = profiler.search_related_source_files(
+        seed_queries, max_files=max_files_per_round
+    )
+    pending: list[str] = [hit.file for hit in hits]
+
+    loaded: list[str] = []
+    facts_by_file: dict[str, SourceFileFacts] = {}
+    rounds: list[DiscoveryRound] = []
+    dag: Optional[MechanismDAG] = None
+    inputs = DAGInputs()
+    previous_unresolved: Optional[set[str]] = None
+
+    for index in range(max_rounds):
+        budget_left = max(0, max_files_total - len(loaded))
+        new_files = [f for f in pending if f not in facts_by_file]
+        new_files = new_files[: min(max_files_per_round, budget_left)]
+        if not new_files and index > 0:
+            break
+
+        for facts in load_facts(
+            profiler,
+            cache_root,
+            new_files,
+            source_hash,
+            source_root=source_root,
+        ):
+            facts_by_file[facts.file] = facts
+        loaded.extend(new_files)
+
+        inputs = dag_inputs_from_facts(facts_by_file.values())
+        fetched_files: list[str] = []
+        provider = make_helper_body_provider(profiler, fetched_files)
+        dag = build_mechanism_dag(
+            inputs.bindings,
+            terminal,
+            inventory=inventory,
+            schema_signals=schema_signals,
+            logged_signals=logged_signals,
+            helper_expressions=inputs.helper_expressions,
+            helper_body_provider=provider,
+            parameter_predicates=inputs.parameter_predicates,
+            parameter_values=parameter_values,
+            parameter_names=inputs.parameter_names,
+            parameter_aliases=inputs.parameter_aliases,
+            terminal_file=terminal_file,
+        )
+
+        unresolved = set(dag.unresolved_symbols)
+        rounds.append(
+            DiscoveryRound(
+                index=index,
+                new_files=list(new_files),
+                unresolved_symbols=sorted(unresolved),
+                vertices=len(dag.vertices),
+                edges=len(dag.edges),
+            )
+        )
+
+        if not unresolved:
+            break
+        if unresolved == previous_unresolved and not fetched_files:
+            break
+        previous_unresolved = unresolved
+
+        gap_queries = dedupe_keep_order(
+            query
+            for symbol in sorted(unresolved)
+            for query in _definition_queries(symbol)
+        )
+        gap_hits = (
+            profiler.search_related_source_files(
+                gap_queries, max_files=max_files_per_round
+            )
+            if gap_queries
+            else []
+        )
+        pending = dedupe_keep_order(
+            [hit.file for hit in gap_hits] + fetched_files
+        )
+
+    return DiscoveryResult(
+        dag=dag,
+        inputs=inputs,
+        files_loaded=loaded,
+        rounds=rounds,
+    )
