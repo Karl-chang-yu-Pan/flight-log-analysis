@@ -404,3 +404,31 @@ def test_provider_resolves_definition_despite_many_callers(tmp_path):
     found = provider("calc_gain")
     assert found and found[0].name.endswith("calc_gain")
     assert "src/lib/gain/gain.cpp" in fetched
+
+
+def test_qualified_terminal_is_stripped_to_bare_member(tmp_path):
+    """Seeder-style qualified terminals (``Rtl::_final_out``) must slice
+    the same DAG as the bare member — a qualified form matches no writer
+    and previously produced an empty DAG."""
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/rtl.cpp": """
+void Rtl::pick_altitude()
+{
+    _final_out = gspeed + 1.0f;
+}
+""",
+    })
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=["pick_altitude"],
+        terminal="Rtl::_final_out",
+        source_hash="hash",
+        logged_signals={"gspeed"},
+    )
+
+    op_targets = {v.variable for v in result.dag.vertices if v.kind == "operation"}
+    assert "_final_out" in op_targets

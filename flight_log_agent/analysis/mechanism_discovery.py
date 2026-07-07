@@ -332,6 +332,12 @@ def discover_mechanism_dag(
     out. No LLM anywhere — seed selection and sufficiency judgment are
     the caller's problem (the judge stage).
     """
+    # Strip a class/type qualifier (``RTL::_destination.alt``,
+    # ``mission_item_s::altitude``) — writers are keyed on the bare
+    # member as written at the assignment site, so a qualified terminal
+    # can never match one and would slice an empty DAG.
+    terminal = str(terminal).rsplit("::", 1)[-1].strip()
+
     seed_queries = dedupe_keep_order([*(str(s) for s in seeds if s), terminal])
     hits = profiler.search_related_source_files(
         seed_queries, max_files=max_files_per_round

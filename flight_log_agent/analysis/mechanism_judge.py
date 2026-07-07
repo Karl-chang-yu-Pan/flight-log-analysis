@@ -166,6 +166,11 @@ Output:
   HOLD the quantity the question asks about, each with the source file
   expected to write it. Order by likelihood; at most three.
 
+Each terminal must be the bare variable name exactly as it appears on
+the LEFT side of its assignment in source — ``_destination.alt``,
+``_rtl_alt`` — never class-qualified (``RTL::_destination.alt``) and
+never type-qualified (``mission_item_s::altitude``).
+
 Do not use log data, do not verify anything, do not draft hypotheses.
 """,
     tools=[],
