@@ -175,6 +175,7 @@ def build_mechanism_dag(
     parameter_names: Optional[Iterable[str]] = None,
     parameter_aliases: Optional[dict[str, str]] = None,
     snippet_context_lines: int = 3,
+    terminal_file: Optional[str] = None,
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
 
@@ -207,7 +208,13 @@ def build_mechanism_dag(
     resolve params whose member name equals the param name; PX4 members
     routinely drop the module prefix, so the alias map is what resolves
     the rest. ``source_root`` enables per-vertex snippet embedding —
-    omit to keep tests hermetic.
+    omit to keep tests hermetic. ``terminal_file`` (optional) scopes the
+    terminal's writers to that file when any exist there —
+    ``normalize_symbol`` strips the leading ``_`` (member ↔ logged
+    convention), so a multi-module binding set can contain a same-named
+    but unrelated variable from another class (NPFG ``lateral_accel``
+    vs L1 ``_lateral_accel``); the hint keeps the slice on the module
+    the caller actually asked about.
     """
     builder = _DAGBuilder(
         source_bindings=[_as_binding_dict(b) for b in source_bindings],
@@ -222,6 +229,7 @@ def build_mechanism_dag(
         parameter_names=set(parameter_names or ()),
         parameter_aliases=dict(parameter_aliases or {}),
         snippet_context_lines=snippet_context_lines,
+        terminal_file=terminal_file,
     )
     return builder.build()
 
@@ -247,9 +255,11 @@ class _DAGBuilder:
         parameter_names: set[str],
         parameter_aliases: dict[str, str],
         snippet_context_lines: int,
+        terminal_file: Optional[str] = None,
     ) -> None:
         self.terminal_raw = terminal
         self.terminal = normalize_symbol(terminal)
+        self.terminal_file = str(terminal_file) if terminal_file else None
         self.helper_index = helper_index
         self.helper_body_provider = helper_body_provider
         # Helpers already probed via the provider so a repeated call for an
@@ -401,6 +411,17 @@ class _DAGBuilder:
                     continue
                 walked_symbols.add(sym)
                 writers = self._writers_of(sym)
+                if writers and sym == self.terminal and self.terminal_file:
+                    # Scope the terminal to its module: a multi-module
+                    # binding set can hold a same-named-after-normalization
+                    # but unrelated variable from another class. Fall back
+                    # to all writers when none live in the hinted file.
+                    scoped = [
+                        b for b in writers
+                        if self._binding_first_file(b) == self.terminal_file
+                    ]
+                    if scoped:
+                        writers = scoped
                 if writers:
                     for binding in writers:
                         if id(binding) not in self._emitted_ids:
@@ -501,6 +522,12 @@ class _DAGBuilder:
         return dedupe_keep_order(
             source_expression_names(_normalize_cpp_expression(str(expression)))
         )
+
+    @staticmethod
+    def _binding_first_file(binding: dict[str, Any]) -> str:
+        path = binding.get("assignment_path") or []
+        first = path[0] if path else {}
+        return str((first or {}).get("file") or "")
 
     def _writers_of(self, symbol_norm: str) -> list[dict[str, Any]]:
         """Bindings that write ``symbol_norm`` (as a logged output or a
@@ -740,6 +767,17 @@ class _DAGBuilder:
         """
         producers = self._producers_by_symbol.get(symbol_norm)
         if producers:
+            # Prefer a producer from the consumer's own file — the
+            # leading-underscore strip in ``normalize_symbol`` can fuse a
+            # member with a same-named local from another module, and
+            # same-file linkage is the strongest disambiguation available
+            # without full class scoping. Fall back to the last producer.
+            if file:
+                same_file = [
+                    p for p in producers if self.vertices[p].file == file
+                ]
+                if same_file:
+                    return same_file[-1]
             return producers[-1]
 
         # 2a. Graph-native derivation: if ``source_expression`` contains a

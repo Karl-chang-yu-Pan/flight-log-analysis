@@ -1587,3 +1587,54 @@ def test_cpp_qualified_expression_wires_inner_logged_signal_not_dropped():
     assert any(
         e.source_id == ev[0].id and e.target_id == ryaw.id for e in dag.edges
     ), "logged signal not connected to the operation that references it"
+
+
+def test_terminal_file_scopes_writers_to_named_module():
+    """NPFG regression shape: ``_lateral_accel`` (one module's member) and
+    ``lateral_accel`` (another module's local) normalize identically, so an
+    unscoped multi-module slice fuses two unrelated variables. With
+    ``terminal_file`` the terminal keeps only that file's writers."""
+    bindings = [
+        _fake_binding(binding_id="l1", target="_lateral_accel",
+                      expression="_K_L1 * ground_speed", file="l1.cpp", line=10),
+        _fake_binding(binding_id="npfg", target="lateral_accel",
+                      expression="lateralAccel(air_vel, airspeed)", file="npfg.cpp", line=20),
+    ]
+
+    unscoped = build_mechanism_dag(bindings, "_lateral_accel")
+    fused = {v.file for v in unscoped.vertices if v.kind == "operation"
+             and v.variable in {"_lateral_accel", "lateral_accel"}}
+    assert fused == {"l1.cpp", "npfg.cpp"}, "collision precondition changed"
+
+    scoped = build_mechanism_dag(bindings, "_lateral_accel", terminal_file="l1.cpp")
+    terminal_ops = [v for v in scoped.vertices if v.kind == "operation"
+                    and v.variable in {"_lateral_accel", "lateral_accel"}]
+    assert {v.file for v in terminal_ops} == {"l1.cpp"}
+
+    # Hint naming a file with no writers must fall back, not empty the slice.
+    fallback = build_mechanism_dag(bindings, "_lateral_accel", terminal_file="other.cpp")
+    assert any(v.kind == "operation" for v in fallback.vertices)
+
+
+def test_symbol_producer_prefers_same_file_writer():
+    """A consumer reading a symbol written in its own file AND in another
+    module links to the same-file producer, not blindly the last one."""
+    bindings = [
+        # other-module writer indexed AFTER the same-file one would win
+        # under pure producers[-1]; order the same-file writer first so a
+        # last-wins bug is caught.
+        _fake_binding(binding_id="own", target="shared_gain",
+                      expression="own_input * 2", file="a.cpp", line=5),
+        _fake_binding(binding_id="foreign", target="shared_gain",
+                      expression="foreign_input * 3", file="b.cpp", line=7),
+        _fake_binding(binding_id="consumer", target="output",
+                      expression="shared_gain + 1", file="a.cpp", line=9),
+    ]
+    dag = build_mechanism_dag(bindings, "output")
+
+    consumer = next(v for v in dag.vertices if v.variable == "output")
+    producers = {v.id: v for v in dag.vertices if v.variable == "shared_gain"}
+    incoming = [e for e in dag.edges if e.target_id == consumer.id
+                and e.source_id in producers]
+    assert len(incoming) == 1
+    assert producers[incoming[0].source_id].file == "a.cpp"
