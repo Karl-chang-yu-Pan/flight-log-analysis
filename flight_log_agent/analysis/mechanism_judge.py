@@ -17,12 +17,15 @@ and unit-testable; the LLM runner is injectable so tests stub it.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Union
 
 from agents import Agent
 from pydantic import BaseModel, Field
+
+from flight_log_agent.expression_math import is_safe_math_function_name
 
 from flight_log_agent.analysis.mechanism_discovery import (
     DiscoveryResult,
@@ -65,6 +68,7 @@ def render_discovery_compact(
     operations: list[str] = []
     branches: list[str] = []
     helper_returns: list[str] = []
+    call_heads: set[str] = set()
     evidence: dict[str, list[str]] = {}
 
     for vertex in dag.vertices if dag else []:
@@ -73,6 +77,11 @@ def render_discovery_compact(
             entry = f"{vertex.variable} <- {_truncate(vertex.expression or '')} @ {location}"
             if vertex.provenance and vertex.provenance.startswith("helper_return"):
                 helper_returns.append(str(vertex.variable))
+            for head in re.findall(
+                r"\b([A-Za-z_][A-Za-z0-9_]{3,})\s*\(", str(vertex.expression or "")
+            ):
+                if not is_safe_math_function_name(head):
+                    call_heads.add(head)
             operations.append(entry)
         elif vertex.kind == "branch":
             predicate = vertex.predicate_lowered or vertex.predicate_raw or ""
@@ -94,6 +103,15 @@ def render_discovery_compact(
         "operations": _capped(operations, max_operations),
         "branches": _capped(branches, max_branches),
         "helper_subgraphs": sorted(set(helper_returns)),
+        # Call heads in operation expressions with no expanded subgraph —
+        # what the judge can name in expand_calls.
+        "unexpanded_calls": _capped(
+            sorted(
+                call_heads
+                - {name.split("::")[-2] for name in helper_returns if "::" in name}
+            ),
+            max_unresolved,
+        ),
         "evidence": {
             kind: _capped(sorted(set(items)), max_evidence)
             for kind, items in sorted(evidence.items())
@@ -143,6 +161,8 @@ class DiscoveryVerdict(BaseModel):
     sufficient: bool
     selected_terminal: str
     essential_gaps: list[str] = Field(default_factory=list)
+    expand_calls: list[str] = Field(default_factory=list)
+    next_terminals: list[TerminalCandidate] = Field(default_factory=list)
     reasoning: str = ""
 
 
@@ -171,6 +191,11 @@ the LEFT side of its assignment in source — ``_destination.alt``,
 ``_rtl_alt`` — never class-qualified (``RTL::_destination.alt``) and
 never type-qualified (``mission_item_s::altitude``).
 
+Prefer the variable written at the DECISION SITE — where the questioned
+quantity is computed or adapted (``_airspeed_sp`` after adaptation) —
+over the published topic field that merely logs it; list the published
+field as a secondary candidate.
+
 Do not use log data, do not verify anything, do not draft hypotheses.
 """,
     tools=[],
@@ -196,8 +221,17 @@ Decide from these facts only:
 - essential_gaps: unresolved symbols that MUST be resolved to answer
   (they carry the questioned quantity or gate it). Everything else —
   bookkeeping counters, foreign-module noise, display-only values — is
-  ignorable and must not be listed. An empty list means no further
-  discovery is worthwhile even if sufficient is false.
+  ignorable and must not be listed.
+- expand_calls: entries from the rendering's unexpanded_calls whose
+  body must be inlined to answer (the function computing or adapting
+  the questioned quantity).
+- next_terminals: when NO given candidate holds the questioned quantity
+  at its decision site, name a better bare variable (with file) from
+  the rendering's operations.
+
+When sufficient is false you MUST fill at least one of essential_gaps,
+expand_calls, or next_terminals — or leave all empty only if no further
+discovery could possibly help. One follow-up round is granted at most.
 
 Never request raw source; never speculate beyond the rendering.
 """,
@@ -292,30 +326,44 @@ async def discover_with_judge(
 
     selected = results.get(verdict.selected_terminal)
     bonus_round_used = False
-    if (
-        not verdict.sufficient
-        and verdict.essential_gaps
-        and verdict.selected_terminal in results
-    ):
-        candidate = next(
-            (
-                c
-                for c in seeds.candidate_terminals
-                if c.terminal == verdict.selected_terminal
-            ),
-            None,
-        )
-        selected = discover_mechanism_dag(
-            profiler,
-            cache_root,
-            [*seeds.seeds, *verdict.essential_gaps],
-            verdict.selected_terminal,
-            source_hash,
-            terminal_file=candidate.terminal_file if candidate else None,
-            **discovery_kwargs,
-        )
-        results[verdict.selected_terminal] = selected
-        bonus_round_used = True
+    steer = verdict.essential_gaps or verdict.expand_calls or verdict.next_terminals
+    if not verdict.sufficient and steer:
+        # The judge steers exactly one follow-up: re-terminal when it
+        # named a better decision-site variable, else re-slice the
+        # selected terminal with gaps/calls as extra seeds. The rerun
+        # gets a larger budget — the flat one suits single-module
+        # slices but starves multi-module chains.
+        if verdict.next_terminals:
+            target = verdict.next_terminals[0]
+            bonus_terminal = target.terminal
+            bonus_file = target.terminal_file
+        else:
+            bonus_terminal = verdict.selected_terminal
+            bonus_file = next(
+                (
+                    c.terminal_file
+                    for c in seeds.candidate_terminals
+                    if c.terminal == verdict.selected_terminal
+                ),
+                None,
+            )
+        if bonus_terminal:
+            bonus_kwargs = dict(discovery_kwargs)
+            bonus_kwargs["max_rounds"] = bonus_kwargs.get("max_rounds", 3) + 2
+            bonus_kwargs["max_files_total"] = (
+                bonus_kwargs.get("max_files_total", 24) + 12
+            )
+            selected = discover_mechanism_dag(
+                profiler,
+                cache_root,
+                [*seeds.seeds, *verdict.essential_gaps, *verdict.expand_calls],
+                bonus_terminal,
+                source_hash,
+                terminal_file=bonus_file,
+                **bonus_kwargs,
+            )
+            results[bonus_terminal] = selected
+            bonus_round_used = True
 
     return JudgedDiscovery(
         seeds=seeds,

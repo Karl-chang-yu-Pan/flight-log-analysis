@@ -158,3 +158,48 @@ def test_judge_grants_one_bonus_round_for_essential_gaps(tmp_path):
         v.variable for v in judged.selected.dag.vertices if v.kind == "operation"
     }
     assert "_dest_val" in op_targets
+
+
+def test_render_lists_unexpanded_calls(tmp_path):
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/fw.cpp": """
+void Fw::run()
+{
+    _airspeed_sp = adapt_airspeed_setpoint(_base_sp);
+}
+""",
+    })
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["Fw::run"],
+        terminal="_airspeed_sp", source_hash="hash",
+    )
+    render = render_discovery_compact(result)
+    assert "adapt_airspeed_setpoint" in render["unexpanded_calls"]
+
+
+def test_judge_next_terminals_reterminal_bonus_round(tmp_path):
+    """An insufficient verdict naming next_terminals re-slices ONCE from
+    the judge-proposed decision-site variable."""
+    profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            return DiscoverySeeds(
+                seeds=["pick_altitude"],
+                candidate_terminals=[TerminalCandidate(terminal="_final_out")],
+            )
+        return DiscoveryVerdict(
+            sufficient=False,
+            selected_terminal="_final_out",
+            next_terminals=[TerminalCandidate(terminal="_dest_val")],
+        )
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler, tmp_path / "cache", "why?", "hash",
+            run_agent=stub_runner, logged_signals={"gspeed"},
+        )
+    )
+    assert judged.bonus_round_used is True
+    assert judged.selected.dag.terminal == "_dest_val"
+    assert "_dest_val" in judged.results
