@@ -233,6 +233,14 @@ When sufficient is false you MUST fill at least one of essential_gaps,
 expand_calls, or next_terminals — or leave all empty only if no further
 discovery could possibly help. One follow-up round is granted at most.
 
+essential_gaps and expand_calls entries are BARE symbol or function
+names copied from unresolved_symbols / unexpanded_calls / operation
+expressions — never sentences; they are used verbatim as source-search
+queries. empty_candidates lists terminals whose slice found nothing:
+never select those; if no shown candidate holds the questioned quantity,
+propose a replacement in next_terminals taken from the operations of a
+non-empty rendering.
+
 Never request raw source; never speculate beyond the rendering.
 """,
     tools=[],
@@ -313,14 +321,25 @@ async def discover_with_judge(
             **discovery_kwargs,
         )
 
+    # A candidate whose slice found nothing can't ground anything —
+    # keep it out of the judge's choices so an authoritative-sounding
+    # name doesn't outrank a smaller-but-real slice. If everything is
+    # empty the judge sees it all and must re-terminal.
+    non_empty = {
+        terminal: result
+        for terminal, result in results.items()
+        if result.dag is not None and result.dag.vertices
+    }
+    judged_candidates = non_empty or results
     verdict = await runner(
         judge_agent,
         {
             "question": question,
             "candidates": {
                 terminal: render_discovery_compact(result)
-                for terminal, result in results.items()
+                for terminal, result in judged_candidates.items()
             },
+            "empty_candidates": sorted(set(results) - set(judged_candidates)),
         },
     )
 
@@ -347,6 +366,13 @@ async def discover_with_judge(
                 ),
                 None,
             )
+        # Gap entries are used verbatim as search queries — a prose
+        # sentence greps nothing. Keep only symbol-shaped entries.
+        symbol_gaps = [
+            gap
+            for gap in [*verdict.essential_gaps, *verdict.expand_calls]
+            if gap and " " not in gap.strip() and len(gap) < 60
+        ]
         if bonus_terminal:
             bonus_kwargs = dict(discovery_kwargs)
             bonus_kwargs["max_rounds"] = bonus_kwargs.get("max_rounds", 3) + 2
@@ -356,7 +382,7 @@ async def discover_with_judge(
             selected = discover_mechanism_dag(
                 profiler,
                 cache_root,
-                [*seeds.seeds, *verdict.essential_gaps, *verdict.expand_calls],
+                [*seeds.seeds, *symbol_gaps],
                 bonus_terminal,
                 source_hash,
                 terminal_file=bonus_file,

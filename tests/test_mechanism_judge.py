@@ -203,3 +203,68 @@ def test_judge_next_terminals_reterminal_bonus_round(tmp_path):
     assert judged.bonus_round_used is True
     assert judged.selected.dag.terminal == "_dest_val"
     assert "_dest_val" in judged.results
+
+
+def test_empty_candidates_are_excluded_from_judge_choices(tmp_path):
+    """A candidate whose slice found nothing must not be offered to the
+    judge as a selectable choice; it is surfaced under empty_candidates."""
+    profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
+    payloads: list[dict] = []
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            return DiscoverySeeds(
+                seeds=["pick_altitude"],
+                candidate_terminals=[
+                    TerminalCandidate(terminal="_ghost_var"),
+                    TerminalCandidate(terminal="_final_out"),
+                ],
+            )
+        payloads.append(payload)
+        return DiscoveryVerdict(sufficient=True, selected_terminal="_final_out")
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler, tmp_path / "cache", "why?", "hash",
+            run_agent=stub_runner, logged_signals={"gspeed"},
+        )
+    )
+
+    assert list(payloads[0]["candidates"]) == ["_final_out"]
+    assert payloads[0]["empty_candidates"] == ["_ghost_var"]
+    assert judged.selected is judged.results["_final_out"]
+
+
+def test_prose_gap_entries_are_dropped_from_bonus_seeds(tmp_path):
+    """Gap entries are verbatim search queries — a sentence greps nothing
+    and must not poison the bonus round; symbol-shaped entries survive."""
+    profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            return DiscoverySeeds(
+                seeds=["pick_altitude"],
+                candidate_terminals=[TerminalCandidate(terminal="_final_out")],
+            )
+        return DiscoveryVerdict(
+            sufficient=False,
+            selected_terminal="_final_out",
+            essential_gaps=[
+                "_dest_val",
+                "the DAG does not show how the setpoint is computed",
+            ],
+        )
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler, tmp_path / "cache", "why?", "hash",
+            run_agent=stub_runner, logged_signals={"gspeed"},
+            max_rounds=1,
+        )
+    )
+
+    assert judged.bonus_round_used is True
+    op_targets = {
+        v.variable for v in judged.selected.dag.vertices if v.kind == "operation"
+    }
+    assert "_dest_val" in op_targets
