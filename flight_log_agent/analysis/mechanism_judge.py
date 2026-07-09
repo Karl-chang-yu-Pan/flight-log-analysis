@@ -179,22 +179,22 @@ Convert a PX4 flight-log question into inputs for deterministic source
 discovery.
 
 Output:
-- seeds: concrete grep-able queries for the PX4 source tree — parameter
-  names (RTL_RETURN_ALT), class/method names (RTL::find_RTL_destination),
-  uORB topic or field names. Prefer specific over generic terms.
+- seeds: concrete grep-able queries for the PX4 source tree — exact
+  parameter names, class or method names, uORB topic or field names
+  drawn from the question and context. Prefer specific over generic
+  terms.
 - candidate_terminals: the C++ symbols (class members or locals) that
   HOLD the quantity the question asks about, each with the source file
   expected to write it. Order by likelihood; at most three.
 
 Each terminal must be the bare variable name exactly as it appears on
-the LEFT side of its assignment in source — ``_destination.alt``,
-``_rtl_alt`` — never class-qualified (``RTL::_destination.alt``) and
-never type-qualified (``mission_item_s::altitude``).
+the LEFT side of its assignment in source — never class-qualified
+(``ClassName::member``) and never type-qualified
+(``struct_type_s::field``).
 
 Prefer the variable written at the DECISION SITE — where the questioned
-quantity is computed or adapted (``_airspeed_sp`` after adaptation) —
-over the published topic field that merely logs it; list the published
-field as a secondary candidate.
+quantity is computed or adapted — over the published topic field that
+merely logs it; list the published field as a secondary candidate.
 
 Do not use log data, do not verify anything, do not draft hypotheses.
 """,
