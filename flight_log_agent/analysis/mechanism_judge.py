@@ -242,9 +242,13 @@ async def discover_with_judge(
     run_agent: Optional[AgentRunnerFn] = None,
     context: Optional[dict[str, Any]] = None,
     max_terminals: int = 2,
+    seeds_override: Optional[DiscoverySeeds] = None,
     **discovery_kwargs: Any,
 ) -> JudgedDiscovery:
     """Seeder → deterministic fixpoint per candidate terminal → judge.
+
+    ``seeds_override`` (e.g. a Layer 4 cache hit for a previously judged
+    question) skips the seeder call entirely; the judge still runs.
 
     The judge may grant at most ONE bonus discovery round: when the
     verdict is insufficient and names ``essential_gaps``, discovery for
@@ -258,7 +262,7 @@ async def discover_with_judge(
     """
     runner = run_agent or _default_run_agent
 
-    seeds = await runner(
+    seeds = seeds_override or await runner(
         seeder_agent,
         {"question": question, "context": context or {}},
     )

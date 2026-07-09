@@ -22,6 +22,7 @@ This is intentionally a skeleton. The important part is the data flow and contex
 import asyncio
 import importlib
 import json
+import os
 import re
 import sys
 import time
@@ -113,7 +114,13 @@ from flight_log_agent.px4.source_mechanism_resolver import (
     SourceMechanismResolver,
     build_source_discovery_log_context,
 )
-from flight_log_agent.px4.msg_schema import resolve_topic_field, is_valid_topic_field
+from flight_log_agent.px4.msg_schema import (
+    load_px4_msg_schema,
+    resolve_topic_field,
+    is_valid_topic_field,
+)
+from flight_log_agent.analysis.dag_pipeline import run_dag_discovery_stage
+from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 
 from flight_log_agent.audit import (
     AgentRunAuditHooks,
@@ -338,6 +345,8 @@ async def analyze_flight_log(
     max_candidates: int = 5,
     mechanism_cache_dir: str = ".flightlog_cache/mechanisms",
     force_mechanism_refresh: bool = False,
+    dag_discovery: Optional[bool] = None,
+    dag_cache_dir: str = ".flightlog_cache",
 ) -> FlightLogReport:
     log_path_obj = Path(log_path)
     mission_path_obj = Path(mission_path) if mission_path else None
@@ -468,6 +477,83 @@ async def analyze_flight_log(
             airframe=airframe_context,
             question_intent=question_intent,
         )
+
+        # ------------------------------------------------------------
+        # Stage 4-alt (#73): DAG discovery + judge + feasibility.
+        # Behind a flag; replaces Stages 3-5 and the report agent while
+        # the legacy path below stays untouched when the flag is off.
+        # ------------------------------------------------------------
+        dag_discovery_enabled = (
+            dag_discovery
+            if dag_discovery is not None
+            else os.environ.get("FLIGHT_LOG_DAG_DISCOVERY", "").lower()
+            in {"1", "true", "yes"}
+        )
+        if dag_discovery_enabled and source_snapshot is not None:
+            schema = load_px4_msg_schema(source_snapshot)
+            dag_logged_signals = {
+                f"{topic}.{field}"
+                for topic, fields in schema.items()
+                for field in fields
+            }
+
+            async def run_dag_agent(agent: Any, payload: dict[str, Any]) -> Any:
+                return await _run_agent(
+                    audit_logger,
+                    f"dag.{agent.name}",
+                    agent,
+                    payload,
+                    ctx,
+                    max_turns=2,
+                )
+
+            dag_stage = await run_dag_discovery_stage(
+                MechanismSourceProfiler(source_snapshot),
+                Path(dag_cache_dir),
+                user_question,
+                source_snapshot.commit_sha,
+                log_path_obj,
+                inventory=inventory,
+                run_agent=run_dag_agent,
+                context={
+                    "airframe": airframe_context.model_dump(),
+                    "question_intent": question_intent.model_dump(),
+                },
+                source_root=source_snapshot.repository_path,
+                logged_signals=dag_logged_signals,
+                schema_signals=dag_logged_signals,
+            )
+            audit_logger.log_event(
+                "dag_discovery.finished",
+                output={
+                    "verdict": dag_stage.judged.verdict.model_dump(),
+                    "layer4_hit": dag_stage.layer4_hit,
+                    "render": dag_stage.render,
+                },
+            )
+
+            report = dag_stage.report
+            apply_deterministic_report_summaries(report, airframe_context, question_intent)
+            report = generate_report_plots(report, ctx, audit_logger)
+            validation = validate_report(report)
+            audit_logger.log_event("validation.finished", output=validation.model_dump())
+            if not validation.passed:
+                report = enforce_validation_downgrades(report, validation)
+                validation = validate_report(report)
+                audit_logger.log_event(
+                    "validation_after_downgrade.finished", output=validation.model_dump()
+                )
+            save_report(report, report_path)
+            audit_logger.log_event(
+                "run.finished",
+                output={
+                    "report_path": str(report_path),
+                    "validation_passed": validation.passed,
+                    "dev_log_dir": str(audit_logger.run_dir),
+                    "dag_discovery": True,
+                },
+            )
+            return report
 
         # ------------------------------------------------------------
         # Stage 3: retrieve and validate cached source mechanisms
