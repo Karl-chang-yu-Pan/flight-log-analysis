@@ -163,6 +163,7 @@ class DiscoveryVerdict(BaseModel):
     essential_gaps: list[str] = Field(default_factory=list)
     expand_calls: list[str] = Field(default_factory=list)
     next_terminals: list[TerminalCandidate] = Field(default_factory=list)
+    explaining_branches: list[str] = Field(default_factory=list)
     reasoning: str = ""
 
 
@@ -232,6 +233,12 @@ Decide from these facts only:
 When sufficient is false you MUST fill at least one of essential_gaps,
 expand_calls, or next_terminals — or leave all empty only if no further
 discovery could possibly help. One follow-up round is granted at most.
+
+When sufficient is true you MUST fill explaining_branches with the
+branch predicate string(s), copied verbatim from the rendering's
+branches, whose taking explains the questioned behavior. They are
+cross-checked against flight-data feasibility — a mechanism whose
+explaining branch never fired cannot be the answer.
 
 essential_gaps and expand_calls entries are BARE symbol or function
 names copied from unresolved_symbols / unexpanded_calls / operation

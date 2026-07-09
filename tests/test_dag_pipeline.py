@@ -54,6 +54,7 @@ def _stub_runner(calls: list[str]):
         return DiscoveryVerdict(
             sufficient=True,
             selected_terminal="_final_out",
+            explaining_branches=["_param_rtl_type.get() == 1"],
             reasoning="terminal grounded in constant and parameter gate",
         )
 
@@ -181,3 +182,55 @@ def test_insufficient_verdict_yields_unresolved_report(tmp_path):
     assert hypothesis.confidence == "unresolved"
     assert stage.report.unconfirmed == [hypothesis.title]
     assert stage.report.confirmed == []
+
+
+def _run_with_verdict(tmp_path, verdict_kwargs):
+    from flight_log_agent.analysis.mechanism_judge import (
+        DiscoverySeeds as Seeds,
+        DiscoveryVerdict as Verdict,
+        TerminalCandidate as Cand,
+        seeder_agent as seeder,
+    )
+
+    profiler = _mini_tree(tmp_path)
+
+    async def run(agent, payload):
+        if agent is seeder:
+            return Seeds(seeds=["pick_altitude"],
+                         candidate_terminals=[Cand(terminal="_final_out")])
+        return Verdict(sufficient=True, selected_terminal="_final_out",
+                       **verdict_kwargs)
+
+    return asyncio.run(
+        run_dag_discovery_stage(
+            profiler, tmp_path / "cache", "why?", "srchash",
+            Path("/nonexistent.ulg"), ulog_hash="u", run_agent=run,
+        )
+    )
+
+
+def test_sufficient_with_unmatched_branch_is_downgraded(tmp_path):
+    stage = _run_with_verdict(
+        tmp_path, {"explaining_branches": ["some_bogus_predicate > 99"]}
+    )
+    h = stage.report.ranked_hypotheses[0]
+    assert h.confidence == "low"
+    assert stage.report.confirmed == []
+    assert any("feasibility-dead" in u or "absent" in u for u in h.unresolved_evidence)
+
+
+def test_sufficient_without_named_branch_is_downgraded(tmp_path):
+    stage = _run_with_verdict(tmp_path, {})
+    h = stage.report.ranked_hypotheses[0]
+    assert h.confidence == "low"
+    assert stage.report.confirmed == []
+    assert any("without naming" in u for u in h.unresolved_evidence)
+
+
+def test_sufficient_with_live_matching_branch_stays_confirmed(tmp_path):
+    stage = _run_with_verdict(
+        tmp_path, {"explaining_branches": ["_param_rtl_type.get() == 1"]}
+    )
+    h = stage.report.ranked_hypotheses[0]
+    assert h.confidence == "medium"
+    assert stage.report.confirmed == [h.title]

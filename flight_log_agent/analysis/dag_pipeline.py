@@ -172,8 +172,51 @@ def build_report_from_dag(
                 )
             )
 
-    confidence = "medium" if verdict.sufficient else "unresolved"
+    # Cross-check the judge's claimed mechanism against flight-data
+    # feasibility: a sufficient verdict must name explaining branches,
+    # and at least one must exist in the DAG without being feasibility-
+    # dead. Otherwise the confirmation is downgraded — the mechanism may
+    # be real code, but nothing shows it fired in THIS flight.
     unresolved_evidence = list(dag.unresolved_symbols) if dag else []
+    branches_verified = False
+    if verdict.sufficient and verdict.explaining_branches and dag is not None:
+        dag_predicates = {
+            (v.predicate_raw or "", v.feasibility_verdict or "unknown")
+            for v in dag.vertices
+            if v.kind == "branch"
+        } | {
+            (v.predicate_lowered or "", v.feasibility_verdict or "unknown")
+            for v in dag.vertices
+            if v.kind == "branch"
+        }
+        for named in verdict.explaining_branches:
+            needle = " ".join(str(named).split())
+            for predicate, feasibility in dag_predicates:
+                haystack = " ".join(predicate.split())
+                if not needle or not haystack:
+                    continue
+                if (needle in haystack or haystack in needle) and feasibility != "always_false":
+                    branches_verified = True
+                    break
+            if branches_verified:
+                break
+        if not branches_verified:
+            unresolved_evidence.insert(
+                0,
+                "judge-named explaining branch(es) absent from the DAG or "
+                "feasibility-dead: " + "; ".join(verdict.explaining_branches[:3]),
+            )
+    elif verdict.sufficient:
+        unresolved_evidence.insert(
+            0, "judge confirmed the mechanism without naming an explaining branch"
+        )
+
+    if verdict.sufficient and branches_verified:
+        confidence = "medium"
+    elif verdict.sufficient:
+        confidence = "low"
+    else:
+        confidence = "unresolved"
 
     hypothesis = HypothesisReportItem(
         title=f"Mechanism slice for {verdict.selected_terminal or 'unknown terminal'}",
@@ -200,13 +243,14 @@ def build_report_from_dag(
         confidence=confidence,
     )
 
+    confirmed = verdict.sufficient and branches_verified
     return FlightLogReport(
         airframe_summary="",
         question_intent_summary=question,
         ranked_hypotheses=[hypothesis],
         excluded_mechanisms=[],
-        confirmed=[hypothesis.title] if verdict.sufficient else [],
-        unconfirmed=[] if verdict.sufficient else [hypothesis.title],
+        confirmed=[hypothesis.title] if confirmed else [],
+        unconfirmed=[] if confirmed else [hypothesis.title],
         final_summary=verdict.reasoning or "",
     )
 
