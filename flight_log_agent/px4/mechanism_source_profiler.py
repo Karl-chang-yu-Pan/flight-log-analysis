@@ -841,10 +841,24 @@ class MechanismSourceProfiler:
             aliases_per_function = self._extract_reference_aliases_per_function(definitions)
             control_predicates = self._control_predicates_by_line(text)
 
-            for line_no, line in self._iter_code_lines(text):
+            code_lines = list(self._iter_code_lines(text))
+            for index, (line_no, line) in enumerate(code_lines):
                 stripped = line.strip()
                 if not stripped or stripped.startswith("//"):
                     continue
+                if (
+                    "=" in stripped
+                    and not stripped.endswith((";", "{", "}"))
+                    and stripped.count("(") > stripped.count(")")
+                ):
+                    # RHS continues on later lines (a multi-line call
+                    # initializer) — join until parens balance so the
+                    # assignment pattern can match the full statement.
+                    for _, continuation in code_lines[index + 1 : index + 26]:
+                        line = line + " " + continuation.strip()
+                        if line.count("(") <= line.count(")"):
+                            break
+                    stripped = line.strip()
                 function_name = self._function_name_for_line(definitions, line_no)
                 func_aliases = aliases_per_function.get(function_name or "", {})
                 for match in self._SOURCE_ASSIGNMENT_PATTERN.finditer(line):
@@ -1273,7 +1287,8 @@ class MechanismSourceProfiler:
             rel_file = self._rel(path)
             var_to_struct = self._extract_struct_variables(text)
             control_predicates = self._control_predicates_by_line(text)
-            for line_no, line in self._iter_code_lines(text):
+            code_lines = list(self._iter_code_lines(text))
+            for index, (line_no, line) in enumerate(code_lines):
                 stripped = line.strip()
                 if not stripped or stripped.startswith("//"):
                     continue
@@ -1286,6 +1301,19 @@ class MechanismSourceProfiler:
                         continue
                     receiver = self._call_receiver(line, match.start())
                     args = self._call_args(line, match.end() - 1)
+                    if not args and self._matching_delimiter(
+                        line, match.end() - 1, "(", ")"
+                    ) is None:
+                        # The argument list continues on later lines; join
+                        # until it balances so multi-line calls keep args.
+                        joined = line
+                        for _, continuation in code_lines[index + 1 : index + 26]:
+                            joined += " " + continuation.strip()
+                            if self._matching_delimiter(
+                                joined, match.end() - 1, "(", ")"
+                            ) is not None:
+                                break
+                        args = self._call_args(joined, match.end() - 1)
                     argument_topics = self._argument_topics(args, var_to_struct)
                     predicates = control_predicates.get(line_no, [])
                     refs.append(

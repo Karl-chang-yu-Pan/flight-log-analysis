@@ -1916,3 +1916,54 @@ def test_file_path_boost_penalizes_camelcase_test_files(tmp_path):
     legit = profiler._file_path_boost("src/modules/navigator/latest.cpp")
     assert penalized < 0
     assert legit > 0
+
+
+def test_function_call_args_captured_across_multiple_lines(tmp_path):
+    """A statement call whose argument list spans several lines must keep
+    its arguments; single-line parsing returned [] and dropped the
+    argument dataflow entirely."""
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "fw.cpp").write_text(
+        """
+void Fw::control()
+{
+    _controller.update(first_arg,
+               second_arg + 1.0f,
+               third_arg);
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+
+    calls = profiler.extract_function_calls_from_source(["src/modules/example/fw.cpp"])
+    update = next(c for c in calls if c.name == "update")
+    assert update.receiver == "_controller"
+    assert update.args[0] == "first_arg"
+    assert "second_arg" in update.args[1]
+    assert update.args[2] == "third_arg"
+
+
+def test_assignment_captured_across_multiple_lines(tmp_path):
+    """A declaration whose call initializer spans lines must still yield
+    a source assignment with the full RHS."""
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "fw.cpp").write_text(
+        """
+void Fw::control()
+{
+    float target_speed = adapt_speed(first_arg,
+               second_arg,
+               third_arg);
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+
+    sas = profiler.extract_source_assignments_from_source(["src/modules/example/fw.cpp"])
+    hit = next(s for s in sas if s.target == "target_speed")
+    assert "adapt_speed" in hit.expression
+    assert "third_arg" in hit.expression
