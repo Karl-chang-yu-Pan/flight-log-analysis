@@ -432,3 +432,59 @@ void Rtl::pick_altitude()
 
     op_targets = {v.variable for v in result.dag.vertices if v.kind == "operation"}
     assert "_final_out" in op_targets
+
+
+def test_call_statement_argument_flow_crosses_object_boundary(tmp_path):
+    """The airspeed-residual shape: a caller local flows into a member
+    object's state only through a bare call statement's argument. The
+    synthesized formal<-actual binding lets the backward slice cross
+    caller -> callee: _speed_state <- speed_sp(formal) <- target_speed
+    <- adapt_speed() and its gating branch."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        dag_inputs_from_facts,
+        load_facts,
+    )
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/fw/fw.cpp": """
+void Fw::control()
+{
+    float target_speed = adapt_speed(base_speed);
+    _tecs.update(target_speed);
+}
+
+float Fw::adapt_speed(float base_speed)
+{
+    if (_param_gnd_min.get() > base_speed) {
+        return _param_gnd_min.get();
+    }
+    return base_speed;
+}
+""",
+        "src/lib/tecs/tecs.cpp": """
+void Tecs::update(float speed_sp)
+{
+    _speed_state = speed_sp;
+}
+""",
+    })
+    facts = load_facts(
+        profiler, tmp_path / "cache",
+        ["src/modules/fw/fw.cpp", "src/lib/tecs/tecs.cpp"], "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "_speed_state",
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+    )
+
+    op_targets = {v.variable for v in dag.vertices if v.kind == "operation"}
+    assert "_speed_state" in op_targets
+    assert "speed_sp" in op_targets, "synthesized formal<-actual hop missing"
+    assert "target_speed" in op_targets, "caller local not reached"
+    branches = [v.predicate_raw or "" for v in dag.vertices if v.kind == "branch"]
+    assert any("_param_gnd_min" in b for b in branches), \
+        "adaptation branch not reached through the argument hop"

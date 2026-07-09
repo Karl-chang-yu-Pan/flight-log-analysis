@@ -177,6 +177,7 @@ def build_mechanism_dag(
     parameter_aliases: Optional[dict[str, str]] = None,
     snippet_context_lines: int = 3,
     terminal_file: Optional[str] = None,
+    call_statements: Sequence[Any] = (),
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
 
@@ -231,6 +232,7 @@ def build_mechanism_dag(
         parameter_aliases=dict(parameter_aliases or {}),
         snippet_context_lines=snippet_context_lines,
         terminal_file=terminal_file,
+        call_statements=[_as_binding_dict(c) for c in call_statements],
     )
     return builder.build()
 
@@ -257,10 +259,12 @@ class _DAGBuilder:
         parameter_aliases: dict[str, str],
         snippet_context_lines: int,
         terminal_file: Optional[str] = None,
+        call_statements: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         self.terminal_raw = terminal
         self.terminal = normalize_symbol(terminal)
         self.terminal_file = str(terminal_file) if terminal_file else None
+        self._call_statements = list(call_statements or [])
         self.helper_index = helper_index
         self.helper_body_provider = helper_body_provider
         # Helpers already probed via the provider so a repeated call for an
@@ -390,6 +394,8 @@ class _DAGBuilder:
         constructed directly, and struct-root field expansion is folded
         into the same walk.
         """
+        self._register_call_statement_bindings()
+
         frontier: deque[tuple[str, str]] = deque([("symbol", self.terminal)])
         walked_symbols: set[str] = set()
         materialized_helpers: set[str] = set()
@@ -523,6 +529,91 @@ class _DAGBuilder:
         return dedupe_keep_order(
             source_expression_names(_normalize_cpp_expression(str(expression)))
         )
+
+    def _register_call_statement_bindings(self) -> None:
+        """Model side-effect argument flow across bare call statements.
+
+        ``obj.method(a, b);`` passes each actual into the callee's formal,
+        which the callee body reads as ordinary state — but the statement
+        is not an assignment, so no binding exists and the backward walk
+        cannot cross the argument hop (a caller local feeding a member
+        object's published field stays invisible). Synthesize one binding
+        ``formal <- actual`` per resolvable call; the callee body's own
+        assignments are ordinary source bindings already.
+
+        Only IN-SET callees are considered: an unloaded callee has no body
+        bindings to walk, so the synthesized hop would be inert — and
+        probing the provider with generic statement names (``update``)
+        drags junk definitions. When several loaded classes define the
+        name, a callee whose class context matches the receiver's struct
+        type wins; else the deterministic first match (the Milestone 2
+        receiver-typing note on :meth:`_pick_helper_key` applies here too).
+        """
+        for call in self._call_statements:
+            name = str(call.get("name") or "")
+            args = [str(a) for a in (call.get("args") or []) if str(a).strip()]
+            if not name or len(name) < 4 or not args:
+                continue
+            if is_safe_math_function_name(name):
+                continue
+            matches = [key for key in self.helper_index if key[0] == name]
+            if not matches:
+                continue
+            receiver = str(call.get("receiver") or "")
+            receiver_type = (
+                self._struct_variables.get(receiver)
+                or self._struct_variables.get(receiver.lstrip("_"))
+                if receiver
+                else None
+            )
+            # Bind only an UNAMBIGUOUS callee — a generic statement name
+            # (``update``) matched by sorted-first would spray one class's
+            # formals with every caller's actuals and fuse unrelated
+            # modules. Resolution: exact receiver struct type, then
+            # receiver↔class name affinity (member ``_tecs`` ↔ class
+            # ``TECS``, underscores/case ignored), then a unique name.
+            helper_key = None
+            if receiver_type:
+                exact = [k for k in matches if str(k[1]) == receiver_type]
+                if exact:
+                    helper_key = sorted(exact)[0]
+            if helper_key is None and receiver:
+                affinity = receiver.strip("_").replace("_", "").lower()
+                akin = [
+                    k
+                    for k in matches
+                    if str(k[1] or "").replace("_", "").lower() == affinity
+                ]
+                if akin:
+                    helper_key = sorted(akin)[0]
+            if helper_key is None and len(matches) == 1:
+                helper_key = matches[0]
+            if helper_key is None:
+                continue
+            helper = self.helper_index.get(helper_key) or {}
+            formals = [str(f) for f in (helper.get("parameters") or [])]
+            if not formals:
+                continue
+            file = str(call.get("file") or "")
+            line_raw = call.get("line")
+            line = int(line_raw) if isinstance(line_raw, (int, float)) else 0
+            predicates = list(call.get("control_predicates") or [])
+            for formal, actual in zip(formals, args):
+                formal_norm = normalize_symbol(formal)
+                if not formal_norm:
+                    continue
+                self._by_target[formal_norm].append(
+                    {
+                        "target_symbol": formal,
+                        "source_symbol": actual,
+                        "assignment_path": [
+                            {"file": file, "line": line, "expression": actual}
+                        ],
+                        "logged_signal": "",
+                        "control_predicates": predicates,
+                        "struct_variables": {},
+                    }
+                )
 
     @staticmethod
     def _binding_first_file(binding: dict[str, Any]) -> str:

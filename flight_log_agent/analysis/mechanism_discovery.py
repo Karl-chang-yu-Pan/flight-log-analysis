@@ -79,6 +79,7 @@ class DAGInputs:
     parameter_predicates: list[dict[str, Any]] = field(default_factory=list)
     parameter_aliases: dict[str, str] = field(default_factory=dict)
     parameter_names: set[str] = field(default_factory=set)
+    call_statements: list[dict[str, Any]] = field(default_factory=list)
 
 
 def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
@@ -94,6 +95,7 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
     seen_bindings: set[tuple[str, str, str, int]] = set()
     seen_helpers: set[tuple[str, str, int]] = set()
     seen_predicates: set[tuple[str, str, int]] = set()
+    seen_calls: set[tuple[str, str, str, int]] = set()
 
     for facts_entry in facts:
         entry = _as_dict(facts_entry)
@@ -134,6 +136,21 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                 continue
             seen_predicates.add(key)
             inputs.parameter_predicates.append(predicate_dict)
+
+        for call in entry.get("function_calls") or []:
+            call_dict = _as_dict(call)
+            if not call_dict.get("args"):
+                continue
+            key = (
+                str(call_dict.get("name") or ""),
+                str(call_dict.get("receiver") or ""),
+                str(call_dict.get("file") or ""),
+                int(call_dict.get("line") or 0),
+            )
+            if key in seen_calls:
+                continue
+            seen_calls.add(key)
+            inputs.call_statements.append(call_dict)
 
         for parameter in entry.get("referenced_parameters") or []:
             parameter_dict = _as_dict(parameter)
@@ -384,6 +401,7 @@ def discover_mechanism_dag(
             parameter_names=inputs.parameter_names,
             parameter_aliases=inputs.parameter_aliases,
             terminal_file=terminal_file,
+            call_statements=inputs.call_statements,
         )
 
         unresolved = set(dag.unresolved_symbols)
