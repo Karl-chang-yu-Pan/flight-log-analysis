@@ -1,6 +1,8 @@
 import math
 from types import SimpleNamespace
 
+import numpy as np
+
 import flight_log_agent.ulog.interactive_plots as ulog_interactive_plots
 
 
@@ -155,20 +157,20 @@ def test_build_interactive_plot_payload_adds_fixed_wing_body_velocity_angles(mon
     ulog = _fake_ulog(
         {
             "vehicle_status": {
-                "timestamp": [0, 1_000_000],
-                "vehicle_type": [2, 2],
+                "timestamp": np.array([0, 1_000_000]),
+                "vehicle_type": np.array([2, 2]),
             },
             "vehicle_local_position": {
-                "timestamp": [0, 1_000_000],
-                "vx": [10.0, 10.0],
-                "vy": [0.0, 0.0],
-                "vz": [1.0, 1.0],
+                "timestamp": np.array([0, 1_000_000]),
+                "vx": np.array([10.0, 10.0]),
+                "vy": np.array([0.0, 0.0]),
+                "vz": np.array([1.0, 1.0]),
             },
             "vehicle_attitude": {
-                "timestamp": [0, 1_000_000],
-                "roll": [0.0, 0.0],
-                "pitch": [0.0, 0.0],
-                "yaw": [0.0, 0.0],
+                "timestamp": np.array([0, 1_000_000]),
+                "roll": np.array([0.0, 0.0]),
+                "pitch": np.array([0.0, 0.0]),
+                "yaw": np.array([0.0, 0.0]),
             },
         }
     )
@@ -178,7 +180,7 @@ def test_build_interactive_plot_payload_adds_fixed_wing_body_velocity_angles(mon
     payload = ulog_interactive_plots.build_interactive_plot_payload("flight.ulg")
 
     plot = next(plot for plot in payload["plots"] if plot["id"] == "fixed_wing_body_velocity_angles")
-    assert [series["label"] for series in plot["series"]] == ["AoA", "Sideslip"]
+    assert [series["label"] for series in plot["series"]] == ["AoA", "Sideslip", "Total Speed"]
     assert plot["series"][0]["unit"] == "deg"
     assert math.isclose(
         plot["series"][0]["values"][0],
@@ -186,6 +188,11 @@ def test_build_interactive_plot_payload_adds_fixed_wing_body_velocity_angles(mon
         abs_tol=1e-6,
     )
     assert plot["series"][1]["values"] == [0.0, 0.0]
+    assert plot["series"][2]["unit"] == "m/s"
+    assert all(
+        math.isclose(value, math.sqrt(101.0), abs_tol=1e-6)
+        for value in plot["series"][2]["values"]
+    )
 
 
 def test_build_interactive_plot_payload_adds_multirotor_heading_velocity(monkeypatch):
@@ -216,6 +223,84 @@ def test_build_interactive_plot_payload_adds_multirotor_heading_velocity(monkeyp
     right = next(series for series in plot["series"] if series["label"] == "Right")
     assert all(math.isclose(value, 0.0, abs_tol=1e-6) for value in forward["values"])
     assert all(math.isclose(value, -1.0, abs_tol=1e-6) for value in right["values"])
+
+
+def test_build_interactive_plot_payload_masks_vtol_velocity_plots(monkeypatch):
+    ulog = _fake_ulog(
+        {
+            "vtol_vehicle_status": {
+                "timestamp": [0, 1_000_000, 2_000_000],
+                "vehicle_vtol_state": [3, 1, 2],
+            },
+            "vehicle_local_position": {
+                "timestamp": [0, 1_000_000, 2_000_000],
+                "vx": [1.0, 2.0, 3.0],
+                "vy": [0.0, 0.0, 0.0],
+                "vz": [0.0, 1.0, 1.0],
+            },
+            "vehicle_attitude": {
+                "timestamp": [0, 1_000_000, 2_000_000],
+                "roll": [0.0, 0.0, 0.0],
+                "pitch": [0.0, 0.0, 0.0],
+                "yaw": [0.0, 0.0, 0.0],
+            },
+        }
+    )
+    monkeypatch.setattr(ulog_interactive_plots, "ULog", lambda path: ulog)
+    monkeypatch.setattr(ulog_interactive_plots, "prepare_ulog_for_plotting", lambda parsed: parsed)
+
+    payload = ulog_interactive_plots.build_interactive_plot_payload("flight.ulg")
+
+    multirotor = next(plot for plot in payload["plots"] if plot["id"] == "multirotor_heading_velocity")
+    forward = next(series for series in multirotor["series"] if series["label"] == "Forward")
+    assert forward["values"] == [1.0, 2.0, 0.0]
+
+    fixed_wing = next(plot for plot in payload["plots"] if plot["id"] == "fixed_wing_body_velocity_angles")
+    aoa = next(series for series in fixed_wing["series"] if series["label"] == "AoA")
+    total_speed = next(series for series in fixed_wing["series"] if series["label"] == "Total Speed")
+    assert aoa["values"][0] == 0.0
+    assert math.isclose(aoa["values"][1], math.degrees(math.atan2(1.0, 2.0)), abs_tol=1e-6)
+    assert math.isclose(aoa["values"][2], math.degrees(math.atan2(1.0, 3.0)), abs_tol=1e-6)
+    assert total_speed["values"][0] == 0.0
+    assert math.isclose(total_speed["values"][1], math.sqrt(5.0), abs_tol=1e-6)
+    assert math.isclose(total_speed["values"][2], math.sqrt(10.0), abs_tol=1e-6)
+
+
+def test_build_interactive_plot_payload_splits_vtol_actuator_controls(monkeypatch):
+    ulog = _fake_ulog(
+        {
+            "actuator_controls_0": {
+                "timestamp": [0, 1_000_000],
+                "control[0]": [0.1, 0.2],
+                "control[1]": [0.3, 0.4],
+                "control[2]": [0.5, 0.6],
+                "control[3]": [0.7, 0.8],
+            },
+            "actuator_controls_1": {
+                "timestamp": [0, 1_000_000],
+                "control[0]": [-0.1, -0.2],
+                "control[1]": [-0.3, -0.4],
+                "control[2]": [-0.5, -0.6],
+                "control[3]": [0.9, 1.0],
+            },
+        }
+    )
+    monkeypatch.setattr(ulog_interactive_plots, "ULog", lambda path: ulog)
+    monkeypatch.setattr(ulog_interactive_plots, "prepare_ulog_for_plotting", lambda parsed: parsed)
+
+    payload = ulog_interactive_plots.build_interactive_plot_payload("flight.ulg")
+
+    controls = next(plot for plot in payload["plots"] if plot["id"] == "actuator_controls")
+    fixed_wing_controls = next(plot for plot in payload["plots"] if plot["id"] == "actuator_controls_1")
+    assert controls["title"] == "Actuator Controls"
+    assert fixed_wing_controls["title"] == "Actuator Controls 1 (VTOL in Fixed-Wing mode)"
+    assert [series["label"] for series in controls["series"]] == ["Roll", "Pitch", "Yaw", "Thrust (up)"]
+    assert [series["label"] for series in fixed_wing_controls["series"]] == [
+        "Roll",
+        "Pitch",
+        "Yaw",
+        "Thrust (forward)",
+    ]
 
 
 def test_build_interactive_plot_payload_adds_high_rate_spectrogram(monkeypatch):

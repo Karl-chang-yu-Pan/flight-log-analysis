@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_left
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 from pyulog import ULog
@@ -212,17 +212,6 @@ TIMESERIES_PLOTS = [
         ],
     },
     {
-        "id": "actuator_controls",
-        "title": "Actuator Controls",
-        "y_range": [-1.0, 1.0],
-        "series": [
-            {"label": "Torque roll", "signals": ["vehicle_torque_setpoint.xyz[0]", "actuator_controls_0.control[0]"]},
-            {"label": "Torque pitch", "signals": ["vehicle_torque_setpoint.xyz[1]", "actuator_controls_0.control[1]"]},
-            {"label": "Torque yaw", "signals": ["vehicle_torque_setpoint.xyz[2]", "actuator_controls_0.control[2]"]},
-            {"label": "Thrust", "signals": ["vehicle_thrust_setpoint.xyz[2]", "actuator_controls_0.control[3]"]},
-        ],
-    },
-    {
         "id": "motor_outputs",
         "title": "Motor Outputs",
         "y_range": [-1.0, 1.0],
@@ -416,6 +405,8 @@ def build_interactive_plot_payload(
         plot = _build_timeseries_plot(definition, ulog, start_s, end_s, overlays, max_points)
         if plot is not None:
             plots.append(plot)
+
+    plots.extend(_build_actuator_control_plots(ulog, start_s, end_s, overlays, max_points))
 
     for definition in SPECTROGRAM_PLOTS:
         plot = _build_spectrogram_plot(definition, ulog, start_s, end_s, max_points)
@@ -667,16 +658,17 @@ def _build_velocity_frame_plots(
     end_s: float,
     max_points: int,
 ) -> list[dict[str, Any]]:
-    styles = _flight_styles_present(ulog)
+    style_profile = _flight_style_profile(ulog)
+    styles = style_profile["styles"]
     plots = []
 
     if "fixed_wing" in styles:
-        plot = _build_fixed_wing_velocity_angle_plot(ulog, start_s, end_s, max_points)
+        plot = _build_fixed_wing_velocity_angle_plot(ulog, start_s, end_s, max_points, style_profile)
         if plot is not None:
             plots.append(plot)
 
     if "multirotor" in styles:
-        plot = _build_multirotor_heading_velocity_plot(ulog, start_s, end_s, max_points)
+        plot = _build_multirotor_heading_velocity_plot(ulog, start_s, end_s, max_points, style_profile)
         if plot is not None:
             plots.append(plot)
 
@@ -688,6 +680,7 @@ def _build_fixed_wing_velocity_angle_plot(
     start_s: float,
     end_s: float,
     max_points: int,
+    style_profile: dict[str, Any],
 ) -> dict[str, Any] | None:
     velocity = _raw_field_series(ulog, "vehicle_local_position", ["vx", "vy", "vz"], start_s, end_s)
     attitude = _raw_field_series(ulog, "vehicle_attitude", ["roll", "pitch", "yaw"], start_s, end_s)
@@ -697,7 +690,15 @@ def _build_fixed_wing_velocity_angle_plot(
     time_s = []
     aoa = []
     sideslip = []
+    total_speed = []
     for index, sample_time in enumerate(velocity["time_s"]):
+        if not _style_valid_at_time(style_profile, "fixed_wing", sample_time):
+            time_s.append(sample_time)
+            aoa.append(0.0)
+            sideslip.append(0.0)
+            total_speed.append(0.0)
+            continue
+
         roll = _interpolated_value(attitude["time_s"], attitude["roll"], sample_time)
         pitch = _interpolated_value(attitude["time_s"], attitude["pitch"], sample_time)
         yaw = _interpolated_value(attitude["time_s"], attitude["yaw"], sample_time)
@@ -719,11 +720,12 @@ def _build_fixed_wing_velocity_angle_plot(
         time_s.append(sample_time)
         aoa.append(math.degrees(math.atan2(down, forward)))
         sideslip.append(math.degrees(math.atan2(right, math.hypot(forward, down))))
+        total_speed.append(math.sqrt(forward * forward + right * right + down * down))
 
     if not time_s:
         return None
 
-    time_s, aoa, sideslip = _downsample_multi(time_s, [aoa, sideslip], max_points)
+    time_s, aoa, sideslip, total_speed = _downsample_multi(time_s, [aoa, sideslip, total_speed], max_points)
     return {
         "id": "fixed_wing_body_velocity_angles",
         "title": "Fixed-Wing Body Velocity Angles",
@@ -750,6 +752,16 @@ def _build_fixed_wing_velocity_angle_plot(
                 "time_s": time_s,
                 "values": sideslip,
             },
+            {
+                "key": "fixed_wing_body_velocity_angles_total_speed",
+                "label": "Total Speed",
+                "signal": "derived.vehicle_body_velocity_total_speed",
+                "unit": "m/s",
+                "axis_label": "[m/s]",
+                "color": COLORS3[2],
+                "time_s": time_s,
+                "values": total_speed,
+            },
         ],
         "overlays": [],
         "warnings": [],
@@ -761,6 +773,7 @@ def _build_multirotor_heading_velocity_plot(
     start_s: float,
     end_s: float,
     max_points: int,
+    style_profile: dict[str, Any],
 ) -> dict[str, Any] | None:
     velocity = _raw_field_series(ulog, "vehicle_local_position", ["vx", "vy"], start_s, end_s)
     attitude = _raw_field_series(ulog, "vehicle_attitude", ["yaw"], start_s, end_s)
@@ -771,6 +784,12 @@ def _build_multirotor_heading_velocity_plot(
     forward_values = []
     right_values = []
     for index, sample_time in enumerate(velocity["time_s"]):
+        if not _style_valid_at_time(style_profile, "multirotor", sample_time):
+            time_s.append(sample_time)
+            forward_values.append(0.0)
+            right_values.append(0.0)
+            continue
+
         yaw = _interpolated_value(attitude["time_s"], attitude["yaw"], sample_time)
         if yaw is None:
             continue
@@ -822,6 +841,241 @@ def _build_multirotor_heading_velocity_plot(
         "overlays": [],
         "warnings": [],
     }
+
+
+def _build_actuator_control_plots(
+    ulog: Any,
+    start_s: float,
+    end_s: float,
+    overlays: list[dict[str, Any]],
+    max_points: int,
+) -> list[dict[str, Any]]:
+    if _has_dataset(ulog, "actuator_motors") or _has_dataset(ulog, "actuator_servos"):
+        candidates = [
+            _build_dynamic_actuator_control_plot(ulog, 0, "actuator_controls", "Actuator Controls", start_s, end_s, overlays, max_points),
+            _build_dynamic_actuator_control_plot(
+                ulog,
+                1,
+                "actuator_controls_1",
+                "Actuator Controls 1 (VTOL in Fixed-Wing mode)",
+                start_s,
+                end_s,
+                overlays,
+                max_points,
+            ),
+        ]
+    else:
+        candidates = [
+            _build_legacy_actuator_control_plot(ulog, 0, "actuator_controls", "Actuator Controls", "Thrust (up)", start_s, end_s, overlays, max_points),
+            _build_legacy_actuator_control_plot(
+                ulog,
+                1,
+                "actuator_controls_1",
+                "Actuator Controls 1 (VTOL in Fixed-Wing mode)",
+                "Thrust (forward)",
+                start_s,
+                end_s,
+                overlays,
+                max_points,
+            ),
+        ]
+
+    return [plot for plot in candidates if plot is not None]
+
+
+def _build_legacy_actuator_control_plot(
+    ulog: Any,
+    instance: int,
+    plot_id: str,
+    title: str,
+    thrust_label: str,
+    start_s: float,
+    end_s: float,
+    overlays: list[dict[str, Any]],
+    max_points: int,
+) -> dict[str, Any] | None:
+    dataset = _find_dataset(ulog, f"actuator_controls_{instance}")
+    series_defs = [
+        ("control[0]", "Roll", COLORS8[0], None),
+        ("control[1]", "Pitch", COLORS8[1], None),
+        ("control[2]", "Yaw", COLORS8[2], None),
+        ("control[3]", thrust_label, COLORS8[3], None),
+    ]
+    return _build_actuator_control_plot_from_dataset(
+        dataset,
+        plot_id,
+        title,
+        series_defs,
+        start_s,
+        end_s,
+        overlays,
+        max_points,
+    )
+
+
+def _build_dynamic_actuator_control_plot(
+    ulog: Any,
+    instance: int,
+    plot_id: str,
+    title: str,
+    start_s: float,
+    end_s: float,
+    overlays: list[dict[str, Any]],
+    max_points: int,
+) -> dict[str, Any] | None:
+    torque_dataset = _find_dataset(ulog, "vehicle_torque_setpoint", instance)
+    thrust_dataset = _find_dataset(ulog, "vehicle_thrust_setpoint", instance)
+    if thrust_dataset is None and instance != 0:
+        thrust_dataset = _find_dataset(ulog, "vehicle_thrust_setpoint", 0)
+
+    series = []
+    for field_name, label, color in (
+        ("xyz[0]", "Roll", COLORS8[0]),
+        ("xyz[1]", "Pitch", COLORS8[1]),
+        ("xyz[2]", "Yaw", COLORS8[2]),
+    ):
+        item = _dataset_field_series(
+            torque_dataset,
+            field_name,
+            f"{plot_id}_{_series_key_suffix(label)}",
+            label,
+            color,
+            start_s,
+            end_s,
+            max_points,
+        )
+        if item is not None:
+            series.append(item)
+
+    thrust_defs = [("xyz[0]", "Thrust (forward)", COLORS8[4], None)]
+    if instance == 0:
+        thrust_defs.insert(0, ("xyz[2]", "Thrust (up)", COLORS8[3], lambda value: -value))
+
+    for field_name, label, color, transform in thrust_defs:
+        item = _dataset_field_series(
+            thrust_dataset,
+            field_name,
+            f"{plot_id}_{_series_key_suffix(label)}",
+            label,
+            color,
+            start_s,
+            end_s,
+            max_points,
+            transform=transform,
+        )
+        if item is not None:
+            series.append(item)
+
+    return _actuator_control_plot_payload(plot_id, title, series, overlays)
+
+
+def _build_actuator_control_plot_from_dataset(
+    dataset: Any,
+    plot_id: str,
+    title: str,
+    series_defs: list[tuple[str, str, str, Any]],
+    start_s: float,
+    end_s: float,
+    overlays: list[dict[str, Any]],
+    max_points: int,
+) -> dict[str, Any] | None:
+    series = []
+    for field_name, label, color, transform in series_defs:
+        item = _dataset_field_series(
+            dataset,
+            field_name,
+            f"{plot_id}_{_series_key_suffix(label)}",
+            label,
+            color,
+            start_s,
+            end_s,
+            max_points,
+            transform=transform,
+        )
+        if item is not None:
+            series.append(item)
+    return _actuator_control_plot_payload(plot_id, title, series, overlays)
+
+
+def _actuator_control_plot_payload(
+    plot_id: str,
+    title: str,
+    series: list[dict[str, Any]],
+    overlays: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not series:
+        return None
+    return {
+        "id": plot_id,
+        "title": title,
+        "kind": "timeseries",
+        "time_range_s": _series_time_range(series),
+        "y_range": [-1.0, 1.0],
+        "series": series,
+        "overlays": overlays,
+        "warnings": [],
+    }
+
+
+def _dataset_field_series(
+    dataset: Any,
+    field_name: str,
+    key: str,
+    label: str,
+    color: str,
+    start_s: float,
+    end_s: float,
+    max_points: int,
+    *,
+    transform: Any = None,
+) -> dict[str, Any] | None:
+    if dataset is None:
+        return None
+    data = getattr(dataset, "data", {}) or {}
+    timestamps = data.get("timestamp")
+    values = data.get(field_name)
+    if timestamps is None or values is None:
+        return None
+
+    time_s = []
+    series_values = []
+    for timestamp, value in zip(timestamps, values):
+        try:
+            sample_time = _timestamp_to_seconds(timestamp)
+            sample_value = float(_json_safe_value(value))
+        except (TypeError, ValueError):
+            continue
+        if sample_time < start_s or sample_time > end_s or not math.isfinite(sample_value):
+            continue
+        if transform is not None:
+            sample_value = transform(sample_value)
+        time_s.append(sample_time)
+        series_values.append(sample_value)
+
+    if not time_s:
+        return None
+    time_s, series_values = _downsample_pair(time_s, series_values, max_points)
+    return {
+        "key": key,
+        "label": label,
+        "signal": f"{getattr(dataset, 'name', '')}.{field_name}",
+        "unit": None,
+        "axis_label": None,
+        "color": color,
+        "time_s": time_s,
+        "values": series_values,
+    }
+
+
+def _series_time_range(series: list[dict[str, Any]]) -> list[float]:
+    times = [time for item in series for time in item.get("time_s", [])]
+    if not times:
+        return [0.0, 0.0]
+    return [_round_float(min(times)), _round_float(max(times))]
+
+
+def _series_key_suffix(label: str) -> str:
+    return "".join(char.lower() if char.isalnum() else "_" for char in label).strip("_")
 
 
 def _build_spectrogram_plot(
@@ -975,8 +1229,9 @@ def _raw_field_series(
     field_names: list[str],
     start_s: float,
     end_s: float,
+    topic_instance: int = 0,
 ) -> dict[str, list[float]] | None:
-    dataset = _find_dataset(ulog, topic_name)
+    dataset = _find_dataset(ulog, topic_name, topic_instance)
     if dataset is None:
         return None
 
@@ -1023,6 +1278,143 @@ def _raw_field_series(
     return result if result["time_s"] else None
 
 
+def _flight_style_profile(ulog: Any) -> dict[str, Any]:
+    states = _flight_style_states(ulog)
+    styles = _flight_styles_present(ulog)
+    for _, state in states:
+        if state == "transition":
+            styles.update({"fixed_wing", "multirotor"})
+        elif state in {"fixed_wing", "multirotor"}:
+            styles.add(state)
+    return {
+        "styles": styles,
+        "states": states,
+    }
+
+
+def _style_valid_at_time(profile: dict[str, Any], style: str, sample_time: float) -> bool:
+    states = profile.get("states") or []
+    if not states:
+        return style in (profile.get("styles") or set())
+
+    state = _state_at_time(states, sample_time)
+    if state == "transition":
+        return style in {"fixed_wing", "multirotor"}
+    return state == style
+
+
+def _state_at_time(states: list[tuple[float, str]], sample_time: float) -> str | None:
+    if not states:
+        return None
+    current = states[0][1]
+    for state_time, state in states:
+        if sample_time < state_time:
+            break
+        current = state
+    return current
+
+
+def _flight_style_states(ulog: Any) -> list[tuple[float, str]]:
+    vtol_status = _find_dataset(ulog, "vtol_vehicle_status")
+    if vtol_status is not None:
+        data = getattr(vtol_status, "data", {}) or {}
+        states = _states_from_field(data, "vehicle_vtol_state", _style_from_vtol_state)
+        if states:
+            return states
+
+    vehicle_status = _find_dataset(ulog, "vehicle_status")
+    if vehicle_status is None:
+        return []
+    data = getattr(vehicle_status, "data", {}) or {}
+    timestamps = data.get("timestamp")
+    if timestamps is None:
+        return []
+
+    transition_values = data.get("in_transition_mode")
+    vehicle_type_values = data.get("vehicle_type")
+    rotary_values = data.get("is_rotary_wing")
+    states = []
+    for index, timestamp in enumerate(timestamps):
+        try:
+            sample_time = _timestamp_to_seconds(timestamp)
+        except (TypeError, ValueError):
+            continue
+
+        transition = _indexed_truthy(transition_values, index)
+        if transition:
+            state = "transition"
+        elif vehicle_type_values is not None:
+            state = _style_from_vehicle_type(_indexed_value(vehicle_type_values, index))
+        elif rotary_values is not None:
+            state = "multirotor" if _indexed_truthy(rotary_values, index) else "fixed_wing"
+        else:
+            state = None
+        if state is not None and (not states or states[-1][1] != state):
+            states.append((sample_time, state))
+    return states
+
+
+def _states_from_field(data: dict[str, Any], field_name: str, mapper: Any) -> list[tuple[float, str]]:
+    timestamps = data.get("timestamp")
+    values = data.get(field_name)
+    if timestamps is None or values is None:
+        return []
+    states = []
+    for timestamp, value in zip(timestamps, values):
+        state = mapper(value)
+        if state is None:
+            continue
+        try:
+            sample_time = _timestamp_to_seconds(timestamp)
+        except (TypeError, ValueError):
+            continue
+        if not states or states[-1][1] != state:
+            states.append((sample_time, state))
+    return states
+
+
+def _style_from_vtol_state(value: Any) -> str | None:
+    parsed = _safe_int(value)
+    if parsed == 1:
+        return "transition"
+    if parsed in {2, 4}:
+        return "fixed_wing"
+    if parsed == 3:
+        return "multirotor"
+    return None
+
+
+def _style_from_vehicle_type(value: Any) -> str | None:
+    parsed = _safe_int(value)
+    if parsed == 1:
+        return "multirotor"
+    if parsed == 2:
+        return "fixed_wing"
+    return None
+
+
+def _indexed_truthy(values: Any, index: int) -> bool:
+    value = _indexed_value(values, index)
+    if value is None:
+        return False
+    safe_value = _json_safe_value(value)
+    if isinstance(safe_value, bool):
+        return safe_value
+    try:
+        return float(safe_value) != 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _indexed_value(values: Any, index: int) -> Any:
+    if values is None:
+        return None
+    try:
+        return values[index]
+    except (TypeError, IndexError):
+        return None
+
+
 def _flight_styles_present(ulog: Any) -> set[str]:
     styles: set[str] = set()
 
@@ -1036,23 +1428,32 @@ def _flight_styles_present(ulog: Any) -> set[str]:
 
     vehicle_status = _find_dataset(ulog, "vehicle_status")
     if vehicle_status is not None:
-        for value in (getattr(vehicle_status, "data", {}) or {}).get("vehicle_type", []) or []:
-            parsed = _safe_int(value)
-            if parsed == 1:
-                styles.add("multirotor")
-            elif parsed == 2:
-                styles.add("fixed_wing")
+        data = getattr(vehicle_status, "data", {}) or {}
+        for value in _iter_field_values(data, "vehicle_type"):
+            style = _style_from_vehicle_type(value)
+            if style is not None:
+                styles.add(style)
 
     vtol_status = _find_dataset(ulog, "vtol_vehicle_status")
     if vtol_status is not None:
-        for value in (getattr(vtol_status, "data", {}) or {}).get("vehicle_vtol_state", []) or []:
-            parsed = _safe_int(value)
-            if parsed == 3:
-                styles.add("multirotor")
-            elif parsed in {2, 4}:
-                styles.add("fixed_wing")
+        data = getattr(vtol_status, "data", {}) or {}
+        for value in _iter_field_values(data, "vehicle_vtol_state"):
+            style = _style_from_vtol_state(value)
+            if style == "transition":
+                styles.update({"fixed_wing", "multirotor"})
+            elif style is not None:
+                styles.add(style)
 
     return styles
+
+
+def _iter_field_values(data: Any, field_name: str) -> Iterable[Any]:
+    if not isinstance(data, dict):
+        return ()
+    values = data.get(field_name)
+    if values is None:
+        return ()
+    return values
 
 
 def _field_has_truthy_value(values: Any) -> bool:
@@ -1438,17 +1839,41 @@ def _series_key(plot_id: str, label: str) -> str:
     return f"{plot_id}_{normalized.strip('_')}"
 
 
-def _find_dataset(ulog: Any, topic_name: str) -> Any:
-    try:
-        return getattr(ulog, "get_dataset")(topic_name)
-    except Exception:
-        pass
+def _has_dataset(ulog: Any, topic_name: str, topic_instance: int = 0) -> bool:
+    return _find_dataset(ulog, topic_name, topic_instance) is not None
+
+
+def _find_dataset(ulog: Any, topic_name: str, topic_instance: int = 0) -> Any:
+    get_dataset = getattr(ulog, "get_dataset", None)
+    if get_dataset is not None:
+        if topic_instance != 0:
+            try:
+                dataset = get_dataset(topic_name, topic_instance)
+                if _dataset_matches_instance(dataset, topic_instance):
+                    return dataset
+            except TypeError:
+                pass
+            except Exception:
+                pass
+        else:
+            try:
+                dataset = get_dataset(topic_name)
+                if _dataset_matches_instance(dataset, topic_instance):
+                    return dataset
+            except Exception:
+                pass
 
     for dataset in getattr(ulog, "data_list", []) or []:
-        if getattr(dataset, "name", None) == topic_name:
+        if getattr(dataset, "name", None) == topic_name and _dataset_matches_instance(dataset, topic_instance):
             return dataset
 
     return None
+
+
+def _dataset_matches_instance(dataset: Any, topic_instance: int) -> bool:
+    if dataset is None:
+        return False
+    return _safe_int(getattr(dataset, "multi_id", 0)) == topic_instance
 
 
 def _lat_lon_alt_deg(ulog: Any, dataset: Any) -> tuple[Any, Any, Any]:
