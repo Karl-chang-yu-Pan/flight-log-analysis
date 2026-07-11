@@ -227,12 +227,22 @@ def build_report_from_dag(
             if v.kind == "branch"
         }
         for named in verdict.explaining_branches:
+            # The judge copies entries from the rendering verbatim — strip
+            # the trailing feasibility tag and the truncation ellipsis so
+            # long predicates still match (prefix containment).
             needle = " ".join(str(named).split())
+            needle = re.sub(r"\s*\[[a-z_]+\]\s*$", "", needle).rstrip("… ").strip()
             for predicate, feasibility in dag_predicates:
                 haystack = " ".join(predicate.split())
                 if not needle or not haystack:
                     continue
-                if (needle in haystack or haystack in needle) and feasibility != "always_false":
+                if feasibility == "always_false":
+                    continue
+                if (
+                    needle in haystack
+                    or haystack in needle
+                    or haystack.startswith(needle)
+                ):
                     branches_verified = True
                     break
             if branches_verified:

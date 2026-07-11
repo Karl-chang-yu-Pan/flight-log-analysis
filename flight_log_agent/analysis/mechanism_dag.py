@@ -711,7 +711,10 @@ class _DAGBuilder:
         scope_file, scope_function = scope
         if scope_file and target_writers:
             root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
-            if root.startswith("_"):
+            # PX4 marks members with a LEADING underscore in modules and a
+            # TRAILING one in libraries (``airspeed_ref_``) — both are
+            # class members, visible across the class file family.
+            if root.startswith("_") or root.endswith("_"):
                 family = self._file_family(scope_file)
                 same_family = [
                     b

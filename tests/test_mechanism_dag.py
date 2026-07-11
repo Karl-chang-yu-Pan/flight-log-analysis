@@ -1746,3 +1746,24 @@ def test_member_symbols_prefer_family_writers():
     gain_files = {v.file for v in dag.vertices
                   if v.kind == "operation" and v.variable == "_gain"}
     assert gain_files == {"src/modules/a/a.hpp"}
+
+
+def test_trailing_underscore_members_resolve_across_class_files():
+    """PX4 library classes mark members with a TRAILING underscore
+    (``airspeed_ref_``); a consumer in the class header must reach
+    writers in the class cpp — member family rule, not local rule."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out", expression="getRef()",
+                      file="src/lib/npfg/npfg.hpp", line=1, function="Npfg::getRef"),
+        _fake_binding(binding_id="r", target="ref_out", expression="airspeed_ref_",
+                      file="src/lib/npfg/npfg.hpp", line=2, function="Npfg::getRef",
+                      logged_signal=""),
+        _fake_binding(binding_id="w", target="airspeed_ref_", expression="wind_speed + margin",
+                      file="src/lib/npfg/npfg.cpp", line=3, function="Npfg::guide",
+                      logged_signal=""),
+    ]
+    dag = build_mechanism_dag(bindings, "ref_out",
+                              terminal_file="src/lib/npfg/npfg.hpp")
+
+    ops = {v.variable for v in dag.vertices if v.kind == "operation"}
+    assert "airspeed_ref_" in ops

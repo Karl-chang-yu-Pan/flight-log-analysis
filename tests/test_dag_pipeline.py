@@ -254,3 +254,15 @@ def test_layer4_path_includes_seeder_fingerprint_and_prunes_stale(tmp_path):
         )
     )
     assert not stale.exists()
+
+
+def test_explaining_branch_matches_despite_render_suffix_and_truncation(tmp_path):
+    """The judge copies branch entries verbatim from the rendering,
+    including the trailing feasibility tag and truncation ellipsis."""
+    stage = _run_with_verdict(
+        tmp_path,
+        {"explaining_branches": ["_param_rtl_type.get() ==… [unknown]"]},
+    )
+    h = stage.report.ranked_hypotheses[0]
+    assert h.confidence == "medium"
+    assert stage.report.confirmed == [h.title]
