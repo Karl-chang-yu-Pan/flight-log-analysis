@@ -53,6 +53,7 @@ def _capped(items: list[Any], cap: int) -> list[Any]:
 def render_discovery_compact(
     result: DiscoveryResult,
     *,
+    dag: Optional[Any] = None,
     max_operations: int = 60,
     max_branches: int = 25,
     max_evidence: int = 30,
@@ -63,8 +64,11 @@ def render_discovery_compact(
     Operations render as ``target <- expression @ file:line``; evidence
     groups by kind; the per-round trace shows how the fixpoint converged
     so the judge can see whether gaps were shrinking or churning.
+    ``dag`` (optional) substitutes a feasibility-annotated graph for
+    ``result.dag`` — branches then carry flight-data verdicts and active
+    windows.
     """
-    dag = result.dag
+    dag = dag if dag is not None else result.dag
     operations: list[str] = []
     branches: list[str] = []
     helper_returns: list[str] = []
@@ -85,9 +89,12 @@ def render_discovery_compact(
             operations.append(entry)
         elif vertex.kind == "branch":
             predicate = vertex.predicate_lowered or vertex.predicate_raw or ""
-            branches.append(
-                f"{_truncate(predicate)} [{vertex.feasibility_verdict or 'unknown'}]"
-            )
+            tag = vertex.feasibility_verdict or "unknown"
+            if vertex.active_windows:
+                first = vertex.active_windows[0][0]
+                last = vertex.active_windows[-1][1]
+                tag += f"; active {len(vertex.active_windows)}w {first:.1f}-{last:.1f}s"
+            branches.append(f"{_truncate(predicate)} [{tag}]")
         elif vertex.kind == "evidence":
             kind = str(vertex.sub_kind or "other")
             label = str(vertex.signal_name or "")
@@ -234,6 +241,13 @@ When sufficient is false you MUST fill at least one of essential_gaps,
 expand_calls, or next_terminals — or leave all empty only if no further
 discovery could possibly help. One follow-up round is granted at most.
 
+Branch entries end with a flight-data feasibility tag: [always_false]
+means the predicate never held in THIS flight — treat that path as
+inactive and do NOT demand its grounding; [always_true] held
+throughout; "active Nw A-Bs" lists when it held. For questions about
+behavior that occurs only sometimes, prefer the branch whose active
+windows can explain WHEN it occurred.
+
 When sufficient is true you MUST fill explaining_branches with the
 branch predicate string(s), copied verbatim from the rendering's
 branches, whose taking explains the questioned behavior. They are
@@ -279,6 +293,7 @@ class JudgedDiscovery:
     verdict: DiscoveryVerdict
     results: dict[str, DiscoveryResult] = field(default_factory=dict)
     selected: Optional[DiscoveryResult] = None
+    selected_annotated: Optional[Any] = None
     bonus_round_used: bool = False
 
 
@@ -292,12 +307,21 @@ async def discover_with_judge(
     context: Optional[dict[str, Any]] = None,
     max_terminals: int = 2,
     seeds_override: Optional[DiscoverySeeds] = None,
+    annotate: Optional[Callable[[DiscoveryResult], Any]] = None,
     **discovery_kwargs: Any,
 ) -> JudgedDiscovery:
     """Seeder → deterministic fixpoint per candidate terminal → judge.
 
     ``seeds_override`` (e.g. a Layer 4 cache hit for a previously judged
     question) skips the seeder call entirely; the judge still runs.
+
+    ``annotate`` (optional) maps a DiscoveryResult to a feasibility-
+    annotated DAG; when given, the judge sees annotated renders (branch
+    verdicts + active windows) so it can dismiss paths dead in THIS
+    flight instead of demanding their static grounding. After a bonus
+    round the improved DAG is re-annotated and judged ONCE more — the
+    verdict is never left stale relative to the graph it describes.
+    Worst case: seeder + judge + bonus re-judge = 3 LLM calls.
 
     The judge may grant at most ONE bonus discovery round: when the
     verdict is insufficient and names ``essential_gaps``, discovery for
@@ -338,12 +362,20 @@ async def discover_with_judge(
         if result.dag is not None and result.dag.vertices
     }
     judged_candidates = non_empty or results
+
+    annotated_by_terminal: dict[str, Any] = {}
+
+    def _render(terminal: str, result: DiscoveryResult) -> dict[str, Any]:
+        annotated = annotate(result) if annotate is not None else None
+        annotated_by_terminal[terminal] = annotated
+        return render_discovery_compact(result, dag=annotated)
+
     verdict = await runner(
         judge_agent,
         {
             "question": question,
             "candidates": {
-                terminal: render_discovery_compact(result)
+                terminal: _render(terminal, result)
                 for terminal, result in judged_candidates.items()
             },
             "empty_candidates": sorted(set(results) - set(judged_candidates)),
@@ -397,11 +429,26 @@ async def discover_with_judge(
             )
             results[bonus_terminal] = selected
             bonus_round_used = True
+            # Re-judge ONCE over the improved graph — otherwise the
+            # verdict (and the report built from it) describes the
+            # pre-bonus DAG. The re-judge's own steering fields are not
+            # acted on; one follow-up round is the hard cap.
+            verdict = await runner(
+                judge_agent,
+                {
+                    "question": question,
+                    "candidates": {bonus_terminal: _render(bonus_terminal, selected)},
+                    "empty_candidates": [],
+                    "note": "post-follow-up render; no further discovery rounds remain",
+                },
+            )
 
+    selected_annotated = annotated_by_terminal.get(verdict.selected_terminal)
     return JudgedDiscovery(
         seeds=seeds,
         verdict=verdict,
         results=results,
-        selected=selected,
+        selected=results.get(verdict.selected_terminal, selected),
+        selected_annotated=selected_annotated,
         bonus_round_used=bonus_round_used,
     )

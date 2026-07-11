@@ -231,7 +231,7 @@ def build_report_from_dag(
             # the trailing feasibility tag and the truncation ellipsis so
             # long predicates still match (prefix containment).
             needle = " ".join(str(named).split())
-            needle = re.sub(r"\s*\[[a-z_]+\]\s*$", "", needle).rstrip("… ").strip()
+            needle = re.sub(r"\s*\[[^\]]*\]\s*$", "", needle).rstrip("… ").strip()
             for predicate, feasibility in dag_predicates:
                 haystack = " ".join(predicate.split())
                 if not needle or not haystack:
@@ -327,6 +327,16 @@ async def run_dag_discovery_stage(
 
     parameter_values = dict((inventory or {}).get("parameters") or {})
 
+    def annotate(result: DiscoveryResult) -> Optional[MechanismDAG]:
+        if result.dag is None:
+            return None
+        samples = _signal_samples_for_dag(result.dag, log_path)
+        return evaluate_feasibility(
+            result.dag,
+            parameter_values=parameter_values,
+            signal_samples=samples,
+        )
+
     judged = await discover_with_judge(
         profiler,
         cache_root,
@@ -335,24 +345,21 @@ async def run_dag_discovery_stage(
         run_agent=run_agent,
         context=context,
         seeds_override=cached_seeds,
+        annotate=annotate,
         parameter_values=parameter_values,
         inventory=inventory,
         **discovery_kwargs,
     )
 
-    annotated: Optional[MechanismDAG] = None
+    annotated: Optional[MechanismDAG] = judged.selected_annotated
     selected: Optional[DiscoveryResult] = judged.selected
     if selected is not None and selected.dag is not None:
         terminal = selected.dag.terminal
         write_dag_to_cache(
             selected.dag, layer2_cache_path(cache_root, source_hash, terminal)
         )
-        samples = _signal_samples_for_dag(selected.dag, log_path)
-        annotated = evaluate_feasibility(
-            selected.dag,
-            parameter_values=parameter_values,
-            signal_samples=samples,
-        )
+        if annotated is None:
+            annotated = annotate(selected)
         if ulog_hash is None:
             stat = log_path.stat()
             ulog_hash = hashlib.sha256(

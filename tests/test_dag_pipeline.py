@@ -266,3 +266,13 @@ def test_explaining_branch_matches_despite_render_suffix_and_truncation(tmp_path
     h = stage.report.ranked_hypotheses[0]
     assert h.confidence == "medium"
     assert stage.report.confirmed == [h.title]
+
+
+def test_explaining_branch_matches_despite_windowed_tag(tmp_path):
+    stage = _run_with_verdict(
+        tmp_path,
+        {"explaining_branches": ["_param_rtl_type.get() == 1 [unknown; active 2w 1.0-2.0s]"]},
+    )
+    h = stage.report.ranked_hypotheses[0]
+    assert h.confidence == "medium"
+    assert stage.report.confirmed == [h.title]

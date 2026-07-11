@@ -179,8 +179,10 @@ void Fw::run()
 
 def test_judge_next_terminals_reterminal_bonus_round(tmp_path):
     """An insufficient verdict naming next_terminals re-slices ONCE from
-    the judge-proposed decision-site variable."""
+    the judge-proposed decision-site variable; the re-judge then rules
+    on the new terminal's graph."""
     profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
+    judge_calls: list[dict] = []
 
     async def stub_runner(agent, payload):
         if agent is seeder_agent:
@@ -188,11 +190,14 @@ def test_judge_next_terminals_reterminal_bonus_round(tmp_path):
                 seeds=["pick_altitude"],
                 candidate_terminals=[TerminalCandidate(terminal="_final_out")],
             )
-        return DiscoveryVerdict(
-            sufficient=False,
-            selected_terminal="_final_out",
-            next_terminals=[TerminalCandidate(terminal="_dest_val")],
-        )
+        judge_calls.append(payload)
+        if len(judge_calls) == 1:
+            return DiscoveryVerdict(
+                sufficient=False,
+                selected_terminal="_final_out",
+                next_terminals=[TerminalCandidate(terminal="_dest_val")],
+            )
+        return DiscoveryVerdict(sufficient=True, selected_terminal="_dest_val")
 
     judged = asyncio.run(
         discover_with_judge(
@@ -268,3 +273,80 @@ def test_prose_gap_entries_are_dropped_from_bonus_seeds(tmp_path):
         v.variable for v in judged.selected.dag.vertices if v.kind == "operation"
     }
     assert "_dest_val" in op_targets
+
+
+def test_judge_sees_annotated_render_and_selected_annotated_returned(tmp_path):
+    profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
+    payloads: list[dict] = []
+    annotated_dags: list = []
+
+    def fake_annotate(result):
+        vertices = [
+            v.model_copy(update={"feasibility_verdict": "always_true",
+                                 "active_windows": [(10.0, 50.0)]})
+            if v.kind == "branch" else v
+            for v in result.dag.vertices
+        ]
+        annotated = result.dag.model_copy(update={"vertices": vertices})
+        annotated_dags.append(annotated)
+        return annotated
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            return DiscoverySeeds(
+                seeds=["pick_altitude"],
+                candidate_terminals=[TerminalCandidate(terminal="_final_out")],
+            )
+        payloads.append(payload)
+        return DiscoveryVerdict(sufficient=True, selected_terminal="_final_out")
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler, tmp_path / "cache", "why?", "hash",
+            run_agent=stub_runner, logged_signals={"gspeed"},
+            annotate=fake_annotate,
+        )
+    )
+
+    branches = payloads[0]["candidates"]["_final_out"]["branches"]
+    assert any("always_true; active 1w 10.0-50.0s" in b for b in branches)
+    assert judged.selected_annotated is annotated_dags[-1]
+
+
+def test_bonus_round_triggers_single_rejudge(tmp_path):
+    """After the bonus round the improved graph is judged once more; the
+    re-judge's own steering is not acted on (hard cap of one round)."""
+    profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
+    judge_calls: list[dict] = []
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            return DiscoverySeeds(
+                seeds=["pick_altitude"],
+                candidate_terminals=[TerminalCandidate(terminal="_final_out")],
+            )
+        judge_calls.append(payload)
+        if len(judge_calls) == 1:
+            return DiscoveryVerdict(
+                sufficient=False, selected_terminal="_final_out",
+                essential_gaps=["_dest_val"],
+            )
+        return DiscoveryVerdict(
+            sufficient=False, selected_terminal="_final_out",
+            essential_gaps=["_never_acted_on"],
+        )
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler, tmp_path / "cache", "why?", "hash",
+            run_agent=stub_runner, logged_signals={"gspeed"},
+            max_rounds=1,
+        )
+    )
+
+    assert len(judge_calls) == 2
+    assert judged.bonus_round_used is True
+    op_targets = {v.variable for v in judged.selected.dag.vertices
+                  if v.kind == "operation"}
+    assert "_dest_val" in op_targets
+    assert judged.verdict.essential_gaps == ["_never_acted_on"]
