@@ -1967,3 +1967,24 @@ void Fw::control()
     hit = next(s for s in sas if s.target == "target_speed")
     assert "adapt_speed" in hit.expression
     assert "third_arg" in hit.expression
+
+
+def test_constructor_style_initialization_extracted_as_assignment(tmp_path):
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "wv.cpp").write_text(
+        """
+void Wv::run()
+{
+    matrix::Vector3f body_z_sp(matrix::Quatf(att_sp.q_d).dcm_z());
+    _roll_sp = -asinf(body_z_sp(1));
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+
+    sas = profiler.extract_source_assignments_from_source(["src/modules/example/wv.cpp"])
+    hit = next((s for s in sas if s.target == "body_z_sp"), None)
+    assert hit is not None
+    assert "q_d" in hit.expression

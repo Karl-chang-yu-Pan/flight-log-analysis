@@ -861,6 +861,34 @@ class MechanismSourceProfiler:
                     stripped = line.strip()
                 function_name = self._function_name_for_line(definitions, line_no)
                 func_aliases = aliases_per_function.get(function_name or "", {})
+                # Constructor-style initialization ``Type name(expr);``
+                # inside a function body is an assignment the ``=`` pattern
+                # misses (the declaration form loses e.g. quaternion
+                # inputs entirely).
+                if function_name:
+                    ctor = re.match(
+                        r"^\s*(?:[A-Za-z_][\w:]*(?:<[^<>]*>)?)\s+"
+                        r"(?P<target>[A-Za-z_]\w*)\s*\((?P<expr>[^;={}]+)\)\s*;\s*$",
+                        line,
+                    )
+                    if ctor and not self._FUNCTION_SIGNATURE_PATTERN.search(
+                        " ".join(line.split())
+                    ):
+                        refs.append(
+                            SourceAssignmentRef(
+                                target=ctor.group("target"),
+                                expression=self._normalize_source_expression(
+                                    ctor.group("expr")
+                                ),
+                                function=function_name,
+                                assignment_operator="=",
+                                file=rel_file,
+                                line=line_no,
+                                evidence=stripped,
+                                control_predicates=control_predicates.get(line_no, []),
+                                struct_variables=dict(var_to_struct),
+                            )
+                        )
                 for match in self._SOURCE_ASSIGNMENT_PATTERN.finditer(line):
                     target = self._clean_field_path(match.group("target"))
                     target = self._apply_reference_alias(target, func_aliases)

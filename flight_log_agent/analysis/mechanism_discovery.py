@@ -215,9 +215,16 @@ def _definition_queries(symbol: str) -> list[str]:
     tree and only burns the round's file budget).
     """
     root = symbol.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
-    if len(root) < 4:
-        return []
-    return [f"{root} ="]
+    queries: list[str] = []
+    if len(root) >= 4:
+        queries.append(f"{root} =")
+    if "." in symbol or "->" in symbol:
+        # Accessor gap (``_obj.getThing``): the definition lives under the
+        # METHOD name, not the receiver — ``root =`` greps the wrong thing.
+        tail = symbol.replace("->", ".").rsplit(".", 1)[-1].strip().strip("()")
+        if len(tail) >= 4:
+            queries.append(f"{tail}(")
+    return queries
 
 
 def _gap_definition_files(
