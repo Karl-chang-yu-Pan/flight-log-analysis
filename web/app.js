@@ -5,6 +5,11 @@ const state = {
   plotLoadToken: 0,
   plotTrackers: {},
   sharedPlotTracker: null,
+  pendingPlotTracker: null,
+  plotTrackerFrame: null,
+  plotScrollFrame: null,
+  plotResizeTimer: null,
+  plotRenderMetrics: {},
   hiddenPlotSeries: {},
   analysisRunId: null,
   analysisPollTimer: null,
@@ -28,6 +33,7 @@ const els = {
   plotSidebar: document.getElementById("plotSidebar"),
   plotSidebarToggle: document.getElementById("plotSidebarToggle"),
   plotSidebarStatus: document.getElementById("plotSidebarStatus"),
+  plotNavigationMenu: document.getElementById("plotNavigationMenu"),
   plotNavigation: document.getElementById("plotNavigation"),
   plotRows: document.getElementById("plotRows"),
   factGrid: document.getElementById("factGrid"),
@@ -81,6 +87,22 @@ els.logTagList.addEventListener("click", (event) => {
   if (!button) return;
   removeCurrentLogTag(button.dataset.removeLogTag);
 });
+els.plotNavigation.addEventListener("click", (event) => {
+  const link = event.target.closest("a[data-plot-target]");
+  if (!link) return;
+  event.preventDefault();
+  const plot = document.getElementById(link.dataset.plotTarget);
+  if (plot) plot.scrollIntoView({ block: "start" });
+  els.plotNavigationMenu.removeAttribute("open");
+});
+els.plotSidebar.addEventListener("scroll", scheduleVisiblePlotTrackerDraw, { passive: true });
+document.addEventListener("click", (event) => {
+  if (!els.plotNavigationMenu.open || els.plotNavigationMenu.contains(event.target)) return;
+  els.plotNavigationMenu.removeAttribute("open");
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") els.plotNavigationMenu.removeAttribute("open");
+});
 const initialParams = new URLSearchParams(window.location.search);
 const initialBrowseId = initialParams.get("browse_id");
 if (initialBrowseId) {
@@ -102,7 +124,6 @@ els.sidebarToggle.addEventListener("click", () => {
     state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar",
   );
   els.sidebarToggle.querySelector("span").textContent = state.sidebarCollapsed ? "›" : "‹";
-  window.requestAnimationFrame(() => drawInteractivePlots(state.plotPayload?.plots || []));
 });
 
 els.plotSidebarToggle.addEventListener("click", () => {
@@ -115,11 +136,12 @@ els.plotSidebarToggle.addEventListener("click", () => {
     state.plotSidebarCollapsed ? "Expand plots" : "Collapse plots",
   );
   els.plotSidebarToggle.querySelector("span").textContent = state.plotSidebarCollapsed ? "‹" : "›";
-  window.requestAnimationFrame(() => drawInteractivePlots(state.plotPayload?.plots || []));
+  els.plotNavigationMenu.removeAttribute("open");
+  if (!state.plotSidebarCollapsed) schedulePlotResize();
 });
 
 window.addEventListener("resize", () => {
-  window.requestAnimationFrame(() => drawInteractivePlots(state.plotPayload?.plots || []));
+  schedulePlotResize();
 });
 
 async function loadReview() {
@@ -132,8 +154,18 @@ async function loadReview() {
     });
     state.payload = result;
     state.plotPayload = null;
+    if (state.plotTrackerFrame != null) {
+      window.cancelAnimationFrame(state.plotTrackerFrame);
+      state.plotTrackerFrame = null;
+    }
+    if (state.plotScrollFrame != null) {
+      window.cancelAnimationFrame(state.plotScrollFrame);
+      state.plotScrollFrame = null;
+    }
     state.plotTrackers = {};
     state.sharedPlotTracker = null;
+    state.pendingPlotTracker = null;
+    state.plotRenderMetrics = {};
     state.hiddenPlotSeries = {};
     state.availableTags = [];
     state.currentLogTags = result?.browse?.row?.tags || [];
@@ -635,9 +667,10 @@ function renderInteractivePlots() {
 }
 
 function renderPlotNavigation(plots) {
-  els.plotNavigation.hidden = !plots.length;
+  els.plotNavigationMenu.hidden = !plots.length;
+  if (!plots.length) els.plotNavigationMenu.removeAttribute("open");
   els.plotNavigation.innerHTML = plots.map((plot, index) => `
-    <a href="#plot-${index}">${escapeHtml(plot.title || `Plot ${index + 1}`)}</a>
+    <a href="#plot-${index}" data-plot-target="plot-${index}">${escapeHtml(plot.title || `Plot ${index + 1}`)}</a>
   `).join("");
 }
 
@@ -655,7 +688,10 @@ function renderInteractivePlot(plot, index) {
         <h3>${escapeHtml(plot.title)}</h3>
         <span class="plot-time" id="plotTime-${escapeAttr(plot.id)}">${escapeHtml(formatLogTime(tracker))}</span>
       </div>
-      <canvas class="plot-canvas" id="plotCanvas-${escapeAttr(plot.id)}"></canvas>
+      <div class="plot-canvas-stack">
+        <canvas class="plot-canvas" id="plotCanvas-${escapeAttr(plot.id)}"></canvas>
+        <canvas class="plot-tracker-canvas" id="plotTrackerCanvas-${escapeAttr(plot.id)}" aria-hidden="true"></canvas>
+      </div>
       <div class="plot-tracker">
         <input
           id="plotTracker-${escapeAttr(plot.id)}"
@@ -718,6 +754,18 @@ function bindInteractivePlots(plots) {
 }
 
 function setSharedPlotTracker(time) {
+  if (!Number.isFinite(time)) return;
+  state.pendingPlotTracker = time;
+  if (state.plotTrackerFrame != null) return;
+  state.plotTrackerFrame = window.requestAnimationFrame(flushSharedPlotTracker);
+}
+
+function flushSharedPlotTracker() {
+  state.plotTrackerFrame = null;
+  const time = state.pendingPlotTracker;
+  state.pendingPlotTracker = null;
+  if (!Number.isFinite(time)) return;
+
   const plots = state.plotPayload?.plots || [];
   state.sharedPlotTracker = time;
   plots.forEach((plot) => {
@@ -727,11 +775,53 @@ function setSharedPlotTracker(time) {
     const slider = document.getElementById(`plotTracker-${plot.id}`);
     if (slider) slider.value = String(tracker);
   });
-  drawInteractivePlots(plots);
+  drawInteractivePlotTrackers(plots, { visibleOnly: true });
+}
+
+function scheduleVisiblePlotTrackerDraw() {
+  if (state.plotScrollFrame != null) return;
+  state.plotScrollFrame = window.requestAnimationFrame(() => {
+    state.plotScrollFrame = null;
+    drawInteractivePlotTrackers(state.plotPayload?.plots || [], { visibleOnly: true });
+  });
+}
+
+function schedulePlotResize() {
+  if (state.plotResizeTimer != null) {
+    window.clearTimeout(state.plotResizeTimer);
+  }
+  state.plotResizeTimer = window.setTimeout(() => {
+    state.plotResizeTimer = null;
+    drawResizedInteractivePlots(state.plotPayload?.plots || []);
+  }, 100);
 }
 
 function drawInteractivePlots(plots) {
   plots.forEach(drawInteractivePlot);
+}
+
+function drawInteractivePlotTrackers(plots, { visibleOnly = false } = {}) {
+  plots.forEach((plot) => {
+    if (!visibleOnly || isPlotNearViewport(plot)) drawInteractivePlotTracker(plot);
+  });
+}
+
+function isPlotNearViewport(plot) {
+  const canvas = document.getElementById(`plotTrackerCanvas-${plot.id}`);
+  const section = canvas?.closest(".interactive-plot");
+  if (!section) return false;
+  const plotRect = section.getBoundingClientRect();
+  const sidebarRect = els.plotSidebar.getBoundingClientRect();
+  const margin = 200;
+  return plotRect.bottom >= sidebarRect.top - margin
+    && plotRect.top <= sidebarRect.bottom + margin;
+}
+
+function drawResizedInteractivePlots(plots) {
+  plots.forEach((plot) => {
+    const canvas = document.getElementById(`plotCanvas-${plot.id}`);
+    if (canvas && canvasNeedsResize(canvas)) drawInteractivePlot(plot);
+  });
 }
 
 function drawInteractivePlot(plot) {
@@ -750,6 +840,25 @@ function drawInteractivePlot(plot) {
     drawTimeseriesPlot(ctx, canvas, bounds, plot);
   }
 
+  drawInteractivePlotTracker(plot);
+}
+
+function drawInteractivePlotTracker(plot) {
+  const canvas = document.getElementById(`plotTrackerCanvas-${plot.id}`);
+  if (!canvas) return;
+
+  const ctx = prepareCanvas(canvas);
+  const bounds = plotBounds(canvas);
+  ctx.clearRect(0, 0, bounds.width, bounds.height);
+
+  if (plot.kind === "local_position") {
+    drawLocalPositionTracker(ctx, bounds, plot);
+  } else if (plot.kind === "spectrogram") {
+    drawSpectrogramTracker(ctx, bounds, plot);
+  } else {
+    drawTimeseriesTracker(ctx, bounds, plot);
+  }
+
   updatePlotReadout(plot);
 }
 
@@ -766,6 +875,14 @@ function prepareCanvas(canvas) {
   const ctx = canvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   return ctx;
+}
+
+function canvasNeedsResize(canvas) {
+  const ratio = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  return canvas.width !== Math.round(rect.width * ratio)
+    || canvas.height !== Math.round(rect.height * ratio);
 }
 
 function plotBounds(canvas) {
@@ -792,7 +909,7 @@ function drawPlotFrame(ctx, canvas, bounds) {
 function drawTimeseriesPlot(ctx, canvas, bounds, plot) {
   const visibleSeries = (plot.series || []).filter((series) => isPlotSourceVisible(plot.id, series.key));
   const xRange = plot.time_range_s || [0, 1];
-  const yRange = plot.y_range || numericRange(visibleSeries.flatMap((series) => series.values || []));
+  const yRange = resolveTimeseriesYRange(plot, visibleSeries);
   drawTimeOverlays(ctx, bounds, xRange, plot.overlays || []);
   drawGrid(ctx, bounds);
 
@@ -807,7 +924,12 @@ function drawTimeseriesPlot(ctx, canvas, bounds, plot) {
       series.color,
     );
   });
+}
 
+function drawTimeseriesTracker(ctx, bounds, plot) {
+  const visibleSeries = (plot.series || []).filter((series) => isPlotSourceVisible(plot.id, series.key));
+  const xRange = plot.time_range_s || [0, 1];
+  const yRange = resolveTimeseriesYRange(plot, visibleSeries);
   const tracker = clampTracker(plot.id, xRange[0], xRange[1]);
   drawTimeTracker(ctx, bounds, tracker, xRange);
   drawTimeseriesTrackerPoints(ctx, bounds, visibleSeries, tracker, xRange, yRange);
@@ -816,7 +938,7 @@ function drawTimeseriesPlot(ctx, canvas, bounds, plot) {
 
 function drawLocalPositionPlot(ctx, canvas, bounds, plot) {
   const visibleTraces = (plot.traces || []).filter((trace) => isPlotSourceVisible(plot.id, trace.key));
-  const range = localPositionRange(plot, visibleTraces, bounds);
+  const range = resolveLocalPositionRange(plot, visibleTraces, bounds);
   drawGrid(ctx, bounds);
 
   visibleTraces.forEach((trace) => {
@@ -834,7 +956,11 @@ function drawLocalPositionPlot(ctx, canvas, bounds, plot) {
       );
     }
   });
+}
 
+function drawLocalPositionTracker(ctx, bounds, plot) {
+  const visibleTraces = (plot.traces || []).filter((trace) => isPlotSourceVisible(plot.id, trace.key));
+  const range = resolveLocalPositionRange(plot, visibleTraces, bounds);
   const tracker = clampTracker(plot.id, plot.time_range_s?.[0] || 0, plot.time_range_s?.[1] || 0);
   visibleTraces.forEach((trace) => {
     const marker = sampleTraceAtTime(trace, tracker);
@@ -855,7 +981,10 @@ function drawSpectrogramPlot(ctx, canvas, bounds, plot) {
   const yRange = plot.frequency_range_hz || numericRange(plot.frequencies_hz || []);
   drawSpectrogramImage(ctx, bounds, plot, xRange, yRange);
   drawGrid(ctx, bounds);
+}
 
+function drawSpectrogramTracker(ctx, bounds, plot) {
+  const xRange = plot.time_range_s || numericRange(plot.time_s || []);
   const tracker = clampTracker(plot.id, xRange[0], xRange[1]);
   drawTimeTracker(ctx, bounds, tracker, xRange);
   updatePlotTime(plot.id, tracker);
@@ -1149,6 +1278,34 @@ function numericRange(values) {
   }
   const padding = (max - min) * 0.08;
   return [min - padding, max + padding];
+}
+
+function resolveTimeseriesYRange(plot, visibleSeries) {
+  if (Array.isArray(plot.y_range) && plot.y_range.length >= 2) {
+    return plot.y_range;
+  }
+
+  const cache = state.plotRenderMetrics[plot.id] || {};
+  const visibilityKey = visibleSeries.map((series) => series.key).join("|");
+  if (cache.yRangeKey !== visibilityKey) {
+    cache.yRangeKey = visibilityKey;
+    cache.yRange = numericRange(visibleSeries.flatMap((series) => series.values || []));
+    state.plotRenderMetrics[plot.id] = cache;
+  }
+  return cache.yRange || [0, 1];
+}
+
+function resolveLocalPositionRange(plot, visibleTraces, bounds) {
+  const cache = state.plotRenderMetrics[plot.id] || {};
+  const visibilityKey = visibleTraces.map((trace) => trace.key).join("|");
+  const dimensionsKey = `${bounds.right - bounds.left}:${bounds.bottom - bounds.top}`;
+  const rangeKey = `${visibilityKey}:${dimensionsKey}`;
+  if (cache.localPositionRangeKey !== rangeKey) {
+    cache.localPositionRangeKey = rangeKey;
+    cache.localPositionRange = localPositionRange(plot, visibleTraces, bounds);
+    state.plotRenderMetrics[plot.id] = cache;
+  }
+  return cache.localPositionRange;
 }
 
 function xyRange(traces, bounds) {

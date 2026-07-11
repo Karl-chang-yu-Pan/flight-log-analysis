@@ -214,5 +214,38 @@ def test_upload_review_and_browse_pages_have_separate_navigation_contracts():
     assert 'id="appShell"' not in upload_html
     assert 'id="uploadForm"' not in review_html
     assert 'id="downloadMenu"' in review_html
+    assert 'id="plotNavigationMenu"' in review_html
     assert 'id="plotNavigation"' in review_html
     assert "/review?browse_id=" in browse_js
+
+
+def test_review_plot_controls_use_dropdown_navigation_and_tracker_overlays():
+    review_html = (web_app.WEB_DIR / "review.html").read_text(encoding="utf-8")
+    app_js = (web_app.WEB_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (web_app.WEB_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert '<summary>Navigation</summary>' in review_html
+    assert 'id="plotNavigation"' in review_html
+    assert 'plotTrackerCanvas-${escapeAttr(plot.id)}' in app_js
+    assert "requestAnimationFrame(flushSharedPlotTracker)" in app_js
+    assert "drawInteractivePlotTrackers(plots, { visibleOnly: true })" in app_js
+    assert ".plot-navigation-menu" in styles
+    assert "position: absolute" in styles
+
+    tracker_handler = app_js.split("function setSharedPlotTracker", 1)[1].split(
+        "function schedulePlotResize",
+        1,
+    )[0]
+    left_sidebar_handler = app_js.split(
+        'els.sidebarToggle.addEventListener("click"',
+        1,
+    )[1].split('els.plotSidebarToggle.addEventListener("click"', 1)[0]
+    right_sidebar_handler = app_js.split(
+        'els.plotSidebarToggle.addEventListener("click"',
+        1,
+    )[1].split('window.addEventListener("resize"', 1)[0]
+
+    assert "drawInteractivePlots" not in tracker_handler
+    assert "drawInteractivePlotTrackers(plots, { visibleOnly: true })" in tracker_handler
+    assert "drawInteractivePlots" not in left_sidebar_handler
+    assert "drawInteractivePlots" not in right_sidebar_handler

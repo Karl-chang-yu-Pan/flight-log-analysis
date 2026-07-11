@@ -189,11 +189,16 @@
             <h2>Flight Review Plots</h2>
             <p id="plotSidebarStatus">Loading plots</p>
           </div>
-          <button class="icon-button" id="plotSidebarToggle" type="button" title="Collapse plots" aria-label="Collapse plots">
-            <span aria-hidden="true">›</span>
-          </button>
+          <div class="plot-sidebar-actions">
+            <details class="plot-navigation-menu" id="plotNavigationMenu" hidden>
+              <summary>Navigation</summary>
+              <nav id="plotNavigation" class="plot-navigation" aria-label="Plot navigation"></nav>
+            </details>
+            <button class="icon-button" id="plotSidebarToggle" type="button" title="Collapse plots" aria-label="Collapse plots">
+              <span aria-hidden="true">›</span>
+            </button>
+          </div>
         </div>
-        <nav id="plotNavigation" class="plot-navigation" aria-label="Plot navigation"></nav>
         <div id="plotRows" class="plot-list"></div>
       </aside>
     </div>

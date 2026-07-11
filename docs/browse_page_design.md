@@ -204,6 +204,8 @@ Download remains available while viewing a valid log. It provides the original
 ULog, all parameters, and non-default parameters. KML is shown only when the log
 contains usable GPS position data.
 
-Generate a simple plot anchor list inside the right plot sidebar. It scrolls to
-the selected plot and does not use sticky positioning or active-section
-tracking. Plot-specific controls remain with each plot.
+Generate a Navigation dropdown in the right plot-sidebar header, following
+Flight Review's interaction. Its overlay menu lists the available plot anchors,
+scrolls to the selected plot, and folds when it is not needed. Do not reserve a
+permanent row for the index and do not add active-section tracking. Plot-specific
+controls remain with each plot.
