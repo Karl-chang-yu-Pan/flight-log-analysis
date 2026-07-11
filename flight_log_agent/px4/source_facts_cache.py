@@ -25,9 +25,14 @@ where Layer 1 fits among Layers 2 (unresolved DAG per terminal), 3
 
 from __future__ import annotations
 
+import hashlib
 import re
+import shutil
 import subprocess
+import sys
+from functools import lru_cache
 from pathlib import Path
+from types import ModuleType
 from typing import List, Optional, Union
 
 from pydantic import BaseModel, Field
@@ -77,6 +82,70 @@ class SourceFileFacts(BaseModel):
 _FS_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
+@lru_cache(maxsize=1)
+def extractor_fingerprint() -> str:
+    """Content fingerprint of the extraction code.
+
+    Hashes the source bytes of the profiler module and every first-party
+    module it (transitively) references, so ANY edit — committed or not —
+    yields a new fingerprint and Layer 1 entries produced by older code
+    become unreachable. No manually-bumped version constant: the cache
+    keys on what the code IS, not on what someone remembered to label it.
+    """
+    package_prefix = __name__.split(".", 1)[0]
+    root = sys.modules[MechanismSourceProfiler.__module__]
+    seen: set[str] = set()
+    queue: list[str] = [root.__name__]
+    files: set[Path] = set()
+    while queue:
+        name = queue.pop()
+        if name in seen or not name.startswith(package_prefix):
+            continue
+        seen.add(name)
+        module = sys.modules.get(name)
+        module_file = getattr(module, "__file__", None)
+        if module is None or not module_file:
+            continue
+        files.add(Path(module_file))
+        for attribute in vars(module).values():
+            if isinstance(attribute, ModuleType):
+                queue.append(attribute.__name__)
+            else:
+                dependency = getattr(attribute, "__module__", None)
+                if isinstance(dependency, str):
+                    queue.append(dependency)
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(str(path).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+_PRUNED_ROOTS: set[tuple[str, str]] = set()
+
+
+def _prune_stale_fingerprints(cache_root: Path, current: str) -> None:
+    """Delete Layer 1 trees written by other extractor versions.
+
+    Entries under a stale fingerprint are fully regenerable garbage — no
+    migration is possible (the old output simply lacks whatever the new
+    code extracts), so purge-and-lazily-rebuild is the semantics. Runs
+    once per (cache_root, fingerprint) per process.
+    """
+    key = (str(cache_root), current)
+    if key in _PRUNED_ROOTS:
+        return
+    _PRUNED_ROOTS.add(key)
+    source_dir = Path(cache_root) / "source"
+    if not source_dir.is_dir():
+        return
+    for entry in source_dir.iterdir():
+        if entry.is_dir() and entry.name != current:
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 def _file_path_slug(file_path: str) -> str:
     """Filesystem-safe slug for a source file path.
 
@@ -88,8 +157,19 @@ def _file_path_slug(file_path: str) -> str:
 
 
 def layer1_cache_path(cache_root: Path, source_hash: str, file_path: str) -> Path:
-    """Layer 1 path: ``{cache_root}/source/{source_hash}/{file_slug}.json``."""
-    return Path(cache_root) / "source" / source_hash / f"{_file_path_slug(file_path)}.json"
+    """Layer 1 path:
+    ``{cache_root}/source/{extractor_fp}/{source_hash}/{file_slug}.json``.
+
+    The extractor fingerprint level makes entries from older extraction
+    code unreachable the moment the code changes.
+    """
+    return (
+        Path(cache_root)
+        / "source"
+        / extractor_fingerprint()
+        / source_hash
+        / f"{_file_path_slug(file_path)}.json"
+    )
 
 
 def write_source_facts(facts: SourceFileFacts, path: Path) -> None:
@@ -155,7 +235,7 @@ def get_source_facts_for_file(
     if source_root is None:
         return None
 
-    source_dir = cache_root / "source"
+    source_dir = cache_root / "source" / extractor_fingerprint()
     if not source_dir.is_dir():
         return None
 
@@ -221,6 +301,7 @@ def get_or_extract_facts(
     Layer 1 entries. The discovery loop is the intended owner of that
     reassembly.
     """
+    _prune_stale_fingerprints(Path(cache_root), extractor_fingerprint())
     facts = get_source_facts_for_file(
         cache_root,
         file_path,

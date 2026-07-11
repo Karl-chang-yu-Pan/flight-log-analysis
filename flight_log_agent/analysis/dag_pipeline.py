@@ -55,9 +55,46 @@ def _question_slug(question: str) -> str:
     return f"{stem}.{digest}"
 
 
+def seeder_fingerprint() -> str:
+    """Content fingerprint of what produces a Layer 4 entry: the seeder's
+    instructions and output schema. Prompt edits invalidate cached seeds
+    automatically — no manual cache clearing."""
+    from flight_log_agent.analysis.mechanism_judge import seeder_agent
+
+    import json as _json
+
+    payload = seeder_agent.instructions + _json.dumps(
+        DiscoverySeeds.model_json_schema(), sort_keys=True
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+_PRUNED_INTENT_ROOTS: set[tuple[str, str]] = set()
+
+
+def _prune_stale_intent(cache_root: Path, current: str) -> None:
+    key = (str(cache_root), current)
+    if key in _PRUNED_INTENT_ROOTS:
+        return
+    _PRUNED_INTENT_ROOTS.add(key)
+    intent_dir = Path(cache_root) / "intent"
+    if not intent_dir.is_dir():
+        return
+    import shutil
+
+    for entry in intent_dir.iterdir():
+        if entry.is_dir() and entry.name != current:
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 def layer4_cache_path(cache_root: Union[str, Path], question: str) -> Path:
-    """Layer 4 path: ``{cache_root}/intent/{slug}.{digest}.json``."""
-    return Path(cache_root) / "intent" / f"{_question_slug(question)}.json"
+    """Layer 4 path: ``{cache_root}/intent/{seeder_fp}/{slug}.json``."""
+    return (
+        Path(cache_root)
+        / "intent"
+        / seeder_fingerprint()
+        / f"{_question_slug(question)}.json"
+    )
 
 
 def write_seeds_to_cache(seeds: DiscoverySeeds, path: Path) -> None:
@@ -274,6 +311,7 @@ async def run_dag_discovery_stage(
     file name + size so distinct logs don't collide.
     """
     cache_root = Path(cache_root)
+    _prune_stale_intent(cache_root, seeder_fingerprint())
     seeds_path = layer4_cache_path(cache_root, question)
     cached_seeds = read_seeds_from_cache(seeds_path)
 

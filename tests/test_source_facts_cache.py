@@ -9,6 +9,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
 from flight_log_agent.px4.source_facts_cache import (
     SourceFileFacts,
     extract_facts_for_file,
+    extractor_fingerprint,
     get_or_extract_facts,
     get_source_facts_for_file,
     layer1_cache_path,
@@ -17,11 +18,34 @@ from flight_log_agent.px4.source_facts_cache import (
 )
 
 
-def test_layer1_cache_path_composes_source_hash_and_file_slug(tmp_path):
+def test_layer1_cache_path_composes_fingerprint_hash_and_file_slug(tmp_path):
     path = layer1_cache_path(tmp_path, "abcdef", "src/modules/navigator/rtl.cpp")
     assert path.parent.name == "abcdef"
-    assert path.parent.parent.name == "source"
+    assert path.parent.parent.name == extractor_fingerprint()
+    assert path.parent.parent.parent.name == "source"
     assert path.name == "src__modules__navigator__rtl.cpp.json"
+
+
+def test_extractor_fingerprint_is_stable_within_process():
+    assert extractor_fingerprint() == extractor_fingerprint()
+    assert len(extractor_fingerprint()) == 16
+
+
+def test_stale_fingerprint_trees_are_pruned_on_extraction(tmp_path):
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helper.cpp").write_text("void foo() { _x = 1; }\n", encoding="utf-8")
+    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+
+    cache_root = tmp_path / "cache"
+    stale = cache_root / "source" / "deadbeefdeadbeef" / "oldhash"
+    stale.mkdir(parents=True)
+    (stale / "junk.json").write_text("{}", encoding="utf-8")
+
+    get_or_extract_facts(profiler, cache_root, "src/modules/example/helper.cpp", "hash")
+
+    assert not (cache_root / "source" / "deadbeefdeadbeef").exists()
+    assert layer1_cache_path(cache_root, "hash", "src/modules/example/helper.cpp").exists()
 
 
 def test_layer1_cache_path_handles_leading_slash_and_special_chars(tmp_path):

@@ -234,3 +234,23 @@ def test_sufficient_with_live_matching_branch_stays_confirmed(tmp_path):
     h = stage.report.ranked_hypotheses[0]
     assert h.confidence == "medium"
     assert stage.report.confirmed == [h.title]
+
+
+def test_layer4_path_includes_seeder_fingerprint_and_prunes_stale(tmp_path):
+    from flight_log_agent.analysis.dag_pipeline import seeder_fingerprint
+
+    path = layer4_cache_path(tmp_path, "why?")
+    assert path.parent.name == seeder_fingerprint()
+    assert path.parent.parent.name == "intent"
+
+    stale = tmp_path / "cache" / "intent" / "0123456789abcdef"
+    stale.mkdir(parents=True)
+    profiler = _mini_tree(tmp_path)
+    calls: list[str] = []
+    asyncio.run(
+        run_dag_discovery_stage(
+            profiler, tmp_path / "cache", "why?", "srchash",
+            Path("/nonexistent.ulg"), ulog_hash="u", run_agent=_stub_runner(calls),
+        )
+    )
+    assert not stale.exists()
