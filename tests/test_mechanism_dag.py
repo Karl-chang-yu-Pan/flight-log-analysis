@@ -20,10 +20,12 @@ def _fake_binding(
     line: int,
     logged_signal: str | None = None,
     control_predicates: list[str] | None = None,
+    function: str | None = None,
 ) -> dict:
     """A binding with ``logged_signal`` defaulted to the target — the
     BindingIndex backward walk starts from ``logged_signal``, so tests
-    seed it explicitly."""
+    seed it explicitly. Pass ``logged_signal=""`` to exercise the scoped
+    target-writer path (logged-output writers bypass visibility)."""
     return {
         "binding_id": binding_id,
         "source_symbol": expression,
@@ -31,6 +33,7 @@ def _fake_binding(
         "logged_signal": target if logged_signal is None else logged_signal,
         "assignment_path": [{"file": file, "line": line, "expression": expression}],
         "control_predicates": control_predicates or [],
+        "function": function or "",
     }
 
 
@@ -1684,3 +1687,62 @@ def test_bare_short_helper_still_expands():
     assert [v for v in dag.vertices
             if v.provenance and v.provenance.startswith("helper_return")], \
         "bare short helper was not expanded"
+
+
+def test_local_symbols_never_fuse_across_files():
+    """The ATT-fusion shape: two modules both have a local named ``spd``.
+    The walk from module A's terminal must resolve ``spd`` only within
+    A's file+function — B's same-named local is a different variable and
+    its subtree (sensor_b) must not enter the slice."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out_a", expression="spd + 1.0",
+                      file="a.cpp", line=1, function="Alpha::run"),
+        _fake_binding(binding_id="wa", target="spd", expression="sensor_a",
+                      file="a.cpp", line=2, function="Alpha::run",
+                      logged_signal=""),
+        _fake_binding(binding_id="wb", target="spd", expression="sensor_b",
+                      file="b.cpp", line=3, function="Beta::run",
+                      logged_signal=""),
+    ]
+    dag = build_mechanism_dag(bindings, "_out_a", terminal_file="a.cpp")
+
+    spd_files = {v.file for v in dag.vertices
+                 if v.kind == "operation" and v.variable == "spd"}
+    assert spd_files == {"a.cpp"}
+    assert not any("sensor_b" in str(v.signal_name or "") for v in dag.vertices)
+
+
+def test_member_symbols_widen_when_family_has_no_writer():
+    """A member consumed in one class but written only elsewhere
+    (inheritance, cross-file flows) must still resolve — members widen
+    on family miss; only locals are strict."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out_a", expression="_shared_member + 1.0",
+                      file="a.cpp", line=1, function="Alpha::run"),
+        _fake_binding(binding_id="w", target="_shared_member", expression="sensor_b",
+                      file="b.cpp", line=2, function="Beta::update",
+                      logged_signal=""),
+    ]
+    dag = build_mechanism_dag(bindings, "_out_a", terminal_file="a.cpp")
+
+    ops = {v.variable for v in dag.vertices if v.kind == "operation"}
+    assert "_shared_member" in ops
+
+
+def test_member_symbols_prefer_family_writers():
+    bindings = [
+        _fake_binding(binding_id="t", target="_out_a", expression="_gain + 1.0",
+                      file="src/modules/a/a.cpp", line=1, function="Alpha::run"),
+        _fake_binding(binding_id="near", target="_gain", expression="near_source",
+                      file="src/modules/a/a.hpp", line=2, function="Alpha::init",
+                      logged_signal=""),
+        _fake_binding(binding_id="far", target="_gain", expression="far_source",
+                      file="src/modules/b/b.cpp", line=3, function="Beta::init",
+                      logged_signal=""),
+    ]
+    dag = build_mechanism_dag(bindings, "_out_a",
+                              terminal_file="src/modules/a/a.cpp")
+
+    gain_files = {v.file for v in dag.vertices
+                  if v.kind == "operation" and v.variable == "_gain"}
+    assert gain_files == {"src/modules/a/a.hpp"}

@@ -396,39 +396,52 @@ class _DAGBuilder:
         """
         self._register_call_statement_bindings()
 
-        frontier: deque[tuple[str, str]] = deque([("symbol", self.terminal)])
-        walked_symbols: set[str] = set()
+        # Every frontier symbol carries the scope of the site that
+        # referenced it — writers are then resolved under C++-faithful
+        # visibility instead of a global by-name index, so a local named
+        # ``dt`` in one module can never bind to another module's ``dt``.
+        Scope = tuple[str, str]  # (file, bare function)
+        terminal_scope: Scope = (self.terminal_file or "", "")
+        frontier: deque[tuple[str, str, Scope]] = deque(
+            [("symbol", self.terminal_raw, terminal_scope)]
+        )
+        walked: set[tuple[str, Scope]] = set()
         materialized_helpers: set[str] = set()
         self._emitted_ids: set[int] = set()
         self._emitted_bindings: list[dict[str, Any]] = []
 
-        def enqueue_expression(expression: str) -> None:
-            for symbol in self._walk_symbols(expression):
-                if symbol and symbol not in walked_symbols:
-                    frontier.append(("symbol", symbol))
+        def enqueue_expression(expression: str, scope: Scope) -> None:
+            if not expression:
+                return
+            normalized_expr = _normalize_cpp_expression(str(expression))
+            for raw in dedupe_keep_order(source_expression_names(normalized_expr)):
+                if raw:
+                    frontier.append(("symbol", raw, scope))
             for helper_name in self._find_helper_calls(expression):
                 if helper_name not in materialized_helpers:
-                    frontier.append(("helper", helper_name))
+                    frontier.append(("helper", helper_name, scope))
 
         while frontier:
-            kind, payload = frontier.popleft()
+            kind, payload, scope = frontier.popleft()
             if kind == "symbol":
-                sym = payload
-                if sym in walked_symbols:
+                raw = payload
+                norm = normalize_symbol(raw)
+                if not norm or (norm, scope) in walked:
                     continue
-                walked_symbols.add(sym)
-                writers = self._writers_of(sym)
-                if writers and sym == self.terminal and self.terminal_file:
-                    # Scope the terminal to its module: a multi-module
-                    # binding set can hold a same-named-after-normalization
-                    # but unrelated variable from another class. Fall back
-                    # to all writers when none live in the hinted file.
-                    scoped = [
-                        b for b in writers
-                        if self._binding_first_file(b) == self.terminal_file
-                    ]
-                    if scoped:
-                        writers = scoped
+                walked.add((norm, scope))
+                if norm == self.terminal:
+                    writers = self._writers_of(norm)
+                    if writers and self.terminal_file:
+                        # Scope the terminal to its module; fall back to
+                        # all writers when none live in the hinted file.
+                        scoped = [
+                            b for b in writers
+                            if self._binding_first_file(b) == self.terminal_file
+                        ]
+                        if scoped:
+                            writers = scoped
+                else:
+                    writers = self._scoped_writers(norm, raw, scope)
                 if writers:
                     for binding in writers:
                         if id(binding) not in self._emitted_ids:
@@ -439,22 +452,31 @@ class _DAGBuilder:
                                 is_terminal=self._binding_reaches_terminal(binding),
                             )
                         enqueue_expression(
-                            str(binding.get("source_symbol") or binding.get("expression") or "")
+                            str(binding.get("source_symbol") or binding.get("expression") or ""),
+                            self._binding_site_scope(binding),
                         )
                 elif (
-                    "." not in sym
-                    and sym != self.terminal
-                    and sym not in self.logged_signals
-                    and self._match_parameter(sym) is None
+                    "." not in norm
+                    and norm != self.terminal
+                    and norm not in self.logged_signals
+                    and self._match_parameter(norm) is None
                 ):
                     # Bare struct root with no direct writer — pull its
                     # field writes (``_mission_item`` → ``_mission_item.*``).
-                    for field_binding in self._field_writers_of(sym):
-                        field_target = normalize_symbol(
-                            str(field_binding.get("target_symbol") or field_binding.get("target") or "")
+                    for field_binding in self._field_writers_of(norm):
+                        field_target = str(
+                            field_binding.get("target_symbol")
+                            or field_binding.get("target")
+                            or ""
                         )
-                        if field_target and field_target not in walked_symbols:
-                            frontier.append(("symbol", field_target))
+                        if field_target:
+                            frontier.append(
+                                (
+                                    "symbol",
+                                    field_target,
+                                    self._binding_site_scope(field_binding),
+                                )
+                            )
             else:  # helper
                 helper_name = payload
                 if helper_name in materialized_helpers:
@@ -475,10 +497,14 @@ class _DAGBuilder:
                     body_expressions.append(str(return_expression))
                 for pointer_write in helper.get("pointer_output_writes") or []:
                     body_expressions.append(str(pointer_write.get("expression") or ""))
+                body_scope: Scope = (
+                    str(helper.get("file") or ""),
+                    self._bare_function(helper_key[0] if helper_key else helper_name),
+                )
                 for expression in body_expressions:
                     # The (b) fix: helper-body symbols drive the same frontier,
                     # so their writers get emitted instead of going opaque.
-                    enqueue_expression(expression)
+                    enqueue_expression(expression, body_scope)
 
         # Wire edges now that every producer vertex has been emitted.
         for binding in self._emitted_bindings:
@@ -612,6 +638,12 @@ class _DAGBuilder:
                         "logged_signal": "",
                         "control_predicates": predicates,
                         "struct_variables": {},
+                        # The formal lives in the CALLEE; the actual's
+                        # symbols resolve at the call site (see
+                        # _binding_target_scope / _binding_site_scope).
+                        "scope_file": str(helper.get("file") or ""),
+                        "scope_function": name,
+                        "function": "",
                     }
                 )
 
@@ -620,6 +652,90 @@ class _DAGBuilder:
         path = binding.get("assignment_path") or []
         first = path[0] if path else {}
         return str((first or {}).get("file") or "")
+
+    @staticmethod
+    def _bare_function(name: Any) -> str:
+        return str(name or "").rsplit("::", 1)[-1].strip()
+
+    @staticmethod
+    def _file_family(path: str) -> tuple[str, str]:
+        """(directory, stem) — the class file family (``rtl.cpp``/``rtl.h``)."""
+        text = str(path or "")
+        directory, _, base = text.rpartition("/")
+        return (directory, base.split(".", 1)[0])
+
+    def _binding_target_scope(self, binding: dict[str, Any]) -> tuple[str, str]:
+        """Where the binding's TARGET symbol lives (visibility scope).
+
+        Synthesized call bindings carry explicit ``scope_file`` /
+        ``scope_function`` keys pointing at the callee (the formal lives
+        there even though the write site is the caller); ordinary
+        bindings default to their write site.
+        """
+        file = str(binding.get("scope_file") or self._binding_first_file(binding) or "")
+        function = self._bare_function(
+            binding.get("scope_function") or binding.get("function") or ""
+        )
+        return (file, function)
+
+    def _binding_site_scope(self, binding: dict[str, Any]) -> tuple[str, str]:
+        """Where the binding's EXPRESSION text lives — the scope its
+        referenced symbols are resolved in."""
+        return (
+            self._binding_first_file(binding),
+            self._bare_function(binding.get("function") or ""),
+        )
+
+    def _scoped_writers(
+        self,
+        symbol_norm: str,
+        symbol_raw: str,
+        scope: tuple[str, str],
+    ) -> list[dict[str, Any]]:
+        """Writers of a symbol under C++-faithful visibility.
+
+        Logged-output writers bypass scoping — uORB topics are the one
+        legitimate cross-module channel. Target writers are filtered by
+        the PX4 naming convention on the symbol's root:
+
+        * member (``_``-prefixed): same class file family; when the
+          family has no writer, widen to all (inheritance and cross-file
+          member flows stay reachable).
+        * local (bare): same file, and same function when both sides
+          know theirs. Locals never widen — a stranger's same-named
+          local is a different variable, which is exactly the fusion
+          this prevents.
+        """
+        output_writers = list(self._by_output.get(symbol_norm, []))
+        target_writers = list(self._by_target.get(symbol_norm, []))
+        scope_file, scope_function = scope
+        if scope_file and target_writers:
+            root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
+            if root.startswith("_"):
+                family = self._file_family(scope_file)
+                same_family = [
+                    b
+                    for b in target_writers
+                    if self._file_family(self._binding_target_scope(b)[0]) == family
+                ]
+                target_writers = same_family or target_writers
+            else:
+                scoped = []
+                for binding in target_writers:
+                    b_file, b_function = self._binding_target_scope(binding)
+                    if b_file != scope_file:
+                        continue
+                    if scope_function and b_function and b_function != scope_function:
+                        continue
+                    scoped.append(binding)
+                target_writers = scoped
+        seen: set[int] = set()
+        out: list[dict[str, Any]] = []
+        for binding in output_writers + target_writers:
+            if id(binding) not in seen:
+                seen.add(id(binding))
+                out.append(binding)
+        return out
 
     def _writers_of(self, symbol_norm: str) -> list[dict[str, Any]]:
         """Bindings that write ``symbol_norm`` (as a logged output or a

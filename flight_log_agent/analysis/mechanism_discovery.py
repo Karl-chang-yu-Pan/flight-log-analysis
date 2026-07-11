@@ -53,6 +53,7 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
     return {
         "target_symbol": str(ref.get("target") or ""),
         "source_symbol": str(ref.get("expression") or ""),
+        "function": str(ref.get("function") or ""),
         "assignment_path": [
             {
                 "file": str(ref.get("file") or ""),
