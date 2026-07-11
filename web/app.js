@@ -9,12 +9,17 @@ const state = {
   analysisPollTimer: null,
   sidebarCollapsed: false,
   plotSidebarCollapsed: false,
+  availableTags: [],
+  currentLogTags: [],
+  tagStatus: "",
 };
 
 const els = {
   appShell: document.getElementById("appShell"),
   form: document.getElementById("preparseForm"),
   logFile: document.getElementById("logFile"),
+  logPath: document.getElementById("logPath"),
+  browseLogId: document.getElementById("browseLogId"),
   runStatus: document.getElementById("runStatus"),
   uploadProgress: document.getElementById("uploadProgress"),
   uploadProgressBar: document.getElementById("uploadProgressBar"),
@@ -46,6 +51,13 @@ const els = {
   analysisReport: document.getElementById("analysisReport"),
   changedParameterRows: document.getElementById("changedParameterRows"),
   timelineRows: document.getElementById("timelineRows"),
+  logTagPanel: document.getElementById("logTagPanel"),
+  logTagList: document.getElementById("logTagList"),
+  logTagStatus: document.getElementById("logTagStatus"),
+  logTagSelect: document.getElementById("logTagSelect"),
+  logTagAdd: document.getElementById("logTagAdd"),
+  logTagNewName: document.getElementById("logTagNewName"),
+  logTagCreate: document.getElementById("logTagCreate"),
 };
 
 els.form.addEventListener("submit", async (event) => {
@@ -60,6 +72,32 @@ els.messageSearch.addEventListener("input", renderWarnings);
 els.messageFilter.addEventListener("change", renderWarnings);
 els.topicSearch.addEventListener("input", renderTopics);
 els.analysisButton.addEventListener("click", startAnalysis);
+els.logTagAdd.addEventListener("click", addSelectedLogTag);
+els.logTagCreate.addEventListener("click", createAndAddLogTag);
+els.logTagNewName.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    createAndAddLogTag();
+  }
+});
+els.logTagList.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove-log-tag]");
+  if (!button) return;
+  removeCurrentLogTag(button.dataset.removeLogTag);
+});
+els.logFile.addEventListener("change", clearBrowseLogSelection);
+els.logPath.addEventListener("input", clearBrowseLogSelection);
+
+const initialParams = new URLSearchParams(window.location.search);
+const initialBrowseId = initialParams.get("browse_id");
+const initialLogPath = initialParams.get("log_path");
+if (initialBrowseId) {
+  els.browseLogId.value = initialBrowseId;
+  window.requestAnimationFrame(() => preparseLog());
+} else if (initialLogPath) {
+  els.logPath.value = initialLogPath;
+  window.requestAnimationFrame(() => preparseLog());
+}
 
 els.sidebarToggle.addEventListener("click", () => {
   state.sidebarCollapsed = !state.sidebarCollapsed;
@@ -95,6 +133,9 @@ async function preparseLog() {
   setStatus("Pre-parsing...");
   const formData = new FormData(els.form);
   const hasUpload = els.logFile.files && els.logFile.files.length > 0;
+  if (hasUpload) {
+    els.browseLogId.value = "";
+  }
 
   try {
     const result = hasUpload
@@ -105,6 +146,16 @@ async function preparseLog() {
     state.plotTrackers = {};
     state.sharedPlotTracker = null;
     state.hiddenPlotSeries = {};
+    state.availableTags = [];
+    state.currentLogTags = result?.browse?.row?.tags || [];
+    state.tagStatus = "";
+    if (result?.inputs?.log_path) {
+      els.logPath.value = result.inputs.log_path;
+    }
+    if (result?.browse?.log_id) {
+      els.browseLogId.value = result.browse.log_id;
+    }
+    await refreshLoadedLogTags();
     resetAnalysis();
     renderAll();
     loadInteractivePlots();
@@ -399,13 +450,14 @@ function clearAnalysisPoll() {
 
 async function preparseLocalPath(formData) {
   const payload = {
+    browse_log_id: stringOrNull(formData.get("browse_log_id")),
     log_path: stringOrNull(formData.get("log_path")),
     mission_path: stringOrNull(formData.get("mission_path")),
     source_path: stringOrNull(formData.get("source_path")),
     parameters_xml_path: stringOrNull(formData.get("parameters_xml_path")),
   };
 
-  if (!payload.log_path) {
+  if (!payload.log_path && !payload.browse_log_id) {
     throw new Error("Choose a ULog file or provide a local ULog path.");
   }
 
@@ -452,12 +504,111 @@ function uploadAndPreparse(formData) {
   });
 }
 
+async function refreshLoadedLogTags() {
+  const logId = currentBrowseLogId();
+  if (!logId) {
+    state.availableTags = [];
+    state.currentLogTags = [];
+    state.tagStatus = "Not indexed";
+    return;
+  }
+
+  try {
+    const [tagsPayload, logPayload] = await Promise.all([
+      fetchJson("/api/browse-tags"),
+      fetchJson(`/api/browse-log?log_id=${encodeURIComponent(logId)}`),
+    ]);
+    state.availableTags = tagsPayload.tags || [];
+    state.currentLogTags = logPayload.log?.tags || [];
+    state.tagStatus = "";
+    if (state.payload?.browse) {
+      state.payload.browse.row = logPayload.log;
+      state.payload.browse.log_id = logPayload.log?.id || state.payload.browse.log_id;
+    }
+  } catch (error) {
+    state.tagStatus = error.message;
+  }
+}
+
+async function addSelectedLogTag() {
+  const tag = els.logTagSelect.value;
+  if (!tag) return;
+  await updateCurrentLogTag(tag, "add");
+}
+
+async function createAndAddLogTag() {
+  const name = els.logTagNewName.value.trim();
+  if (!name) return;
+  const logId = currentBrowseLogId();
+  if (!logId) return;
+
+  els.logTagCreate.disabled = true;
+  try {
+    await fetchJson("/api/browse-tags", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    await updateCurrentLogTag(name, "add");
+    els.logTagNewName.value = "";
+  } catch (error) {
+    state.tagStatus = error.message;
+    renderLogTags();
+  } finally {
+    els.logTagCreate.disabled = false;
+  }
+}
+
+async function removeCurrentLogTag(tag) {
+  if (!tag) return;
+  await updateCurrentLogTag(tag, "remove");
+}
+
+async function updateCurrentLogTag(tag, action) {
+  const logId = currentBrowseLogId();
+  if (!logId) return;
+
+  els.logTagAdd.disabled = true;
+  try {
+    await fetchJson("/api/browse-log-tags", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ log_id: logId, tag, action }),
+    });
+    await refreshLoadedLogTags();
+    renderLogTags();
+  } catch (error) {
+    state.tagStatus = error.message;
+    renderLogTags();
+  } finally {
+    renderLogTags();
+  }
+}
+
+function currentBrowseLogId() {
+  return state.payload?.browse?.log_id || state.payload?.browse?.row?.id || "";
+}
+
+function clearBrowseLogSelection() {
+  els.browseLogId.value = "";
+}
+
+async function fetchJson(url, options) {
+  const response = await fetch(url, options);
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.error || `HTTP ${response.status}`);
+  }
+  return result;
+}
+
 function renderAll() {
   renderFacts();
   renderWarnings();
   renderParameters();
   renderTopics();
   renderMainSummary();
+  renderLogTags();
   renderChangedParameters();
   renderTimeline();
   renderInteractivePlots();
@@ -1433,6 +1584,30 @@ function renderMainSummary() {
     ${uploadText}
     <p>Default comparison uses embedded ULog airframe defaults, then embedded system defaults, then the optional parameters XML fallback.</p>
   `;
+}
+
+function renderLogTags() {
+  const logId = currentBrowseLogId();
+  els.logTagPanel.hidden = !state.payload || !logId;
+  if (els.logTagPanel.hidden) return;
+
+  const assigned = state.currentLogTags || [];
+  const available = (state.availableTags || [])
+    .map((tag) => tag.name)
+    .filter((tag) => !assigned.includes(tag));
+  els.logTagStatus.textContent = state.tagStatus || "";
+  els.logTagList.innerHTML = assigned.length
+    ? assigned.map((tag) => `
+      <button class="tag-pill" data-remove-log-tag="${escapeAttr(tag)}" type="button" title="Remove tag">
+        ${escapeHtml(tag)} <span aria-hidden="true">x</span>
+      </button>
+    `).join("")
+    : `<span class="empty-inline">No tags assigned.</span>`;
+  els.logTagSelect.innerHTML = `
+    <option value="">Add existing tag</option>
+    ${available.map((tag) => `<option value="${escapeAttr(tag)}">${escapeHtml(tag)}</option>`).join("")}
+  `;
+  els.logTagAdd.disabled = !available.length;
 }
 
 function renderChangedParameters() {

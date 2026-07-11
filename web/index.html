@@ -98,6 +98,7 @@
 
       <main class="main-canvas">
         <form class="input-bar upload-form" id="preparseForm" enctype="multipart/form-data">
+          <input id="browseLogId" name="browse_log_id" type="hidden">
           <label>
             ULog file
             <input id="logFile" name="log_file" type="file" accept=".ulg">
@@ -113,9 +114,10 @@
           <label>
             PX4 source
             <input id="sourcePath" name="source_path" type="text" placeholder="optional PX4 checkout">
-          </label>
-          <button type="submit">Pre-parse</button>
-          <details class="advanced-inputs">
+            </label>
+            <button type="submit">Pre-parse</button>
+            <a class="button-link" href="/browse">Browse</a>
+            <details class="advanced-inputs">
             <summary>Use local paths instead</summary>
             <div class="advanced-grid">
               <label>
@@ -144,6 +146,21 @@
           </div>
           <div id="mainSummary" class="summary-panel">
             <p>Load a ULog to inspect deterministic facts before running the analysis agent.</p>
+          </div>
+          <div id="logTagPanel" class="log-tag-panel" hidden>
+            <div class="section-title-row">
+              <h3>Tags</h3>
+              <span id="logTagStatus" class="status-text"></span>
+            </div>
+            <div id="logTagList" class="row-tags"></div>
+            <div class="tag-editor">
+              <select id="logTagSelect">
+                <option value="">Add existing tag</option>
+              </select>
+              <button id="logTagAdd" type="button">Add</button>
+              <input id="logTagNewName" type="text" placeholder="New tag">
+              <button id="logTagCreate" type="button">Create</button>
+            </div>
           </div>
         </section>
 

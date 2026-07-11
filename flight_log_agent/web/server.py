@@ -5,11 +5,13 @@ import asyncio
 import cgi
 import json
 import mimetypes
+import os
 import subprocess
 import threading
 import time
 import traceback
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,26 @@ from pyulog import ULog
 from flight_log_agent.ulog.preparse_view import build_preparse_payload
 from flight_log_agent.audit import DEFAULT_DEV_LOG_ROOT, make_json_safe
 from flight_log_agent.ulog.interactive_plots import build_interactive_plot_payload
+from flight_log_agent.web.browse_index import (
+    BrowseConfig,
+    add_log_tag,
+    create_tag,
+    ensure_browse_db,
+    get_log,
+    import_flight_review,
+    list_tags,
+    load_browse_airframe_metadata,
+    query_logs,
+    refresh_airframe_image_keys,
+    remove_log_tag,
+    resolve_airframe_image_root,
+    upsert_log_from_path,
+)
+
+
+def _optional_env_path(name: str) -> Path | None:
+    value = os.environ.get(name)
+    return Path(value).expanduser() if value else None
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -27,6 +49,13 @@ WEB_DIR = ROOT_DIR / "web"
 UPLOAD_ROOT = ROOT_DIR / "uploads"
 OUTPUT_ROOT = ROOT_DIR / "outputs"
 WEB_DEV_LOG_ROOT = ROOT_DIR / DEFAULT_DEV_LOG_ROOT
+BROWSE_CONFIG = BrowseConfig(
+    browse_db_path=Path(os.environ.get("FLIGHT_LOG_BROWSE_DB_PATH", OUTPUT_ROOT / "browse.sqlite")),
+    flight_review_storage_path=_optional_env_path("FLIGHT_REVIEW_STORAGE_PATH"),
+    flight_review_db_path=_optional_env_path("FLIGHT_REVIEW_DB_PATH"),
+    flight_review_log_dir=_optional_env_path("FLIGHT_REVIEW_LOG_DIR"),
+    airframe_image_root=Path(os.environ.get("AIRFRAME_IMAGE_ROOT", WEB_DIR / "airframes")),
+)
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 UPLOAD_FIELDS = {
     "log_file": ".ulg",
@@ -46,6 +75,30 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             self._serve_file(WEB_DIR / "index.html")
+            return
+
+        if path == "/browse":
+            self._serve_file(WEB_DIR / "browse.html")
+            return
+
+        if path == "/api/browse-logs":
+            self._handle_browse_logs(parsed.query)
+            return
+
+        if path == "/api/browse-log":
+            self._handle_browse_log(parsed.query)
+            return
+
+        if path == "/api/browse-tags":
+            self._send_json({"tags": list_tags(BROWSE_CONFIG.browse_db_path)})
+            return
+
+        if path == "/api/browse-config":
+            self._send_json(browse_config_payload())
+            return
+
+        if path.startswith("/airframe_img/"):
+            self._handle_airframe_image(path.removeprefix("/airframe_img/"))
             return
 
         if path.startswith("/api/analyze-runs/"):
@@ -83,6 +136,18 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             self._handle_interactive_plots()
             return
 
+        if parsed.path == "/api/browse-import-flight-review":
+            self._handle_browse_import()
+            return
+
+        if parsed.path == "/api/browse-tags":
+            self._handle_create_browse_tag()
+            return
+
+        if parsed.path == "/api/browse-log-tags":
+            self._handle_browse_log_tag()
+            return
+
         self._send_json({"error": "not found"}, status=404)
 
     def _handle_preparse_json(self) -> None:
@@ -92,10 +157,23 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
 
-        log_path = str(payload.get("log_path") or "").strip()
-        if not log_path:
-            self._send_json({"error": "log_path is required"}, status=400)
-            return
+        browse_row = None
+        browse_log_id = str(payload.get("browse_log_id") or "").strip()
+        if browse_log_id:
+            try:
+                browse_row = get_log(BROWSE_CONFIG.browse_db_path, browse_log_id)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"error": repr(exc)}, status=500)
+                return
+            log_path = str(browse_row["log_path"] or "").strip()
+        else:
+            log_path = str(payload.get("log_path") or "").strip()
+            if not log_path:
+                self._send_json({"error": "log_path is required"}, status=400)
+                return
 
         try:
             result = build_preparse_payload(
@@ -108,6 +186,14 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": repr(exc)}, status=500)
             return
 
+        if browse_row is not None:
+            result["browse"] = {"indexed": True, "log_id": browse_row["id"], "row": browse_row}
+        else:
+            result["browse"] = index_browse_log(
+                Path(log_path),
+                source_kind="local_path",
+                original_filename=Path(log_path).name,
+            )
         self._send_json(result)
 
     def _handle_upload_preparse(self) -> None:
@@ -153,7 +239,107 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
                 else None
             ),
         }
+        result["browse"] = index_browse_log(
+            log_path,
+            source_kind="upload",
+            source_log_id=log_path.parent.name,
+            original_filename=log_path.name,
+        )
         self._send_json(result)
+
+    def _handle_browse_logs(self, query: str) -> None:
+        params = parse_qs(query)
+        try:
+            payload = query_logs(
+                BROWSE_CONFIG.browse_db_path,
+                search=_first_param(params, "search"),
+                tags=_tag_params(params),
+                upload_start=_first_param(params, "upload_start"),
+                upload_end=_first_param(params, "upload_end"),
+                log_start=_first_param(params, "log_start"),
+                log_end=_first_param(params, "log_end"),
+                sort=_first_param(params, "sort") or "upload_date",
+                direction=_first_param(params, "direction") or "desc",
+                limit=_int_param(params, "limit", 50),
+                offset=_int_param(params, "offset", 0),
+            )
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
+            return
+        self._send_json(payload)
+
+    def _handle_browse_log(self, query: str) -> None:
+        params = parse_qs(query)
+        try:
+            row = get_log(BROWSE_CONFIG.browse_db_path, _first_param(params, "log_id"))
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
+            return
+        self._send_json({"log": row})
+
+    def _handle_browse_import(self) -> None:
+        try:
+            payload = import_flight_review(BROWSE_CONFIG)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
+            return
+        self._send_json(payload)
+
+    def _handle_create_browse_tag(self) -> None:
+        try:
+            payload = self._read_json_body()
+            tag = create_tag(BROWSE_CONFIG.browse_db_path, str(payload.get("name") or ""))
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
+            return
+        self._send_json({"tag": tag, "tags": list_tags(BROWSE_CONFIG.browse_db_path)})
+
+    def _handle_browse_log_tag(self) -> None:
+        try:
+            payload = self._read_json_body()
+            log_id = str(payload.get("log_id") or "")
+            tag = str(payload.get("tag") or "")
+            action = str(payload.get("action") or "add")
+            if action == "remove":
+                remove_log_tag(BROWSE_CONFIG.browse_db_path, log_id, tag)
+            else:
+                add_log_tag(BROWSE_CONFIG.browse_db_path, log_id, tag)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
+            return
+        self._send_json({"ok": True, "tags": list_tags(BROWSE_CONFIG.browse_db_path)})
+
+    def _handle_airframe_image(self, image_name: str) -> None:
+        image_name = unquote(image_name).strip().lstrip("/")
+        if not image_name:
+            self._send_json({"error": "image is required"}, status=400)
+            return
+        image_root = resolve_airframe_image_root(BROWSE_CONFIG)
+        requested = (image_root / image_name).resolve()
+        try:
+            requested.relative_to(image_root.resolve())
+        except ValueError:
+            self._send_json({"error": "invalid image path"}, status=400)
+            return
+        if not requested.is_file():
+            fallback = (image_root / "AirframeUnknown.svg").resolve()
+            requested = fallback if fallback.is_file() else requested
+        self._serve_file(requested)
 
     def _handle_start_analysis(self) -> None:
         try:
@@ -570,6 +756,82 @@ def resolve_artifact_path(path_value: str) -> Path:
     return requested
 
 
+def browse_config_payload() -> dict[str, Any]:
+    return {
+        "browse_db_path": str(BROWSE_CONFIG.browse_db_path),
+        "flight_review_storage_path": (
+            str(BROWSE_CONFIG.flight_review_storage_path)
+            if BROWSE_CONFIG.flight_review_storage_path
+            else None
+        ),
+        "flight_review_db_path": (
+            str(BROWSE_CONFIG.flight_review_db_path)
+            if BROWSE_CONFIG.flight_review_db_path
+            else None
+        ),
+        "flight_review_log_dir": (
+            str(BROWSE_CONFIG.flight_review_log_dir)
+            if BROWSE_CONFIG.flight_review_log_dir
+            else None
+        ),
+        "airframe_image_root": (
+            str(BROWSE_CONFIG.airframe_image_root)
+            if BROWSE_CONFIG.airframe_image_root
+            else None
+        ),
+    }
+
+
+def index_browse_log(
+    log_path: Path,
+    *,
+    source_kind: str,
+    source_log_id: str | None = None,
+    original_filename: str | None = None,
+) -> dict[str, Any]:
+    try:
+        airframes = load_browse_airframe_metadata(BROWSE_CONFIG)
+        record = upsert_log_from_path(
+            BROWSE_CONFIG.browse_db_path,
+            log_path,
+            upload_date=datetime.now(timezone.utc),
+            source_kind=source_kind,
+            source_log_id=source_log_id,
+            original_filename=original_filename,
+            airframes=airframes,
+            airframe_image_root=resolve_airframe_image_root(BROWSE_CONFIG),
+        )
+    except Exception as exc:
+        return {"indexed": False, "error": repr(exc)}
+    try:
+        row = get_log(BROWSE_CONFIG.browse_db_path, record["id"])
+    except Exception:
+        row = None
+    return {"indexed": True, "log_id": record["id"], "row": row}
+
+
+def _first_param(params: dict[str, list[str]], name: str) -> str:
+    values = params.get(name) or []
+    return values[0].strip() if values else ""
+
+
+def _tag_params(params: dict[str, list[str]]) -> list[str]:
+    tags: list[str] = []
+    for value in params.get("tag", []) + params.get("tags", []):
+        for tag in str(value or "").split(","):
+            clean = tag.strip()
+            if clean and clean not in tags:
+                tags.append(clean)
+    return tags
+
+
+def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
+    try:
+        return int(_first_param(params, name) or default)
+    except ValueError:
+        return default
+
+
 def _run_analysis_job(run_id: str, user_question: str) -> None:
     _update_analysis_run(run_id, status="running", started_at=time.time())
     try:
@@ -752,12 +1014,38 @@ def public_ngrok_url(payload: dict[str, Any]) -> str | None:
 
 
 def main() -> None:
+    global BROWSE_CONFIG
+
     parser = argparse.ArgumentParser(description="Run the flight-log preparse web UI.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
     parser.add_argument("--ngrok", action="store_true", help="Expose the local UI through ngrok.")
     parser.add_argument("--ngrok-bin", default="ngrok", help="Path to the ngrok executable.")
+    parser.add_argument("--browse-db-path", default=str(BROWSE_CONFIG.browse_db_path))
+    parser.add_argument("--flight-review-storage-path", default=None)
+    parser.add_argument("--flight-review-db-path", default=None)
+    parser.add_argument("--flight-review-log-dir", default=None)
+    parser.add_argument("--airframe-image-root", default=str(BROWSE_CONFIG.airframe_image_root or WEB_DIR / "airframes"))
     args = parser.parse_args()
+
+    BROWSE_CONFIG = BrowseConfig(
+        browse_db_path=Path(args.browse_db_path).expanduser(),
+        flight_review_storage_path=_optional_cli_path(
+            args.flight_review_storage_path,
+            BROWSE_CONFIG.flight_review_storage_path,
+        ),
+        flight_review_db_path=_optional_cli_path(
+            args.flight_review_db_path,
+            BROWSE_CONFIG.flight_review_db_path,
+        ),
+        flight_review_log_dir=_optional_cli_path(
+            args.flight_review_log_dir,
+            BROWSE_CONFIG.flight_review_log_dir,
+        ),
+        airframe_image_root=Path(args.airframe_image_root).expanduser(),
+    )
+    ensure_browse_db(BROWSE_CONFIG.browse_db_path)
+    refresh_airframe_image_keys(BROWSE_CONFIG)
 
     ngrok_process = None
     server = ThreadingHTTPServer((args.host, args.port), FlightLogWebHandler)
@@ -788,6 +1076,12 @@ def main() -> None:
                 ngrok_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 ngrok_process.kill()
+
+
+def _optional_cli_path(value: str | None, fallback: Path | None) -> Path | None:
+    if value:
+        return Path(value).expanduser()
+    return fallback
 
 
 if __name__ == "__main__":

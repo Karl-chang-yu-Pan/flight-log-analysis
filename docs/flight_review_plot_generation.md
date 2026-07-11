@@ -13,6 +13,11 @@ based on these reference files:
 - `ref/flight_review/app/plot_app/pid_analysis.py`
 - `ref/flight_review/app/plot_app/statistics_plots.py`
 - `ref/flight_review/app/plot_app/overview_generator.py`
+- `ref/flight_review/app/plot_app/templates/browse.html`
+- `ref/flight_review/app/tornado_handlers/browse.py`
+- `ref/flight_review/app/serve.py`
+- `ref/flight_review/app/setup_db.py`
+- `ref/flight_review/app/plot_app/config.py`
 
 ## High-Level Flow
 
@@ -33,6 +38,76 @@ flow:
 The loaded `ULog` object is cached in RAM by `load_ulog_file()` using
 `functools.lru_cache(maxsize=get_log_cache_size())`. This matters because ULog
 loading is expensive and Bokeh reloads `main.py` per session.
+
+## Browse Page And Overview Images
+
+Flight Review's browse page is wired through Tornado routes registered in
+`serve.py`:
+
+- `/browse` renders `BrowseHandler`.
+- `/browse_data_retrieval` serves `BrowseDataRetrievalHandler`.
+- `/overview_img/(.*)` statically serves files from `get_overview_img_filepath()`.
+
+The browse template is `plot_app/templates/browse.html`. It initializes a
+DataTables table with server-side filtering, `searchDelay: 500`, and AJAX data
+from `browse_data_retrieval`. If the page is opened with `?search=...`,
+`BrowseHandler` passes that value as the initial DataTables search. After each
+AJAX response, the template mirrors the current search text back into the page
+URL as `?search=...`.
+
+Flight Review browse columns are:
+
+- #
+- Uploaded
+- Overview
+- Type
+- Airframe
+- Hardware
+- Software
+- Duration
+- Start Time
+- Flight Modes
+
+`BrowseDataRetrievalHandler` reads DataTables request parameters such as
+`search[value]`, `order[0][column]`, `order[0][dir]`, `start`, `length`, and
+`draw`. It filters and pages data server-side from SQLite.
+
+The browse query uses two primary tables:
+
+- `Logs`: upload-side metadata such as `Id`, `Date`, `Description`, `Source`,
+  `Public`, and other public-log workflow fields.
+- `LogsGenerated`: generated log metadata such as `Duration`, `MavType`,
+  `AutostartId`, `Hardware`, `Software`, `NumLoggedErrors`,
+  `NumLoggedWarnings`, `FlightModes`, `SoftwareVersion`, `UUID`,
+  `FlightModeDurations`, and `StartTime`.
+
+The global search uses SQL `LIKE` over fields including `Logs.Description`,
+`LogsGenerated.MavType`, `Hardware`, `Software`, `SoftwareVersion`, and `UUID`.
+It also has special handling for PX4 version/release/hash-like searches.
+
+The GPS overview image is stored as a file, not a database blob:
+
+- `get_overview_img_filepath()` returns `<cache>/img`.
+- `overview_generator.generate_overview_img()` writes `<log_id>.png` into that
+  directory.
+- The browse handler checks whether `<log_id>.png` exists.
+- If present, it renders an image URL like `/overview_img/<log_id>.png`.
+- If absent, it renders a "No Image Preview" placeholder.
+
+The overview image generation flow is:
+
+1. `generate_overview_img_from_id(log_id)` loads `<log_files>/<log_id>.ulg`.
+2. It reads `vehicle_gps_position`.
+3. It keeps only samples with `fix_type > 2`.
+4. It reads latitude and longitude using `get_lat_lon_alt_deg()`, supporting
+   both newer `latitude_deg`/`longitude_deg` fields and older `lat`/`lon`
+   integer fields.
+5. It computes the GPS bounding box and map zoom.
+6. It renders a map with `smopy`, overlays the GPS path in red, hides axes, and
+   saves the image as PNG.
+
+On upload, Flight Review generates `LogsGenerated` data and schedules overview
+image generation asynchronously after the log is accepted.
 
 ## ULog Topics Loaded
 

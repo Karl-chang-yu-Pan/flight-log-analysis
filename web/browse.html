@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Browse Flight Logs</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="browse-page">
+      <header class="browse-header">
+        <div>
+          <h1>Browse Logs</h1>
+          <p id="browseStatus">Loading</p>
+        </div>
+        <div class="browse-actions">
+          <a class="button-link" href="/">Upload Log</a>
+          <button id="importFlightReview" type="button">Import Flight Review</button>
+        </div>
+      </header>
+
+      <section class="browse-filters" aria-label="Browse filters">
+        <label>
+          Search
+          <input id="browseSearch" type="search" placeholder="Search metadata">
+        </label>
+        <label>
+          Upload From
+          <input id="uploadStart" type="date">
+        </label>
+        <label>
+          Upload To
+          <input id="uploadEnd" type="date">
+        </label>
+        <label>
+          Log From
+          <input id="logStart" type="date">
+        </label>
+        <label>
+          Log To
+          <input id="logEnd" type="date">
+        </label>
+      </section>
+
+      <section class="browse-tag-bar" aria-label="Tags">
+        <div id="tagFilters" class="tag-filter-list"></div>
+      </section>
+
+      <section class="browse-table-section">
+        <div class="table-shell browse-table-shell">
+          <table class="dense-table browse-table">
+            <thead>
+              <tr>
+                <th>
+                  <button class="sort-button" data-sort="upload_date" type="button">Upload Date</button>
+                </th>
+                <th>
+                  <button class="sort-button" data-sort="log_date" type="button">Log Date</button>
+                </th>
+                <th>Vehicle</th>
+                <th>
+                  <button class="sort-button" data-sort="hardware" type="button">Hardware</button>
+                </th>
+                <th>
+                  <button class="sort-button" data-sort="software" type="button">Software</button>
+                </th>
+                <th>
+                  <button class="sort-button" data-sort="duration" type="button">Duration</button>
+                </th>
+                <th>
+                  <button class="sort-button" data-sort="error_count" type="button">Errors</button>
+                </th>
+                <th>Flight Modes</th>
+                <th>Tags</th>
+              </tr>
+            </thead>
+            <tbody id="browseRows">
+              <tr><td colspan="9" class="empty-state">Loading logs.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <footer class="browse-pagination">
+          <button id="prevPage" type="button">Previous</button>
+          <span id="pageSummary">0 logs</span>
+          <button id="nextPage" type="button">Next</button>
+        </footer>
+      </section>
+    </main>
+    <script src="/browse.js"></script>
+  </body>
+</html>
