@@ -1,4 +1,5 @@
 const state = {
+  browseLogId: "",
   payload: null,
   plotPayload: null,
   plotLoadToken: 0,
@@ -16,19 +17,18 @@ const state = {
 
 const els = {
   appShell: document.getElementById("appShell"),
-  form: document.getElementById("preparseForm"),
-  logFile: document.getElementById("logFile"),
-  logPath: document.getElementById("logPath"),
-  browseLogId: document.getElementById("browseLogId"),
   runStatus: document.getElementById("runStatus"),
-  uploadProgress: document.getElementById("uploadProgress"),
-  uploadProgressBar: document.getElementById("uploadProgressBar"),
+  downloadLog: document.getElementById("downloadLog"),
+  downloadParameters: document.getElementById("downloadParameters"),
+  downloadNonDefaultParameters: document.getElementById("downloadNonDefaultParameters"),
+  downloadKml: document.getElementById("downloadKml"),
   sidebar: document.getElementById("sidebar"),
   sidebarToggle: document.getElementById("sidebarToggle"),
   sidebarSummary: document.getElementById("sidebarSummary"),
   plotSidebar: document.getElementById("plotSidebar"),
   plotSidebarToggle: document.getElementById("plotSidebarToggle"),
   plotSidebarStatus: document.getElementById("plotSidebarStatus"),
+  plotNavigation: document.getElementById("plotNavigation"),
   plotRows: document.getElementById("plotRows"),
   factGrid: document.getElementById("factGrid"),
   warningsList: document.getElementById("warningsList"),
@@ -44,6 +44,7 @@ const els = {
   topicRows: document.getElementById("topicRows"),
   topicCount: document.getElementById("topicCount"),
   mainSummary: document.getElementById("mainSummary"),
+  analysisSourcePath: document.getElementById("analysisSourcePath"),
   analysisQuestion: document.getElementById("analysisQuestion"),
   analysisButton: document.getElementById("analysisButton"),
   analysisStatus: document.getElementById("analysisStatus"),
@@ -59,11 +60,6 @@ const els = {
   logTagNewName: document.getElementById("logTagNewName"),
   logTagCreate: document.getElementById("logTagCreate"),
 };
-
-els.form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await preparseLog();
-});
 
 els.parameterSearch.addEventListener("input", renderParameters);
 els.parameterStatus.addEventListener("change", renderParameters);
@@ -85,18 +81,15 @@ els.logTagList.addEventListener("click", (event) => {
   if (!button) return;
   removeCurrentLogTag(button.dataset.removeLogTag);
 });
-els.logFile.addEventListener("change", clearBrowseLogSelection);
-els.logPath.addEventListener("input", clearBrowseLogSelection);
-
 const initialParams = new URLSearchParams(window.location.search);
 const initialBrowseId = initialParams.get("browse_id");
-const initialLogPath = initialParams.get("log_path");
 if (initialBrowseId) {
-  els.browseLogId.value = initialBrowseId;
-  window.requestAnimationFrame(() => preparseLog());
-} else if (initialLogPath) {
-  els.logPath.value = initialLogPath;
-  window.requestAnimationFrame(() => preparseLog());
+  state.browseLogId = initialBrowseId;
+  configureDownloadLinks(initialBrowseId);
+  window.requestAnimationFrame(() => loadReview());
+} else {
+  setStatus("Missing log");
+  els.mainSummary.innerHTML = `<p class="message-item">Choose a log from <a href="/browse">Browse</a> or <a href="/upload">Upload</a>.</p>`;
 }
 
 els.sidebarToggle.addEventListener("click", () => {
@@ -129,18 +122,14 @@ window.addEventListener("resize", () => {
   window.requestAnimationFrame(() => drawInteractivePlots(state.plotPayload?.plots || []));
 });
 
-async function preparseLog() {
-  setStatus("Pre-parsing...");
-  const formData = new FormData(els.form);
-  const hasUpload = els.logFile.files && els.logFile.files.length > 0;
-  if (hasUpload) {
-    els.browseLogId.value = "";
-  }
-
+async function loadReview() {
+  setStatus("Loading...");
   try {
-    const result = hasUpload
-      ? await uploadAndPreparse(formData)
-      : await preparseLocalPath(formData);
+    const result = await fetchJson("/api/preparse", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ browse_log_id: state.browseLogId }),
+    });
     state.payload = result;
     state.plotPayload = null;
     state.plotTrackers = {};
@@ -149,12 +138,11 @@ async function preparseLog() {
     state.availableTags = [];
     state.currentLogTags = result?.browse?.row?.tags || [];
     state.tagStatus = "";
-    if (result?.inputs?.log_path) {
-      els.logPath.value = result.inputs.log_path;
-    }
     if (result?.browse?.log_id) {
-      els.browseLogId.value = result.browse.log_id;
+      state.browseLogId = result.browse.log_id;
     }
+    els.analysisSourcePath.value = result?.inputs?.source_path || "";
+    updateKmlDownloadAvailability();
     await refreshLoadedLogTags();
     resetAnalysis();
     renderAll();
@@ -163,8 +151,6 @@ async function preparseLog() {
   } catch (error) {
     setStatus("Failed");
     els.mainSummary.innerHTML = `<p class="message-item">${escapeHtml(error.message)}</p>`;
-  } finally {
-    hideUploadProgressSoon();
   }
 }
 
@@ -175,7 +161,7 @@ async function startAnalysis() {
   }
 
   const inputs = state.payload.inputs || {};
-  const currentSourcePath = stringOrNull(new FormData(els.form).get("source_path"));
+  const currentSourcePath = stringOrNull(els.analysisSourcePath.value);
   const question = els.analysisQuestion.value.trim()
     || "Analyze this flight log and identify the most likely root causes.";
   const payload = {
@@ -448,62 +434,6 @@ function clearAnalysisPoll() {
   }
 }
 
-async function preparseLocalPath(formData) {
-  const payload = {
-    browse_log_id: stringOrNull(formData.get("browse_log_id")),
-    log_path: stringOrNull(formData.get("log_path")),
-    mission_path: stringOrNull(formData.get("mission_path")),
-    source_path: stringOrNull(formData.get("source_path")),
-    parameters_xml_path: stringOrNull(formData.get("parameters_xml_path")),
-  };
-
-  if (!payload.log_path && !payload.browse_log_id) {
-    throw new Error("Choose a ULog file or provide a local ULog path.");
-  }
-
-  const response = await fetch("/api/preparse", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const result = await response.json();
-  if (!response.ok) {
-    throw new Error(result.error || `HTTP ${response.status}`);
-  }
-  return result;
-}
-
-function uploadAndPreparse(formData) {
-  return new Promise((resolve, reject) => {
-    showUploadProgress(0);
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/upload-preparse");
-    xhr.responseType = "json";
-
-    xhr.upload.addEventListener("progress", (event) => {
-      if (event.lengthComputable) {
-        showUploadProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
-      }
-    });
-
-    xhr.addEventListener("load", () => {
-      showUploadProgress(100);
-      const result = xhr.response || {};
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(result);
-      } else {
-        reject(new Error(result.error || `HTTP ${xhr.status}`));
-      }
-    });
-
-    xhr.addEventListener("error", () => {
-      reject(new Error("Upload failed."));
-    });
-
-    xhr.send(formData);
-  });
-}
-
 async function refreshLoadedLogTags() {
   const logId = currentBrowseLogId();
   if (!logId) {
@@ -586,11 +516,22 @@ async function updateCurrentLogTag(tag, action) {
 }
 
 function currentBrowseLogId() {
-  return state.payload?.browse?.log_id || state.payload?.browse?.row?.id || "";
+  return state.payload?.browse?.log_id || state.payload?.browse?.row?.id || state.browseLogId;
 }
 
-function clearBrowseLogSelection() {
-  els.browseLogId.value = "";
+function configureDownloadLinks(logId) {
+  const baseUrl = `/api/browse-download?log_id=${encodeURIComponent(logId)}&type=`;
+  els.downloadLog.href = `${baseUrl}ulog`;
+  els.downloadParameters.href = `${baseUrl}parameters`;
+  els.downloadNonDefaultParameters.href = `${baseUrl}parameters_non_default`;
+  els.downloadKml.href = `${baseUrl}kml`;
+}
+
+function updateKmlDownloadAvailability() {
+  const hasGpsPosition = (state.payload?.topics || []).some(
+    (topic) => topic.name === "vehicle_gps_position" && !topic.missing_expected,
+  );
+  els.downloadKml.hidden = !hasGpsPosition;
 }
 
 async function fetchJson(url, options) {
@@ -671,26 +612,36 @@ function renderInteractivePlots() {
   const plots = state.plotPayload?.plots || [];
   if (!state.payload) {
     els.plotSidebarStatus.textContent = "Load a log";
+    renderPlotNavigation([]);
     els.plotRows.innerHTML = `<p class="plot-empty">Load a ULog to view Flight Review plots.</p>`;
     return;
   }
 
   if (!state.plotPayload) {
     els.plotSidebarStatus.textContent = "Plots pending";
+    renderPlotNavigation([]);
     els.plotRows.innerHTML = `<p class="plot-empty">Plots will load after pre-parse completes.</p>`;
     return;
   }
 
   els.plotSidebarStatus.textContent = plots.length ? `${plots.length} plots` : "No plottable data";
+  renderPlotNavigation(plots);
   els.plotRows.innerHTML = plots.length
-    ? plots.map(renderInteractivePlot).join("")
+    ? plots.map((plot, index) => renderInteractivePlot(plot, index)).join("")
     : `<p class="plot-empty">No Flight Review plot signals were available in this log.</p>`;
 
   bindInteractivePlots(plots);
   window.requestAnimationFrame(() => drawInteractivePlots(plots));
 }
 
-function renderInteractivePlot(plot) {
+function renderPlotNavigation(plots) {
+  els.plotNavigation.hidden = !plots.length;
+  els.plotNavigation.innerHTML = plots.map((plot, index) => `
+    <a href="#plot-${index}">${escapeHtml(plot.title || `Plot ${index + 1}`)}</a>
+  `).join("");
+}
+
+function renderInteractivePlot(plot, index) {
   const [start, end] = plot.time_range_s || [0, 0];
   const tracker = clampTracker(plot.id, start, end);
   const sources = plot.kind === "local_position"
@@ -699,7 +650,7 @@ function renderInteractivePlot(plot) {
   const step = Math.max((end - start) / 1000, 0.001);
 
   return `
-    <section class="interactive-plot" data-plot-id="${escapeAttr(plot.id)}">
+    <section class="interactive-plot" id="plot-${index}" data-plot-id="${escapeAttr(plot.id)}">
       <div class="interactive-plot-header">
         <h3>${escapeHtml(plot.title)}</h3>
         <span class="plot-time" id="plotTime-${escapeAttr(plot.id)}">${escapeHtml(formatLogTime(tracker))}</span>
@@ -1668,18 +1619,6 @@ function formatEventTime(value) {
 
 function artifactUrl(path) {
   return `/artifacts?path=${encodeURIComponent(path)}`;
-}
-
-function showUploadProgress(percent) {
-  els.uploadProgress.hidden = false;
-  els.uploadProgressBar.style.width = `${percent}%`;
-}
-
-function hideUploadProgressSoon() {
-  window.setTimeout(() => {
-    els.uploadProgress.hidden = true;
-    els.uploadProgressBar.style.width = "0%";
-  }, 800);
 }
 
 function stringOrNull(value) {

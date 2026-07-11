@@ -1,10 +1,16 @@
 from io import BytesIO
 from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 import pytest
 from pyulog import ULog
 
 import flight_log_agent.web.server as web_app
+from flight_log_agent.web.log_downloads import (
+    extract_gps_coordinates,
+    serialize_kml_track,
+    serialize_parameter_rows,
+)
 from flight_log_agent.web.server import (
     analysis_event_message,
     build_analysis_progress,
@@ -155,3 +161,58 @@ def test_resolve_artifact_path_allows_outputs_and_rejects_other_paths(tmp_path, 
 
     with pytest.raises(ValueError, match="not allowed"):
         web_app.resolve_artifact_path(str(tmp_path / "plot.png"))
+
+
+def test_parameter_download_serialization_supports_all_and_non_default_rows():
+    rows = [
+        {"name": "COM_ARM_WO_GPS", "raw_value": 1, "default_status": "default"},
+        {"name": "MPC_XY_CRUISE", "raw_value": 8.5, "default_status": "non_default"},
+    ]
+
+    assert serialize_parameter_rows(rows, non_default_only=False).decode("utf-8") == (
+        "1\t1\tCOM_ARM_WO_GPS\t1\t6\n"
+        "1\t1\tMPC_XY_CRUISE\t8.5\t9\n"
+    )
+    assert serialize_parameter_rows(rows, non_default_only=True).decode("utf-8") == (
+        "1\t1\tMPC_XY_CRUISE\t8.5\t9\n"
+    )
+
+
+def test_gps_download_supports_new_and_legacy_field_units():
+    new_fields = {
+        "latitude_deg": [25.0, 25.1],
+        "longitude_deg": [121.0, 121.1],
+        "altitude_msl_m": [100.0, 101.0],
+        "fix_type": [2, 3],
+    }
+    legacy_fields = {
+        "lat": [250000000],
+        "lon": [1210000000],
+        "alt": [100000],
+        "fix_type": [3],
+    }
+
+    assert extract_gps_coordinates(new_fields) == [(121.1, 25.1, 101.0)]
+    assert extract_gps_coordinates(legacy_fields) == [(121.0, 25.0, 100.0)]
+
+
+def test_kml_download_contains_flight_track_coordinates():
+    payload = serialize_kml_track([(121.0, 25.0, 100.0)])
+    root = ET.fromstring(payload)
+    coordinates = root.find(".//{http://www.opengis.net/kml/2.2}coordinates")
+
+    assert coordinates is not None
+    assert coordinates.text == "121.000000000,25.000000000,100.000"
+
+
+def test_upload_review_and_browse_pages_have_separate_navigation_contracts():
+    upload_html = (web_app.WEB_DIR / "index.html").read_text(encoding="utf-8")
+    review_html = (web_app.WEB_DIR / "review.html").read_text(encoding="utf-8")
+    browse_js = (web_app.WEB_DIR / "browse.js").read_text(encoding="utf-8")
+
+    assert 'id="uploadForm"' in upload_html
+    assert 'id="appShell"' not in upload_html
+    assert 'id="uploadForm"' not in review_html
+    assert 'id="downloadMenu"' in review_html
+    assert 'id="plotNavigation"' in review_html
+    assert "/review?browse_id=" in browse_js

@@ -3,102 +3,29 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Flight Log Analysis</title>
+    <title>Upload Flight Log</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
-  <body>
-    <div class="app-shell" id="appShell">
-      <aside class="sidebar" id="sidebar">
-        <div class="sidebar-header">
-          <div>
-            <h1>Flight Log</h1>
-            <p id="sidebarSummary">No log loaded</p>
-          </div>
-          <button class="icon-button" id="sidebarToggle" type="button" title="Collapse sidebar" aria-label="Collapse sidebar">
-            <span aria-hidden="true">‹</span>
-          </button>
+  <body class="upload-page">
+    <header class="app-nav">
+      <a class="app-nav-brand" href="/upload">Flight Log Review</a>
+      <nav class="app-nav-actions" aria-label="Upload navigation">
+        <a class="active" href="/upload" aria-current="page">Upload</a>
+        <a href="/browse">Browse</a>
+      </nav>
+    </header>
+
+    <main class="upload-workspace">
+      <div class="upload-heading">
+        <div>
+          <h1>Upload Flight Log</h1>
+          <p>Choose a ULog and optional analysis inputs.</p>
         </div>
+        <span id="uploadStatus" class="status-text">Idle</span>
+      </div>
 
-        <section class="fact-section">
-          <h2>Facts</h2>
-          <dl class="fact-grid" id="factGrid"></dl>
-        </section>
-
-        <section class="fact-section">
-          <div class="section-title-row">
-            <h2>Messages</h2>
-            <span class="count-pill" id="warningCount">0</span>
-          </div>
-          <div class="toolbar compact-toolbar">
-            <input id="messageSearch" type="search" placeholder="Search messages">
-            <select id="messageFilter">
-              <option value="important">Important</option>
-              <option value="errors">Errors only</option>
-              <option value="all">All messages</option>
-            </select>
-          </div>
-          <div class="message-table-shell scroll-panel messages-panel">
-            <table class="dense-table message-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Level</th>
-                  <th>Message</th>
-                </tr>
-              </thead>
-              <tbody id="warningsList"></tbody>
-            </table>
-          </div>
-        </section>
-
-        <section class="fact-section">
-          <div class="section-title-row">
-            <h2>Parameters</h2>
-            <span class="count-pill" id="parameterCount">0</span>
-          </div>
-          <div class="toolbar">
-            <input id="parameterSearch" type="search" placeholder="Search all parameters">
-            <select id="parameterStatus">
-              <option value="all">All parameters</option>
-              <option value="non_default">Non-default</option>
-              <option value="default">Default</option>
-              <option value="unknown">Unknown default</option>
-            </select>
-            <label class="check-row">
-              <input id="hideRcCal" type="checkbox">
-              Hide RC/CAL
-            </label>
-          </div>
-          <div class="table-shell scroll-panel parameters-panel">
-            <table class="dense-table parameter-table">
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Value</th>
-                  <th>Default</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody id="parameterRows"></tbody>
-            </table>
-          </div>
-        </section>
-
-        <section class="fact-section">
-          <div class="section-title-row">
-            <h2>Topics</h2>
-            <span class="count-pill" id="topicCount">0</span>
-          </div>
-          <div class="toolbar">
-            <input id="topicSearch" type="search" placeholder="Search topics and fields">
-          </div>
-          <div id="topicRows" class="topic-list scroll-panel topics-panel"></div>
-        </section>
-      </aside>
-
-      <main class="main-canvas">
-        <form class="input-bar upload-form" id="preparseForm" enctype="multipart/form-data">
-          <input id="browseLogId" name="browse_log_id" type="hidden">
+      <form class="upload-panel" id="uploadForm" enctype="multipart/form-data">
+        <div class="upload-grid">
           <label>
             ULog file
             <input id="logFile" name="log_file" type="file" accept=".ulg">
@@ -114,106 +41,37 @@
           <label>
             PX4 source
             <input id="sourcePath" name="source_path" type="text" placeholder="optional PX4 checkout">
-            </label>
-            <button type="submit">Pre-parse</button>
-            <a class="button-link" href="/browse">Browse</a>
-            <details class="advanced-inputs">
-            <summary>Use local paths instead</summary>
-            <div class="advanced-grid">
-              <label>
-                ULog path
-                <input id="logPath" name="log_path" type="text" placeholder="/path/to/flight.ulg">
-              </label>
-              <label>
-                Mission path
-                <input id="missionPath" name="mission_path" type="text" placeholder="optional .plan or .waypoints">
-              </label>
-              <label>
-                Parameters XML path
-                <input id="parametersXmlPath" name="parameters_xml_path" type="text" placeholder="optional parameters.xml">
-              </label>
-            </div>
-          </details>
-        </form>
-        <div class="upload-progress" id="uploadProgress" hidden>
-          <div class="upload-progress-bar" id="uploadProgressBar"></div>
+          </label>
         </div>
 
-        <section class="canvas-section">
-          <div class="section-title-row">
-            <h2>Pre-parse Result</h2>
-            <span id="runStatus" class="status-text">Idle</span>
-          </div>
-          <div id="mainSummary" class="summary-panel">
-            <p>Load a ULog to inspect deterministic facts before running the analysis agent.</p>
-          </div>
-          <div id="logTagPanel" class="log-tag-panel" hidden>
-            <div class="section-title-row">
-              <h3>Tags</h3>
-              <span id="logTagStatus" class="status-text"></span>
-            </div>
-            <div id="logTagList" class="row-tags"></div>
-            <div class="tag-editor">
-              <select id="logTagSelect">
-                <option value="">Add existing tag</option>
-              </select>
-              <button id="logTagAdd" type="button">Add</button>
-              <input id="logTagNewName" type="text" placeholder="New tag">
-              <button id="logTagCreate" type="button">Create</button>
-            </div>
-          </div>
-        </section>
-
-        <section class="canvas-section">
-          <div class="section-title-row">
-            <h2>Agent Analysis</h2>
-            <span id="analysisStatus" class="status-text">Idle</span>
-          </div>
-          <div class="analysis-controls">
+        <details class="advanced-inputs">
+          <summary>Use local paths instead</summary>
+          <div class="advanced-grid">
             <label>
-              Question
-              <textarea id="analysisQuestion" rows="3" placeholder="Why did the aircraft drop altitude right after transition?"></textarea>
+              ULog path
+              <input id="logPath" name="log_path" type="text" placeholder="/path/to/flight.ulg">
             </label>
-            <button id="analysisButton" type="button" disabled>Run Analysis</button>
+            <label>
+              Mission path
+              <input id="missionPath" name="mission_path" type="text" placeholder="optional .plan or .waypoints">
+            </label>
+            <label>
+              Parameters XML path
+              <input id="parametersXmlPath" name="parameters_xml_path" type="text" placeholder="optional parameters.xml">
+            </label>
           </div>
-          <div id="analysisProgress" class="progress-list"></div>
-          <div id="analysisReport" class="analysis-report"></div>
-        </section>
+        </details>
 
-        <section class="canvas-section">
-          <h2>Changed Parameters</h2>
-          <div class="table-shell main-table">
-            <table class="dense-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Name</th>
-                  <th>Value</th>
-                </tr>
-              </thead>
-              <tbody id="changedParameterRows"></tbody>
-            </table>
-          </div>
-        </section>
-
-        <section class="canvas-section">
-          <h2>Timeline</h2>
-          <div id="timelineRows" class="timeline-list"></div>
-        </section>
-      </main>
-      <aside class="plot-sidebar" id="plotSidebar">
-        <div class="plot-sidebar-header">
-          <div>
-            <h2>Flight Review Plots</h2>
-            <p id="plotSidebarStatus">Load a log</p>
-          </div>
-          <button class="icon-button" id="plotSidebarToggle" type="button" title="Collapse plots" aria-label="Collapse plots">
-            <span aria-hidden="true">›</span>
-          </button>
+        <div class="upload-actions">
+          <button id="uploadButton" type="submit">Upload and Review</button>
         </div>
-        <div id="plotRows" class="plot-list"></div>
-      </aside>
-    </div>
-    <script src="/app.js"></script>
+      </form>
+
+      <div class="upload-progress" id="uploadProgress" hidden>
+        <div class="upload-progress-bar" id="uploadProgressBar"></div>
+      </div>
+      <p id="uploadError" class="upload-error" hidden></p>
+    </main>
+    <script src="/upload.js"></script>
   </body>
 </html>

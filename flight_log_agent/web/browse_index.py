@@ -110,6 +110,7 @@ def upsert_log_from_path(
     original_filename: str | None = None,
     airframes: Mapping[str, Mapping[str, str]] | None = None,
     airframe_image_root: Path | None = None,
+    review_inputs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     record = build_log_record_from_path(
         log_path,
@@ -119,6 +120,7 @@ def upsert_log_from_path(
         original_filename=original_filename,
         airframes=airframes,
         airframe_image_root=airframe_image_root,
+        review_inputs=review_inputs,
     )
     with _connect(db_path) as con:
         _ensure_schema(con)
@@ -314,6 +316,7 @@ def build_log_record_from_path(
     original_filename: str | None = None,
     airframes: Mapping[str, Mapping[str, str]] | None = None,
     airframe_image_root: Path | None = None,
+    review_inputs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     log_path = Path(log_path)
     inventory = parse_ulog_inventory(log_path)
@@ -334,6 +337,14 @@ def build_log_record_from_path(
         inventory.get("git_hash"),
         ulog_info.get("ver_sw"),
     )
+
+    record_metadata = {
+        "inventory": inventory,
+        "ulog_info": ulog_info,
+    }
+    normalized_review_inputs = _normalize_review_inputs(review_inputs)
+    if normalized_review_inputs:
+        record_metadata["review_inputs"] = normalized_review_inputs
 
     record = {
         "id": log_id,
@@ -363,10 +374,7 @@ def build_log_record_from_path(
         "duration_s": inventory.get("duration_s"),
         "error_count": _error_count(inventory.get("logged_messages") or []),
         "flight_modes": flight_modes,
-        "metadata": {
-            "inventory": inventory,
-            "ulog_info": ulog_info,
-        },
+        "metadata": record_metadata,
     }
     record["search_text"] = _build_search_text(record)
     return record
@@ -642,6 +650,7 @@ def _order_by(sort: str, direction: str) -> str:
 
 
 def _row_payload(con: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    metadata = _json_object(row["metadata_json"])
     tags = [
         tag_row[0]
         for tag_row in con.execute(
@@ -675,6 +684,7 @@ def _row_payload(con: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         "error_count": row["error_count"],
         "flight_modes": json.loads(row["flight_modes_json"] or "[]"),
         "tags": tags,
+        "review_inputs": _normalize_review_inputs(metadata.get("review_inputs")),
     }
 
 
@@ -798,6 +808,25 @@ def _clean_optional(value: Any) -> str | None:
 
 def _clean_tag(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _normalize_review_inputs(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    normalized = {}
+    for key in ("mission_path", "source_path", "parameters_xml_path"):
+        clean_value = _clean_optional(value.get(key))
+        if clean_value:
+            normalized[key] = clean_value
+    return normalized
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _float_or_none(value: Any) -> float | None:

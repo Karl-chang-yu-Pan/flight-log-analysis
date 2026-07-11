@@ -18,6 +18,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   min-width: 320px;
@@ -33,10 +37,117 @@ select {
   font: inherit;
 }
 
+.app-nav {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 52px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.app-nav-brand {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.app-nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.app-nav-actions > a,
+.download-menu > summary {
+  min-height: 32px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  list-style: none;
+  text-decoration: none;
+}
+
+.app-nav-actions > a:hover,
+.app-nav-actions > a.active,
+.download-menu > summary:hover,
+.download-menu[open] > summary {
+  background: var(--surface-subtle);
+  color: var(--accent);
+}
+
+.download-menu {
+  position: relative;
+}
+
+.download-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.download-menu-items {
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  z-index: 12;
+  display: grid;
+  width: max-content;
+  min-width: 210px;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  box-shadow: 0 8px 20px rgb(32 38 32 / 12%);
+}
+
+.download-menu-items a {
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.download-menu-items a:last-child {
+  border-bottom: 0;
+}
+
+.download-menu-items a:hover {
+  background: var(--surface-subtle);
+  color: var(--accent);
+}
+
+.review-page {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: minmax(340px, 440px) minmax(0, 1fr) minmax(360px, 480px);
   min-height: 100vh;
+}
+
+.review-page .app-shell {
+  min-height: 0;
+}
+
+.review-page .main-canvas {
+  overflow-y: auto;
+}
+
+.review-page .sidebar,
+.review-page .plot-sidebar {
+  max-height: 100%;
 }
 
 .app-shell.sidebar-collapsed {
@@ -119,6 +230,35 @@ select {
   margin-top: 3px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.plot-navigation {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.plot-navigation a {
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+.plot-navigation a:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.plot-sidebar.collapsed .plot-navigation {
+  display: none;
 }
 
 h1,
@@ -504,6 +644,94 @@ h2 {
   margin-top: 10px;
 }
 
+.upload-page {
+  min-height: 100vh;
+}
+
+.upload-workspace {
+  width: min(920px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 36px 0;
+}
+
+.upload-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.upload-heading p {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.upload-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.upload-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.upload-grid label,
+.advanced-grid label,
+.analysis-context label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.upload-grid input,
+.advanced-grid input,
+.analysis-context input {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 7px 9px;
+}
+
+.upload-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.upload-actions button {
+  min-height: 36px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #ffffff;
+  padding: 8px 13px;
+  cursor: pointer;
+}
+
+.upload-actions button:disabled {
+  border-color: var(--line-strong);
+  background: var(--line-strong);
+  cursor: not-allowed;
+}
+
+.upload-error {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--danger);
+  background: #fff2f2;
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .upload-progress {
   height: 4px;
   overflow: hidden;
@@ -535,6 +763,10 @@ h2 {
   gap: 10px;
   align-items: end;
   margin-bottom: 12px;
+}
+
+.analysis-context {
+  margin-bottom: 10px;
 }
 
 .analysis-controls label {
@@ -860,6 +1092,16 @@ h2 {
 }
 
 @media (max-width: 980px) {
+  .review-page {
+    display: block;
+    height: auto;
+    overflow: visible;
+  }
+
+  .review-page .main-canvas {
+    overflow-y: visible;
+  }
+
   .app-shell {
     grid-template-columns: 1fr;
   }
@@ -894,18 +1136,42 @@ h2 {
     grid-template-columns: 1fr;
   }
 
+  .upload-grid {
+    grid-template-columns: 1fr;
+  }
+
   .summary-kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 560px) {
+  .app-nav {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .app-nav-actions {
+    width: 100%;
+  }
+
+  .download-menu-items {
+    right: auto;
+    left: 0;
+  }
+
   .main-canvas {
     padding: 12px;
   }
 
   .summary-kpis {
     grid-template-columns: 1fr;
+  }
+
+  .upload-workspace {
+    width: min(100% - 24px, 920px);
+    padding: 24px 0;
   }
 }
 

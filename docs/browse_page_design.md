@@ -182,3 +182,28 @@ Path resolution should work as follows:
 
 The importer should preserve the existing Flight Review database and log files
 intact. Rebuild/resync should only write to our browse DB.
+
+## Upload And Review Layout
+
+Keep upload and review as separate routes:
+
+- `/upload` (and `/`) is the dedicated upload/local-path page.
+- `/review?browse_id=<id>` is the dedicated review page.
+- The upload flow indexes the log, then redirects to its review route.
+- The Upload Date cell on the browse page links to the review route; there is no
+  separate Open column or button.
+
+The review page keeps the existing three-column workspace:
+
+- Log facts, messages, parameters, and topics on the left
+- Summary, tags, analysis, changed parameters, and timeline in the center
+- Flight Review plots on the right
+
+Add a page-level row above that workspace with Upload, Browse, and Download.
+Download remains available while viewing a valid log. It provides the original
+ULog, all parameters, and non-default parameters. KML is shown only when the log
+contains usable GPS position data.
+
+Generate a simple plot anchor list inside the right plot sidebar. It scrolls to
+the selected plot and does not use sticky positioning or active-section
+tracking. Plot-specific controls remain with each plot.

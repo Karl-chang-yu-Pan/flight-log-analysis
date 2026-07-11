@@ -151,7 +151,7 @@ function renderRows() {
 
   browseEls.rows.innerHTML = browseState.rows.map((row) => `
     <tr>
-      <td><a class="table-link" href="/?browse_id=${encodeURIComponent(row.id)}">${escapeHtml(formatDate(row.upload_date) || "Open")}</a></td>
+      <td><a class="table-link" href="/review?browse_id=${encodeURIComponent(row.id)}">${escapeHtml(formatDate(row.upload_date) || "Unknown date")}</a></td>
       <td>${escapeHtml(formatDate(row.log_date))}</td>
       <td>${renderAirframe(row)}</td>
       <td>${escapeHtml(row.hardware || "")}</td>

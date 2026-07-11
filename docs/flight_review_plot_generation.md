@@ -39,6 +39,29 @@ The loaded `ULog` object is cached in RAM by `load_ulog_file()` using
 `functools.lru_cache(maxsize=get_log_cache_size())`. This matters because ULog
 loading is expensive and Bokeh reloads `main.py` per session.
 
+## Upload And Review Navigation
+
+Flight Review keeps upload and review as separate page states. The upload page
+collects the log and its metadata, then the generated log id opens the Bokeh
+review application through `/plot_app?log=<id>`.
+
+The review header exposes page-level actions above the plots:
+
+- Upload
+- Browse
+- Download
+- Navigation
+- Plot Legend
+
+The Download menu is available from the review header. Its entries are generated
+for the current log and include the original ULog, parameter exports, and
+position-based formats when the required data exists.
+
+The Navigation menu is generated from the available plots. Selecting an entry
+calls `scrollIntoView()` for that plot's anchor. Flight Review does not implement
+this plot index as a sticky active-section navigator; it is a header dropdown,
+while plot-specific controls remain attached to each Bokeh plot.
+
 ## Browse Page And Overview Images
 
 Flight Review's browse page is wired through Tornado routes registered in

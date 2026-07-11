@@ -165,12 +165,21 @@ def test_uploaded_log_uses_metadata_group_image(tmp_path, monkeypatch):
         source_log_id="upload-id",
         airframes=load_browse_airframe_metadata(config),
         airframe_image_root=config.airframe_image_root,
+        review_inputs={
+            "mission_path": tmp_path / "mission.plan",
+            "source_path": tmp_path / "PX4-Autopilot",
+        },
     )
 
     assert record["airframe_name"] == "Generic Standard VTOL"
     assert record["airframe_group"] == "Standard VTOL"
     assert record["airframe_image_key"] == "VTOLPlane"
-    assert get_log(config.browse_db_path, "upload-id")["airframe_image_key"] == "VTOLPlane"
+    stored = get_log(config.browse_db_path, "upload-id")
+    assert stored["airframe_image_key"] == "VTOLPlane"
+    assert stored["review_inputs"] == {
+        "mission_path": str(tmp_path / "mission.plan"),
+        "source_path": str(tmp_path / "PX4-Autopilot"),
+    }
 
 
 def test_missing_airframe_asset_uses_unknown_fallback(tmp_path):

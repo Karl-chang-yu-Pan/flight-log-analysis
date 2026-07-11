@@ -37,6 +37,10 @@ from flight_log_agent.web.browse_index import (
     resolve_airframe_image_root,
     upsert_log_from_path,
 )
+from flight_log_agent.web.log_downloads import (
+    build_kml_download,
+    build_parameter_download,
+)
 
 
 def _optional_env_path(name: str) -> Path | None:
@@ -77,6 +81,14 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             self._serve_file(WEB_DIR / "index.html")
             return
 
+        if path == "/upload":
+            self._serve_file(WEB_DIR / "index.html")
+            return
+
+        if path == "/review":
+            self._serve_file(WEB_DIR / "review.html")
+            return
+
         if path == "/browse":
             self._serve_file(WEB_DIR / "browse.html")
             return
@@ -95,6 +107,10 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/browse-config":
             self._send_json(browse_config_payload())
+            return
+
+        if path == "/api/browse-download":
+            self._handle_browse_download(parsed.query)
             return
 
         if path.startswith("/airframe_img/"):
@@ -176,11 +192,22 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
                 return
 
         try:
+            stored_inputs = (browse_row or {}).get("review_inputs") or {}
+            mission_path = _optional_payload_path(payload, "mission_path") or stored_inputs.get(
+                "mission_path"
+            )
+            source_path = _optional_payload_path(payload, "source_path") or stored_inputs.get(
+                "source_path"
+            )
+            parameters_xml_path = _optional_payload_path(
+                payload,
+                "parameters_xml_path",
+            ) or stored_inputs.get("parameters_xml_path")
             result = build_preparse_payload(
                 log_path,
-                mission_path=_optional_payload_path(payload, "mission_path"),
-                source_path=_optional_payload_path(payload, "source_path"),
-                parameters_xml_path=_optional_payload_path(payload, "parameters_xml_path"),
+                mission_path=mission_path,
+                source_path=source_path,
+                parameters_xml_path=parameters_xml_path,
             )
         except Exception as exc:
             self._send_json({"error": repr(exc)}, status=500)
@@ -193,6 +220,11 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
                 Path(log_path),
                 source_kind="local_path",
                 original_filename=Path(log_path).name,
+                review_inputs={
+                    "mission_path": mission_path,
+                    "source_path": source_path,
+                    "parameters_xml_path": parameters_xml_path,
+                },
             )
         self._send_json(result)
 
@@ -244,6 +276,11 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             source_kind="upload",
             source_log_id=log_path.parent.name,
             original_filename=log_path.name,
+            review_inputs={
+                "mission_path": saved_files.get("mission_file"),
+                "source_path": _form_value(form, "source_path"),
+                "parameters_xml_path": saved_files.get("parameters_xml_file"),
+            },
         )
         self._send_json(result)
 
@@ -282,6 +319,47 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": repr(exc)}, status=500)
             return
         self._send_json({"log": row})
+
+    def _handle_browse_download(self, query: str) -> None:
+        params = parse_qs(query)
+        log_id = _first_param(params, "log_id")
+        download_type = _first_param(params, "type") or "ulog"
+        try:
+            row = get_log(BROWSE_CONFIG.browse_db_path, log_id)
+            log_path = Path(str(row.get("log_path") or ""))
+            if not log_path.is_file():
+                raise FileNotFoundError("log file does not exist")
+            original_name = safe_upload_filename(
+                str(row.get("original_filename") or log_path.name)
+            )
+            filename_stem = Path(original_name).stem or "flight-log"
+
+            if download_type == "ulog":
+                self._send_download_file(log_path, original_name)
+                return
+            if download_type == "parameters":
+                data = build_parameter_download(log_path, non_default_only=False)
+                self._send_download_bytes(data, f"{filename_stem}.params")
+                return
+            if download_type == "parameters_non_default":
+                data = build_parameter_download(log_path, non_default_only=True)
+                self._send_download_bytes(data, f"{filename_stem}-non-default.params")
+                return
+            if download_type == "kml":
+                data = build_kml_download(log_path)
+                self._send_download_bytes(
+                    data,
+                    f"{filename_stem}.kml",
+                    content_type="application/vnd.google-earth.kml+xml",
+                )
+                return
+            raise ValueError("unsupported download type")
+        except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=404)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
 
     def _handle_browse_import(self) -> None:
         try:
@@ -455,6 +533,30 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_download_file(self, path: Path, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        with path.open("rb") as file:
+            while chunk := file.read(1024 * 1024):
+                self.wfile.write(chunk)
+
+    def _send_download_bytes(
+        self,
+        data: bytes,
+        filename: str,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(data)
 
@@ -788,6 +890,7 @@ def index_browse_log(
     source_kind: str,
     source_log_id: str | None = None,
     original_filename: str | None = None,
+    review_inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         airframes = load_browse_airframe_metadata(BROWSE_CONFIG)
@@ -800,6 +903,7 @@ def index_browse_log(
             original_filename=original_filename,
             airframes=airframes,
             airframe_image_root=resolve_airframe_image_root(BROWSE_CONFIG),
+            review_inputs=review_inputs,
         )
     except Exception as exc:
         return {"indexed": False, "error": repr(exc)}

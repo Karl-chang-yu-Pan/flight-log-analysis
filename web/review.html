@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Flight Log Review</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body class="review-page">
+    <header class="app-nav">
+      <a class="app-nav-brand" href="/upload">Flight Log Review</a>
+      <nav class="app-nav-actions" aria-label="Review navigation">
+        <a href="/upload">Upload</a>
+        <a href="/browse">Browse</a>
+        <details class="download-menu" id="downloadMenu">
+          <summary>Download</summary>
+          <div class="download-menu-items">
+            <a id="downloadLog" href="#">Log File</a>
+            <a id="downloadParameters" href="#">Parameters</a>
+            <a id="downloadNonDefaultParameters" href="#">Parameters (non-default)</a>
+            <a id="downloadKml" href="#" hidden>KML Track</a>
+          </div>
+        </details>
+      </nav>
+    </header>
+
+    <div class="app-shell" id="appShell">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <div>
+            <h1>Flight Log</h1>
+            <p id="sidebarSummary">Loading log</p>
+          </div>
+          <button class="icon-button" id="sidebarToggle" type="button" title="Collapse sidebar" aria-label="Collapse sidebar">
+            <span aria-hidden="true">‹</span>
+          </button>
+        </div>
+
+        <section class="fact-section">
+          <h2>Facts</h2>
+          <dl class="fact-grid" id="factGrid"></dl>
+        </section>
+
+        <section class="fact-section">
+          <div class="section-title-row">
+            <h2>Messages</h2>
+            <span class="count-pill" id="warningCount">0</span>
+          </div>
+          <div class="toolbar compact-toolbar">
+            <input id="messageSearch" type="search" placeholder="Search messages">
+            <select id="messageFilter">
+              <option value="important">Important</option>
+              <option value="errors">Errors only</option>
+              <option value="all">All messages</option>
+            </select>
+          </div>
+          <div class="message-table-shell scroll-panel messages-panel">
+            <table class="dense-table message-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Level</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody id="warningsList"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="fact-section">
+          <div class="section-title-row">
+            <h2>Parameters</h2>
+            <span class="count-pill" id="parameterCount">0</span>
+          </div>
+          <div class="toolbar">
+            <input id="parameterSearch" type="search" placeholder="Search all parameters">
+            <select id="parameterStatus">
+              <option value="all">All parameters</option>
+              <option value="non_default">Non-default</option>
+              <option value="default">Default</option>
+              <option value="unknown">Unknown default</option>
+            </select>
+            <label class="check-row">
+              <input id="hideRcCal" type="checkbox">
+              Hide RC/CAL
+            </label>
+          </div>
+          <div class="table-shell scroll-panel parameters-panel">
+            <table class="dense-table parameter-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Value</th>
+                  <th>Default</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="parameterRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="fact-section">
+          <div class="section-title-row">
+            <h2>Topics</h2>
+            <span class="count-pill" id="topicCount">0</span>
+          </div>
+          <div class="toolbar">
+            <input id="topicSearch" type="search" placeholder="Search topics and fields">
+          </div>
+          <div id="topicRows" class="topic-list scroll-panel topics-panel"></div>
+        </section>
+      </aside>
+
+      <main class="main-canvas">
+        <section class="canvas-section review-summary-section">
+          <div class="section-title-row">
+            <h2>Log Summary</h2>
+            <span id="runStatus" class="status-text">Loading</span>
+          </div>
+          <div id="mainSummary" class="summary-panel">
+            <p>Loading the indexed flight log.</p>
+          </div>
+          <div id="logTagPanel" class="log-tag-panel" hidden>
+            <div class="section-title-row">
+              <h3>Tags</h3>
+              <span id="logTagStatus" class="status-text"></span>
+            </div>
+            <div id="logTagList" class="row-tags"></div>
+            <div class="tag-editor">
+              <select id="logTagSelect">
+                <option value="">Add existing tag</option>
+              </select>
+              <button id="logTagAdd" type="button">Add</button>
+              <input id="logTagNewName" type="text" placeholder="New tag">
+              <button id="logTagCreate" type="button">Create</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="canvas-section">
+          <div class="section-title-row">
+            <h2>Agent Analysis</h2>
+            <span id="analysisStatus" class="status-text">Idle</span>
+          </div>
+          <div class="analysis-context">
+            <label>
+              PX4 source
+              <input id="analysisSourcePath" type="text" placeholder="optional PX4 checkout">
+            </label>
+          </div>
+          <div class="analysis-controls">
+            <label>
+              Question
+              <textarea id="analysisQuestion" rows="3" placeholder="Why did the aircraft drop altitude right after transition?"></textarea>
+            </label>
+            <button id="analysisButton" type="button" disabled>Run Analysis</button>
+          </div>
+          <div id="analysisProgress" class="progress-list"></div>
+          <div id="analysisReport" class="analysis-report"></div>
+        </section>
+
+        <section class="canvas-section">
+          <h2>Changed Parameters</h2>
+          <div class="table-shell main-table">
+            <table class="dense-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Name</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody id="changedParameterRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="canvas-section">
+          <h2>Timeline</h2>
+          <div id="timelineRows" class="timeline-list"></div>
+        </section>
+      </main>
+
+      <aside class="plot-sidebar" id="plotSidebar">
+        <div class="plot-sidebar-header">
+          <div>
+            <h2>Flight Review Plots</h2>
+            <p id="plotSidebarStatus">Loading plots</p>
+          </div>
+          <button class="icon-button" id="plotSidebarToggle" type="button" title="Collapse plots" aria-label="Collapse plots">
+            <span aria-hidden="true">›</span>
+          </button>
+        </div>
+        <nav id="plotNavigation" class="plot-navigation" aria-label="Plot navigation"></nav>
+        <div id="plotRows" class="plot-list"></div>
+      </aside>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
