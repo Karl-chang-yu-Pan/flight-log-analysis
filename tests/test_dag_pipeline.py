@@ -276,3 +276,62 @@ def test_explaining_branch_matches_despite_windowed_tag(tmp_path):
     h = stage.report.ranked_hypotheses[0]
     assert h.confidence == "medium"
     assert stage.report.confirmed == [h.title]
+
+
+def test_replay_verified_upgrades_confidence_to_high(tmp_path):
+    from flight_log_agent.analysis.mechanism_judge import (
+        DiscoverySeeds as Seeds, DiscoveryVerdict as Verdict,
+        TerminalCandidate as Cand, seeder_agent as seeder,
+    )
+    from flight_log_agent.analysis.dag_pipeline import build_report_from_dag
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path)
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", ["pick_altitude"], "_final_out", "hash")
+    from flight_log_agent.analysis.mechanism_judge import JudgedDiscovery
+    judged = JudgedDiscovery(
+        seeds=Seeds(seeds=[], candidate_terminals=[Cand(terminal="_final_out")]),
+        verdict=Verdict(sufficient=True, selected_terminal="_final_out",
+                        explaining_branches=["_param_rtl_type.get() == 1"]),
+        results={"_final_out": result}, selected=result,
+    )
+    replay = {"observed": "x.y", "verified": True,
+              "results": [{"grounded": "a+b", "evaluable": True, "match_fraction": 0.9}]}
+    report = build_report_from_dag("why?", judged, result.dag, replay=replay)
+    assert report.ranked_hypotheses[0].confidence == "high"
+    assert any("expression replay" in e for e in report.ranked_hypotheses[0].evidence)
+
+    unverified = build_report_from_dag("why?", judged, result.dag,
+                                       replay={"verified": False, "results": []})
+    assert unverified.ranked_hypotheses[0].confidence == "medium"
+
+
+def test_seeds_not_cached_when_selected_slice_is_empty(tmp_path):
+    """A seeder sample whose discovery produced an empty slice must not
+    be cached as the question's answer — the next run retries the
+    seeder instead of replaying the bad sample."""
+    from flight_log_agent.analysis.mechanism_judge import (
+        DiscoverySeeds as Seeds, DiscoveryVerdict as Verdict,
+        TerminalCandidate as Cand, seeder_agent as seeder,
+    )
+
+    profiler = _mini_tree(tmp_path)
+
+    async def run(agent, payload):
+        if agent is seeder:
+            return Seeds(seeds=["nonexistent_marker"],
+                         candidate_terminals=[Cand(terminal="_ghost_var")])
+        return Verdict(sufficient=False, selected_terminal="_ghost_var")
+
+    stage = asyncio.run(
+        run_dag_discovery_stage(
+            profiler, tmp_path / "cache", "why?", "srchash",
+            Path("/nonexistent.ulg"), ulog_hash="u", run_agent=run,
+        )
+    )
+
+    assert read_seeds_from_cache(
+        layer4_cache_path(tmp_path / "cache", "why?")
+    ) is None
+    assert stage.report.confirmed == []

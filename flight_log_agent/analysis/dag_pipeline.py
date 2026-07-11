@@ -127,6 +127,7 @@ class DagStageResult:
     render: dict[str, Any]
     layer4_hit: bool
     report: FlightLogReport
+    replay: Optional[dict[str, Any]] = None
 
 
 def _signal_samples_for_dag(
@@ -154,10 +155,106 @@ def _signal_samples_for_dag(
     return samples
 
 
+def replay_terminal_expressions(
+    annotated: MechanismDAG,
+    log_path: Path,
+    parameter_values: dict[str, Any],
+    logged_set: set[str],
+    observed_hint: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Numerically verify the mechanism: ground each terminal write's
+    expression through the graph, evaluate it over the log, and measure
+    how long it matches the observed signal within tolerance.
+
+    Fully structural — grounding walks the DAG, the observed signal
+    resolves from the logged catalogue (hint first, then the terminal),
+    and the match check reuses the interval evaluator as the predicate
+    ``abs(grounded - observed) <= tol``. Returns None when nothing is
+    replayable (no logged observed signal, no terminal writes).
+    """
+    from flight_log_agent.analysis.mechanism_dag import (
+        _evaluate_predicate_intervals,
+        ground_expression_via_edges,
+    )
+
+    def resolve(hint: str) -> Optional[str]:
+        if not hint:
+            return None
+        if hint in logged_set:
+            return hint
+        matches = [s for s in logged_set if s.endswith("." + hint.rsplit(".", 1)[-1])]
+        return matches[0] if len(matches) == 1 else None
+
+    observed = resolve(observed_hint or "") or resolve(str(annotated.terminal or ""))
+    if observed is None:
+        return None
+    terminal_ops = [
+        v
+        for v in annotated.vertices
+        if v.kind == "operation" and (v.metadata or {}).get("is_terminal")
+    ]
+    if not terminal_ops:
+        return None
+    index = ULogEvidenceIndex.from_path(log_path, [observed])
+    resolution = index.resolve_signal(observed)
+    if resolution.status != "observed" or resolution.series is None:
+        return None
+    observed_samples = [(s.time_s, s.value) for s in resolution.series.samples]
+    if len(observed_samples) < 2:
+        return None
+    samples = dict(_signal_samples_for_dag(annotated, log_path))
+    samples[observed] = observed_samples
+    magnitudes = [
+        abs(float(v)) for _, v in observed_samples if isinstance(v, (int, float))
+    ]
+    tolerance = 0.05 * (sum(magnitudes) / len(magnitudes)) if magnitudes else 1e-3
+    span = observed_samples[-1][0] - observed_samples[0][0]
+
+    results: list[dict[str, Any]] = []
+    for op in terminal_ops:
+        grounded = ground_expression_via_edges(
+            str(op.expression or ""), op.id, annotated
+        )
+        if not grounded:
+            continue
+        windows = _evaluate_predicate_intervals(
+            f"abs(({grounded}) - ({observed})) <= {tolerance}",
+            parameter_values,
+            {},
+            samples,
+        )
+        if windows is None:
+            results.append(
+                {"expression": op.expression, "grounded": grounded, "evaluable": False}
+            )
+            continue
+        matched = sum(end - start for start, end in windows)
+        results.append(
+            {
+                "expression": op.expression,
+                "grounded": grounded,
+                "evaluable": True,
+                "match_fraction": round(matched / span, 3) if span else 0.0,
+            }
+        )
+    if not results:
+        return None
+    verified = any(
+        r.get("evaluable") and r.get("match_fraction", 0.0) >= 0.5 for r in results
+    )
+    return {
+        "observed": observed,
+        "tolerance": round(tolerance, 6),
+        "results": results,
+        "verified": verified,
+    }
+
+
 def build_report_from_dag(
     question: str,
     judged: JudgedDiscovery,
     annotated_dag: Optional[MechanismDAG],
+    replay: Optional[dict[str, Any]] = None,
 ) -> FlightLogReport:
     """Deterministic FlightLogReport from the verdict + annotated DAG.
 
@@ -258,7 +355,11 @@ def build_report_from_dag(
             0, "judge confirmed the mechanism without naming an explaining branch"
         )
 
-    if verdict.sufficient and branches_verified:
+    if verdict.sufficient and branches_verified and replay and replay.get("verified"):
+        # Structure confirmed AND the grounded expression numerically
+        # reproduces the observed signal — the honest "high".
+        confidence = "high"
+    elif verdict.sufficient and branches_verified:
         confidence = "medium"
     elif verdict.sufficient:
         confidence = "low"
@@ -282,6 +383,20 @@ def build_report_from_dag(
             f"mechanism DAG: {len(dag.vertices)} vertices / {len(dag.edges)} edges"
             if dag
             else "no DAG was produced",
+            *(
+                [
+                    "expression replay vs "
+                    + str(replay.get("observed"))
+                    + ": "
+                    + "; ".join(
+                        f"{r.get('grounded', '')[:60]} match={r.get('match_fraction')}"
+                        for r in replay.get("results", [])
+                        if r.get("evaluable")
+                    )
+                ]
+                if replay
+                else []
+            ),
         ],
         contradicting_evidence=[],
         unresolved_evidence=unresolved_evidence[:12],
@@ -337,6 +452,47 @@ async def run_dag_discovery_stage(
             signal_samples=samples,
         )
 
+    logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
+
+    def condition_windows(condition: Any) -> Optional[dict[str, Any]]:
+        """Evaluate the questioned comparison over the log: resolve the
+        signal hint against the logged catalogue (exact, then unique
+        suffix), the reference against ULog parameters, then compute the
+        intervals where the condition held."""
+        from flight_log_agent.analysis.mechanism_dag import (
+            _evaluate_predicate_intervals,
+        )
+
+        hint = str(condition.signal_hint or "").strip()
+        signal = hint if hint in logged_set else None
+        if signal is None:
+            matches = [s for s in logged_set if s.endswith("." + hint.rsplit(".", 1)[-1])]
+            signal = matches[0] if len(matches) == 1 else None
+        if signal is None:
+            return {"error": f"signal hint {hint!r} did not resolve", "windows": None}
+        reference: Any = parameter_values.get(str(condition.reference).upper())
+        if reference is None:
+            try:
+                reference = float(condition.reference)
+            except (TypeError, ValueError):
+                return {"error": f"reference {condition.reference!r} did not resolve", "windows": None}
+        index = ULogEvidenceIndex.from_path(log_path, [signal])
+        resolution = index.resolve_signal(signal)
+        if resolution.status != "observed" or resolution.series is None:
+            return {"error": f"{signal} not observed in log", "windows": None}
+        samples = {
+            signal: [(s.time_s, s.value) for s in resolution.series.samples]
+        }
+        windows = _evaluate_predicate_intervals(
+            f"{signal} {condition.op} {reference}", {}, {}, samples
+        )
+        return {
+            "signal": signal,
+            "op": condition.op,
+            "reference": reference,
+            "windows": windows,
+        }
+
     judged = await discover_with_judge(
         profiler,
         cache_root,
@@ -346,6 +502,7 @@ async def run_dag_discovery_stage(
         context=context,
         seeds_override=cached_seeds,
         annotate=annotate,
+        condition_windows=condition_windows,
         parameter_values=parameter_values,
         inventory=inventory,
         **discovery_kwargs,
@@ -353,7 +510,7 @@ async def run_dag_discovery_stage(
 
     annotated: Optional[MechanismDAG] = judged.selected_annotated
     selected: Optional[DiscoveryResult] = judged.selected
-    if selected is not None and selected.dag is not None:
+    if selected is not None and selected.dag is not None and selected.dag.vertices:
         terminal = selected.dag.terminal
         write_dag_to_cache(
             selected.dag, layer2_cache_path(cache_root, source_hash, terminal)
@@ -369,14 +526,33 @@ async def run_dag_discovery_stage(
             annotated,
             layer3_cache_path(cache_root, source_hash, ulog_hash, terminal),
         )
+        # Seeds are cached only when they EARNED it — a seeder sample
+        # whose discovery produced an empty selected slice must not
+        # become the question's replayed answer; the next run retries
+        # the seeder instead.
         if cached_seeds is None:
             write_seeds_to_cache(judged.seeds, seeds_path)
 
-    report = build_report_from_dag(question, judged, annotated)
+    replay: Optional[dict[str, Any]] = None
+    if annotated is not None:
+        replay = replay_terminal_expressions(
+            annotated,
+            log_path,
+            parameter_values,
+            logged_set,
+            observed_hint=(
+                judged.seeds.questioned_condition.signal_hint
+                if judged.seeds.questioned_condition
+                else None
+            ),
+        )
+
+    report = build_report_from_dag(question, judged, annotated, replay=replay)
     return DagStageResult(
         judged=judged,
         annotated_dag=annotated,
         render=render_discovery_compact(selected) if selected else {},
         layer4_hit=cached_seeds is not None,
         report=report,
+        replay=replay,
     )

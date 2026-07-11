@@ -1767,3 +1767,62 @@ def test_trailing_underscore_members_resolve_across_class_files():
 
     ops = {v.variable for v in dag.vertices if v.kind == "operation"}
     assert "airspeed_ref_" in ops
+
+
+def test_internal_state_branch_grounds_through_graph_and_gets_windows():
+    """A branch predicate over internal state (no direct logged/param
+    reference) grounds through the graph — the state's producer chain
+    ends at a logged signal — and evaluates to active windows."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out", expression="val + 1.0",
+                      file="a.cpp", line=1, function="A::run",
+                      control_predicates=["_flare_states.flaring"]),
+        _fake_binding(binding_id="s", target="_flare_states.flaring",
+                      expression="vehicle_land_detected.flaring_flag",
+                      file="a.cpp", line=2, function="A::poll",
+                      logged_signal=""),
+    ]
+    dag = build_mechanism_dag(
+        bindings, "_out",
+        logged_signals={"vehicle_land_detected.flaring_flag"},
+    )
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples={
+            "vehicle_land_detected.flaring_flag": [
+                (0.0, 0), (10.0, 1), (20.0, 0), (30.0, 0),
+            ]
+        },
+        prune_dead=False,
+    )
+    branch = next(v for v in annotated.vertices if v.kind == "branch")
+    assert branch.active_windows, "grounded internal-state predicate produced no windows"
+    assert branch.active_windows[0][0] == 10.0
+
+
+def test_grounding_substitutes_constant_values():
+    """Grounding a predicate whose producer is a value-carrying constant
+    leaf exercises the literal-rendering path (live RTL crashed on it)."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out", expression="val + 1.0",
+                      file="a.cpp", line=1, function="A::run",
+                      control_predicates=["_mode_state == MODE_ON"]),
+        _fake_binding(binding_id="m", target="_mode_state",
+                      expression="vehicle_status.nav_mode",
+                      file="a.cpp", line=2, function="A::poll",
+                      logged_signal=""),
+        _fake_binding(binding_id="c", target="MODE_ON", expression="3",
+                      file="a.cpp", line=3, function="",
+                      logged_signal=""),
+    ]
+    dag = build_mechanism_dag(bindings, "_out",
+                              logged_signals={"vehicle_status.nav_mode"})
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples={"vehicle_status.nav_mode": [
+            (0.0, 0), (10.0, 3), (20.0, 0), (30.0, 0)]},
+        prune_dead=False,
+    )
+    branch = next(v for v in annotated.vertices if v.kind == "branch")
+    assert branch.active_windows
+    assert branch.active_windows[0][0] == 10.0

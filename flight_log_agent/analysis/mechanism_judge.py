@@ -39,7 +39,7 @@ from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfil
 # ---------------------------------------------------------------------------
 
 
-def _truncate(text: str, limit: int = 90) -> str:
+def _truncate(text: str, limit: int = 240) -> str:
     text = str(text or "")
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -54,10 +54,10 @@ def render_discovery_compact(
     result: DiscoveryResult,
     *,
     dag: Optional[Any] = None,
-    max_operations: int = 60,
-    max_branches: int = 25,
-    max_evidence: int = 30,
-    max_unresolved: int = 25,
+    max_operations: int = 400,
+    max_branches: int = 400,
+    max_evidence: int = 400,
+    max_unresolved: int = 400,
 ) -> dict[str, Any]:
     """JSON-able compact view of one discovery result.
 
@@ -67,6 +67,11 @@ def render_discovery_compact(
     ``dag`` (optional) substitutes a feasibility-annotated graph for
     ``result.dag`` — branches then carry flight-data verdicts and active
     windows.
+
+    The ``max_*`` limits are SAFETY VALVES against pathological graphs,
+    not curation — the judge must see the whole slice (a starved render
+    measurably produced wrong-shaped verdicts). Truncation is always
+    marked with an explicit ``… +N more`` tail.
     """
     dag = dag if dag is not None else result.dag
     operations: list[str] = []
@@ -154,11 +159,22 @@ class TerminalCandidate(BaseModel):
     reason: str = ""
 
 
+class QuestionedCondition(BaseModel):
+    """The comparison the question asserts, when it asserts one —
+    evaluated deterministically over the log so the judge can compare
+    deviation windows against branch active-windows."""
+
+    signal_hint: str
+    op: str
+    reference: str
+
+
 class DiscoverySeeds(BaseModel):
     """Seeder output: grep-able queries + candidate terminals."""
 
     seeds: list[str]
     candidate_terminals: list[TerminalCandidate]
+    questioned_condition: Optional[QuestionedCondition] = None
     notes: list[str] = Field(default_factory=list)
 
 
@@ -204,6 +220,12 @@ Prefer the variable written at the DECISION SITE — where the questioned
 quantity is computed or adapted — over the published topic field that
 merely logs it; list the published field as a secondary candidate.
 
+If the question asserts a comparison (a quantity above/below/equal to a
+parameter or value), fill questioned_condition with the LOGGED signal
+that records the quantity (topic.field), the comparison operator, and
+the reference (a parameter name or number). It is evaluated over the
+log to find when the questioned behavior actually occurred.
+
 Do not use log data, do not verify anything, do not draft hypotheses.
 """,
     tools=[],
@@ -247,6 +269,11 @@ inactive and do NOT demand its grounding; [always_true] held
 throughout; "active Nw A-Bs" lists when it held. For questions about
 behavior that occurs only sometimes, prefer the branch whose active
 windows can explain WHEN it occurred.
+
+questioned_windows (when present) gives the time intervals where the
+QUESTIONED condition itself held in the log. The explaining branch's
+active windows should overlap them; a branch active only outside them
+cannot be the answer.
 
 When sufficient is true you MUST fill explaining_branches with the
 branch predicate string(s), copied verbatim from the rendering's
@@ -308,6 +335,7 @@ async def discover_with_judge(
     max_terminals: int = 2,
     seeds_override: Optional[DiscoverySeeds] = None,
     annotate: Optional[Callable[[DiscoveryResult], Any]] = None,
+    condition_windows: Optional[Callable[["QuestionedCondition"], Any]] = None,
     **discovery_kwargs: Any,
 ) -> JudgedDiscovery:
     """Seeder → deterministic fixpoint per candidate terminal → judge.
@@ -370,10 +398,15 @@ async def discover_with_judge(
         annotated_by_terminal[terminal] = annotated
         return render_discovery_compact(result, dag=annotated)
 
+    deviation: Any = None
+    if seeds.questioned_condition is not None and condition_windows is not None:
+        deviation = condition_windows(seeds.questioned_condition)
+
     verdict = await runner(
         judge_agent,
         {
             "question": question,
+            "questioned_windows": deviation,
             "candidates": {
                 terminal: _render(terminal, result)
                 for terminal, result in judged_candidates.items()
@@ -437,6 +470,7 @@ async def discover_with_judge(
                 judge_agent,
                 {
                     "question": question,
+                    "questioned_windows": deviation,
                     "candidates": {bonus_terminal: _render(bonus_terminal, selected)},
                     "empty_candidates": [],
                     "note": "post-follow-up render; no further discovery rounds remain",

@@ -33,6 +33,7 @@ from flight_log_agent.analysis.parameter_lookup import (
 )
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.expression_math import is_safe_math_function_name
+from flight_log_agent.px4.mechanism_source_profiler import substitute_expression_symbols
 from flight_log_agent.symbols import (
     is_signal_reference,
     looks_like_enum_constant,
@@ -429,6 +430,11 @@ class _DAGBuilder:
                 if not norm or (norm, scope) in walked:
                     continue
                 walked.add((norm, scope))
+                if norm != self.terminal and norm in self._source_constants:
+                    # Source-defined constants resolve as value-carrying
+                    # evidence leaves at wiring time; walking their single
+                    # literal write would demote them to bare operations.
+                    continue
                 if norm == self.terminal:
                     writers = self._writers_of(norm)
                     if writers and self.terminal_file:
@@ -455,6 +461,13 @@ class _DAGBuilder:
                             str(binding.get("source_symbol") or binding.get("expression") or ""),
                             self._binding_site_scope(binding),
                         )
+                        # A branch's inputs are part of the mechanism:
+                        # walking predicate symbols emits the internal-state
+                        # writers that feasibility grounding later follows.
+                        for predicate in binding.get("control_predicates") or []:
+                            enqueue_expression(
+                                str(predicate), self._binding_site_scope(binding)
+                            )
                 elif (
                     "." not in norm
                     and norm != self.terminal
@@ -1888,6 +1901,75 @@ def _canonical_predicate(predicate: str) -> str:
 _PARAM_ACCESSOR_RE = re.compile(r"_param_(?P<name>[A-Za-z0-9_]+)\.get\(\s*\)")
 
 
+def ground_expression_via_edges(
+    expression: str,
+    vertex_id: str,
+    dag: MechanismDAG,
+    *,
+    enum_values: Optional[dict[str, Any]] = None,
+    max_depth: int = 6,
+) -> Optional[str]:
+    """Lower ``expression`` toward logged form using the graph itself.
+
+    Each symbol the vertex reads (its incoming data edges' roles) is
+    substituted with its producer's grounded form: a logged-signal leaf
+    substitutes its signal name, a constant/parameter leaf its value or
+    name, and an operation recursively grounds its own expression.
+    Opaque producers stay as-is (the caller's evaluator then fails
+    honestly). ``struct_s::NAME`` enum references substitute from
+    ``enum_values``. Purely structural — works for any vertex kind on
+    any module.
+    """
+    vertices_by_id = {v.id: v for v in dag.vertices}
+    edges_by_target: dict[str, list[DAGEdge]] = {}
+    for edge in dag.edges:
+        if edge.kind == "data" and edge.role:
+            edges_by_target.setdefault(edge.target_id, []).append(edge)
+
+    enums = {str(k): v for k, v in (enum_values or {}).items()}
+
+    def producer_form(producer_id: str, depth: int, seen: frozenset[str]) -> Optional[str]:
+        vertex = vertices_by_id.get(producer_id)
+        if vertex is None or producer_id in seen or depth > max_depth:
+            return None
+        if vertex.kind == "evidence":
+            if vertex.sub_kind == "logged_signal" and vertex.signal_name:
+                return str(vertex.signal_name)
+            value = (vertex.metadata or {}).get("value")
+            if value is not None:
+                return _format_lowered_value(value)
+            if vertex.sub_kind == "parameter" and vertex.signal_name:
+                return str(vertex.signal_name)
+            return None
+        if vertex.kind == "operation" and vertex.expression:
+            return ground(
+                str(vertex.expression), producer_id, depth + 1, seen | {producer_id}
+            )
+        return None
+
+    def ground(text: str, target_id: str, depth: int, seen: frozenset[str]) -> Optional[str]:
+        result = text
+        for edge in edges_by_target.get(target_id, []):
+            role = str(edge.role)
+            replacement = producer_form(edge.source_id, depth, seen)
+            if replacement is None:
+                continue
+            result = substitute_expression_symbols(result, [role], [replacement])
+        # Enum constants (``launch_detection_status_s::STATE_X``).
+        def enum_sub(match: "re.Match[str]") -> str:
+            name = match.group("name")
+            value = enums.get(name)
+            return _format_lowered_value(value) if value is not None else match.group(0)
+
+        result = re.sub(
+            r"\b[A-Za-z_]\w*_s::(?P<name>[A-Z][A-Z0-9_]+)\b", enum_sub, result
+        )
+        return result
+
+    grounded = ground(str(expression or ""), vertex_id, 0, frozenset({vertex_id}))
+    return grounded
+
+
 def evaluate_feasibility(
     dag: MechanismDAG,
     *,
@@ -1932,9 +2014,27 @@ def evaluate_feasibility(
         verdict = _reduce_predicate(predicate, params, enums)
         windows: list[tuple[float, float]] = []
 
-        if verdict == "unknown" and samples:
-            evaluated = _evaluate_predicate_intervals(predicate, params, enums, samples)
-            if evaluated is not None:
+        if verdict == "unknown":
+            evaluated = (
+                _evaluate_predicate_intervals(predicate, params, enums, samples)
+                if samples
+                else None
+            )
+            if evaluated is None:
+                # Internal-state predicate (``_flare_states.flaring``) —
+                # no direct param/logged reference. Ground it through the
+                # graph: substitute each symbol with its producer's logged
+                # form via the branch's own data edges, then retry.
+                grounded = ground_expression_via_edges(
+                    predicate, vertex.id, dag, enum_values=enums
+                )
+                if grounded and grounded != predicate:
+                    verdict = _reduce_predicate(grounded, params, enums)
+                    if verdict == "unknown" and samples:
+                        evaluated = _evaluate_predicate_intervals(
+                            grounded, params, enums, samples
+                        )
+            if verdict == "unknown" and evaluated is not None:
                 windows = evaluated
                 if not windows:
                     verdict = "always_false"
