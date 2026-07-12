@@ -28,6 +28,7 @@ async function uploadAndOpenReview() {
   uploadEls.button.disabled = true;
   uploadEls.error.hidden = true;
   setUploadStatus(hasUpload ? "Uploading" : "Loading local log");
+  if (!hasUpload) setUploadProcessing("Processing local log");
 
   try {
     const result = hasUpload
@@ -56,6 +57,9 @@ function uploadLog(formData) {
     request.upload.addEventListener("progress", (event) => {
       if (!event.lengthComputable) return;
       setUploadProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
+    });
+    request.upload.addEventListener("load", () => {
+      setUploadProcessing("Processing log");
     });
     request.addEventListener("load", () => {
       let result;
@@ -100,13 +104,28 @@ function setUploadStatus(message) {
 
 function setUploadProgress(percent) {
   uploadEls.progress.hidden = false;
+  uploadEls.progress.className = "upload-progress";
   uploadEls.progressBar.style.width = `${percent}%`;
+  uploadEls.progress.setAttribute("aria-valuenow", String(percent));
+  uploadEls.progress.setAttribute("aria-valuetext", `${percent}% uploaded`);
+}
+
+function setUploadProcessing(message) {
+  uploadEls.progress.hidden = false;
+  uploadEls.progress.className = "upload-progress indeterminate";
+  uploadEls.progressBar.style.width = "";
+  uploadEls.progress.removeAttribute("aria-valuenow");
+  uploadEls.progress.setAttribute("aria-valuetext", message);
+  setUploadStatus(message);
 }
 
 function hideUploadProgressSoon() {
   window.setTimeout(() => {
     uploadEls.progress.hidden = true;
+    uploadEls.progress.className = "upload-progress";
     uploadEls.progressBar.style.width = "0%";
+    uploadEls.progress.removeAttribute("aria-valuenow");
+    uploadEls.progress.removeAttribute("aria-valuetext");
   }, 500);
 }
 

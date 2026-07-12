@@ -96,6 +96,10 @@ The UI should support:
 - Adding existing tags to a log
 - Removing tags from a log
 - Filtering by selected tags
+- Searching the existing global tag catalog while assigning tags on review
+
+Removing a tag from a log must remove only that assignment. The tag remains in
+the global catalog so it can be reused on another log.
 
 Tag filtering is must-include only. If multiple tags are selected, a log must contain all selected tags.
 
@@ -209,3 +213,17 @@ Flight Review's interaction. Its overlay menu lists the available plot anchors,
 scrolls to the selected plot, and folds when it is not needed. Do not reserve a
 permanent row for the index and do not add active-section tracking. Plot-specific
 controls remain with each plot.
+
+## Loading Progress
+
+Show loading progress across the complete upload-to-review workflow:
+
+- Use determinate percentage progress while uploading file bytes.
+- Switch to indeterminate progress during server-side parsing.
+- Use indeterminate progress for local-path parsing because there is no byte
+  transfer to measure.
+- Keep review loading progress visible through pre-parse and plot generation.
+- Mark the review workspace ready only after the first plot render completes.
+
+Do not display fabricated percentages for parsing or plot generation when the
+server does not report measurable progress.

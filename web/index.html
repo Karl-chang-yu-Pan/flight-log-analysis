@@ -67,7 +67,15 @@
         </div>
       </form>
 
-      <div class="upload-progress" id="uploadProgress" hidden>
+      <div
+        class="upload-progress"
+        id="uploadProgress"
+        role="progressbar"
+        aria-label="Uploading flight log"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        hidden
+      >
         <div class="upload-progress-bar" id="uploadProgressBar"></div>
       </div>
       <p id="uploadError" class="upload-error" hidden></p>

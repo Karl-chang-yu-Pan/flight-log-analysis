@@ -97,6 +97,10 @@ def test_query_logs_combines_must_include_tags(tmp_path):
     remove_log_tag(config.browse_db_path, "flight_review:log1", "regression")
     result = query_logs(config.browse_db_path, tags=["reviewed", "regression"])
     assert result["filtered"] == 0
+    assert list_tags(config.browse_db_path) == [
+        {"name": "regression", "log_count": 0},
+        {"name": "reviewed", "log_count": 2},
+    ]
 
 
 def test_get_log_returns_browse_row_with_tags(tmp_path):

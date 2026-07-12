@@ -211,9 +211,12 @@ def test_upload_review_and_browse_pages_have_separate_navigation_contracts():
     browse_js = (web_app.WEB_DIR / "browse.js").read_text(encoding="utf-8")
 
     assert 'id="uploadForm"' in upload_html
+    assert 'id="uploadProgress"' in upload_html
     assert 'id="appShell"' not in upload_html
     assert 'id="uploadForm"' not in review_html
     assert 'id="downloadMenu"' in review_html
+    assert 'id="reviewLoadProgress"' in review_html
+    assert 'id="logTagSearch"' in review_html
     assert 'id="plotNavigationMenu"' in review_html
     assert 'id="plotNavigation"' in review_html
     assert "/review?browse_id=" in browse_js
@@ -249,3 +252,16 @@ def test_review_plot_controls_use_dropdown_navigation_and_tracker_overlays():
     assert "drawInteractivePlotTrackers(plots, { visibleOnly: true })" in tracker_handler
     assert "drawInteractivePlots" not in left_sidebar_handler
     assert "drawInteractivePlots" not in right_sidebar_handler
+
+
+def test_review_tags_are_searchable_and_load_progress_covers_plot_generation():
+    app_js = (web_app.WEB_DIR / "app.js").read_text(encoding="utf-8")
+    upload_js = (web_app.WEB_DIR / "upload.js").read_text(encoding="utf-8")
+
+    assert 'logTagSearch.addEventListener("input", renderLogTags)' in app_js
+    assert "tag.toLowerCase().includes(query)" in app_js
+    assert 'setReviewLoadProgress("Loading flight log")' in app_js
+    assert 'setReviewLoadProgress("Generating plots")' in app_js
+    assert "await waitForPlotPaint()" in app_js
+    assert 'setUploadProcessing("Processing log")' in upload_js
+    assert 'setUploadProcessing("Processing local log")' in upload_js

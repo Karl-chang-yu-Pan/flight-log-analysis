@@ -18,11 +18,13 @@ const state = {
   availableTags: [],
   currentLogTags: [],
   tagStatus: "",
+  reviewProgressHideTimer: null,
 };
 
 const els = {
   appShell: document.getElementById("appShell"),
   runStatus: document.getElementById("runStatus"),
+  reviewLoadProgress: document.getElementById("reviewLoadProgress"),
   downloadLog: document.getElementById("downloadLog"),
   downloadParameters: document.getElementById("downloadParameters"),
   downloadNonDefaultParameters: document.getElementById("downloadNonDefaultParameters"),
@@ -61,6 +63,7 @@ const els = {
   logTagPanel: document.getElementById("logTagPanel"),
   logTagList: document.getElementById("logTagList"),
   logTagStatus: document.getElementById("logTagStatus"),
+  logTagSearch: document.getElementById("logTagSearch"),
   logTagSelect: document.getElementById("logTagSelect"),
   logTagAdd: document.getElementById("logTagAdd"),
   logTagNewName: document.getElementById("logTagNewName"),
@@ -75,6 +78,7 @@ els.messageFilter.addEventListener("change", renderWarnings);
 els.topicSearch.addEventListener("input", renderTopics);
 els.analysisButton.addEventListener("click", startAnalysis);
 els.logTagAdd.addEventListener("click", addSelectedLogTag);
+els.logTagSearch.addEventListener("input", renderLogTags);
 els.logTagCreate.addEventListener("click", createAndAddLogTag);
 els.logTagNewName.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
@@ -146,6 +150,7 @@ window.addEventListener("resize", () => {
 
 async function loadReview() {
   setStatus("Loading...");
+  setReviewLoadProgress("Loading flight log");
   try {
     const result = await fetchJson("/api/preparse", {
       method: "POST",
@@ -178,10 +183,19 @@ async function loadReview() {
     await refreshLoadedLogTags();
     resetAnalysis();
     renderAll();
-    loadInteractivePlots();
-    setStatus("Loaded");
+    setReviewLoadProgress("Generating plots");
+    const plotsLoaded = await loadInteractivePlots();
+    if (plotsLoaded) {
+      await waitForPlotPaint();
+      setStatus("Loaded");
+      completeReviewLoadProgress();
+    } else {
+      setStatus("Loaded with plot error");
+      failReviewLoadProgress("Plot loading failed");
+    }
   } catch (error) {
     setStatus("Failed");
+    failReviewLoadProgress("Flight log loading failed");
     els.mainSummary.innerHTML = `<p class="message-item">${escapeHtml(error.message)}</p>`;
   }
 }
@@ -592,7 +606,7 @@ async function loadInteractivePlots() {
   if (!logPath) {
     els.plotSidebarStatus.textContent = "Missing log path";
     els.plotRows.innerHTML = `<p class="plot-empty">No log path available for plots.</p>`;
-    return;
+    return false;
   }
 
   const token = state.plotLoadToken + 1;
@@ -610,15 +624,17 @@ async function loadInteractivePlots() {
     if (!response.ok) {
       throw new Error(result.error || `HTTP ${response.status}`);
     }
-    if (token !== state.plotLoadToken) return;
+    if (token !== state.plotLoadToken) return false;
 
     state.plotPayload = result;
     initializePlotTrackers(result.plots || []);
     renderInteractivePlots();
+    return true;
   } catch (error) {
-    if (token !== state.plotLoadToken) return;
+    if (token !== state.plotLoadToken) return false;
     els.plotSidebarStatus.textContent = "Plot load failed";
     els.plotRows.innerHTML = `<p class="plot-empty">${escapeHtml(error.message)}</p>`;
+    return false;
   }
 }
 
@@ -1703,6 +1719,9 @@ function renderLogTags() {
   const available = (state.availableTags || [])
     .map((tag) => tag.name)
     .filter((tag) => !assigned.includes(tag));
+  const query = els.logTagSearch.value.trim().toLowerCase();
+  const matching = available.filter((tag) => tag.toLowerCase().includes(query));
+  const selectedTag = els.logTagSelect.value;
   els.logTagStatus.textContent = state.tagStatus || "";
   els.logTagList.innerHTML = assigned.length
     ? assigned.map((tag) => `
@@ -1711,11 +1730,14 @@ function renderLogTags() {
       </button>
     `).join("")
     : `<span class="empty-inline">No tags assigned.</span>`;
+  const emptyLabel = query ? "No matching tags" : "No existing tags";
   els.logTagSelect.innerHTML = `
-    <option value="">Add existing tag</option>
-    ${available.map((tag) => `<option value="${escapeAttr(tag)}">${escapeHtml(tag)}</option>`).join("")}
+    <option value="">${matching.length ? "Select existing tag" : emptyLabel}</option>
+    ${matching.map((tag) => `<option value="${escapeAttr(tag)}">${escapeHtml(tag)}</option>`).join("")}
   `;
-  els.logTagAdd.disabled = !available.length;
+  if (matching.includes(selectedTag)) els.logTagSelect.value = selectedTag;
+  els.logTagSelect.disabled = !matching.length;
+  els.logTagAdd.disabled = !matching.length;
 }
 
 function renderChangedParameters() {
@@ -1752,6 +1774,42 @@ function timelineText(row) {
 
 function setStatus(text) {
   els.runStatus.textContent = text;
+}
+
+function setReviewLoadProgress(message) {
+  if (state.reviewProgressHideTimer != null) {
+    window.clearTimeout(state.reviewProgressHideTimer);
+    state.reviewProgressHideTimer = null;
+  }
+  els.reviewLoadProgress.hidden = false;
+  els.reviewLoadProgress.className = "app-load-progress indeterminate";
+  els.reviewLoadProgress.removeAttribute("aria-valuenow");
+  els.reviewLoadProgress.setAttribute("aria-valuetext", message);
+  els.appShell.setAttribute("aria-busy", "true");
+}
+
+function completeReviewLoadProgress() {
+  els.reviewLoadProgress.className = "app-load-progress complete";
+  els.reviewLoadProgress.setAttribute("aria-valuenow", "100");
+  els.reviewLoadProgress.setAttribute("aria-valuetext", "Flight log ready");
+  els.appShell.setAttribute("aria-busy", "false");
+  state.reviewProgressHideTimer = window.setTimeout(() => {
+    els.reviewLoadProgress.hidden = true;
+    state.reviewProgressHideTimer = null;
+  }, 700);
+}
+
+function failReviewLoadProgress(message) {
+  els.reviewLoadProgress.className = "app-load-progress failed";
+  els.reviewLoadProgress.removeAttribute("aria-valuenow");
+  els.reviewLoadProgress.setAttribute("aria-valuetext", message);
+  els.appShell.setAttribute("aria-busy", "false");
+}
+
+function waitForPlotPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+  });
 }
 
 function setAnalysisStatus(text) {
