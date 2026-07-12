@@ -1982,3 +1982,44 @@ def test_dotted_formal_rebinds_to_actual_nested_placement():
     leaves = {v.signal_name for v in dag.vertices
               if v.kind == "evidence" and v.sub_kind == "logged_signal"}
     assert "position_setpoint_triplet.current.type" in leaves
+
+
+def test_rebinding_survives_passthrough_and_cycles():
+    """Pass-through forwarding (formal bound to a same-named actual) is
+    ignored as identity, and alias cycles must not recurse forever."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out",
+                      expression="pos_sp_curr.type + 1",
+                      file="fw.cpp", line=1, function="Fw::run"),
+        # identity pass-through from a forwarding call
+        _fake_binding(binding_id="fwd", target="pos_sp_curr",
+                      expression="pos_sp_curr",
+                      file="fw.cpp", line=2, function="Fw::inner",
+                      logged_signal=""),
+        # the real rebinding
+        _fake_binding(binding_id="rebind", target="pos_sp_curr",
+                      expression="_trip.current",
+                      file="fw.cpp", line=3, function="Fw::run",
+                      logged_signal=""),
+        # alias cycle: a <-> b
+        _fake_binding(binding_id="c1", target="alias_a",
+                      expression="alias_b", file="fw.cpp", line=4,
+                      function="Fw::run", logged_signal=""),
+        _fake_binding(binding_id="c2", target="alias_b",
+                      expression="alias_a", file="fw.cpp", line=5,
+                      function="Fw::run", logged_signal=""),
+        _fake_binding(binding_id="t2", target="_out2",
+                      expression="alias_a.field + 1",
+                      file="fw.cpp", line=6, function="Fw::run"),
+    ]
+    bindings[2]["struct_variables"] = {"_trip": "position_setpoint_triplet_s"}
+    dag = build_mechanism_dag(
+        bindings, "_out",
+        logged_signals={"position_setpoint_triplet.current.type"},
+    )
+    leaves = {v.signal_name for v in dag.vertices
+              if v.kind == "evidence" and v.sub_kind == "logged_signal"}
+    assert "position_setpoint_triplet.current.type" in leaves
+
+    dag2 = build_mechanism_dag(bindings, "_out2")  # must terminate
+    assert dag2.vertices

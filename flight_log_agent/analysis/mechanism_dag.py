@@ -269,6 +269,8 @@ class _DAGBuilder:
         self.terminal = normalize_symbol(terminal)
         self.terminal_file = str(terminal_file) if terminal_file else None
         self._call_statements = list(call_statements or [])
+        # Guards dotted-root rebinding recursion against alias cycles.
+        self._rebinding_stack: set[str] = set()
         # Schema-derived message enums, scoped per message
         # (``{message: {CONSTANT: value}}``) — resolved at wiring time
         # like every other constant, never as a flat global table.
@@ -1074,7 +1076,7 @@ class _DAGBuilder:
         # reaches the actual's logged placement
         # (``triplet.current.field``) instead of degrading to the nested
         # message name.
-        if "." in symbol_raw:
+        if "." in symbol_raw and symbol_norm not in self._rebinding_stack:
             root_raw, _, tail = symbol_raw.replace("->", ".").partition(".")
             root_norm = normalize_symbol(root_raw)
             rebinders = [
@@ -1089,18 +1091,25 @@ class _DAGBuilder:
                     r"[A-Za-z_][\w.]*",
                     str(b.get("source_symbol") or "").strip(),
                 )
+                # Pass-through forwarding (formal bound to a same-named
+                # actual) is an identity, not a rebinding.
+                and normalize_symbol(str(b.get("source_symbol") or "")) != root_norm
             ]
             targets = {str(b.get("source_symbol")).strip() for b in rebinders}
             if len(targets) == 1:
                 rewritten = f"{next(iter(targets))}.{tail}"
                 if normalize_symbol(rewritten) != symbol_norm:
-                    return self._resolve_symbol_producer(
-                        normalize_symbol(rewritten),
-                        rewritten,
-                        source_expression,
-                        file,
-                        line,
-                    )
+                    self._rebinding_stack.add(symbol_norm)
+                    try:
+                        return self._resolve_symbol_producer(
+                            normalize_symbol(rewritten),
+                            rewritten,
+                            source_expression,
+                            file,
+                            line,
+                        )
+                    finally:
+                        self._rebinding_stack.discard(symbol_norm)
 
         # 2a. Graph-native derivation: if ``source_expression`` contains a
         # ``symbol_raw().field`` chain, resolve it via the helper's
