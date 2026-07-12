@@ -1068,6 +1068,40 @@ class _DAGBuilder:
             if visible:
                 return visible[-1]
 
+        # 1b. Dotted reference whose ROOT is rebound by a unique simple
+        # writer (a formal bound to its actual, a reference alias):
+        # rewrite root -> actual and re-resolve, so ``formal.field``
+        # reaches the actual's logged placement
+        # (``triplet.current.field``) instead of degrading to the nested
+        # message name.
+        if "." in symbol_raw:
+            root_raw, _, tail = symbol_raw.replace("->", ".").partition(".")
+            root_norm = normalize_symbol(root_raw)
+            rebinders = [
+                b
+                for b in self._filter_visible_writers(
+                    list(self._by_target.get(root_norm, [])),
+                    root_raw,
+                    (file or "", ""),
+                )
+                if not b.get("control_predicates")
+                and re.fullmatch(
+                    r"[A-Za-z_][\w.]*",
+                    str(b.get("source_symbol") or "").strip(),
+                )
+            ]
+            targets = {str(b.get("source_symbol")).strip() for b in rebinders}
+            if len(targets) == 1:
+                rewritten = f"{next(iter(targets))}.{tail}"
+                if normalize_symbol(rewritten) != symbol_norm:
+                    return self._resolve_symbol_producer(
+                        normalize_symbol(rewritten),
+                        rewritten,
+                        source_expression,
+                        file,
+                        line,
+                    )
+
         # 2a. Graph-native derivation: if ``source_expression`` contains a
         # ``symbol_raw().field`` chain, resolve it via the helper's
         # ``return_type`` and the PX4 msg schema.
@@ -1292,6 +1326,13 @@ class _DAGBuilder:
         if len(parts) == 2:
             var_candidate, field = parts
             resolved = self._resolve_struct_var_field(var_candidate, field)
+            if resolved is not None:
+                return resolved
+        # Nested placement: ``var.member.field`` — the struct variable is
+        # the ROOT and the field path is everything after it.
+        root, _, nested_tail = symbol_raw.partition(".")
+        if nested_tail and "." in nested_tail:
+            resolved = self._resolve_struct_var_field(root, nested_tail)
             if resolved is not None:
                 return resolved
         if not source_expression:

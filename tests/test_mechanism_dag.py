@@ -1956,3 +1956,29 @@ def test_px4_macro_predicates_evaluate():
     )
     branch = next(v for v in annotated.vertices if v.kind == "branch")
     assert branch.active_windows == [(10.0, 20.0)]
+
+
+def test_dotted_formal_rebinds_to_actual_nested_placement():
+    """``formal.field`` follows the formal's unique simple rebinding to
+    the actual's logged placement instead of degrading to the nested
+    message name (position_setpoint.type vs the logged
+    position_setpoint_triplet.current.type)."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out",
+                      expression="pos_sp_curr.type + 1",
+                      file="fw.cpp", line=1, function="Fw::run"),
+        _fake_binding(binding_id="rebind", target="pos_sp_curr",
+                      expression="_pos_sp_triplet.current",
+                      file="fw.cpp", line=2, function="Fw::run",
+                      logged_signal=""),
+    ]
+    bindings[1]["struct_variables"] = {
+        "_pos_sp_triplet": "position_setpoint_triplet_s"
+    }
+    dag = build_mechanism_dag(
+        bindings, "_out",
+        logged_signals={"position_setpoint_triplet.current.type"},
+    )
+    leaves = {v.signal_name for v in dag.vertices
+              if v.kind == "evidence" and v.sub_kind == "logged_signal"}
+    assert "position_setpoint_triplet.current.type" in leaves
