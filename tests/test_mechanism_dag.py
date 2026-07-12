@@ -1826,3 +1826,77 @@ def test_grounding_substitutes_constant_values():
     branch = next(v for v in annotated.vertices if v.kind == "branch")
     assert branch.active_windows
     assert branch.active_windows[0][0] == 10.0
+
+
+def test_logged_inputs_are_leaves_not_publisher_tunnels():
+    """A logged input the mechanism reads must terminate as evidence —
+    its PUBLISHER (another module across the uORB boundary) must not be
+    walked. Only the terminal enters source through its publishers."""
+    bindings = [
+        # terminal enters source via its publisher (logged_signal set)
+        _fake_binding(binding_id="t", target="out_field",
+                      expression="gate_state + 1.0",
+                      file="fw.cpp", line=1, function="Fw::run",
+                      logged_signal="fw_status.out_field"),
+        # mechanism reads a logged input topic field
+        _fake_binding(binding_id="g", target="gate_state",
+                      expression="vehicle_status.vehicle_type",
+                      file="fw.cpp", line=2, function="Fw::run",
+                      logged_signal=""),
+        # the FOREIGN publisher of that input topic — must stay out
+        _fake_binding(binding_id="pub", target="vehicle_status.vehicle_type",
+                      expression="commander_internal_state",
+                      file="commander.cpp", line=3, function="Commander::run",
+                      logged_signal="vehicle_status.vehicle_type"),
+    ]
+    dag = build_mechanism_dag(
+        bindings, "fw_status.out_field",
+        logged_signals={"vehicle_status.vehicle_type", "fw_status.out_field"},
+    )
+
+    files = {v.file for v in dag.vertices if v.kind == "operation" and v.file}
+    assert "commander.cpp" not in files, "publisher tunneled through a logged leaf"
+    leaves = {v.signal_name for v in dag.vertices
+              if v.kind == "evidence" and v.sub_kind == "logged_signal"}
+    assert "vehicle_status.vehicle_type" in leaves
+    assert not any("commander_internal_state" in str(v.signal_name or "")
+                   for v in dag.vertices)
+
+
+def test_helper_pick_prefers_caller_module_and_skips_foreign_ambiguity():
+    """A bare call resolves to the helper in the CALLER's module when
+    several classes define the name; all-foreign ambiguity stays opaque
+    (sorted-first used to materialize another module's subgraph)."""
+    ours = _fake_helper(
+        name="Mission::set_index", file="src/modules/navigator/mission.cpp",
+        line=5, evidence="int Mission::set_index(int i)",
+        assignments={}, return_expression="nav_internal * 2",
+    )
+    foreign = _fake_helper(
+        name="MavlinkMissionManager::set_index",
+        file="src/modules/mavlink/mavlink_mission.cpp",
+        line=9, evidence="int MavlinkMissionManager::set_index(int i)",
+        assignments={}, return_expression="mav_internal * 3",
+    )
+    bindings = [
+        _fake_binding(binding_id="t", target="_out", expression="set_index(2)",
+                      file="src/modules/navigator/rtl.cpp", line=1,
+                      function="RTL::run"),
+    ]
+    dag = build_mechanism_dag(bindings, "_out",
+                              helper_expressions=[foreign, ours])
+
+    bodies = {v.file for v in dag.vertices
+              if v.provenance and v.provenance.startswith("helper_return")}
+    assert bodies == {"src/modules/navigator/mission.cpp"}
+
+    # all-foreign ambiguity: caller in a third module → opaque, no subgraph
+    bindings2 = [
+        _fake_binding(binding_id="t", target="_out", expression="set_index(2)",
+                      file="src/modules/commander/Commander.cpp", line=1,
+                      function="Commander::run"),
+    ]
+    dag2 = build_mechanism_dag(bindings2, "_out",
+                               helper_expressions=[foreign, ours])
+    assert not [v for v in dag2.vertices
+                if v.provenance and v.provenance.startswith("helper_return")]

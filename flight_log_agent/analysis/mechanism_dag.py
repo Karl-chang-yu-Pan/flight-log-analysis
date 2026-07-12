@@ -418,7 +418,7 @@ class _DAGBuilder:
             for raw in dedupe_keep_order(source_expression_names(normalized_expr)):
                 if raw:
                     frontier.append(("symbol", raw, scope))
-            for helper_name in self._find_helper_calls(expression):
+            for helper_name in self._find_helper_calls(expression, scope[0]):
                 if helper_name not in materialized_helpers:
                     frontier.append(("helper", helper_name, scope))
 
@@ -434,6 +434,13 @@ class _DAGBuilder:
                     # Source-defined constants resolve as value-carrying
                     # evidence leaves at wiring time; walking their single
                     # literal write would demote them to bare operations.
+                    continue
+                if norm != self.terminal and norm in self.logged_signals:
+                    # Known ground: the log records this signal, so it is
+                    # an evidence leaf no matter which index would match
+                    # it — member copies (``_vehicle_status.x``) normalize
+                    # onto the topic field and would otherwise widen into
+                    # the publisher module.
                     continue
                 if norm == self.terminal:
                     writers = self._writers_of(norm)
@@ -475,8 +482,14 @@ class _DAGBuilder:
                     and self._match_parameter(norm) is None
                 ):
                     # Bare struct root with no direct writer — pull its
-                    # field writes (``_mission_item`` → ``_mission_item.*``).
-                    for field_binding in self._field_writers_of(norm):
+                    # field writes (``_mission_item`` → ``_mission_item.*``)
+                    # under the SAME visibility rules as direct writers:
+                    # unscoped, this globally pulled every module's
+                    # same-named struct locals (mavlink's mission_item.*).
+                    field_writers = self._filter_visible_writers(
+                        self._field_writers_of(norm), raw, scope
+                    )
+                    for field_binding in field_writers:
                         field_target = str(
                             field_binding.get("target_symbol")
                             or field_binding.get("target")
@@ -495,8 +508,10 @@ class _DAGBuilder:
                 if helper_name in materialized_helpers:
                     continue
                 materialized_helpers.add(helper_name)
-                self._materialize_helper_subgraph(helper_name, wire_edges=False)
-                helper_key = self._pick_helper_key(helper_name)
+                self._materialize_helper_subgraph(
+                    helper_name, wire_edges=False, scope_file=scope[0]
+                )
+                helper_key = self._pick_helper_key(helper_name, scope[0])
                 helper = self.helper_index.get(helper_key) if helper_key else None
                 if not helper:
                     continue
@@ -718,9 +733,32 @@ class _DAGBuilder:
           know theirs. Locals never widen — a stranger's same-named
           local is a different variable, which is exactly the fusion
           this prevents.
+
+        ``_by_output`` (the logged-signal publisher index) is deliberately
+        NOT consulted here: a logged input is an evidence LEAF — its
+        values come from the log, and its publisher is a different
+        module's mechanism across the uORB boundary. Only the terminal
+        enters source through its publishers (see :meth:`build`).
+        Unioning publishers at every step walked the airspeed slice
+        through Commander → vehicle_command → Mavlink and beyond.
         """
-        output_writers = list(self._by_output.get(symbol_norm, []))
-        target_writers = list(self._by_target.get(symbol_norm, []))
+        target_writers = self._filter_visible_writers(
+            list(self._by_target.get(symbol_norm, [])), symbol_raw, scope
+        )
+        seen: set[int] = set()
+        out: list[dict[str, Any]] = []
+        for binding in target_writers:
+            if id(binding) not in seen:
+                seen.add(id(binding))
+                out.append(binding)
+        return out
+
+    def _filter_visible_writers(
+        self,
+        target_writers: list[dict[str, Any]],
+        symbol_raw: str,
+        scope: tuple[str, str],
+    ) -> list[dict[str, Any]]:
         scope_file, scope_function = scope
         if scope_file and target_writers:
             root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
@@ -734,7 +772,19 @@ class _DAGBuilder:
                     for b in target_writers
                     if self._file_family(self._binding_target_scope(b)[0]) == family
                 ]
-                target_writers = same_family or target_writers
+                if not same_family:
+                    # Inheritance widening stays within the MODULE (same
+                    # directory): RTL's members live in navigator/'s
+                    # MissionBlock, not in another module that happens to
+                    # write a same-named member.
+                    module = family[0]
+                    same_family = [
+                        b
+                        for b in target_writers
+                        if self._file_family(self._binding_target_scope(b)[0])[0]
+                        == module
+                    ]
+                target_writers = same_family
             else:
                 scoped = []
                 for binding in target_writers:
@@ -745,13 +795,7 @@ class _DAGBuilder:
                         continue
                     scoped.append(binding)
                 target_writers = scoped
-        seen: set[int] = set()
-        out: list[dict[str, Any]] = []
-        for binding in output_writers + target_writers:
-            if id(binding) not in seen:
-                seen.add(id(binding))
-                out.append(binding)
-        return out
+        return target_writers
 
     def _writers_of(self, symbol_norm: str) -> list[dict[str, Any]]:
         """Bindings that write ``symbol_norm`` (as a logged output or a
@@ -828,8 +872,8 @@ class _DAGBuilder:
                 self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
         # Helper-call inputs.
-        for helper_call in self._find_helper_calls(expression):
-            helper_key = self._pick_helper_key(helper_call)
+        for helper_call in self._find_helper_calls(expression, file):
+            helper_key = self._pick_helper_key(helper_call, file)
             if helper_key is None:
                 continue
             helper_return_id = self._helper_subgraph_return_id.get(helper_key)
@@ -869,7 +913,7 @@ class _DAGBuilder:
         by :meth:`_emit_operation_vertex` so a source_assignments-derived
         binding for the same call site does not double-emit.
         """
-        helper_key = self._pick_helper_key(helper_call)
+        helper_key = self._pick_helper_key(helper_call, file)
         if helper_key is None:
             return
         helper = self.helper_index.get(helper_key)
@@ -928,7 +972,7 @@ class _DAGBuilder:
         function is invoked once per name; a limitation on today's parser,
         good enough for the RTL/airspeed cases.
         """
-        helper_key = self._pick_helper_key(helper_call)
+        helper_key = self._pick_helper_key(helper_call, file)
         if helper_key is None:
             return
         formals = self._helper_parameter_vertices.get(helper_key)
@@ -991,18 +1035,31 @@ class _DAGBuilder:
         """
         producers = self._producers_by_symbol.get(symbol_norm)
         if producers:
-            # Prefer a producer from the consumer's own file — the
-            # leading-underscore strip in ``normalize_symbol`` can fuse a
-            # member with a same-named local from another module, and
-            # same-file linkage is the strongest disambiguation available
-            # without full class scoping. Fall back to the last producer.
-            if file:
-                same_file = [
-                    p for p in producers if self.vertices[p].file == file
+            # Wiring applies the SAME visibility semantics as the walk
+            # (see _scoped_writers): locals never cross files, members
+            # widen family → module. A global last-producer fallback here
+            # re-linked navigator consumers to mavlink's same-named
+            # locals after the walk had correctly kept them apart. When
+            # no visible producer exists, fall through to evidence
+            # classification instead of linking across modules.
+            if not file:
+                return producers[-1]
+            root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
+            if root.startswith("_") or root.endswith("_"):
+                family = self._file_family(file)
+                visible = [
+                    p
+                    for p in producers
+                    if self._file_family(self.vertices[p].file or "") == family
+                ] or [
+                    p
+                    for p in producers
+                    if self._file_family(self.vertices[p].file or "")[0] == family[0]
                 ]
-                if same_file:
-                    return same_file[-1]
-            return producers[-1]
+            else:
+                visible = [p for p in producers if self.vertices[p].file == file]
+            if visible:
+                return visible[-1]
 
         # 2a. Graph-native derivation: if ``source_expression`` contains a
         # ``symbol_raw().field`` chain, resolve it via the helper's
@@ -1407,7 +1464,9 @@ class _DAGBuilder:
     # Helper subgraph nesting
     # ------------------------------------------------------------
 
-    def _find_helper_calls(self, expression: str) -> list[str]:
+    def _find_helper_calls(
+        self, expression: str, scope_file: Optional[str] = None
+    ) -> list[str]:
         """Return helper names invoked in ``expression`` that we can expand.
 
         A name is expandable when it appears in ``helper_index`` under some
@@ -1443,11 +1502,17 @@ class _DAGBuilder:
             ):
                 continue
             seen.add(candidate)
-            if self._pick_helper_key(candidate) is not None:
+            if self._pick_helper_key(candidate, scope_file) is not None:
                 matches.append(candidate)
         return matches
 
-    def _materialize_helper_subgraph(self, helper_name: str, *, wire_edges: bool = True) -> Optional[str]:
+    def _materialize_helper_subgraph(
+        self,
+        helper_name: str,
+        *,
+        wire_edges: bool = True,
+        scope_file: Optional[str] = None,
+    ) -> Optional[str]:
         """Emit the helper's body as nested vertices, return its output vertex id.
 
         Memoized by ``(helper_name, class_context)``. Preserves every
@@ -1456,7 +1521,7 @@ class _DAGBuilder:
         When ``wire_edges`` is False, only vertices are emitted (pass 1).
         Edges are wired by :meth:`_wire_helper_subgraph_edges` in pass 2.
         """
-        helper_key = self._pick_helper_key(helper_name)
+        helper_key = self._pick_helper_key(helper_name, scope_file)
         if helper_key is None:
             return None
         cached = self._helper_subgraph_return_id.get(helper_key)
@@ -1612,12 +1677,18 @@ class _DAGBuilder:
                 if producer_id is not None:
                     self._add_edge(producer_id, terminal_id, kind="data", role=f"branch:{symbol}")
 
-    def _pick_helper_key(self, helper_name: str) -> Optional[tuple[str, str]]:
+    def _pick_helper_key(
+        self, helper_name: str, scope_file: Optional[str] = None
+    ) -> Optional[tuple[str, str]]:
         """Choose one ``(name, class_context)`` for a call like ``foo(...)``.
 
-        Milestone 1: if multiple class contexts define ``foo``, pick the
-        first deterministically. Multi-context disambiguation via the
-        caller's class scope is Milestone 2 work.
+        When several classes define the name, the CALLER's scope decides
+        — same file family, then same module directory. A unique match
+        wins regardless of module (cross-module library helpers).
+        Multiple candidates that are ALL foreign to the caller's module
+        are ambiguous: return None and let the call stay opaque —
+        sorted-first here materialized MavlinkMissionManager's subgraph
+        for navigator calls to same-named Mission methods.
 
         On miss, consult the on-demand helper provider (if any) — the
         cross-file callee isn't in the pre-flattened helper set but the
@@ -1625,18 +1696,38 @@ class _DAGBuilder:
         ``helper_index`` so subsequent lookups skip the provider call.
         """
         matches = [key for key in self.helper_index if key[0] == helper_name]
-        if matches:
-            return sorted(matches)[0]
-        if self.helper_body_provider is None or helper_name in self._helper_provider_probed:
-            return None
-        self._helper_provider_probed.add(helper_name)
-        fetched = self.helper_body_provider(helper_name)
-        for helper in _coerce_helpers(fetched):
-            key_iter = _index_helpers([helper])
-            for key, value in key_iter.items():
-                self.helper_index.setdefault(key, value)
-        matches = [key for key in self.helper_index if key[0] == helper_name]
         if not matches:
+            if (
+                self.helper_body_provider is None
+                or helper_name in self._helper_provider_probed
+            ):
+                return None
+            self._helper_provider_probed.add(helper_name)
+            fetched = self.helper_body_provider(helper_name)
+            for helper in _coerce_helpers(fetched):
+                key_iter = _index_helpers([helper])
+                for key, value in key_iter.items():
+                    self.helper_index.setdefault(key, value)
+            matches = [key for key in self.helper_index if key[0] == helper_name]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        if scope_file:
+            family = self._file_family(scope_file)
+            preferred = [
+                k
+                for k in matches
+                if self._file_family(str(self.helper_index[k].get("file") or ""))
+                == family
+            ] or [
+                k
+                for k in matches
+                if self._file_family(str(self.helper_index[k].get("file") or ""))[0]
+                == family[0]
+            ]
+            if preferred:
+                return sorted(preferred)[0]
             return None
         return sorted(matches)[0]
 
