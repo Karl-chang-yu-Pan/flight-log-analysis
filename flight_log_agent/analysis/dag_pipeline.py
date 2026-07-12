@@ -155,6 +155,58 @@ def _signal_samples_for_dag(
     return samples
 
 
+def resolve_questioned_signal(
+    hint: str,
+    logged_set: set[str],
+    dags: list[Optional[MechanismDAG]],
+) -> tuple[Optional[str], Optional[str], list[str]]:
+    """Resolve the seeder's signal hint against the log catalogue and the
+    discovered slices — never by string fuzz.
+
+    Exact schema match wins. Otherwise the hint's TOPIC (which must
+    exist) is intersected with the fields the candidate DAGs actually
+    connect to (their logged-evidence leaves): the publish-site facts in
+    the slice carry the true field name even when the hinted field was
+    renamed across versions. Unique intersection resolves; anything else
+    returns an honest error plus the candidates.
+    """
+    hint = str(hint or "").strip()
+    if not hint:
+        return None, "empty signal hint", []
+    if hint in logged_set:
+        return hint, None, []
+    topic = hint.split(".", 1)[0]
+    connected = {
+        str(v.signal_name)
+        for dag in dags
+        if dag is not None
+        for v in dag.vertices
+        if v.kind == "evidence"
+        and v.sub_kind == "logged_signal"
+        and str(v.signal_name or "").startswith(topic + ".")
+    }
+    if len(connected) == 1:
+        return next(iter(connected)), None, []
+    if connected:
+        return None, f"hint {hint!r} is ambiguous in the slice", sorted(connected)
+    # Slice carries no leaf for the topic (the questioned signal may be
+    # downstream of the terminal). Fall back to the SCHEMA scoped to the
+    # hinted topic: the hinted field name contained in exactly one real
+    # field resolves (renames keep the token); several matches return as
+    # candidates for the judge rather than a guess.
+    field = hint.rsplit(".", 1)[-1]
+    schema_matches = sorted(
+        s
+        for s in logged_set
+        if s.startswith(topic + ".") and field in s.rsplit(".", 1)[-1]
+    )
+    if len(schema_matches) == 1:
+        return schema_matches[0], None, []
+    if schema_matches:
+        return None, f"hint {hint!r} matches several fields", schema_matches
+    return None, f"signal hint {hint!r} did not resolve", []
+
+
 def replay_terminal_expressions(
     annotated: MechanismDAG,
     log_path: Path,
@@ -454,22 +506,23 @@ async def run_dag_discovery_stage(
 
     logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
 
-    def condition_windows(condition: Any) -> Optional[dict[str, Any]]:
+    def condition_windows(condition: Any, candidates: Any = None) -> Optional[dict[str, Any]]:
         """Evaluate the questioned comparison over the log: resolve the
-        signal hint against the logged catalogue (exact, then unique
-        suffix), the reference against ULog parameters, then compute the
-        intervals where the condition held."""
+        signal hint via the schema and the discovered slices, the
+        reference against ULog parameters, then compute the intervals
+        where the condition held."""
         from flight_log_agent.analysis.mechanism_dag import (
             _evaluate_predicate_intervals,
         )
 
-        hint = str(condition.signal_hint or "").strip()
-        signal = hint if hint in logged_set else None
+        dags = [
+            r.dag for r in (candidates or {}).values() if r is not None
+        ] if isinstance(candidates, dict) else []
+        signal, error, options = resolve_questioned_signal(
+            condition.signal_hint, logged_set, dags
+        )
         if signal is None:
-            matches = [s for s in logged_set if s.endswith("." + hint.rsplit(".", 1)[-1])]
-            signal = matches[0] if len(matches) == 1 else None
-        if signal is None:
-            return {"error": f"signal hint {hint!r} did not resolve", "windows": None}
+            return {"error": error, "candidates": options, "windows": None}
         reference: Any = parameter_values.get(str(condition.reference).upper())
         if reference is None:
             try:

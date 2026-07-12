@@ -1900,3 +1900,59 @@ def test_helper_pick_prefers_caller_module_and_skips_foreign_ambiguity():
                                helper_expressions=[foreign, ours])
     assert not [v for v in dag2.vertices
                 if v.provenance and v.provenance.startswith("helper_return")]
+
+
+def test_schema_enum_resolves_scoped_constant_and_evaluates():
+    """``struct_s::NAME`` resolves from the schema enum registry SCOPED
+    by its own message — value-carrying leaf, evaluable branch."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out", expression="val + 1.0",
+                      file="a.cpp", line=1, function="A::run",
+                      control_predicates=[
+                          "_type_state == position_setpoint_s::SETPOINT_TYPE_LAND"]),
+        _fake_binding(binding_id="m", target="_type_state",
+                      expression="position_setpoint.type",
+                      file="a.cpp", line=2, function="A::poll",
+                      logged_signal=""),
+    ]
+    dag = build_mechanism_dag(
+        bindings, "_out",
+        logged_signals={"position_setpoint.type"},
+        enum_registry={"position_setpoint": {"SETPOINT_TYPE_LAND": 3}},
+    )
+    leaf = next(v for v in dag.vertices if v.kind == "evidence"
+                and v.sub_kind == "constant"
+                and "SETPOINT_TYPE_LAND" in str(v.signal_name))
+    assert leaf.metadata.get("value") == 3
+
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples={"position_setpoint.type": [
+            (0.0, 0), (10.0, 3), (20.0, 0), (30.0, 0)]},
+        prune_dead=False,
+    )
+    branch = next(v for v in annotated.vertices if v.kind == "branch")
+    assert branch.active_windows
+    assert branch.active_windows[0][0] == 10.0
+
+
+def test_px4_macro_predicates_evaluate():
+    """PX4 macro spellings (PX4_ISFINITE) and float suffixes must not
+    poison predicate evaluation — the interval evaluator routes through
+    the centralized expression lowering."""
+    bindings = [
+        _fake_binding(binding_id="t", target="_out", expression="v + 1.0",
+                      file="a.cpp", line=1, function="A::run",
+                      control_predicates=[
+                          "PX4_ISFINITE(wind_speed.value) && wind_speed.value > 0.5f"]),
+    ]
+    dag = build_mechanism_dag(bindings, "_out",
+                              logged_signals={"wind_speed.value"})
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples={"wind_speed.value": [
+            (0.0, 0.0), (10.0, 2.0), (20.0, 0.1)]},
+        prune_dead=False,
+    )
+    branch = next(v for v in annotated.vertices if v.kind == "branch")
+    assert branch.active_windows == [(10.0, 20.0)]

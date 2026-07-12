@@ -341,6 +341,7 @@ def discover_mechanism_dag(
     schema_signals: Optional[Iterable[str]] = None,
     logged_signals: Optional[Iterable[str]] = None,
     parameter_values: Optional[dict[str, Any]] = None,
+    enum_registry: Optional[dict[str, dict[str, Any]]] = None,
 ) -> DiscoveryResult:
     """Deterministic discovery fixpoint: the DAG's own gaps drive the search.
 
@@ -362,6 +363,24 @@ def discover_mechanism_dag(
     # member as written at the assignment site, so a qualified terminal
     # can never match one and would slice an empty DAG.
     terminal = str(terminal).rsplit("::", 1)[-1].strip()
+
+    if enum_registry is None:
+        # Schema-derived message enums, flattened PER MESSAGE (the scope
+        # the reference itself carries) — loaded once per discovery.
+        from flight_log_agent.px4.msg_schema import load_px4_msg_enum_registry
+
+        try:
+            raw_registry = load_px4_msg_enum_registry(profiler.source)
+        except Exception:
+            raw_registry = {}
+        enum_registry = {
+            message: {
+                name: value
+                for enum_map in (enums or {}).values()
+                for name, value in (enum_map or {}).items()
+            }
+            for message, enums in raw_registry.items()
+        }
 
     seed_queries = dedupe_keep_order([*(str(s) for s in seeds if s), terminal])
     hits = profiler.search_related_source_files(
@@ -410,6 +429,7 @@ def discover_mechanism_dag(
             parameter_aliases=inputs.parameter_aliases,
             terminal_file=terminal_file,
             call_statements=inputs.call_statements,
+            enum_registry=enum_registry,
         )
 
         unresolved = set(dag.unresolved_symbols)

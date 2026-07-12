@@ -335,3 +335,33 @@ def test_seeds_not_cached_when_selected_slice_is_empty(tmp_path):
         layer4_cache_path(tmp_path / "cache", "why?")
     ) is None
     assert stage.report.confirmed == []
+
+
+def test_questioned_signal_resolves_via_slice_not_string_fuzz(tmp_path):
+    """A renamed field (hint tecs_status.airspeed_sp vs actual
+    true_airspeed_sp) resolves through the slice's logged leaves for the
+    hinted topic; ambiguity and misses return honest errors."""
+    from flight_log_agent.analysis.dag_pipeline import resolve_questioned_signal
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    logged = {"tecs_status.true_airspeed_sp", "tecs_status.height_rate",
+              "vehicle_status.nav_state"}
+    dag = build_mechanism_dag(
+        [{"target_symbol": "_x", "source_symbol": "tecs_status.true_airspeed_sp",
+          "assignment_path": [{"file": "a.cpp", "line": 1,
+                               "expression": "tecs_status.true_airspeed_sp"}],
+          "logged_signal": "", "control_predicates": [], "function": "A::run"}],
+        "_x", logged_signals=logged,
+    )
+
+    signal, error, cands = resolve_questioned_signal(
+        "tecs_status.airspeed_sp", logged, [dag])
+    assert signal == "tecs_status.true_airspeed_sp" and error is None
+
+    exact, error, _ = resolve_questioned_signal(
+        "vehicle_status.nav_state", logged, [dag])
+    assert exact == "vehicle_status.nav_state"
+
+    missing, error, cands = resolve_questioned_signal(
+        "unknown_topic.field", logged, [dag])
+    assert missing is None and "did not resolve" in error

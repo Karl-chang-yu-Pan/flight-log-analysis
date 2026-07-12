@@ -31,6 +31,12 @@ def canonical_math_function_name(name: str) -> str:
         namespace, candidate = name.rsplit("::", 1)
         if namespace in {"math", "std"}:
             short_name = candidate
+    if short_name.startswith("PX4_"):
+        # PX4 macro spellings of stdlib math (``PX4_ISFINITE``) — the
+        # same shape-aliasing as the namespace and ``f``-suffix rules.
+        lowered = short_name[4:].lower()
+        if lowered in SAFE_MATH_FUNCTIONS:
+            return lowered
     if short_name in {"fmin", "fminf"}:
         return "min"
     if short_name in {"fmax", "fmaxf"}:

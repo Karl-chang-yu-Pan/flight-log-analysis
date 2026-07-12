@@ -400,7 +400,7 @@ async def discover_with_judge(
 
     deviation: Any = None
     if seeds.questioned_condition is not None and condition_windows is not None:
-        deviation = condition_windows(seeds.questioned_condition)
+        deviation = condition_windows(seeds.questioned_condition, judged_candidates)
 
     verdict = await runner(
         judge_agent,

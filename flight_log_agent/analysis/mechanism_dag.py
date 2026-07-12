@@ -179,6 +179,7 @@ def build_mechanism_dag(
     snippet_context_lines: int = 3,
     terminal_file: Optional[str] = None,
     call_statements: Sequence[Any] = (),
+    enum_registry: Optional[dict[str, dict[str, Any]]] = None,
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
 
@@ -234,6 +235,7 @@ def build_mechanism_dag(
         snippet_context_lines=snippet_context_lines,
         terminal_file=terminal_file,
         call_statements=[_as_binding_dict(c) for c in call_statements],
+        enum_registry=dict(enum_registry or {}),
     )
     return builder.build()
 
@@ -261,11 +263,16 @@ class _DAGBuilder:
         snippet_context_lines: int,
         terminal_file: Optional[str] = None,
         call_statements: Optional[list[dict[str, Any]]] = None,
+        enum_registry: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
         self.terminal_raw = terminal
         self.terminal = normalize_symbol(terminal)
         self.terminal_file = str(terminal_file) if terminal_file else None
         self._call_statements = list(call_statements or [])
+        # Schema-derived message enums, scoped per message
+        # (``{message: {CONSTANT: value}}``) — resolved at wiring time
+        # like every other constant, never as a flat global table.
+        self._enum_registry = dict(enum_registry or {})
         self.helper_index = helper_index
         self.helper_body_provider = helper_body_provider
         # Helpers already probed via the provider so a repeated call for an
@@ -1098,6 +1105,22 @@ class _DAGBuilder:
                 line=None,
                 metadata={"value": enum_value, "source": "enum"},
             )
+
+        # 3b. Schema message enum — the reference names its own scope
+        # (``position_setpoint_s.SETPOINT_TYPE_LAND`` → message
+        # ``position_setpoint``); no global name table.
+        enum_root, _, enum_tail = symbol_raw.replace("::", ".").rpartition(".")
+        enum_root = enum_root.split(".", 1)[0].strip()
+        if enum_root.endswith("_s") and enum_tail.isupper():
+            schema_enum = self._enum_registry.get(enum_root[:-2], {}).get(enum_tail)
+            if schema_enum is not None:
+                return self._emit_evidence(
+                    "constant",
+                    symbol_raw,
+                    file=None,
+                    line=None,
+                    metadata={"value": schema_enum, "source": "msg_schema"},
+                )
 
         # 4. C stdlib constant.
         cxx_value = CXX_STDLIB_CONSTANTS.get(symbol_raw.upper())
@@ -2017,8 +2040,6 @@ def ground_expression_via_edges(
         if edge.kind == "data" and edge.role:
             edges_by_target.setdefault(edge.target_id, []).append(edge)
 
-    enums = {str(k): v for k, v in (enum_values or {}).items()}
-
     def producer_form(producer_id: str, depth: int, seen: frozenset[str]) -> Optional[str]:
         vertex = vertices_by_id.get(producer_id)
         if vertex is None or producer_id in seen or depth > max_depth:
@@ -2039,22 +2060,15 @@ def ground_expression_via_edges(
         return None
 
     def ground(text: str, target_id: str, depth: int, seen: frozenset[str]) -> Optional[str]:
-        result = text
+        # Edge roles carry the ``.``-collapsed form; align the text so
+        # ``struct_s::NAME`` and ``obj->field`` references substitute.
+        result = text.replace("->", ".").replace("::", ".")
         for edge in edges_by_target.get(target_id, []):
             role = str(edge.role)
             replacement = producer_form(edge.source_id, depth, seen)
             if replacement is None:
                 continue
             result = substitute_expression_symbols(result, [role], [replacement])
-        # Enum constants (``launch_detection_status_s::STATE_X``).
-        def enum_sub(match: "re.Match[str]") -> str:
-            name = match.group("name")
-            value = enums.get(name)
-            return _format_lowered_value(value) if value is not None else match.group(0)
-
-        result = re.sub(
-            r"\b[A-Za-z_]\w*_s::(?P<name>[A-Z][A-Z0-9_]+)\b", enum_sub, result
-        )
         return result
 
     grounded = ground(str(expression or ""), vertex_id, 0, frozenset({vertex_id}))
@@ -2247,11 +2261,22 @@ def _covers_span(
 
 
 def _substitute_predicate_syntax(predicate: str) -> str:
-    """Apply the same C++ → Python substitutions used by ``_reduce_predicate``."""
+    """Lower a C++ predicate to safe-eval form.
+
+    Routes through :func:`normalize_source_expression` — the centralized
+    C++→Python lowering (macro spellings like ``PX4_ISFINITE``, float
+    suffixes, ``true``/``false``, ternaries) — after substituting PX4
+    parameter accessors and collapsing ``->``/``::``. Duplicating a
+    partial subset here left this path failing on tokens the legacy
+    evaluator handled.
+    """
+    from flight_log_agent.analysis.source_expression import (
+        normalize_source_expression,
+    )
+
     text = _PARAM_ACCESSOR_RE.sub(lambda m: m.group("name").upper(), predicate)
-    text = text.replace("&&", " and ").replace("||", " or ")
-    text = re.sub(r"!(?!=)", " not ", text)
-    return text.replace("->", ".").replace("::", ".")
+    text = text.replace("->", ".").replace("::", ".")
+    return normalize_source_expression(text)
 
 
 def _evaluate_predicate_intervals(
