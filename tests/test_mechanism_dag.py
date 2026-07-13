@@ -2191,3 +2191,26 @@ def test_logged_signal_leaves_carry_observation_status():
         and v.signal_name == "gate_status.field_x"
     )
     assert leaf.metadata.get("observation") == "observed"
+
+
+def test_operation_carries_composed_reachability():
+    """Invariant: every operation carries its complete reachability —
+    the conjunction of governing predicates plus an explicit exactness
+    flag when an unmodeled construct made the formula incomplete."""
+    exact = _fake_binding(binding_id="a", target="out_a",
+                          expression="in_a + 1", file="mod.cpp", line=12,
+                          logged_signal="",
+                          control_predicates=["a > 0", "b > 0"])
+    inexact = {**_fake_binding(binding_id="b", target="out_b",
+                               expression="out_a + 2", file="mod.cpp", line=30,
+                               logged_signal=""),
+               "reachability_exact": False}
+
+    dag = build_mechanism_dag([exact, inexact], "out_b", terminal_file="mod.cpp")
+    ops = {v.variable: v for v in dag.vertices if v.kind == "operation"}
+
+    assert ops["out_a"].metadata["reachability"] == {
+        "all_of": ["a > 0", "b > 0"], "exact": True,
+    }
+    assert ops["out_b"].metadata["reachability"] == {"all_of": [], "exact": False}
+

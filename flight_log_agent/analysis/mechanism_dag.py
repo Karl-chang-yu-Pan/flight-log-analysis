@@ -784,6 +784,9 @@ class _DAGBuilder:
                         "logged_signal": "",
                         "control_predicates": predicates,
                         "control_predicate_lines": predicate_lines,
+                        "reachability_exact": bool(
+                            call.get("reachability_exact", True)
+                        ),
                         "struct_variables": {},
                         # The formal lives in the CALLEE; the actual's
                         # symbols resolve at the call site (see
@@ -959,6 +962,22 @@ class _DAGBuilder:
     def _emit_operation_vertex(self, binding: dict[str, Any], *, is_terminal: bool) -> str:
         op_id, target_raw, file, line, target_norm, expression = self._binding_operation_id(binding)
         if op_id not in self.vertices:
+            metadata: dict[str, Any] = {}
+            if is_terminal:
+                metadata["is_terminal"] = True
+            # The operation's complete reachability: the conjunction of
+            # its governing predicates (sibling negations already folded
+            # into the else/else-if predicate strings), with an explicit
+            # exactness flag — an unmodeled construct (switch, loops)
+            # makes the formula unresolved, never silently partial.
+            metadata["reachability"] = {
+                "all_of": [
+                    str(p)
+                    for p in (binding.get("control_predicates") or [])
+                    if str(p).strip()
+                ],
+                "exact": bool(binding.get("reachability_exact", True)),
+            }
             self.vertices[op_id] = DAGVertex(
                 id=op_id,
                 kind="operation",
@@ -968,7 +987,7 @@ class _DAGBuilder:
                 snippet=self._snippet(file, line),
                 variable=target_raw,
                 expression=expression,
-                metadata={"is_terminal": is_terminal} if is_terminal else {},
+                metadata=metadata,
             )
             self._index_producer(target_norm, op_id)
         return op_id

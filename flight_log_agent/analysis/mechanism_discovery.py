@@ -73,6 +73,7 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         "logged_signal": f"{topic}.{field_name}" if topic and field_name else "",
         "control_predicates": list(ref.get("control_predicates") or []),
         "control_predicate_lines": list(ref.get("control_predicate_lines") or []),
+        "reachability_exact": bool(ref.get("reachability_exact", True)),
         "struct_variables": dict(ref.get("struct_variables") or {}),
     }
 

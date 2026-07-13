@@ -704,3 +704,15 @@ def test_qualifier_scopes_terminal_to_class_family():
 
     unknown = validate_terminal("Gamma::shared_out", cross, [])
     assert unknown.status == "ambiguous"
+
+
+def test_binding_carries_branch_sites_and_reachability():
+    ref = _assignment(
+        control_predicates=["a > 0"],
+        control_predicate_lines=[42],
+        reachability_exact=False,
+    )
+    binding = binding_from_assignment(ref)
+    assert binding["control_predicates"] == ["a > 0"]
+    assert binding["control_predicate_lines"] == [42]
+    assert binding["reachability_exact"] is False
