@@ -278,10 +278,13 @@ def test_explaining_branch_matches_despite_windowed_tag(tmp_path):
     assert stage.report.confirmed == [h.title]
 
 
-def test_replay_verified_upgrades_confidence_to_high(tmp_path):
+def test_replay_status_gates_the_confidence_upgrade(tmp_path):
+    """Only a complete ``matched`` replay upgrades to high; ``partial``
+    is unresolved evidence and never contradiction — the confirmation
+    and confidence stay at the structural level."""
     from flight_log_agent.analysis.mechanism_judge import (
         DiscoverySeeds as Seeds, DiscoveryVerdict as Verdict,
-        TerminalCandidate as Cand, seeder_agent as seeder,
+        TerminalCandidate as Cand,
     )
     from flight_log_agent.analysis.dag_pipeline import build_report_from_dag
     from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
@@ -296,15 +299,25 @@ def test_replay_verified_upgrades_confidence_to_high(tmp_path):
                         explaining_branches=["_param_rtl_type.get() == 1"]),
         results={"_final_out": result}, selected=result,
     )
-    replay = {"observed": "x.y", "verified": True,
-              "results": [{"grounded": "a+b", "evaluable": True, "match_fraction": 0.9}]}
-    report = build_report_from_dag("why?", judged, result.dag, replay=replay)
+    matched = {"status": "matched", "complete": True, "observed": "x.y",
+               "results": [{"grounded": "a+b", "evaluable": True, "match_fraction": 0.9}]}
+    report = build_report_from_dag("why?", judged, result.dag, replay=matched)
     assert report.ranked_hypotheses[0].confidence == "high"
-    assert any("expression replay" in e for e in report.ranked_hypotheses[0].evidence)
+    assert any("expression replay [matched]" in e
+               for e in report.ranked_hypotheses[0].evidence)
 
-    unverified = build_report_from_dag("why?", judged, result.dag,
-                                       replay={"verified": False, "results": []})
-    assert unverified.ranked_hypotheses[0].confidence == "medium"
+    partial = {"status": "partial", "complete": False, "observed": "x.y",
+               "results": [{"grounded": "a+b", "evaluable": True, "match_fraction": 0.9}]}
+    unresolved = build_report_from_dag("why?", judged, result.dag, replay=partial)
+    assert unresolved.ranked_hypotheses[0].confidence == "medium"
+    assert unresolved.ranked_hypotheses[0].contradicting_evidence == []
+
+    skipped = build_report_from_dag(
+        "why?", judged, result.dag,
+        replay={"status": "not_attempted", "complete": False, "reason": "r"})
+    assert skipped.ranked_hypotheses[0].confidence == "medium"
+    assert not any("expression replay" in e
+                   for e in skipped.ranked_hypotheses[0].evidence)
 
 
 def test_seeds_not_cached_when_selected_slice_is_empty(tmp_path):
@@ -398,4 +411,59 @@ def test_replay_observed_signal_resolves_exactly_or_skips():
         dag, Path("/nonexistent.ulg"), {}, {"topic_b.alt"},
         observed_hint="wrong_topic.alt",
     )
-    assert replay is None
+    assert replay["status"] == "not_attempted"
+    assert "did not resolve" in replay["reason"]
+
+
+def test_whole_log_match_caps_at_partial(monkeypatch):
+    """The current comparison runs writers over the whole log without
+    reachability domains, ordering, or coverage — a perfect match is
+    therefore still incomplete evidence: ``partial``, never ``matched``."""
+    from flight_log_agent.analysis import dag_pipeline
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    class _Sample:
+        def __init__(self, t, v):
+            self.time_s = t
+            self.value = v
+
+    class _Series:
+        def __init__(self, samples):
+            self.samples = samples
+
+    class _Resolution:
+        def __init__(self, series):
+            self.status = "observed" if series else "missing"
+            self.series = series
+
+    class _StubIndex:
+        _table = {"topic_b.alt": [_Sample(0.0, 5.0), _Sample(10.0, 5.0)]}
+
+        @classmethod
+        def from_path(cls, path, references):
+            return cls()
+
+        def resolve_signal(self, name):
+            samples = self._table.get(name)
+            return _Resolution(_Series(samples) if samples else None)
+
+    monkeypatch.setattr(dag_pipeline, "ULogEvidenceIndex", _StubIndex)
+
+    dag = build_mechanism_dag(
+        [{"target_symbol": "_x", "source_symbol": "topic_b.alt",
+          "assignment_path": [{"file": "a.cpp", "line": 1,
+                               "expression": "topic_b.alt"}],
+          "logged_signal": "", "control_predicates": [], "function": "A::run"}],
+        "_x", logged_signals={"topic_b.alt"},
+    )
+    replay = dag_pipeline.replay_terminal_expressions(
+        dag, Path("/stubbed.ulg"), {}, {"topic_b.alt"},
+        observed_hint="topic_b.alt",
+    )
+
+    assert replay["status"] == "partial"
+    assert replay["complete"] is False
+    assert any(
+        r.get("evaluable") and r.get("match_fraction", 0) >= 0.99
+        for r in replay["results"]
+    ), "the writer should have matched the whole log"

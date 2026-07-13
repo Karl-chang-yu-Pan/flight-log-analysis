@@ -15,7 +15,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.mechanism_dag import (
@@ -199,27 +199,45 @@ def resolve_questioned_signal(
     return None, f"signal hint {hint!r} did not resolve", []
 
 
+# The five distinct replay states (core correctness invariant):
+# ``matched`` is supporting evidence and ``mismatched`` contradictory
+# evidence ONLY when replay completeness (writer reachability domains,
+# ordering, retained state, alignment, coverage) is trustworthy —
+# neither is reachable from the current whole-log any-writer comparison,
+# which caps at ``partial``. ``partial`` and ``unevaluable`` are
+# unresolved evidence; ``not_attempted`` is neutral.
+ReplayStatus = Literal[
+    "not_attempted", "unevaluable", "partial", "matched", "mismatched"
+]
+
+
 def replay_terminal_expressions(
     annotated: MechanismDAG,
     log_path: Path,
     parameter_values: dict[str, Any],
     logged_set: set[str],
     observed_hint: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
-    """Numerically verify the mechanism: ground each terminal write's
-    expression through the graph, evaluate it over the log, and measure
-    how long it matches the observed signal within tolerance.
+) -> dict[str, Any]:
+    """Numerically compare the mechanism against the log: ground each
+    terminal write's expression through the graph, evaluate it over the
+    log, and measure how long it matches the observed signal within
+    tolerance.
 
     Fully structural — grounding walks the DAG, the observed signal
     resolves from the logged catalogue (hint first, then the terminal),
     and the match check reuses the interval evaluator as the predicate
-    ``abs(grounded - observed) <= tol``. Returns None when nothing is
-    replayable (no logged observed signal, no terminal writes).
+    ``abs(grounded - observed) <= tol``. The result's ``status`` is one
+    of :data:`ReplayStatus`; because writers are compared over the WHOLE
+    log without their reachability domains or ordering, the strongest
+    status this implementation can honestly emit is ``partial``.
     """
     from flight_log_agent.analysis.mechanism_dag import (
         _evaluate_predicate_intervals,
         ground_expression_via_edges,
     )
+
+    def not_attempted(reason: str) -> dict[str, Any]:
+        return {"status": "not_attempted", "complete": False, "reason": reason}
 
     def resolve(hint: str) -> Optional[str]:
         # Exact catalogue membership only — suffix uniqueness is name
@@ -229,21 +247,21 @@ def replay_terminal_expressions(
 
     observed = resolve(observed_hint or "") or resolve(str(annotated.terminal or ""))
     if observed is None:
-        return None
+        return not_attempted("observed signal did not resolve exactly")
     terminal_ops = [
         v
         for v in annotated.vertices
         if v.kind == "operation" and (v.metadata or {}).get("is_terminal")
     ]
     if not terminal_ops:
-        return None
+        return not_attempted("no terminal writes in the graph")
     index = ULogEvidenceIndex.from_path(log_path, [observed])
     resolution = index.resolve_signal(observed)
     if resolution.status != "observed" or resolution.series is None:
-        return None
+        return not_attempted(f"{observed} not observed in this log")
     observed_samples = [(s.time_s, s.value) for s in resolution.series.samples]
     if len(observed_samples) < 2:
-        return None
+        return not_attempted(f"{observed} has too few samples")
     samples = dict(_signal_samples_for_dag(annotated, log_path))
     samples[observed] = observed_samples
     magnitudes = [
@@ -280,15 +298,27 @@ def replay_terminal_expressions(
             }
         )
     if not results:
-        return None
-    verified = any(
-        r.get("evaluable") and r.get("match_fraction", 0.0) >= 0.5 for r in results
-    )
+        status: ReplayStatus = "unevaluable"
+        reason = "no terminal expression grounded through the graph"
+    elif not any(r.get("evaluable") for r in results):
+        status = "unevaluable"
+        reason = "no grounded expression was evaluable over the log"
+    else:
+        # Writers were compared over the whole log without reachability
+        # domains, ordering, or coverage criteria — the comparison is
+        # incomplete by construction, so the evidence stays unresolved.
+        status = "partial"
+        reason = (
+            "writers compared over the whole log without reachability "
+            "domains, ordering, or coverage"
+        )
     return {
+        "status": status,
+        "complete": False,
+        "reason": reason,
         "observed": observed,
         "tolerance": round(tolerance, 6),
         "results": results,
-        "verified": verified,
     }
 
 
@@ -397,9 +427,17 @@ def build_report_from_dag(
             0, "judge confirmed the mechanism without naming an explaining branch"
         )
 
-    if verdict.sufficient and branches_verified and replay and replay.get("verified"):
-        # Structure confirmed AND the grounded expression numerically
-        # reproduces the observed signal — the honest "high".
+    if (
+        verdict.sufficient
+        and branches_verified
+        and replay
+        and replay.get("status") == "matched"
+    ):
+        # Structure confirmed AND a COMPLETE replay numerically
+        # reproduces the observed signal — the honest "high". A
+        # ``partial`` replay is unresolved evidence and never upgrades;
+        # the current whole-log comparison caps at partial, so this
+        # branch stays unreachable until replay completeness lands.
         confidence = "high"
     elif verdict.sufficient and branches_verified:
         confidence = "medium"
@@ -427,7 +465,9 @@ def build_report_from_dag(
             else "no DAG was produced",
             *(
                 [
-                    "expression replay vs "
+                    "expression replay ["
+                    + str(replay.get("status"))
+                    + "] vs "
                     + str(replay.get("observed"))
                     + ": "
                     + "; ".join(
@@ -436,7 +476,7 @@ def build_report_from_dag(
                         if r.get("evaluable")
                     )
                 ]
-                if replay
+                if replay and replay.get("status") not in (None, "not_attempted")
                 else []
             ),
         ],
