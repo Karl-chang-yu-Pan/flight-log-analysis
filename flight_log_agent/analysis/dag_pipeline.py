@@ -189,21 +189,13 @@ def resolve_questioned_signal(
         return next(iter(connected)), None, []
     if connected:
         return None, f"hint {hint!r} is ambiguous in the slice", sorted(connected)
-    # Slice carries no leaf for the topic (the questioned signal may be
-    # downstream of the terminal). Fall back to the SCHEMA scoped to the
-    # hinted topic: the hinted field name contained in exactly one real
-    # field resolves (renames keep the token); several matches return as
-    # candidates for the judge rather than a guess.
-    field = hint.rsplit(".", 1)[-1]
-    schema_matches = sorted(
-        s
-        for s in logged_set
-        if s.startswith(topic + ".") and field in s.rsplit(".", 1)[-1]
-    )
-    if len(schema_matches) == 1:
-        return schema_matches[0], None, []
-    if schema_matches:
-        return None, f"hint {hint!r} matches several fields", schema_matches
+    # Slice carries no leaf for the hinted topic. Substring containment
+    # against the schema is name guessing, not resolution — fields on
+    # the topic are returned only as CANDIDATES for the judge, never
+    # auto-picked, however few there are.
+    candidates = sorted(s for s in logged_set if s.startswith(topic + "."))
+    if candidates:
+        return None, f"hint {hint!r} did not resolve exactly", candidates
     return None, f"signal hint {hint!r} did not resolve", []
 
 
@@ -230,12 +222,10 @@ def replay_terminal_expressions(
     )
 
     def resolve(hint: str) -> Optional[str]:
-        if not hint:
-            return None
-        if hint in logged_set:
-            return hint
-        matches = [s for s in logged_set if s.endswith("." + hint.rsplit(".", 1)[-1])]
-        return matches[0] if len(matches) == 1 else None
+        # Exact catalogue membership only — suffix uniqueness is name
+        # guessing; an unresolved observed signal skips replay rather
+        # than comparing against a guessed one.
+        return hint if hint and hint in logged_set else None
 
     observed = resolve(observed_hint or "") or resolve(str(annotated.terminal or ""))
     if observed is None:

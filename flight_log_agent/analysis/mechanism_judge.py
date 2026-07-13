@@ -74,6 +74,7 @@ def render_discovery_compact(
     marked with an explicit ``… +N more`` tail.
     """
     dag = dag if dag is not None else result.dag
+    validation = getattr(result, "terminal_validation", None)
     operations: list[str] = []
     branches: list[str] = []
     helper_returns: list[str] = []
@@ -110,6 +111,16 @@ def render_discovery_compact(
 
     return {
         "terminal": dag.terminal if dag else None,
+        **(
+            {
+                "terminal_validation": {
+                    "status": validation.status,
+                    "reason": validation.reason,
+                }
+            }
+            if validation is not None and validation.status != "valid"
+            else {}
+        ),
         "vertices": len(dag.vertices) if dag else 0,
         "edges": len(dag.edges) if dag else 0,
         "operations": _capped(operations, max_operations),
@@ -289,6 +300,13 @@ never select those; if no shown candidate holds the questioned quantity,
 propose a replacement in next_terminals taken from the operations of a
 non-empty rendering.
 
+rejected_terminals maps candidates that deterministic validation
+refused to slice to the reason: no write target in the loaded source,
+write targets ambiguous across modules, or absent from the declared
+file. Never select them either. When proposing next_terminals, always
+include terminal_file (the file whose operations show the write) so
+validation can scope the slice.
+
 Never request raw source; never speculate beyond the rendering.
 """,
     tools=[],
@@ -398,6 +416,17 @@ async def discover_with_judge(
         annotated_by_terminal[terminal] = annotated
         return render_discovery_compact(result, dag=annotated)
 
+    def _rejected(pool: dict[str, DiscoveryResult]) -> dict[str, str]:
+        """Terminals whose deterministic validation refused to build,
+        mapped to the reason — the judge must know WHY a candidate is
+        empty to propose a usable replacement."""
+        out: dict[str, str] = {}
+        for terminal, result in pool.items():
+            validation = getattr(result, "terminal_validation", None)
+            if validation is not None and validation.status != "valid":
+                out[terminal] = validation.reason or validation.status
+        return out
+
     deviation: Any = None
     if seeds.questioned_condition is not None and condition_windows is not None:
         deviation = condition_windows(seeds.questioned_condition, judged_candidates)
@@ -412,6 +441,7 @@ async def discover_with_judge(
                 for terminal, result in judged_candidates.items()
             },
             "empty_candidates": sorted(set(results) - set(judged_candidates)),
+            "rejected_terminals": _rejected(results),
         },
     )
 
@@ -473,6 +503,7 @@ async def discover_with_judge(
                     "questioned_windows": deviation,
                     "candidates": {bonus_terminal: _render(bonus_terminal, selected)},
                     "empty_candidates": [],
+                    "rejected_terminals": _rejected({bonus_terminal: selected}),
                     "note": "post-follow-up render; no further discovery rounds remain",
                 },
             )

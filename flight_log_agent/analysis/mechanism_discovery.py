@@ -20,12 +20,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
-from flight_log_agent.analysis.mechanism_dag import MechanismDAG, build_mechanism_dag
+from flight_log_agent.analysis.mechanism_dag import (
+    MechanismDAG,
+    _DAGBuilder,
+    build_mechanism_dag,
+)
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.px4.source_facts_cache import (
     SourceFileFacts,
     get_or_extract_facts,
 )
+from flight_log_agent.symbols import normalize_symbol
 from flight_log_agent.utils import dedupe_keep_order
 
 
@@ -201,6 +206,186 @@ def load_facts(
 
 
 # ---------------------------------------------------------------------------
+# Terminal validation (Phase 0: trust the question and terminals)
+# ---------------------------------------------------------------------------
+
+
+def canonicalize_terminal(terminal: str) -> str:
+    """Strip a class/type qualifier (``Class::member``,
+    ``struct_type_s::field``) — writers are keyed on the bare member as
+    written at the assignment site, so a qualified terminal can never
+    match one. Member paths and indices are preserved."""
+    return str(terminal or "").rsplit("::", 1)[-1].strip()
+
+
+@dataclass
+class TerminalValidation:
+    """Deterministic verdict on one candidate terminal, produced BEFORE
+    any DAG is built from it.
+
+    ``status``:
+
+    * ``valid`` — the terminal has write targets in the loaded facts
+      (scoped to ``resolved_file`` when one could be determined) or is
+      an exact member of the observed logged catalogue.
+    * ``absent`` — no write target anywhere in the loaded facts and not
+      a logged output.
+    * ``absent_in_scope`` — write targets exist, but none in the
+      declared terminal file's family or module.
+    * ``ambiguous`` — write targets span several unrelated locations
+      and no terminal file was declared to pick one; slicing would fuse
+      foreign modules, so nothing is built.
+    """
+
+    terminal: str
+    status: str
+    logged: bool = False
+    write_files: list[str] = field(default_factory=list)
+    resolved_file: Optional[str] = None
+    reason: Optional[str] = None
+
+
+def validate_terminal(
+    terminal: str,
+    bindings: Iterable[dict[str, Any]],
+    logged_signals: Iterable[str],
+    terminal_file: Optional[str] = None,
+) -> TerminalValidation:
+    """Validate a candidate terminal against actual write targets and
+    the observed catalogue — never by prompt trust or name shape.
+
+    Matching mirrors the DAG builder's terminal lookup exactly (the
+    normalized union of written targets and resolved logged signals), so
+    a terminal validated here is one the slicer can act on. Scope rules
+    mirror the walk's visibility conventions: a member-shaped root
+    (leading or trailing underscore) is visible across its module
+    directory, a local only within its file family — write targets
+    spread wider than that without a declared terminal file are
+    ambiguous, not sliceable.
+    """
+    canonical = canonicalize_terminal(terminal)
+    norm = normalize_symbol(canonical)
+    if not norm:
+        return TerminalValidation(
+            terminal=canonical, status="absent", reason="empty terminal"
+        )
+
+    logged = norm in {normalize_symbol(str(s)) for s in logged_signals if s}
+
+    matches: list[dict[str, Any]] = []
+    for binding in bindings:
+        target = normalize_symbol(
+            str(binding.get("target_symbol") or binding.get("target") or "")
+        )
+        published = normalize_symbol(str(binding.get("logged_signal") or ""))
+        if norm in (target, published):
+            matches.append(binding)
+
+    writes_per_file: dict[str, int] = {}
+    for binding in matches:
+        file = _DAGBuilder._binding_first_file(binding)
+        if file:
+            writes_per_file[file] = writes_per_file.get(file, 0) + 1
+    write_files = sorted(writes_per_file)
+
+    if not matches:
+        if logged:
+            return TerminalValidation(
+                terminal=canonical,
+                status="valid",
+                logged=True,
+                reason="observed logged output; no publisher loaded yet",
+            )
+        return TerminalValidation(
+            terminal=canonical,
+            status="absent",
+            reason="no write target in loaded facts",
+        )
+
+    def best_file(files: Iterable[str]) -> Optional[str]:
+        ranked = sorted(set(files), key=lambda f: (-writes_per_file.get(f, 0), f))
+        return ranked[0] if ranked else None
+
+    if terminal_file:
+        if terminal_file in writes_per_file:
+            return TerminalValidation(
+                terminal=canonical,
+                status="valid",
+                logged=logged,
+                write_files=write_files,
+                resolved_file=terminal_file,
+            )
+        declared_family = _DAGBuilder._file_family(terminal_file)
+        family_files = [
+            f
+            for f in write_files
+            if _DAGBuilder._file_family(f) == declared_family
+        ]
+        if not family_files:
+            # Member widening stays within the module (same directory),
+            # matching the walk's visibility convention.
+            root = canonical.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
+            if root.startswith("_") or root.endswith("_"):
+                family_files = [
+                    f
+                    for f in write_files
+                    if _DAGBuilder._file_family(f)[0] == declared_family[0]
+                ]
+        if family_files:
+            return TerminalValidation(
+                terminal=canonical,
+                status="valid",
+                logged=logged,
+                write_files=write_files,
+                resolved_file=best_file(family_files),
+            )
+        return TerminalValidation(
+            terminal=canonical,
+            status="absent_in_scope",
+            logged=logged,
+            write_files=write_files,
+            reason=(
+                f"no write target in declared file {terminal_file};"
+                f" written in: {', '.join(write_files[:4])}"
+            ),
+        )
+
+    root = canonical.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
+    if root.startswith("_") or root.endswith("_"):
+        scopes = {_DAGBuilder._file_family(f)[0] for f in write_files}
+        scope_kind = "modules"
+    else:
+        scopes = {_DAGBuilder._file_family(f) for f in write_files}
+        scope_kind = "file families"
+    if len(scopes) <= 1:
+        return TerminalValidation(
+            terminal=canonical,
+            status="valid",
+            logged=logged,
+            write_files=write_files,
+        )
+    if logged:
+        # An exact observed logged output is resolvable through the
+        # catalogue alone; multiple publisher sites are legitimate.
+        return TerminalValidation(
+            terminal=canonical,
+            status="valid",
+            logged=True,
+            write_files=write_files,
+        )
+    return TerminalValidation(
+        terminal=canonical,
+        status="ambiguous",
+        logged=logged,
+        write_files=write_files,
+        reason=(
+            f"write targets span {len(scopes)} {scope_kind} with no terminal"
+            f" file declared: {', '.join(write_files[:4])}"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Deterministic discovery fixpoint
 # ---------------------------------------------------------------------------
 
@@ -323,6 +508,7 @@ class DiscoveryResult:
     inputs: DAGInputs
     files_loaded: list[str]
     rounds: list[DiscoveryRound]
+    terminal_validation: Optional[TerminalValidation] = None
 
 
 def discover_mechanism_dag(
@@ -357,12 +543,19 @@ def discover_mechanism_dag(
     gap set and no provider fetches), no new files remain, or budgets run
     out. No LLM anywhere — seed selection and sufficiency judgment are
     the caller's problem (the judge stage).
+
+    Every terminal — seeder-proposed, judge-proposed, or replayed from
+    the Layer 4 cache — passes :func:`validate_terminal` against the
+    round's loaded facts before anything is built from it. An absent
+    terminal keeps loading pending files but never builds; an ambiguous
+    or out-of-scope one stops the fixpoint with the structured reason in
+    ``terminal_validation`` — building would fuse unrelated modules.
     """
-    # Strip a class/type qualifier (``RTL::_destination.alt``,
-    # ``mission_item_s::altitude``) — writers are keyed on the bare
-    # member as written at the assignment site, so a qualified terminal
-    # can never match one and would slice an empty DAG.
-    terminal = str(terminal).rsplit("::", 1)[-1].strip()
+    terminal = canonicalize_terminal(terminal)
+    if logged_signals is not None:
+        # Materialized once: consumed by per-round validation AND the
+        # builder, so a one-shot iterable must not exhaust in between.
+        logged_signals = {str(s) for s in logged_signals}
 
     if enum_registry is None:
         # Schema-derived message enums, flattened PER MESSAGE (the scope
@@ -387,12 +580,17 @@ def discover_mechanism_dag(
         seed_queries, max_files=max_files_per_round
     )
     pending: list[str] = [hit.file for hit in hits]
+    if terminal_file:
+        # The declared write file is provenance, not a search guess —
+        # load it first so validation decides with it in evidence.
+        pending = dedupe_keep_order([terminal_file, *pending])
 
     loaded: list[str] = []
     facts_by_file: dict[str, SourceFileFacts] = {}
     rounds: list[DiscoveryRound] = []
     dag: Optional[MechanismDAG] = None
     inputs = DAGInputs()
+    validation: Optional[TerminalValidation] = None
     previous_unresolved: Optional[set[str]] = None
 
     for index in range(max_rounds):
@@ -413,6 +611,44 @@ def discover_mechanism_dag(
         loaded.extend(new_files)
 
         inputs = dag_inputs_from_facts(facts_by_file.values())
+
+        # Gate the build on terminal validation. A verdict scoped to a
+        # resolved file is locked — later rounds load foreign files whose
+        # same-named writers cannot hijack a scoped slice. An UNSCOPED
+        # valid verdict is re-checked every round: writers arriving from
+        # gap searches can reveal the terminal as genuinely ambiguous.
+        locked = (
+            validation is not None
+            and validation.status == "valid"
+            and bool(validation.resolved_file or terminal_file or validation.logged)
+        )
+        if not locked:
+            validation = validate_terminal(
+                terminal, inputs.bindings, logged_signals or (), terminal_file
+            )
+        if validation.status != "valid":
+            dag = None
+            rounds.append(
+                DiscoveryRound(
+                    index=index,
+                    new_files=list(new_files),
+                    unresolved_symbols=[],
+                    vertices=0,
+                    edges=0,
+                )
+            )
+            # Ambiguity only grows with more files; an out-of-scope
+            # verdict is final once the declared file itself is loaded.
+            # Plain absence keeps draining pending files — the writer
+            # may live in a file the seed search found but the round
+            # budget deferred.
+            if validation.status == "ambiguous" or (
+                validation.status == "absent_in_scope"
+                and terminal_file in facts_by_file
+            ):
+                break
+            continue
+
         fetched_files: list[str] = []
         provider = make_helper_body_provider(profiler, fetched_files)
         dag = build_mechanism_dag(
@@ -427,7 +663,7 @@ def discover_mechanism_dag(
             parameter_values=parameter_values,
             parameter_names=inputs.parameter_names,
             parameter_aliases=inputs.parameter_aliases,
-            terminal_file=terminal_file,
+            terminal_file=validation.resolved_file or terminal_file,
             call_statements=inputs.call_statements,
             enum_registry=enum_registry,
         )
@@ -462,4 +698,5 @@ def discover_mechanism_dag(
         inputs=inputs,
         files_loaded=loaded,
         rounds=rounds,
+        terminal_validation=validation,
     )

@@ -365,3 +365,37 @@ def test_questioned_signal_resolves_via_slice_not_string_fuzz(tmp_path):
     missing, error, cands = resolve_questioned_signal(
         "unknown_topic.field", logged, [dag])
     assert missing is None and "did not resolve" in error
+
+
+def test_questioned_hint_never_resolves_by_containment():
+    """A hint whose topic exists in the schema but not in any slice
+    returns the topic's fields as CANDIDATES — even a unique substring
+    match is name guessing, not provenance."""
+    from flight_log_agent.analysis.dag_pipeline import resolve_questioned_signal
+
+    logged = {"topic_a.true_value_sp", "topic_a.mode"}
+    signal, error, cands = resolve_questioned_signal("topic_a.value_sp", logged, [])
+    assert signal is None
+    assert "did not resolve exactly" in error
+    assert cands == ["topic_a.mode", "topic_a.true_value_sp"]
+
+
+def test_replay_observed_signal_resolves_exactly_or_skips():
+    """The replayed observed signal must be an exact catalogue member —
+    suffix uniqueness would compare the mechanism against a guessed
+    signal, so an unresolved hint skips replay entirely."""
+    from flight_log_agent.analysis.dag_pipeline import replay_terminal_expressions
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    dag = build_mechanism_dag(
+        [{"target_symbol": "_x", "source_symbol": "topic_b.alt + 1.0f",
+          "assignment_path": [{"file": "a.cpp", "line": 1,
+                               "expression": "topic_b.alt + 1.0f"}],
+          "logged_signal": "", "control_predicates": [], "function": "A::run"}],
+        "_x", logged_signals={"topic_b.alt"},
+    )
+    replay = replay_terminal_expressions(
+        dag, Path("/nonexistent.ulg"), {}, {"topic_b.alt"},
+        observed_hint="wrong_topic.alt",
+    )
+    assert replay is None

@@ -488,3 +488,191 @@ void Tecs::update(float speed_sp)
     branches = [v.predicate_raw or "" for v in dag.vertices if v.kind == "branch"]
     assert any("_param_gnd_min" in b for b in branches), \
         "adaptation branch not reached through the argument hop"
+
+
+def _vt_binding(target: str, file: str, logged: str = "") -> dict:
+    return {
+        "target_symbol": target,
+        "source_symbol": "input_val + 1.0f",
+        "function": "C::f",
+        "assignment_path": [{"file": file, "line": 1, "expression": "input_val + 1.0f"}],
+        "logged_signal": logged,
+        "control_predicates": [],
+        "struct_variables": {},
+    }
+
+
+def test_validate_terminal_statuses():
+    """Terminal validation resolves against actual write targets and the
+    observed catalogue — qualified spellings canonicalize, absence and
+    observed-output membership are explicit."""
+    from flight_log_agent.analysis.mechanism_discovery import validate_terminal
+
+    bindings = [_vt_binding("_final_out", "src/modules/example/rtl.cpp")]
+
+    valid = validate_terminal("_final_out", bindings, [])
+    assert valid.status == "valid"
+    assert valid.write_files == ["src/modules/example/rtl.cpp"]
+
+    qualified = validate_terminal("Rtl::_final_out", bindings, [])
+    assert qualified.status == "valid" and qualified.terminal == "_final_out"
+
+    absent = validate_terminal("_ghost_var", bindings, [])
+    assert absent.status == "absent" and "no write target" in absent.reason
+
+    observed = validate_terminal("topic_a.alt", [], ["topic_a.alt"])
+    assert observed.status == "valid" and observed.logged is True
+
+
+def test_validate_terminal_scoping_rules():
+    """Scope rules mirror the walk's visibility conventions: locals are
+    ambiguous across file families, members across module directories;
+    a declared terminal file selects, including through its header twin."""
+    from flight_log_agent.analysis.mechanism_discovery import validate_terminal
+
+    cross = [
+        _vt_binding("dist", "src/modules/aaa/alpha.cpp"),
+        _vt_binding("dist", "src/modules/bbb/beta.cpp"),
+    ]
+    ambiguous = validate_terminal("dist", cross, [])
+    assert ambiguous.status == "ambiguous"
+    assert "alpha.cpp" in ambiguous.reason and "beta.cpp" in ambiguous.reason
+
+    scoped = validate_terminal(
+        "dist", cross, [], terminal_file="src/modules/aaa/alpha.cpp"
+    )
+    assert scoped.status == "valid"
+    assert scoped.resolved_file == "src/modules/aaa/alpha.cpp"
+
+    twin = validate_terminal(
+        "dist", cross, [], terminal_file="src/modules/aaa/alpha.hpp"
+    )
+    assert twin.status == "valid"
+    assert twin.resolved_file == "src/modules/aaa/alpha.cpp"
+
+    outside = validate_terminal(
+        "dist", cross, [], terminal_file="src/modules/ccc/gamma.cpp"
+    )
+    assert outside.status == "absent_in_scope"
+
+    member_same_module = [
+        _vt_binding("_alt", "src/modules/aaa/alpha.cpp"),
+        _vt_binding("_alt", "src/modules/aaa/base.cpp"),
+    ]
+    assert validate_terminal("_alt", member_same_module, []).status == "valid"
+
+    member_cross_module = [
+        _vt_binding("_alt", "src/modules/aaa/alpha.cpp"),
+        _vt_binding("_alt", "src/modules/bbb/beta.cpp"),
+    ]
+    assert validate_terminal("_alt", member_cross_module, []).status == "ambiguous"
+
+    # A member reaches its module's other families through the declared
+    # file's directory (inheritance widening), where a local cannot.
+    inherited = validate_terminal(
+        "_alt", member_cross_module, [], terminal_file="src/modules/aaa/other.cpp"
+    )
+    assert inherited.status == "valid"
+    assert inherited.resolved_file == "src/modules/aaa/alpha.cpp"
+
+
+def test_discovery_rejects_ambiguous_terminal_without_declared_file(tmp_path):
+    """Two modules writing the same bare name are different variables:
+    with no declared terminal file nothing is built (slicing would fuse
+    them); the declared file scopes the slice to one module."""
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/aaa/alpha.cpp": """
+void Alpha::run()
+{
+    shared_out = alpha_in + 1.0f;
+}
+""",
+        "src/modules/bbb/beta.cpp": """
+void Beta::run()
+{
+    shared_out = beta_in + 2.0f;
+}
+""",
+    })
+
+    rejected = discover_mechanism_dag(
+        profiler, tmp_path / "cache",
+        seeds=["shared_out"], terminal="shared_out", source_hash="hash",
+    )
+    assert rejected.dag is None
+    assert rejected.terminal_validation.status == "ambiguous"
+
+    scoped = discover_mechanism_dag(
+        profiler, tmp_path / "cache",
+        seeds=["shared_out"], terminal="shared_out", source_hash="hash",
+        terminal_file="src/modules/bbb/beta.cpp",
+    )
+    assert scoped.terminal_validation.status == "valid"
+    terminal_ops = [
+        v for v in scoped.dag.vertices
+        if v.kind == "operation" and v.variable == "shared_out"
+    ]
+    assert terminal_ops
+    assert all(v.file == "src/modules/bbb/beta.cpp" for v in terminal_ops)
+    # The declared file is loaded first — validation decides with it in
+    # evidence even when the ranked seed search would defer it.
+    assert scoped.rounds[0].new_files[0] == "src/modules/bbb/beta.cpp"
+
+
+def test_discovery_reports_absent_terminal(tmp_path):
+    """A terminal with no write target anywhere in the loaded facts
+    builds nothing and carries the structured reason."""
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/aaa/alpha.cpp": """
+void Alpha::run()
+{
+    real_out = alpha_in + 1.0f;
+}
+""",
+    })
+
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache",
+        seeds=["alpha_in"], terminal="_ghost_out", source_hash="hash",
+    )
+    assert result.dag is None
+    assert result.terminal_validation.status == "absent"
+    assert "no write target" in result.terminal_validation.reason
+
+
+def test_discovery_rejects_late_cross_module_ambiguity(tmp_path):
+    """An unscoped terminal that looks unique in round 0 but gains a
+    foreign-module writer from a later gap-search round is genuinely
+    ambiguous — the slice built before the evidence arrived is discarded,
+    not kept. (A verdict scoped by a declared/resolved file stays locked;
+    only the unscoped case re-checks.)"""
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/aaa/alpha.cpp": """
+void Alpha::run_alpha_marker()
+{
+    shared_out = helper_in + 1.0f;
+}
+""",
+        "src/modules/bbb/beta.cpp": """
+void Beta::run()
+{
+    helper_in = 3.0f;
+    shared_out = beta_src + 2.0f;
+}
+""",
+    })
+
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache",
+        seeds=["run_alpha_marker"], terminal="shared_out", source_hash="hash",
+        max_files_per_round=1,
+    )
+    assert result.rounds[0].new_files == ["src/modules/aaa/alpha.cpp"]
+    assert result.dag is None
+    assert result.terminal_validation.status == "ambiguous"

@@ -237,6 +237,11 @@ def test_empty_candidates_are_excluded_from_judge_choices(tmp_path):
 
     assert list(payloads[0]["candidates"]) == ["_final_out"]
     assert payloads[0]["empty_candidates"] == ["_ghost_var"]
+    # Validation tells the judge WHY the candidate is empty, so its
+    # replacement proposal can carry a usable terminal_file.
+    assert payloads[0]["rejected_terminals"] == {
+        "_ghost_var": "no write target in loaded facts"
+    }
     assert judged.selected is judged.results["_final_out"]
 
 
