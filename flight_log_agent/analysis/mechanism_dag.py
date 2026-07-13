@@ -1596,6 +1596,20 @@ class _DAGBuilder:
         if existing is not None:
             return existing
         vertex_id = self._make_id("ev", key)
+        vertex_metadata = dict(metadata) if metadata else {}
+        if sub_kind == "logged_signal":
+            # Declaration validity and observation are INDEPENDENT: a
+            # schema/type-derived placement is a source-proven boundary
+            # that may stop the walk, but only presence in THIS flight's
+            # log makes it flight evidence. Downstream consumers must
+            # never read an unobserved leaf as observed data.
+            vertex_metadata["observation"] = (
+                "observed"
+                if self._signal_known(
+                    exact_symbol(signal), self.logged_signals, self._logged_shapes
+                )
+                else "unobserved"
+            )
         self.vertices[vertex_id] = DAGVertex(
             id=vertex_id,
             kind="evidence",
@@ -1604,7 +1618,7 @@ class _DAGBuilder:
             line=line,
             snippet=self._snippet(file, line),
             signal_name=signal,
-            metadata=dict(metadata) if metadata else {},
+            metadata=vertex_metadata,
         )
         self._evidence_by_signal[key] = vertex_id
         return vertex_id

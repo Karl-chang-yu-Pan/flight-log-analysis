@@ -2151,3 +2151,43 @@ def test_branch_identity_is_the_source_site():
     branches = [v for v in dag.vertices if v.kind == "branch"]
     assert len(branches) == 2, "same-text branches at distinct sites must not fuse"
     assert {v.line for v in branches} == {10, 38}
+
+
+def test_logged_signal_leaves_carry_observation_status():
+    """Declared and observed are independent: a schema-derived placement
+    is a source-proven boundary, but only presence in THIS flight's log
+    marks the leaf observed."""
+    binding = {
+        "target_symbol": "out",
+        "source_symbol": "data.field_x + 1",
+        "function": "Gate::update",
+        "assignment_path": [
+            {"file": "mod.cpp", "line": 4, "expression": "data.field_x + 1"}
+        ],
+        "logged_signal": "",
+        "control_predicates": [],
+        "struct_variables": {"data": "gate_status_s"},
+    }
+
+    declared_only = build_mechanism_dag(
+        [dict(binding)], "out", terminal_file="mod.cpp",
+        schema_signals={"gate_status.field_x"},
+    )
+    leaf = next(
+        v for v in declared_only.vertices
+        if v.kind == "evidence" and v.sub_kind == "logged_signal"
+        and v.signal_name == "gate_status.field_x"
+    )
+    assert leaf.metadata.get("observation") == "unobserved"
+
+    observed = build_mechanism_dag(
+        [dict(binding)], "out", terminal_file="mod.cpp",
+        schema_signals={"gate_status.field_x"},
+        logged_signals={"gate_status.field_x"},
+    )
+    leaf = next(
+        v for v in observed.vertices
+        if v.kind == "evidence" and v.sub_kind == "logged_signal"
+        and v.signal_name == "gate_status.field_x"
+    )
+    assert leaf.metadata.get("observation") == "observed"
