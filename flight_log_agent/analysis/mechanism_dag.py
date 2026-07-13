@@ -388,7 +388,9 @@ class _DAGBuilder:
 
         # Memoization tables.
         self._evidence_by_signal: dict[tuple[str, str], str] = {}
-        self._branch_by_predicate: dict[str, str] = {}
+        # Branch vertices key on (canonical predicate, file, line) — the
+        # source SITE is part of branch identity.
+        self._branch_by_site: dict[tuple[str, str, int], str] = {}
         self._helper_subgraph_return_id: dict[tuple[str, str], str] = {}
         # helper_key -> ordered list of (formal_name, param_vertex_id).
         # Callers wire their i-th argument's producer to the i-th formal
@@ -764,6 +766,7 @@ class _DAGBuilder:
             line_raw = call.get("line")
             line = int(line_raw) if isinstance(line_raw, (int, float)) else 0
             predicates = list(call.get("control_predicates") or [])
+            predicate_lines = list(call.get("control_predicate_lines") or [])
             for formal, actual in zip(formals, args):
                 formal_norm = exact_symbol(formal)
                 if not formal_norm:
@@ -780,6 +783,7 @@ class _DAGBuilder:
                         ],
                         "logged_signal": "",
                         "control_predicates": predicates,
+                        "control_predicate_lines": predicate_lines,
                         "struct_variables": {},
                         # The formal lives in the CALLEE; the actual's
                         # symbols resolve at the call site (see
@@ -972,9 +976,17 @@ class _DAGBuilder:
     def _wire_binding_edges(self, binding: dict[str, Any]) -> None:
         op_id, _target_raw, file, line, target_norm, expression = self._binding_operation_id(binding)
 
-        # Attach control-predicate branches.
-        for predicate in binding.get("control_predicates") or []:
-            branch_id = self._emit_branch(str(predicate), file=file, line=line)
+        # Attach control-predicate branches at their OWN source sites —
+        # the branch's identity is where the control statement lives,
+        # not where the gated assignment does.
+        predicate_sites = binding.get("control_predicate_lines") or []
+        for position, predicate in enumerate(binding.get("control_predicates") or []):
+            site = (
+                int(predicate_sites[position])
+                if position < len(predicate_sites)
+                else line
+            )
+            branch_id = self._emit_branch(str(predicate), file=file, line=site)
             self._add_edge(branch_id, op_id, kind="control")
 
         # Wire each source-expression symbol as an incoming data edge.
@@ -1605,10 +1617,15 @@ class _DAGBuilder:
         line: Optional[int],
     ) -> str:
         canonical = _canonical_predicate(predicate)
-        existing = self._branch_by_predicate.get(canonical)
+        # Branch identity is the SOURCE SITE plus the canonical predicate
+        # — identical text at two different sites is two branches. The
+        # canonical text alone keys only predicate SEMANTICS (parameter-
+        # predicate metadata, lowering), never vertex identity.
+        site_key = (canonical, str(file or ""), int(line or 0))
+        existing = self._branch_by_site.get(site_key)
         if existing is not None:
             return existing
-        vertex_id = self._make_id("br", canonical)
+        vertex_id = self._make_id("br", site_key)
         metadata = self._branch_metadata_from_parameter_predicate(canonical)
         lowered, variables = self._lower_predicate(canonical)
         if variables:
@@ -1624,7 +1641,7 @@ class _DAGBuilder:
             feasibility_verdict="unknown",
             metadata=metadata,
         )
-        self._branch_by_predicate[canonical] = vertex_id
+        self._branch_by_site[site_key] = vertex_id
 
         # A branch's own predicate depends on the symbols it reads. Wire
         # data edges from those producers so pre-evaluation later has

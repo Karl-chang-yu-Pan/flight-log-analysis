@@ -106,7 +106,11 @@ def test_backward_slice_emits_vertices_for_reaching_bindings():
     assert "_destination.alt" in op_targets
 
 
-def test_branch_deduplicates_by_predicate():
+def test_branch_deduplicates_by_source_site():
+    """Two writes gated by the SAME if-statement share one branch vertex
+    — the profiler-emitted site line, not the predicate text, is the
+    identity. Without site info the fallback keys on each write's own
+    line: conservatively split, never falsely merged."""
     predicate = "_param_rtl_type.get() != RTL_TYPE_HOME_OR_RALLY"
     bindings = [
         _fake_binding(
@@ -126,12 +130,22 @@ def test_branch_deduplicates_by_predicate():
             control_predicates=[predicate],
         ),
     ]
+    bindings[0]["control_predicate_lines"] = [160]
+    bindings[1]["control_predicate_lines"] = [160]
 
     dag = build_mechanism_dag(bindings, "_destination.alt")
 
     branches = [v for v in dag.vertices if v.kind == "branch"]
     assert len(branches) == 1
     assert branches[0].predicate_raw == predicate
+    assert branches[0].line == 160
+
+    without_sites = build_mechanism_dag(
+        [{**bindings[0], "control_predicate_lines": []},
+         {**bindings[1], "control_predicate_lines": []}],
+        "_destination.alt",
+    )
+    assert len([v for v in without_sites.vertices if v.kind == "branch"]) == 2
 
 
 def test_two_writes_at_different_lines_produce_two_operation_vertices():
@@ -2108,3 +2122,32 @@ def test_indexed_catalogue_entry_grounds_index_free_reference():
     }
     assert "state.q" in leaves
     assert dag.unresolved_symbols == []
+
+
+def test_branch_identity_is_the_source_site():
+    """Identical predicate text at two source sites is TWO branches;
+    the same site shared by several gated operations is ONE branch."""
+    bindings = [
+        _fake_binding(binding_id="a", target="out_a",
+                      expression="in_a + 1", file="mod.cpp", line=12,
+                      logged_signal="",
+                      control_predicates=["mode == 2"]),
+        _fake_binding(binding_id="b", target="out_b",
+                      expression="in_b + 2", file="mod.cpp", line=13,
+                      logged_signal="",
+                      control_predicates=["mode == 2"]),
+        _fake_binding(binding_id="c", target="out_c",
+                      expression="out_a + out_b", file="mod.cpp", line=40,
+                      logged_signal="",
+                      control_predicates=["mode == 2"]),
+    ]
+    # a and b share one if (site 10); c sits under a DIFFERENT if with
+    # the same text (site 38).
+    bindings[0]["control_predicate_lines"] = [10]
+    bindings[1]["control_predicate_lines"] = [10]
+    bindings[2]["control_predicate_lines"] = [38]
+
+    dag = build_mechanism_dag(bindings, "out_c", terminal_file="mod.cpp")
+    branches = [v for v in dag.vertices if v.kind == "branch"]
+    assert len(branches) == 2, "same-text branches at distinct sites must not fuse"
+    assert {v.line for v in branches} == {10, 38}

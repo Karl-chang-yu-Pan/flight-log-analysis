@@ -102,6 +102,10 @@ class FunctionCallRef(BaseModel):
     args: List[str] = Field(default_factory=list)
     argument_topics: Dict[str, str] = Field(default_factory=dict)
     control_predicates: List[str] = Field(default_factory=list)
+    # Source line of each governing control statement, aligned with
+    # ``control_predicates`` — the branch's own SITE identity, distinct
+    # from this ref's ``line`` (the gated statement).
+    control_predicate_lines: List[int] = Field(default_factory=list)
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
 
 
@@ -117,6 +121,10 @@ class SourceAssignmentRef(BaseModel):
     target_field: Optional[str] = None
     assignment_operator: Optional[str] = None
     control_predicates: List[str] = Field(default_factory=list)
+    # Source line of each governing control statement, aligned with
+    # ``control_predicates`` — the branch's own SITE identity, distinct
+    # from this ref's ``line`` (the gated statement).
+    control_predicate_lines: List[int] = Field(default_factory=list)
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
     # Struct-typed variable → C++ struct type in scope at this assignment's
     # site. Lets the DAG derive ``var.field → topic.field`` bindings
@@ -861,6 +869,9 @@ class MechanismSourceProfiler:
                     stripped = line.strip()
                 function_name = self._function_name_for_line(definitions, line_no)
                 func_aliases = aliases_per_function.get(function_name or "", {})
+                predicate_entries = control_predicates.get(line_no, [])
+                predicates = [p for p, _ in predicate_entries]
+                predicate_lines = [s for _, s in predicate_entries]
                 # Constructor-style initialization ``Type name(expr);``
                 # inside a function body is an assignment the ``=`` pattern
                 # misses (the declaration form loses e.g. quaternion
@@ -885,7 +896,8 @@ class MechanismSourceProfiler:
                                 file=rel_file,
                                 line=line_no,
                                 evidence=stripped,
-                                control_predicates=control_predicates.get(line_no, []),
+                                control_predicates=predicates,
+                                control_predicate_lines=predicate_lines,
                                 struct_variables=dict(var_to_struct),
                             )
                         )
@@ -912,7 +924,6 @@ class MechanismSourceProfiler:
                     root, field = split_source_field(target)
                     struct = var_to_struct.get(root)
                     target_topic = self._topic_from_struct(struct) if struct else None
-                    predicates = control_predicates.get(line_no, [])
                     refs.append(
                         SourceAssignmentRef(
                             target=target,
@@ -926,6 +937,7 @@ class MechanismSourceProfiler:
                             line=line_no,
                             evidence=stripped,
                             control_predicates=predicates,
+                            control_predicate_lines=predicate_lines,
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([target, expression, *predicates]),
                                 var_to_struct,
@@ -946,7 +958,6 @@ class MechanismSourceProfiler:
                     root, field = split_source_field(target)
                     struct = var_to_struct.get(root)
                     target_topic = self._topic_from_struct(struct) if struct else None
-                    predicates = control_predicates.get(line_no, [])
                     refs.append(
                         SourceAssignmentRef(
                             target=target,
@@ -960,6 +971,7 @@ class MechanismSourceProfiler:
                             line=line_no,
                             evidence=stripped,
                             control_predicates=predicates,
+                            control_predicate_lines=predicate_lines,
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([target, expression, *predicates]),
                                 var_to_struct,
@@ -1030,6 +1042,7 @@ class MechanismSourceProfiler:
                         line=call.line,
                         evidence=call.evidence,
                         control_predicates=list(call.control_predicates or []),
+                        control_predicate_lines=list(call.control_predicate_lines or []),
                         symbol_bindings={},
                     )
                 )
@@ -1194,12 +1207,16 @@ class MechanismSourceProfiler:
     _ELSE_BODY_PATTERN = re.compile(r"^else(?!\s*if\b)\s*\{")
     _ELSE_IF_PATTERN = re.compile(r"^else\s+if\b")
 
-    def _control_predicates_by_line(self, text: str) -> Dict[int, List[str]]:
-        predicates_by_line: Dict[int, List[str]] = {}
-        active: List[Tuple[int, str]] = []
+    def _control_predicates_by_line(self, text: str) -> Dict[int, List[Tuple[str, int]]]:
+        """Map each code line to its governing ``(predicate, site_line)``
+        pairs — the site is the line of the control statement itself,
+        the branch's source identity (two textually identical conditions
+        at different sites are different branches)."""
+        predicates_by_line: Dict[int, List[Tuple[str, int]]] = {}
+        active: List[Tuple[int, str, int]] = []
         # Predicates whose ``{`` hasn't been seen yet — first-in first-out
         # so multiple pending ifs pop in the same order the parser saw them.
-        pending: List[str] = []
+        pending: List[Tuple[str, int]] = []
         # Predicate whose ``}`` we just closed, keyed by the depth we're
         # now back at. Used to synthesize ``!(...)`` for the matching
         # ``else`` body.
@@ -1213,21 +1230,22 @@ class MechanismSourceProfiler:
                 depth_after = max(brace_depth - leading_closes, 0)
                 # Capture the outermost predicate about to be dropped so
                 # a following ``else`` can push its negation.
-                filtered = [(d, p) for d, p in active if d >= depth_after]
+                filtered = [(d, p, s) for d, p, s in active if d >= depth_after]
                 if filtered:
                     outermost = min(filtered, key=lambda item: item[0])
                     last_closed_by_depth[depth_after] = outermost[1]
                 brace_depth = depth_after
-                active = [(depth, predicate) for depth, predicate in active if depth < brace_depth]
+                active = [(depth, predicate, site) for depth, predicate, site in active if depth < brace_depth]
 
             # Detect ``else {`` (plain else) and push the negation of the
             # matching if. ``else if`` is picked up below so we can conjoin
-            # the negation with the new condition.
+            # the negation with the new condition. The else's own line is
+            # the synthesized branch's site.
             remainder_pre = stripped[leading_closes:].lstrip()
             if self._ELSE_BODY_PATTERN.match(remainder_pre):
                 negated = last_closed_by_depth.pop(brace_depth, None)
                 if negated:
-                    pending.append(f"!({negated})")
+                    pending.append((f"!({negated})", line_no))
 
             # If this line starts an ``else if`` chain, grab the negation
             # of the just-closed branch so we can combine it with the
@@ -1259,7 +1277,7 @@ class MechanismSourceProfiler:
                 condition = match.group("condition").strip()
                 if branch_kind == "else if" and else_if_negation:
                     condition = f"!({else_if_negation}) && ({condition})"
-                pending.append(condition)
+                pending.append((condition, line_no))
 
             # Consume opens on THIS line: for each ``{``, pop a pending
             # predicate (if any) and push it as active at the current
@@ -1270,15 +1288,18 @@ class MechanismSourceProfiler:
             opens_here = remainder.count("{")
             for _ in range(opens_here):
                 if pending:
-                    active.append((brace_depth, pending.pop(0)))
+                    predicate, site = pending.pop(0)
+                    active.append((brace_depth, predicate, site))
                 brace_depth += 1
             brace_depth = max(brace_depth - remainder.count("}"), 0)
 
             # Snapshot AFTER remainder processing so assignments on the
             # same line as the ``{`` see the predicate.
-            predicates_by_line[line_no] = [predicate for _, predicate in active]
+            predicates_by_line[line_no] = [
+                (predicate, site) for _, predicate, site in active
+            ]
 
-            active = [(depth, predicate) for depth, predicate in active if depth < brace_depth]
+            active = [(depth, predicate, site) for depth, predicate, site in active if depth < brace_depth]
         return predicates_by_line
 
     @staticmethod
@@ -1343,7 +1364,8 @@ class MechanismSourceProfiler:
                                 break
                         args = self._call_args(joined, match.end() - 1)
                     argument_topics = self._argument_topics(args, var_to_struct)
-                    predicates = control_predicates.get(line_no, [])
+                    predicate_entries = control_predicates.get(line_no, [])
+                    predicates = [p for p, _ in predicate_entries]
                     refs.append(
                         FunctionCallRef(
                             name=name,
@@ -1354,6 +1376,7 @@ class MechanismSourceProfiler:
                             line=line_no,
                             evidence=stripped,
                             control_predicates=predicates,
+                            control_predicate_lines=[s for _, s in predicate_entries],
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([stripped, *predicates]),
                                 var_to_struct,

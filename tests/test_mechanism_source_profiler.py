@@ -1988,3 +1988,48 @@ void Wv::run()
     hit = next((s for s in sas if s.target == "body_z_sp"), None)
     assert hit is not None
     assert "q_d" in hit.expression
+
+
+def test_control_predicate_lines_carry_the_branch_site(tmp_path):
+    """Each control predicate carries the line of its OWN control
+    statement — the branch's source identity — not the line of the
+    gated assignment. Two assignments in one if-block share the site;
+    an else's synthesized negation sites at the else line."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "gate.cpp").write_text(
+        """
+void Gate::update()
+{
+    if (mode == 2) {
+        first_out = a + 1.0f;
+        second_out = b + 2.0f;
+    } else {
+        third_out = c + 3.0f;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/gate.cpp"]
+    )
+    by_target = {a.target: a for a in assignments}
+
+    first = by_target["first_out"]
+    second = by_target["second_out"]
+    third = by_target["third_out"]
+
+    assert first.control_predicates == ["mode == 2"]
+    assert len(first.control_predicate_lines) == 1
+    # both if-body assignments share the if's OWN line as the site
+    assert first.control_predicate_lines == second.control_predicate_lines
+    assert first.control_predicate_lines[0] < first.line
+
+    assert third.control_predicates == ["!(mode == 2)"]
+    assert len(third.control_predicate_lines) == 1
+    # the else arm is a different site than the if arm
+    assert third.control_predicate_lines != first.control_predicate_lines
