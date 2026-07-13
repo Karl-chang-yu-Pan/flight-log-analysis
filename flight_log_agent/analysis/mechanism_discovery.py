@@ -30,7 +30,11 @@ from flight_log_agent.px4.source_facts_cache import (
     SourceFileFacts,
     get_or_extract_facts,
 )
-from flight_log_agent.symbols import normalize_symbol
+from flight_log_agent.symbols import (
+    exact_symbol,
+    strip_symbol_indices,
+    symbol_indices_compatible,
+)
 from flight_log_agent.utils import dedupe_keep_order
 
 
@@ -210,12 +214,24 @@ def load_facts(
 # ---------------------------------------------------------------------------
 
 
+def split_terminal_qualifier(terminal: str) -> tuple[str, str]:
+    """Split ``Class::member`` into ``(qualifier, bare member)``.
+
+    The qualifier is SCOPE, not spelling noise: validation uses it to
+    pick the write file whose class family matches, instead of
+    discarding it. The bare member is what writers key on at the
+    assignment site. Member paths and indices are preserved."""
+    text = str(terminal or "").strip()
+    qualifier, sep, bare = text.rpartition("::")
+    return (qualifier.strip() if sep else "", bare.strip())
+
+
 def canonicalize_terminal(terminal: str) -> str:
-    """Strip a class/type qualifier (``Class::member``,
-    ``struct_type_s::field``) — writers are keyed on the bare member as
-    written at the assignment site, so a qualified terminal can never
-    match one. Member paths and indices are preserved."""
-    return str(terminal or "").rsplit("::", 1)[-1].strip()
+    """The sliceable terminal form: the bare member as written at the
+    assignment site. The class qualifier is handled separately as scope
+    evidence by :func:`validate_terminal` — see
+    :func:`split_terminal_qualifier`."""
+    return split_terminal_qualifier(terminal)[1]
 
 
 @dataclass
@@ -255,31 +271,38 @@ def validate_terminal(
     the observed catalogue — never by prompt trust or name shape.
 
     Matching mirrors the DAG builder's terminal lookup exactly (the
-    normalized union of written targets and resolved logged signals), so
-    a terminal validated here is one the slicer can act on. Scope rules
-    mirror the walk's visibility conventions: a member-shaped root
-    (leading or trailing underscore) is visible across its module
-    directory, a local only within its file family — write targets
-    spread wider than that without a declared terminal file are
-    ambiguous, not sliceable.
+    EXACT-identity union of written targets and resolved logged signals,
+    index-compatible spellings included), so a terminal validated here
+    is one the slicer can act on. Scope rules mirror the walk's
+    visibility conventions: a member-shaped root (leading or trailing
+    underscore) is visible across its module directory, a local only
+    within its file family — write targets spread wider than that
+    without a declared terminal file are ambiguous, not sliceable. A
+    ``Class::member`` qualifier is used as scope evidence: it selects
+    the write file whose family matches the class name.
     """
-    canonical = canonicalize_terminal(terminal)
-    norm = normalize_symbol(canonical)
+    qualifier, canonical = split_terminal_qualifier(terminal)
+    norm = exact_symbol(canonical)
     if not norm:
         return TerminalValidation(
             terminal=canonical, status="absent", reason="empty terminal"
         )
 
-    logged = norm in {normalize_symbol(str(s)) for s in logged_signals if s}
+    logged = norm in {exact_symbol(str(s)) for s in logged_signals if s}
 
+    shape = strip_symbol_indices(norm)
     matches: list[dict[str, Any]] = []
     for binding in bindings:
-        target = normalize_symbol(
+        target = exact_symbol(
             str(binding.get("target_symbol") or binding.get("target") or "")
         )
-        published = normalize_symbol(str(binding.get("logged_signal") or ""))
-        if norm in (target, published):
-            matches.append(binding)
+        published = exact_symbol(str(binding.get("logged_signal") or ""))
+        for candidate in (target, published):
+            if strip_symbol_indices(candidate) == shape and symbol_indices_compatible(
+                candidate, norm
+            ):
+                matches.append(binding)
+                break
 
     writes_per_file: dict[str, int] = {}
     for binding in matches:
@@ -305,6 +328,27 @@ def validate_terminal(
     def best_file(files: Iterable[str]) -> Optional[str]:
         ranked = sorted(set(files), key=lambda f: (-writes_per_file.get(f, 0), f))
         return ranked[0] if ranked else None
+
+    if qualifier and not terminal_file:
+        # The class qualifier is scope evidence: pick the write files
+        # whose family stem matches the class name (same underscore/case
+        # convention as receiver↔class affinity). No match falls through
+        # to the unqualified rules — the qualifier could name a base
+        # class whose file is not loaded yet.
+        affinity = qualifier.rsplit("::", 1)[-1].replace("_", "").lower()
+        class_files = [
+            f
+            for f in write_files
+            if _DAGBuilder._file_family(f)[1].replace("_", "").lower() == affinity
+        ]
+        if class_files:
+            return TerminalValidation(
+                terminal=canonical,
+                status="valid",
+                logged=logged,
+                write_files=write_files,
+                resolved_file=best_file(class_files),
+            )
 
     if terminal_file:
         if terminal_file in writes_per_file:
@@ -551,6 +595,7 @@ def discover_mechanism_dag(
     or out-of-scope one stops the fixpoint with the structured reason in
     ``terminal_validation`` — building would fuse unrelated modules.
     """
+    terminal_as_given = str(terminal or "").strip()
     terminal = canonicalize_terminal(terminal)
     if logged_signals is not None:
         # Materialized once: consumed by per-round validation AND the
@@ -624,7 +669,7 @@ def discover_mechanism_dag(
         )
         if not locked:
             validation = validate_terminal(
-                terminal, inputs.bindings, logged_signals or (), terminal_file
+                terminal_as_given, inputs.bindings, logged_signals or (), terminal_file
             )
         if validation.status != "valid":
             dag = None

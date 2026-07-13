@@ -177,3 +177,49 @@ class TestLooksLikeEnumConstant:
     )
     def test_rejects(self, value):
         assert looks_like_enum_constant(value) is False
+
+
+class TestExactSymbol:
+    """Exact identity (the DAG-path form): only syntactic variance
+    collapses; indices, instances, and the member underscore distinguish."""
+
+    def test_preserves_identity_markers(self):
+        from flight_log_agent.symbols import exact_symbol
+
+        assert exact_symbol("state.q[0]") == "state.q[0]"
+        assert exact_symbol("state.q[0]") != exact_symbol("state.q[1]")
+        assert exact_symbol("sensor[0].value") != exact_symbol("sensor[1].value")
+        assert exact_symbol("_x") == "_x"
+        assert exact_symbol("_x") != exact_symbol("x")
+
+    def test_collapses_only_syntax(self):
+        from flight_log_agent.symbols import exact_symbol
+
+        assert exact_symbol(" &_dest->alt ") == "_dest.alt"
+        assert exact_symbol("Class::member") == "Class.member"
+        assert exact_symbol("*ptr") == "ptr"
+
+    def test_empty(self):
+        from flight_log_agent.symbols import exact_symbol
+
+        assert exact_symbol("") == ""
+        assert exact_symbol(None) == ""
+
+
+class TestSymbolIndexCompatibility:
+    def test_shape_and_compatibility(self):
+        from flight_log_agent.symbols import (
+            strip_symbol_indices,
+            symbol_indices_compatible,
+        )
+
+        assert strip_symbol_indices("state.q[0]") == "state.q"
+        assert strip_symbol_indices("sensor[1].value") == "sensor.value"
+
+        # index-free covers any index (whole-object write / read)
+        assert symbol_indices_compatible("q", "q[0]")
+        assert symbol_indices_compatible("state.q[2]", "state.q")
+        # explicit indices never fuse
+        assert not symbol_indices_compatible("state.q[0]", "state.q[1]")
+        assert not symbol_indices_compatible("sensor[0].value", "sensor[1].value")
+        assert symbol_indices_compatible("sensor[1].value", "sensor[1].value")

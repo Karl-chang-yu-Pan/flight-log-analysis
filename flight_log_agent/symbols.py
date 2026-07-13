@@ -52,6 +52,48 @@ def _normalize_symbol_uncached(value: str) -> str:
     return normalized
 
 
+def exact_symbol(value: str) -> str:
+    """Exact canonical spelling of a source/log symbol — the DAG-path
+    identity form.
+
+    Only true syntactic variance collapses: whitespace, outer ``&``/``*``,
+    and the access-separator spellings ``->``/``::`` (which become ``.``).
+    Everything that distinguishes one runtime value from another is
+    PRESERVED — bracket indices (``q[0]`` ≠ ``q[1]``), instance brackets,
+    and the leading underscore (member ``_x`` ≠ local ``x``). This string
+    is the serialized identity; :func:`normalize_symbol` remains the
+    LOSSY form for fuzzy source search and legacy consumers, and must
+    not key vertices, evidence, producer resolution, or replay variables.
+    """
+    return (
+        str(value or "")
+        .strip()
+        .replace("->", ".")
+        .replace("::", ".")
+        .replace(" ", "")
+        .strip("&*")
+    )
+
+
+def strip_symbol_indices(value: str) -> str:
+    """Index-erased SHAPE of an exact symbol — a lookup aid for finding
+    index-compatible writers (``q`` ↔ ``q[0]``), never an identity."""
+    return _BRACKET_INDEX_RE.sub("", exact_symbol(value))
+
+
+def symbol_indices_compatible(a: str, b: str) -> bool:
+    """True when two same-shaped exact symbols can denote the same value:
+    component-wise, an index-free side covers any index (a write to ``q``
+    produces ``q[0]``), while two explicit indices must be equal
+    (``q[0]`` never matches ``q[1]``)."""
+    for part_a, part_b in zip(exact_symbol(a).split("."), exact_symbol(b).split(".")):
+        index_a = _BRACKET_INDEX_RE.search(part_a)
+        index_b = _BRACKET_INDEX_RE.search(part_b)
+        if index_a and index_b and index_a.group(0) != index_b.group(0):
+            return False
+    return True
+
+
 def _topic_is_struct_type(reference: str) -> bool:
     """PX4 struct type names end in ``_s``; topic names do not.
 

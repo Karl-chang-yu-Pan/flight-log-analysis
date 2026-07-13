@@ -676,3 +676,31 @@ void Beta::run()
     assert result.rounds[0].new_files == ["src/modules/aaa/alpha.cpp"]
     assert result.dag is None
     assert result.terminal_validation.status == "ambiguous"
+
+
+def test_qualifier_scopes_terminal_to_class_family():
+    """A ``Class::member`` qualifier is scope evidence, not spelling
+    noise: it selects the write file whose family matches the class
+    name; an unresolvable qualifier falls through to the unqualified
+    rules."""
+    from flight_log_agent.analysis.mechanism_discovery import validate_terminal
+
+    cross = [
+        _vt_binding("shared_out", "src/modules/aaa/alpha.cpp"),
+        _vt_binding("shared_out", "src/modules/bbb/beta.cpp"),
+    ]
+
+    qualified = validate_terminal("Alpha::shared_out", cross, [])
+    assert qualified.status == "valid"
+    assert qualified.resolved_file == "src/modules/aaa/alpha.cpp"
+    assert qualified.terminal == "shared_out"
+
+    snake = validate_terminal("MissionBlock::dist", [
+        _vt_binding("dist", "src/modules/nav/mission_block.cpp"),
+        _vt_binding("dist", "src/modules/other/thing.cpp"),
+    ], [])
+    assert snake.status == "valid"
+    assert snake.resolved_file == "src/modules/nav/mission_block.cpp"
+
+    unknown = validate_terminal("Gamma::shared_out", cross, [])
+    assert unknown.status == "ambiguous"

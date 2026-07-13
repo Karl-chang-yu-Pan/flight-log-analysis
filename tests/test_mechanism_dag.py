@@ -1592,11 +1592,11 @@ def test_cpp_qualified_expression_wires_inner_logged_signal_not_dropped():
     ), "logged signal not connected to the operation that references it"
 
 
-def test_terminal_file_scopes_writers_to_named_module():
-    """NPFG regression shape: ``_lateral_accel`` (one module's member) and
-    ``lateral_accel`` (another module's local) normalize identically, so an
-    unscoped multi-module slice fuses two unrelated variables. With
-    ``terminal_file`` the terminal keeps only that file's writers."""
+def test_member_and_local_spellings_are_distinct_identities():
+    """NPFG regression shape, root-caused: ``_lateral_accel`` (one
+    module's member) and ``lateral_accel`` (another module's local) are
+    DIFFERENT variables and must never fuse — exact identity keeps them
+    apart even with no ``terminal_file`` scoping at all."""
     bindings = [
         _fake_binding(binding_id="l1", target="_lateral_accel",
                       expression="_K_L1 * ground_speed", file="l1.cpp", line=10),
@@ -1605,13 +1605,25 @@ def test_terminal_file_scopes_writers_to_named_module():
     ]
 
     unscoped = build_mechanism_dag(bindings, "_lateral_accel")
-    fused = {v.file for v in unscoped.vertices if v.kind == "operation"
-             and v.variable in {"_lateral_accel", "lateral_accel"}}
-    assert fused == {"l1.cpp", "npfg.cpp"}, "collision precondition changed"
+    sliced = {v.file for v in unscoped.vertices if v.kind == "operation"
+              and v.variable in {"_lateral_accel", "lateral_accel"}}
+    assert sliced == {"l1.cpp"}, "member and local spellings fused"
+
+
+def test_terminal_file_scopes_writers_to_named_module():
+    """Two modules writing the SAME spelling: ``terminal_file`` keeps
+    only that file's writers; a hint naming a writer-less file falls
+    back instead of emptying the slice."""
+    bindings = [
+        _fake_binding(binding_id="l1", target="_lateral_accel",
+                      expression="_K_L1 * ground_speed", file="l1.cpp", line=10),
+        _fake_binding(binding_id="npfg", target="_lateral_accel",
+                      expression="lateralAccel(air_vel, airspeed)", file="npfg.cpp", line=20),
+    ]
 
     scoped = build_mechanism_dag(bindings, "_lateral_accel", terminal_file="l1.cpp")
     terminal_ops = [v for v in scoped.vertices if v.kind == "operation"
-                    and v.variable in {"_lateral_accel", "lateral_accel"}]
+                    and v.variable == "_lateral_accel"]
     assert {v.file for v in terminal_ops} == {"l1.cpp"}
 
     # Hint naming a file with no writers must fall back, not empty the slice.
@@ -2023,3 +2035,76 @@ def test_rebinding_survives_passthrough_and_cycles():
 
     dag2 = build_mechanism_dag(bindings, "_out2")  # must terminate
     assert dag2.vertices
+
+
+def test_array_indices_are_distinct_terminal_identities():
+    """``q[0]`` and ``q[1]`` are different values: slicing from one index
+    takes only that element's writer; an index-free reference still
+    reads every element writer (whole-object dependence)."""
+    bindings = [
+        _fake_binding(binding_id="e0", target="q[0]",
+                      expression="a0 * 2", file="att.cpp", line=5,
+                      logged_signal=""),
+        _fake_binding(binding_id="e1", target="q[1]",
+                      expression="a1 * 3", file="att.cpp", line=6,
+                      logged_signal=""),
+    ]
+
+    element = build_mechanism_dag(bindings, "q[0]", terminal_file="att.cpp")
+    ops = {v.variable for v in element.vertices if v.kind == "operation"}
+    assert "q[0]" in ops
+    assert "q[1]" not in ops, "sibling index fused into the slice"
+
+    whole = build_mechanism_dag(
+        [
+            *bindings,
+            _fake_binding(binding_id="use", target="out",
+                          expression="q * 2", file="att.cpp", line=9,
+                          logged_signal=""),
+        ],
+        "out",
+        terminal_file="att.cpp",
+    )
+    ops = {v.variable for v in whole.vertices if v.kind == "operation"}
+    assert {"q[0]", "q[1]"} <= ops, "index-free read missed element writers"
+
+
+def test_member_copy_convention_grounds_on_logged_topic():
+    """The ONE retained naming equivalence, now explicit: a
+    ``_topic.field`` member copy grounds as evidence on the logged
+    ``topic.field`` instead of walking into the publisher module."""
+    bindings = [
+        _fake_binding(binding_id="b", target="out",
+                      expression="_vehicle_status.nav_state + 1",
+                      file="mod.cpp", line=4, logged_signal=""),
+    ]
+    dag = build_mechanism_dag(
+        bindings, "out", terminal_file="mod.cpp",
+        logged_signals={"vehicle_status.nav_state"},
+    )
+    leaves = {
+        v.signal_name for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "logged_signal"
+    }
+    assert "_vehicle_status.nav_state" in leaves
+    assert dag.unresolved_symbols == []
+
+
+def test_indexed_catalogue_entry_grounds_index_free_reference():
+    """A reference to ``state.q`` grounds when the log records
+    ``state.q[0]`` — shape-compatible membership, not identity fusion."""
+    bindings = [
+        _fake_binding(binding_id="b", target="out",
+                      expression="state.q + 1", file="mod.cpp", line=4,
+                      logged_signal=""),
+    ]
+    dag = build_mechanism_dag(
+        bindings, "out", terminal_file="mod.cpp",
+        logged_signals={"state.q[0]"},
+    )
+    leaves = {
+        v.signal_name for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "logged_signal"
+    }
+    assert "state.q" in leaves
+    assert dag.unresolved_symbols == []

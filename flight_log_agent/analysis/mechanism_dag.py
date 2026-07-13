@@ -35,9 +35,12 @@ from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.expression_math import is_safe_math_function_name
 from flight_log_agent.px4.mechanism_source_profiler import substitute_expression_symbols
 from flight_log_agent.symbols import (
+    exact_symbol,
     is_signal_reference,
     looks_like_enum_constant,
     normalize_symbol,
+    strip_symbol_indices,
+    symbol_indices_compatible,
 )
 from flight_log_agent.utils import dedupe_keep_order, stable_id
 
@@ -213,12 +216,17 @@ def build_mechanism_dag(
     routinely drop the module prefix, so the alias map is what resolves
     the rest. ``source_root`` enables per-vertex snippet embedding —
     omit to keep tests hermetic. ``terminal_file`` (optional) scopes the
-    terminal's writers to that file when any exist there —
-    ``normalize_symbol`` strips the leading ``_`` (member ↔ logged
-    convention), so a multi-module binding set can contain a same-named
-    but unrelated variable from another class (NPFG ``lateral_accel``
-    vs L1 ``_lateral_accel``); the hint keeps the slice on the module
+    terminal's writers to that file when any exist there — a
+    multi-module binding set can contain a same-named but unrelated
+    variable from another class; the hint keeps the slice on the module
     the caller actually asked about.
+
+    Identity is the EXACT symbol spelling (``exact_symbol``): indices,
+    instances, and the leading-underscore member marker all distinguish;
+    the one naming-convention equivalence retained — a ``_topic.field``
+    member copy grounding on the logged ``topic.field`` — is applied
+    explicitly at the catalogue-membership checks (``_signal_known``),
+    never baked into the keys.
     """
     builder = _DAGBuilder(
         source_bindings=[_as_binding_dict(b) for b in source_bindings],
@@ -266,7 +274,7 @@ class _DAGBuilder:
         enum_registry: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
         self.terminal_raw = terminal
-        self.terminal = normalize_symbol(terminal)
+        self.terminal = exact_symbol(terminal)
         self.terminal_file = str(terminal_file) if terminal_file else None
         self._call_statements = list(call_statements or [])
         # Guards dotted-root rebinding recursion against alias cycles.
@@ -281,7 +289,11 @@ class _DAGBuilder:
         # unknown name doesn't re-fetch on every backward-walk pass.
         self._helper_provider_probed: set[str] = set()
         self.source_root = source_root
-        self.logged_signals = {normalize_symbol(s) for s in logged_signals if s}
+        # Catalogues key on the EXACT identity; the index-erased shape
+        # sets serve compatibility membership (``state.q`` grounds when
+        # the log records ``state.q[0]``), never identity.
+        self.logged_signals = {exact_symbol(s) for s in logged_signals if s}
+        self._logged_shapes = {strip_symbol_indices(s) for s in self.logged_signals}
         self.parameter_names = {p for p in parameter_names if p}
         # PX4 parameter member → canonical name (DEFINE_PARAMETERS map).
         # Keyed by both the raw member and its normalized form so
@@ -309,25 +321,30 @@ class _DAGBuilder:
                     _canonical_predicate(predicate), entry
                 )
 
-        self._schema_signals = {normalize_symbol(s) for s in schema_signals if s}
+        self._schema_signals = {exact_symbol(s) for s in schema_signals if s}
+        self._schema_shapes = {strip_symbol_indices(s) for s in self._schema_signals}
 
         # Native backward-walk indexes over the source bindings — the DAG
         # owns the walk rather than delegating to BindingIndex. ``_by_output``
         # keys on the resolved logged signal, ``_by_target`` on the written
-        # symbol; the interleaved build in :meth:`build` traverses them.
+        # symbol — both on the EXACT identity, with index-erased shape maps
+        # so an index-free reference still finds its indexed writers (and
+        # vice versa) without ever fusing distinct indices.
         self._all_bindings: list[dict[str, Any]] = list(source_bindings)
         self._by_output: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._target_shapes: dict[str, list[str]] = defaultdict(list)
+        self._output_shapes: dict[str, list[str]] = defaultdict(list)
         writes_per_target: dict[str, int] = defaultdict(int)
         for binding in self._all_bindings:
-            logged = normalize_symbol(str(binding.get("logged_signal") or ""))
-            target = normalize_symbol(
+            logged = exact_symbol(str(binding.get("logged_signal") or ""))
+            target = exact_symbol(
                 str(binding.get("target_symbol") or binding.get("target") or "")
             )
             if logged:
-                self._by_output[logged].append(binding)
+                self._index_binding(self._by_output, self._output_shapes, logged, binding)
             if target:
-                self._by_target[target].append(binding)
+                self._index_binding(self._by_target, self._target_shapes, target, binding)
                 writes_per_target[target] += 1
 
         # Source-defined numeric constants (enum entry / ``#define`` /
@@ -337,7 +354,7 @@ class _DAGBuilder:
         # (which stored SliceResult objects the DAG mis-typed).
         self._source_constants: dict[str, Any] = {}
         for binding in self._all_bindings:
-            target = normalize_symbol(
+            target = exact_symbol(
                 str(binding.get("target_symbol") or binding.get("target") or "")
             )
             if not target or writes_per_target[target] != 1:
@@ -380,12 +397,97 @@ class _DAGBuilder:
         self._helper_parameter_vertices: dict[
             tuple[str, str], list[tuple[str, str]]
         ] = {}
-        # Assignment-target index: normalized target symbol → list of vertex ids
-        # that produce it. Used to link consumers back to producing operations.
+        # Assignment-target index: EXACT target symbol → list of vertex ids
+        # that produce it, plus the index-erased shape map for
+        # index-compatible lookups.
         self._producers_by_symbol: dict[str, list[str]] = {}
+        self._producer_shapes: dict[str, list[str]] = defaultdict(list)
 
         # Snippet cache to avoid re-reading a file many times.
         self._file_lines_cache: dict[str, list[str]] = {}
+
+    # ------------------------------------------------------------
+    # Exact-identity indexes
+    # ------------------------------------------------------------
+    #
+    # Every index keys on ``exact_symbol`` — the lossless identity.
+    # Lookups accept any index-compatible spelling of the SAME shape
+    # (an index-free reference reads its indexed writers and an indexed
+    # reference reads whole-object writers), but two explicit indices
+    # never fuse. This replaces the old lossy ``normalize_symbol`` keys
+    # that erased indices and the leading-underscore member marker.
+
+    @staticmethod
+    def _index_binding(
+        index: dict[str, list[dict[str, Any]]],
+        shapes: dict[str, list[str]],
+        key: str,
+        binding: dict[str, Any],
+    ) -> None:
+        index[key].append(binding)
+        shape_bucket = shapes[strip_symbol_indices(key)]
+        if key not in shape_bucket:
+            shape_bucket.append(key)
+
+    @staticmethod
+    def _matching_keys(
+        shapes: dict[str, list[str]], symbol_exact: str
+    ) -> list[str]:
+        return [
+            key
+            for key in shapes.get(strip_symbol_indices(symbol_exact), ())
+            if symbol_indices_compatible(key, symbol_exact)
+        ]
+
+    def _targets_matching(self, symbol_exact: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for key in self._matching_keys(self._target_shapes, symbol_exact):
+            for binding in self._by_target.get(key, ()):
+                if id(binding) not in seen:
+                    seen.add(id(binding))
+                    out.append(binding)
+        return out
+
+    def _outputs_matching(self, symbol_exact: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for key in self._matching_keys(self._output_shapes, symbol_exact):
+            for binding in self._by_output.get(key, ()):
+                if id(binding) not in seen:
+                    seen.add(id(binding))
+                    out.append(binding)
+        return out
+
+    def _index_producer(self, key: str, op_id: str) -> None:
+        self._producers_by_symbol.setdefault(key, []).append(op_id)
+        shape_bucket = self._producer_shapes[strip_symbol_indices(key)]
+        if key not in shape_bucket:
+            shape_bucket.append(key)
+
+    def _producers_matching(self, symbol_exact: str) -> list[str]:
+        out: list[str] = []
+        for key in self._matching_keys(self._producer_shapes, symbol_exact):
+            for op_id in self._producers_by_symbol.get(key, ()):
+                if op_id not in out:
+                    out.append(op_id)
+        return out
+
+    def _signal_known(
+        self, symbol_exact: str, catalogue: set[str], shapes: set[str]
+    ) -> bool:
+        """Membership in a signal catalogue by exact identity or
+        index-compatible shape, with ONE documented convention fallback:
+        a leading-underscore member copy of a logged topic
+        (``_vehicle_status.x`` ↔ ``vehicle_status.x``). The convention is
+        naming-derived and lower-confidence, kept explicit here instead
+        of hiding inside a lossy normalization."""
+        if symbol_exact in catalogue or strip_symbol_indices(symbol_exact) in shapes:
+            return True
+        if symbol_exact.startswith("_"):
+            stripped = symbol_exact[1:]
+            return stripped in catalogue or strip_symbol_indices(stripped) in shapes
+        return False
 
     # ------------------------------------------------------------
     # Build
@@ -435,7 +537,7 @@ class _DAGBuilder:
             kind, payload, scope = frontier.popleft()
             if kind == "symbol":
                 raw = payload
-                norm = normalize_symbol(raw)
+                norm = exact_symbol(raw)
                 if not norm or (norm, scope) in walked:
                     continue
                 walked.add((norm, scope))
@@ -444,12 +546,13 @@ class _DAGBuilder:
                     # evidence leaves at wiring time; walking their single
                     # literal write would demote them to bare operations.
                     continue
-                if norm != self.terminal and norm in self.logged_signals:
-                    # Known ground: the log records this signal, so it is
-                    # an evidence leaf no matter which index would match
-                    # it — member copies (``_vehicle_status.x``) normalize
-                    # onto the topic field and would otherwise widen into
-                    # the publisher module.
+                if norm != self.terminal and self._signal_known(
+                    norm, self.logged_signals, self._logged_shapes
+                ):
+                    # Known ground: the log records this signal (exactly,
+                    # by index-compatible shape, or as a member copy of
+                    # the topic), so it is an evidence leaf — walking its
+                    # publisher would widen into another module.
                     continue
                 if norm == self.terminal:
                     writers = self._writers_of(norm)
@@ -571,7 +674,7 @@ class _DAGBuilder:
             return []
         normalized = _normalize_cpp_expression(str(expression))
         return dedupe_keep_order(
-            normalize_symbol(name) for name in source_expression_names(normalized)
+            exact_symbol(name) for name in source_expression_names(normalized)
         )
 
     def _wire_symbols(self, expression: str) -> list[str]:
@@ -662,10 +765,13 @@ class _DAGBuilder:
             line = int(line_raw) if isinstance(line_raw, (int, float)) else 0
             predicates = list(call.get("control_predicates") or [])
             for formal, actual in zip(formals, args):
-                formal_norm = normalize_symbol(formal)
+                formal_norm = exact_symbol(formal)
                 if not formal_norm:
                     continue
-                self._by_target[formal_norm].append(
+                self._index_binding(
+                    self._by_target,
+                    self._target_shapes,
+                    formal_norm,
                     {
                         "target_symbol": formal,
                         "source_symbol": actual,
@@ -752,7 +858,7 @@ class _DAGBuilder:
         through Commander → vehicle_command → Mavlink and beyond.
         """
         target_writers = self._filter_visible_writers(
-            list(self._by_target.get(symbol_norm, [])), symbol_raw, scope
+            self._targets_matching(symbol_norm), symbol_raw, scope
         )
         seen: set[int] = set()
         out: list[dict[str, Any]] = []
@@ -811,8 +917,8 @@ class _DAGBuilder:
         source target). Union of both indexes, de-duplicated by identity."""
         seen: set[int] = set()
         out: list[dict[str, Any]] = []
-        for binding in list(self._by_output.get(symbol_norm, [])) + list(
-            self._by_target.get(symbol_norm, [])
+        for binding in self._outputs_matching(symbol_norm) + self._targets_matching(
+            symbol_norm
         ):
             if id(binding) not in seen:
                 seen.add(id(binding))
@@ -836,7 +942,7 @@ class _DAGBuilder:
     def _binding_operation_id(self, binding: dict[str, Any]) -> tuple[str, str, Optional[str], Optional[int], str, str]:
         """Deterministic identity used by both build passes."""
         target_raw = str(binding.get("target_symbol") or "")
-        target_norm = normalize_symbol(target_raw)
+        target_norm = exact_symbol(target_raw)
         expression = str(binding.get("source_symbol") or "").strip()
         assignment_path = binding.get("assignment_path") or []
         first_hop = assignment_path[0] if assignment_path else {}
@@ -860,7 +966,7 @@ class _DAGBuilder:
                 expression=expression,
                 metadata={"is_terminal": is_terminal} if is_terminal else {},
             )
-            self._producers_by_symbol.setdefault(target_norm, []).append(op_id)
+            self._index_producer(target_norm, op_id)
         return op_id
 
     def _wire_binding_edges(self, binding: dict[str, Any]) -> None:
@@ -873,7 +979,7 @@ class _DAGBuilder:
 
         # Wire each source-expression symbol as an incoming data edge.
         for symbol in self._wire_symbols(expression):
-            normalized = normalize_symbol(symbol)
+            normalized = exact_symbol(symbol)
             if not normalized or normalized == target_norm:
                 continue
             producer_id = self._resolve_symbol_producer(normalized, symbol, expression, file, line)
@@ -939,7 +1045,7 @@ class _DAGBuilder:
         for entry in substituted:
             target = entry["target"]
             expression = entry["expression"]
-            target_norm = normalize_symbol(target)
+            target_norm = exact_symbol(target)
             op_id = self._make_id("op", (target_norm, expression, file or "", line or 0))
             if op_id not in self.vertices:
                 self.vertices[op_id] = DAGVertex(
@@ -953,9 +1059,9 @@ class _DAGBuilder:
                     expression=expression,
                     provenance=f"pointer_output:{helper_key[0]}@{helper_key[1]}",
                 )
-                self._producers_by_symbol.setdefault(target_norm, []).append(op_id)
+                self._index_producer(target_norm, op_id)
             for symbol in self._wire_symbols(expression):
-                normalized = normalize_symbol(symbol)
+                normalized = exact_symbol(symbol)
                 if not normalized or normalized == target_norm:
                     continue
                 producer_id = self._resolve_symbol_producer(
@@ -990,7 +1096,7 @@ class _DAGBuilder:
         args = _extract_call_arguments(helper_call, caller_expression)
         for (formal_name, formal_vertex_id), arg_text in zip(formals, args):
             for symbol in self._wire_symbols(arg_text):
-                normalized = normalize_symbol(symbol)
+                normalized = exact_symbol(symbol)
                 if not normalized:
                     continue
                 producer_id = self._resolve_symbol_producer(
@@ -1042,7 +1148,7 @@ class _DAGBuilder:
         No flat ``symbol_bindings`` table is consulted anywhere — every
         source→logged mapping is derived from graph structure.
         """
-        producers = self._producers_by_symbol.get(symbol_norm)
+        producers = self._producers_matching(symbol_norm)
         if producers:
             # Wiring applies the SAME visibility semantics as the walk
             # (see _scoped_writers): locals never cross files, members
@@ -1078,11 +1184,11 @@ class _DAGBuilder:
         # message name.
         if "." in symbol_raw and symbol_norm not in self._rebinding_stack:
             root_raw, _, tail = symbol_raw.replace("->", ".").partition(".")
-            root_norm = normalize_symbol(root_raw)
+            root_norm = exact_symbol(root_raw)
             rebinders = [
                 b
                 for b in self._filter_visible_writers(
-                    list(self._by_target.get(root_norm, [])),
+                    self._targets_matching(root_norm),
                     root_raw,
                     (file or "", ""),
                 )
@@ -1093,16 +1199,16 @@ class _DAGBuilder:
                 )
                 # Pass-through forwarding (formal bound to a same-named
                 # actual) is an identity, not a rebinding.
-                and normalize_symbol(str(b.get("source_symbol") or "")) != root_norm
+                and exact_symbol(str(b.get("source_symbol") or "")) != root_norm
             ]
             targets = {str(b.get("source_symbol")).strip() for b in rebinders}
             if len(targets) == 1:
                 rewritten = f"{next(iter(targets))}.{tail}"
-                if normalize_symbol(rewritten) != symbol_norm:
+                if exact_symbol(rewritten) != symbol_norm:
                     self._rebinding_stack.add(symbol_norm)
                     try:
                         return self._resolve_symbol_producer(
-                            normalize_symbol(rewritten),
+                            exact_symbol(rewritten),
                             rewritten,
                             source_expression,
                             file,
@@ -1176,8 +1282,9 @@ class _DAGBuilder:
                 metadata={"value": cxx_value, "source": "cxx_stdlib"},
             )
 
-        # 5. Canonical logged signal (direct set membership).
-        if symbol_norm in self.logged_signals:
+        # 5. Canonical logged signal (exact identity, index-compatible
+        # shape, or the explicit member-copy convention).
+        if self._signal_known(symbol_norm, self.logged_signals, self._logged_shapes):
             return self._emit_evidence("logged_signal", symbol_raw, file=None, line=None)
 
         # 6. Parameter accessor heuristic.
@@ -1249,7 +1356,7 @@ class _DAGBuilder:
             key=len,
             reverse=True,
         ):
-            value = self._source_constants.get(normalize_symbol(token))
+            value = self._source_constants.get(exact_symbol(token))
             if value is None:
                 value = CXX_STDLIB_CONSTANTS.get(token)
             if isinstance(value, (int, float, bool)):
@@ -1400,8 +1507,9 @@ class _DAGBuilder:
         if not topic:
             return None
         signal = f"{topic}.{field}"
-        schema_signals = self._schema_signals
-        if signal in self.logged_signals or signal in schema_signals:
+        if self._signal_known(
+            signal, self.logged_signals, self._logged_shapes
+        ) or self._signal_known(signal, self._schema_signals, self._schema_shapes):
             return signal
         return None
 
@@ -1429,8 +1537,9 @@ class _DAGBuilder:
         if not topic:
             return None
         signal = f"{topic}.{field}"
-        schema_signals = self._schema_signals
-        if signal in self.logged_signals or signal in schema_signals:
+        if self._signal_known(
+            signal, self.logged_signals, self._logged_shapes
+        ) or self._signal_known(signal, self._schema_signals, self._schema_shapes):
             return signal
         return None
 
@@ -1524,7 +1633,7 @@ class _DAGBuilder:
         # accessor chains) instead of failing ast extraction wholesale.
         symbol_source = _normalize_cpp_expression(predicate)
         for symbol in dedupe_keep_order(source_expression_names(symbol_source)):
-            normalized = normalize_symbol(symbol)
+            normalized = exact_symbol(symbol)
             if not normalized:
                 continue
             producer_id = self._resolve_symbol_producer(normalized, symbol, symbol_source, file, line)
@@ -1628,7 +1737,7 @@ class _DAGBuilder:
         self._helper_parameter_vertices[helper_key] = formals
 
         for var, expression in (helper.get("assignments") or {}).items():
-            var_norm = normalize_symbol(var)
+            var_norm = exact_symbol(var)
             op_id = self._make_id("op", (helper_key[0], helper_key[1], var_norm, expression))
             if op_id not in self.vertices:
                 self.vertices[op_id] = DAGVertex(
@@ -1642,7 +1751,7 @@ class _DAGBuilder:
                     expression=expression,
                     provenance=f"helper_body:{helper_key[0]}@{helper_key[1]}",
                 )
-                self._producers_by_symbol.setdefault(var_norm, []).append(op_id)
+                self._index_producer(var_norm, op_id)
 
         return_expression = (
             helper.get("lowered_return_expression")
@@ -1687,15 +1796,15 @@ class _DAGBuilder:
         # producer index. This preserves helper-local scoping when two
         # helpers happen to share a formal name (``float x``).
         local_scope = {
-            normalize_symbol(formal): vertex_id
+            exact_symbol(formal): vertex_id
             for formal, vertex_id in self._helper_parameter_vertices.get(helper_key, ())
         }
 
         for var, expression in (helper.get("assignments") or {}).items():
-            var_norm = normalize_symbol(var)
+            var_norm = exact_symbol(var)
             op_id = self._make_id("op", (helper_key[0], helper_key[1], var_norm, expression))
             for symbol in self._wire_symbols(str(expression)):
-                normalized = normalize_symbol(symbol)
+                normalized = exact_symbol(symbol)
                 if not normalized or normalized == var_norm:
                     continue
                 producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
@@ -1716,7 +1825,7 @@ class _DAGBuilder:
                 (helper_key[0], helper_key[1], "__return__", return_expression),
             )
             for symbol in self._wire_symbols(str(return_expression)):
-                normalized = normalize_symbol(symbol)
+                normalized = exact_symbol(symbol)
                 if not normalized:
                     continue
                 producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
@@ -1741,7 +1850,7 @@ class _DAGBuilder:
             if terminal_id is None or not value_expression:
                 continue
             for symbol in self._wire_symbols(value_expression):
-                normalized = normalize_symbol(symbol)
+                normalized = exact_symbol(symbol)
                 if not normalized:
                     continue
                 producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
@@ -1890,8 +1999,8 @@ class _DAGBuilder:
         return None
 
     def _binding_reaches_terminal(self, binding: dict[str, Any]) -> bool:
-        logged = normalize_symbol(str(binding.get("logged_signal") or ""))
-        target = normalize_symbol(str(binding.get("target_symbol") or ""))
+        logged = exact_symbol(str(binding.get("logged_signal") or ""))
+        target = exact_symbol(str(binding.get("target_symbol") or ""))
         return logged == self.terminal or target == self.terminal
 
     def _snippet(self, file: Optional[str], line: Optional[int]) -> Optional[str]:
