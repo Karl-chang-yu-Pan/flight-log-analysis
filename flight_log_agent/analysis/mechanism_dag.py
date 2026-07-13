@@ -978,6 +978,11 @@ class _DAGBuilder:
                 ],
                 "exact": bool(binding.get("reachability_exact", True)),
             }
+            function = self._bare_function(binding.get("function") or "")
+            if function:
+                # The target's declaring callable — wiring visibility for
+                # locals compares against it.
+                metadata["function"] = function
             self.vertices[op_id] = DAGVertex(
                 id=op_id,
                 kind="operation",
@@ -1008,12 +1013,17 @@ class _DAGBuilder:
             branch_id = self._emit_branch(str(predicate), file=file, line=site)
             self._add_edge(branch_id, op_id, kind="control")
 
-        # Wire each source-expression symbol as an incoming data edge.
+        # Wire each source-expression symbol as an incoming data edge,
+        # resolved in the binding's own callable scope.
+        scope_function = self._bare_function(binding.get("function") or "")
         for symbol in self._wire_symbols(expression):
             normalized = exact_symbol(symbol)
             if not normalized or normalized == target_norm:
                 continue
-            producer_id = self._resolve_symbol_producer(normalized, symbol, expression, file, line)
+            producer_id = self._resolve_symbol_producer(
+                normalized, symbol, expression, file, line,
+                scope_function=scope_function,
+            )
             if producer_id is not None:
                 self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
@@ -1149,6 +1159,8 @@ class _DAGBuilder:
         source_expression: str,
         file: Optional[str],
         line: Optional[int],
+        scope_function: str = "",
+        emit_opaque: bool = True,
     ) -> Optional[str]:
         """Link a source-expression symbol to a producer vertex.
 
@@ -1203,7 +1215,26 @@ class _DAGBuilder:
                     if self._file_family(self.vertices[p].file or "")[0] == family[0]
                 ]
             else:
-                visible = [p for p in producers if self.vertices[p].file == file]
+                # Locals resolve within their declaring callable: same
+                # file, and same function when both sides know theirs —
+                # the same visibility the walk applies, so wiring cannot
+                # fuse two functions' same-named locals.
+                def _producer_function(vertex_id: str) -> str:
+                    return str(
+                        (self.vertices[vertex_id].metadata or {}).get("function")
+                        or ""
+                    )
+
+                visible = [
+                    p
+                    for p in producers
+                    if self.vertices[p].file == file
+                    and (
+                        not scope_function
+                        or not _producer_function(p)
+                        or _producer_function(p) == scope_function
+                    )
+                ]
             if visible:
                 return visible[-1]
 
@@ -1238,15 +1269,24 @@ class _DAGBuilder:
                 if exact_symbol(rewritten) != symbol_norm:
                     self._rebinding_stack.add(symbol_norm)
                     try:
-                        return self._resolve_symbol_producer(
+                        # A failed rewrite must not hijack resolution:
+                        # when the rewritten form classifies to nothing,
+                        # the ORIGINAL symbol continues its own sequence
+                        # below instead of surfacing the rewrite's dead
+                        # end as the answer.
+                        rebound = self._resolve_symbol_producer(
                             exact_symbol(rewritten),
                             rewritten,
                             source_expression,
                             file,
                             line,
+                            scope_function=scope_function,
+                            emit_opaque=False,
                         )
                     finally:
                         self._rebinding_stack.discard(symbol_norm)
+                    if rebound is not None:
+                        return rebound
 
         # 2a. Graph-native derivation: if ``source_expression`` contains a
         # ``symbol_raw().field`` chain, resolve it via the helper's
@@ -1340,7 +1380,11 @@ class _DAGBuilder:
         if looks_like_enum_constant(symbol_raw):
             return self._emit_evidence("constant", symbol_raw, file=None, line=None)
 
-        # 8. Unclassified.
+        # 8. Unclassified. Callers probing an alternative spelling
+        # (rebinding) suppress the fallback so the original symbol keeps
+        # its own resolution sequence.
+        if not emit_opaque:
+            return None
         self.unresolved_symbols.add(symbol_raw)
         return self._emit_evidence("opaque_symbol", symbol_raw, file=file, line=line)
 

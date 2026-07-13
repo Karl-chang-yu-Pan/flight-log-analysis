@@ -2214,3 +2214,72 @@ def test_operation_carries_composed_reachability():
     }
     assert ops["out_b"].metadata["reachability"] == {"all_of": [], "exact": False}
 
+
+def test_wiring_respects_callable_scope_for_locals():
+    """Two functions' same-named locals are different variables in
+    WIRING too: the consumer links to its own function's producer, not
+    the file's last one."""
+    bindings = [
+        _fake_binding(binding_id="own", target="gain",
+                      expression="f_in * 1", file="a.cpp", line=5,
+                      logged_signal="", function="C::f"),
+        _fake_binding(binding_id="foreign", target="gain",
+                      expression="g_in * 2", file="a.cpp", line=20,
+                      logged_signal="", function="C::g"),
+        _fake_binding(binding_id="consumer", target="out",
+                      expression="gain + 1", file="a.cpp", line=7,
+                      logged_signal="", function="C::f"),
+    ]
+    dag = build_mechanism_dag(bindings, "out", terminal_file="a.cpp")
+
+    consumer = next(v for v in dag.vertices if v.variable == "out")
+    linked = {
+        e.source_id for e in dag.edges
+        if e.target_id == consumer.id and e.kind == "data"
+    }
+    producers = {v.id: v for v in dag.vertices if v.variable == "gain"}
+    linked_lines = {producers[p].line for p in linked if p in producers}
+    assert linked_lines == {5}, "consumer wired to another function's local"
+
+
+def test_failed_rebinding_falls_back_to_original_resolution():
+    """A unique simple rebinder whose rewritten form resolves to nothing
+    must not hijack resolution: the ORIGINAL dotted symbol continues its
+    own sequence (here: struct-variable derivation to a schema-proven
+    placement)."""
+    bindings = [
+        {
+            "target_symbol": "out",
+            "source_symbol": "data.alt + 1",
+            "function": "C::run",
+            "assignment_path": [
+                {"file": "mod.cpp", "line": 9, "expression": "data.alt + 1"}
+            ],
+            "logged_signal": "",
+            "control_predicates": [],
+            "struct_variables": {"data": "gate_status_s"},
+        },
+        # unique simple writer of the root: rebinding rewrites
+        # data.alt -> other_thing.alt, which resolves to NOTHING
+        {
+            "target_symbol": "data",
+            "source_symbol": "other_thing",
+            "function": "C::run",
+            "assignment_path": [
+                {"file": "mod.cpp", "line": 5, "expression": "other_thing"}
+            ],
+            "logged_signal": "",
+            "control_predicates": [],
+            "struct_variables": {},
+        },
+    ]
+    dag = build_mechanism_dag(
+        bindings, "out", terminal_file="mod.cpp",
+        schema_signals={"gate_status.alt"},
+    )
+    leaves = {
+        v.signal_name for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "logged_signal"
+    }
+    assert "gate_status.alt" in leaves, "failed rewrite hijacked resolution"
+    assert "other_thing.alt" not in dag.unresolved_symbols
