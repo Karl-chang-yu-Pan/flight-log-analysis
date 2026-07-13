@@ -30,7 +30,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -106,6 +106,10 @@ class FunctionCallRef(BaseModel):
     # ``control_predicates`` — the branch's own SITE identity, distinct
     # from this ref's ``line`` (the gated statement).
     control_predicate_lines: List[int] = Field(default_factory=list)
+    # False when a governing construct the extractor does not model
+    # (switch, loops) makes ``control_predicates`` incomplete — the
+    # reachability is then explicitly unresolved, never silently partial.
+    reachability_exact: bool = True
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
 
 
@@ -125,6 +129,10 @@ class SourceAssignmentRef(BaseModel):
     # ``control_predicates`` — the branch's own SITE identity, distinct
     # from this ref's ``line`` (the gated statement).
     control_predicate_lines: List[int] = Field(default_factory=list)
+    # False when a governing construct the extractor does not model
+    # (switch, loops) makes ``control_predicates`` incomplete — the
+    # reachability is then explicitly unresolved, never silently partial.
+    reachability_exact: bool = True
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
     # Struct-typed variable → C++ struct type in scope at this assignment's
     # site. Lets the DAG derive ``var.field → topic.field`` bindings
@@ -376,9 +384,12 @@ class MechanismSourceProfiler:
     _FUNCTION_CALL_PATTERN = re.compile(
         r"(?<![#A-Za-z0-9_])(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)\s*\("
     )
+    # ``=(?!=)`` rejects the first ``=`` of an equality comparison —
+    # ``if (mode == 1) x = 2;`` must extract ``x <- 2``, never the junk
+    # binding ``mode <- = 1) x = 2`` (comparison-as-assignment).
     _SOURCE_ASSIGNMENT_PATTERN = re.compile(
         r"(?P<target>[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|->)\s*[A-Za-z_][A-Za-z0-9_]*)*)"
-        r"\s*=\s*(?P<expr>[^;]+);"
+        r"\s*=(?!=)\s*(?P<expr>[^;]+);"
     )
     # C++ reference declaration: ``[const] Type &name = expression;``.
     # Captured per-function so subsequent uses of ``name.X`` in the body can
@@ -847,7 +858,7 @@ class MechanismSourceProfiler:
             var_to_struct = self._extract_struct_variables(text)
             definitions = self._extract_function_definitions(text, rel_file)
             aliases_per_function = self._extract_reference_aliases_per_function(definitions)
-            control_predicates = self._control_predicates_by_line(text)
+            control_predicates, unresolved_reach = self._control_predicates_by_line(text)
 
             code_lines = list(self._iter_code_lines(text))
             for index, (line_no, line) in enumerate(code_lines):
@@ -872,6 +883,7 @@ class MechanismSourceProfiler:
                 predicate_entries = control_predicates.get(line_no, [])
                 predicates = [p for p, _ in predicate_entries]
                 predicate_lines = [s for _, s in predicate_entries]
+                reachability_exact = line_no not in unresolved_reach
                 # Constructor-style initialization ``Type name(expr);``
                 # inside a function body is an assignment the ``=`` pattern
                 # misses (the declaration form loses e.g. quaternion
@@ -898,6 +910,7 @@ class MechanismSourceProfiler:
                                 evidence=stripped,
                                 control_predicates=predicates,
                                 control_predicate_lines=predicate_lines,
+                                reachability_exact=reachability_exact,
                                 struct_variables=dict(var_to_struct),
                             )
                         )
@@ -938,6 +951,7 @@ class MechanismSourceProfiler:
                             evidence=stripped,
                             control_predicates=predicates,
                             control_predicate_lines=predicate_lines,
+                            reachability_exact=reachability_exact,
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([target, expression, *predicates]),
                                 var_to_struct,
@@ -972,6 +986,7 @@ class MechanismSourceProfiler:
                             evidence=stripped,
                             control_predicates=predicates,
                             control_predicate_lines=predicate_lines,
+                            reachability_exact=reachability_exact,
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([target, expression, *predicates]),
                                 var_to_struct,
@@ -1043,6 +1058,7 @@ class MechanismSourceProfiler:
                         evidence=call.evidence,
                         control_predicates=list(call.control_predicates or []),
                         control_predicate_lines=list(call.control_predicate_lines or []),
+                        reachability_exact=call.reachability_exact,
                         symbol_bindings={},
                     )
                 )
@@ -1205,22 +1221,43 @@ class MechanismSourceProfiler:
         return refs
 
     _ELSE_BODY_PATTERN = re.compile(r"^else(?!\s*if\b)\s*\{")
+    _ELSE_BRACELESS_PATTERN = re.compile(r"^else\b(?!\s*if\b)(?!\s*\{)\s*(?P<rest>.*)$")
     _ELSE_IF_PATTERN = re.compile(r"^else\s+if\b")
+    _OPAQUE_BLOCK_PATTERN = re.compile(r"\b(?:for|do)\s*[\(\{]")
 
-    def _control_predicates_by_line(self, text: str) -> Dict[int, List[Tuple[str, int]]]:
+    def _control_predicates_by_line(
+        self, text: str
+    ) -> Tuple[Dict[int, List[Tuple[str, int]]], Set[int]]:
         """Map each code line to its governing ``(predicate, site_line)``
         pairs — the site is the line of the control statement itself,
         the branch's source identity (two textually identical conditions
-        at different sites are different branches)."""
+        at different sites are different branches).
+
+        The second return value is the set of lines whose reachability is
+        NOT exact: lines governed by a control construct this scan does
+        not model (``switch``/``case``, loops). Their predicates list only
+        what was derivable — consumers must mark them unresolved rather
+        than present a partial predicate as exact.
+        """
         predicates_by_line: Dict[int, List[Tuple[str, int]]] = {}
-        active: List[Tuple[int, str, int]] = []
+        unresolved_lines: Set[int] = set()
+        # Active/pending arm tuples carry (combined predicate, site line,
+        # RAW arm condition, arm kind). The raw condition — never the
+        # combined form — feeds sibling negation, so an else-if chain
+        # emits ``!(A) && !(B) && (C)`` (mutually exclusive siblings)
+        # instead of negating an already-combined arm. Kind ``opaque``
+        # marks a block whose reachability this scan cannot model
+        # (switch, loops): every line it governs is non-exact.
+        active: List[Tuple[int, str, int, str, str]] = []
         # Predicates whose ``{`` hasn't been seen yet — first-in first-out
         # so multiple pending ifs pop in the same order the parser saw them.
-        pending: List[Tuple[str, int]] = []
-        # Predicate whose ``}`` we just closed, keyed by the depth we're
-        # now back at. Used to synthesize ``!(...)`` for the matching
-        # ``else`` body.
-        last_closed_by_depth: Dict[int, str] = {}
+        pending: List[Tuple[str, int, str, str]] = []
+        # Brace-less arms awaiting their single governed statement.
+        braceless_pending: List[Tuple[str, int, str, str]] = []
+        # Raw sibling conditions of the arms closed so far in the chain
+        # at each depth: a plain ``if`` starts a fresh chain, ``else if``
+        # extends it, ``else`` finishes it.
+        chain_by_depth: Dict[int, List[str]] = {}
         brace_depth = 0
         lines = list(self._iter_code_lines(text))
         for index, (line_no, line) in enumerate(lines):
@@ -1228,33 +1265,62 @@ class MechanismSourceProfiler:
             leading_closes = len(stripped) - len(stripped.lstrip("}"))
             if leading_closes:
                 depth_after = max(brace_depth - leading_closes, 0)
-                # Capture the outermost predicate about to be dropped so
-                # a following ``else`` can push its negation.
-                filtered = [(d, p, s) for d, p, s in active if d >= depth_after]
-                if filtered:
-                    outermost = min(filtered, key=lambda item: item[0])
-                    last_closed_by_depth[depth_after] = outermost[1]
+                for depth, _, _, raw, kind in active:
+                    if depth < depth_after:
+                        continue
+                    if kind == "if":
+                        chain_by_depth[depth] = [raw]
+                    elif kind == "else if":
+                        chain_by_depth.setdefault(depth, []).append(raw)
+                    elif kind == "else":
+                        chain_by_depth.pop(depth, None)
                 brace_depth = depth_after
-                active = [(depth, predicate, site) for depth, predicate, site in active if depth < brace_depth]
+                active = [entry for entry in active if entry[0] < brace_depth]
 
-            # Detect ``else {`` (plain else) and push the negation of the
-            # matching if. ``else if`` is picked up below so we can conjoin
-            # the negation with the new condition. The else's own line is
-            # the synthesized branch's site.
+            def _negation_terms() -> str:
+                return " && ".join(
+                    f"!({term})" for term in chain_by_depth.get(brace_depth, [])
+                )
+
+            def _register_chain(kind: str, raw: str) -> None:
+                if kind == "if":
+                    chain_by_depth[brace_depth] = [raw]
+                elif kind == "else if":
+                    chain_by_depth.setdefault(brace_depth, []).append(raw)
+                elif kind == "else":
+                    chain_by_depth.pop(brace_depth, None)
+
+            line_extras: List[Tuple[str, int]] = []
+            is_control_line = False
             remainder_pre = stripped[leading_closes:].lstrip()
-            if self._ELSE_BODY_PATTERN.match(remainder_pre):
-                negated = last_closed_by_depth.pop(brace_depth, None)
-                if negated:
-                    pending.append((f"!({negated})", line_no))
 
-            # If this line starts an ``else if`` chain, grab the negation
-            # of the just-closed branch so we can combine it with the
-            # incoming condition once the branch-condition regex extracts
-            # the new one. Nested-negation form: chained else-ifs build
-            # ``!(!(A) && B) && C`` rather than an accumulated disjunction.
-            else_if_negation: Optional[str] = None
-            if self._ELSE_IF_PATTERN.match(remainder_pre):
-                else_if_negation = last_closed_by_depth.pop(brace_depth, None)
+            # Allman-style ``{`` on its own line after a brace-less-looking
+            # control: the block belongs to it — hand the arm to the
+            # normal open processing.
+            if braceless_pending and remainder_pre.startswith("{"):
+                pending = braceless_pending + pending
+                braceless_pending = []
+
+            # Detect ``else`` (plain else) and push the conjunction of
+            # every closed sibling's negation. The else's own line is the
+            # synthesized branch's site. A brace-less else governs exactly
+            # the next statement (or this line's own trailing statement).
+            if self._ELSE_BODY_PATTERN.match(remainder_pre):
+                negation = _negation_terms()
+                if negation:
+                    pending.append((negation, line_no, "", "else"))
+            else:
+                braceless_else = self._ELSE_BRACELESS_PATTERN.match(remainder_pre)
+                if braceless_else is not None:
+                    negation = _negation_terms()
+                    if negation:
+                        rest = braceless_else.group("rest").strip()
+                        if rest and ";" in rest:
+                            line_extras.append((negation, line_no))
+                            _register_chain("else", "")
+                        else:
+                            is_control_line = True
+                            braceless_pending.append((negation, line_no, "", "else"))
 
             # Reconstruct multi-line if-conditions by joining continuation
             # lines until parens balance. Handles PX4's common:
@@ -1273,11 +1339,78 @@ class MechanismSourceProfiler:
 
             match = self._BRANCH_CONDITION_PATTERN.search(combined)
             branch_kind = " ".join(match.group("kind").split()) if match else ""
-            if match and branch_kind in {"if", "else if"} and "{" in combined[match.end():]:
-                condition = match.group("condition").strip()
-                if branch_kind == "else if" and else_if_negation:
-                    condition = f"!({else_if_negation}) && ({condition})"
-                pending.append((condition, line_no))
+            if match and branch_kind in {"if", "else if"}:
+                if "{" in combined[match.end():]:
+                    condition = match.group("condition").strip()
+                    if branch_kind == "else if":
+                        negation = _negation_terms()
+                        predicate = (
+                            f"{negation} && ({condition})" if negation else condition
+                        )
+                    else:
+                        predicate = condition
+                    pending.append((predicate, line_no, condition, branch_kind))
+                else:
+                    # Brace-less arm(s): the control governs exactly its
+                    # next statement. Nested brace-less controls on one
+                    # line accumulate; innermost registers last, so a
+                    # following else binds to the nearest unmatched if.
+                    is_control_line = True
+                    collected: List[Tuple[str, int, str, str]] = []
+                    rest = combined
+                    while True:
+                        arm = self._BRANCH_CONDITION_PATTERN.search(rest)
+                        arm_kind = " ".join(arm.group("kind").split()) if arm else ""
+                        if not arm or arm_kind not in {"if", "else if"}:
+                            break
+                        condition = arm.group("condition").strip()
+                        if arm_kind == "else if":
+                            negation = _negation_terms()
+                            predicate = (
+                                f"{negation} && ({condition})"
+                                if negation
+                                else condition
+                            )
+                        else:
+                            predicate = condition
+                        collected.append((predicate, line_no, condition, arm_kind))
+                        rest = rest[arm.end():]
+                    statement = rest.strip()
+                    if statement and ";" in statement:
+                        # Same-line governed statement — pending outer
+                        # arms attach too (nested brace-less), outermost
+                        # registering first so a following else binds to
+                        # the nearest unmatched if.
+                        for predicate, site, raw, kind in [
+                            *braceless_pending,
+                            *collected,
+                        ]:
+                            line_extras.append((predicate, site))
+                            _register_chain(kind, raw)
+                        braceless_pending = []
+                    else:
+                        braceless_pending.extend(collected)
+            elif match and branch_kind in {"while", "switch"} and "{" in combined[match.end():]:
+                # Reachability constructs this scan does not model: the
+                # governed block is explicitly NON-exact, never silently
+                # partial.
+                pending.append(("", line_no, "", "opaque"))
+            elif self._OPAQUE_BLOCK_PATTERN.search(combined) and "{" in combined:
+                pending.append(("", line_no, "", "opaque"))
+
+            # A plain statement consumes any pending brace-less arms —
+            # they govern exactly this statement.
+            if (
+                braceless_pending
+                and not is_control_line
+                and stripped
+                and not stripped.startswith("//")
+                and not remainder_pre.startswith("{")
+            ):
+                for predicate, site, raw, kind in braceless_pending:
+                    line_extras.append((predicate, site))
+                    _register_chain(kind, raw)
+                braceless_pending = []
 
             # Consume opens on THIS line: for each ``{``, pop a pending
             # predicate (if any) and push it as active at the current
@@ -1288,19 +1421,23 @@ class MechanismSourceProfiler:
             opens_here = remainder.count("{")
             for _ in range(opens_here):
                 if pending:
-                    predicate, site = pending.pop(0)
-                    active.append((brace_depth, predicate, site))
+                    predicate, site, raw, kind = pending.pop(0)
+                    active.append((brace_depth, predicate, site, raw, kind))
                 brace_depth += 1
             brace_depth = max(brace_depth - remainder.count("}"), 0)
 
             # Snapshot AFTER remainder processing so assignments on the
             # same line as the ``{`` see the predicate.
             predicates_by_line[line_no] = [
-                (predicate, site) for _, predicate, site in active
-            ]
+                (predicate, site)
+                for _, predicate, site, _, kind in active
+                if kind != "opaque"
+            ] + line_extras
+            if any(kind == "opaque" for _, _, _, _, kind in active):
+                unresolved_lines.add(line_no)
 
-            active = [(depth, predicate, site) for depth, predicate, site in active if depth < brace_depth]
-        return predicates_by_line
+            active = [entry for entry in active if entry[0] < brace_depth]
+        return predicates_by_line, unresolved_lines
 
     @staticmethod
     def _compound_assignment_expression(target: str, operator: str, expression: str) -> str:
@@ -1335,7 +1472,7 @@ class MechanismSourceProfiler:
 
             rel_file = self._rel(path)
             var_to_struct = self._extract_struct_variables(text)
-            control_predicates = self._control_predicates_by_line(text)
+            control_predicates, unresolved_reach = self._control_predicates_by_line(text)
             code_lines = list(self._iter_code_lines(text))
             for index, (line_no, line) in enumerate(code_lines):
                 stripped = line.strip()
@@ -1377,6 +1514,7 @@ class MechanismSourceProfiler:
                             evidence=stripped,
                             control_predicates=predicates,
                             control_predicate_lines=[s for _, s in predicate_entries],
+                            reachability_exact=line_no not in unresolved_reach,
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([stripped, *predicates]),
                                 var_to_struct,

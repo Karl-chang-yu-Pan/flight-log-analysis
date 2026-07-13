@@ -740,10 +740,12 @@ MissionBlock::mission_item_to_position_setpoint(const mission_item_s &item, posi
     assert not any(" *" in t or "position_setpoint_s" in t or "mission_item_s" in t for t in targets)
 
 
-def test_else_if_chain_conjoins_negation_with_new_condition(tmp_path):
-    """``if(A){} else if(B){}`` should attach ``!(A) && (B)`` to the
-    else-if body's assignments, and the trailing plain ``else`` should
-    get the negation of the else-if predicate."""
+def test_else_if_chain_negates_raw_siblings(tmp_path):
+    """Sibling arms are mutually exclusive on the RAW conditions:
+    ``if(A){} else if(B){} else if(C){} else{}`` attaches ``A``,
+    ``!(A) && (B)``, ``!(A) && !(B) && (C)``, ``!(A) && !(B) && !(C)``
+    — never the negation of an already-combined arm (``!(!(A) && B)``
+    is ``A || !B``, a different predicate)."""
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -772,9 +774,9 @@ void Cone::pick()
 
     assert by_line[5].control_predicates == ["A > 0"]
     assert by_line[7].control_predicates == ["!(A > 0) && (B > 0)"]
-    assert by_line[9].control_predicates == ["!(!(A > 0) && (B > 0)) && (C > 0)"]
+    assert by_line[9].control_predicates == ["!(A > 0) && !(B > 0) && (C > 0)"]
     assert by_line[11].control_predicates == [
-        "!(!(!(A > 0) && (B > 0)) && (C > 0))"
+        "!(A > 0) && !(B > 0) && !(C > 0)"
     ]
 
 
@@ -2033,3 +2035,85 @@ void Gate::update()
     assert len(third.control_predicate_lines) == 1
     # the else arm is a different site than the if arm
     assert third.control_predicate_lines != first.control_predicate_lines
+
+
+def test_braceless_controls_gate_their_single_statement(tmp_path):
+    """Brace-less if/else arms govern exactly the next statement —
+    same-line and next-line forms — and a following else negates the
+    nearest unmatched if."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "guard.cpp").write_text(
+        """
+void Guard::update()
+{
+    if (mode == 1) same_line_out = a + 1.0f;
+    if (mode == 2)
+        next_line_out = b + 2.0f;
+    else
+        else_out = c + 3.0f;
+    after_out = d + 4.0f;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/guard.cpp"]
+    )
+    by_target = {a.target: a for a in assignments}
+
+    assert by_target["same_line_out"].control_predicates == ["mode == 1"]
+    assert by_target["same_line_out"].control_predicate_lines == [
+        by_target["same_line_out"].line
+    ]
+    assert by_target["next_line_out"].control_predicates == ["mode == 2"]
+    assert by_target["next_line_out"].control_predicate_lines[0] < by_target["next_line_out"].line
+    assert by_target["else_out"].control_predicates == ["!(mode == 2)"]
+    # the statement AFTER the brace-less arms is ungated
+    assert by_target["after_out"].control_predicates == []
+
+
+def test_unmodeled_control_flow_marks_reachability_unresolved(tmp_path):
+    """switch/case and loop bodies are constructs the extractor does not
+    model: assignments inside them carry reachability_exact=False instead
+    of presenting a partial predicate as exact; a plain if stays exact."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "modes.cpp").write_text(
+        """
+void Modes::update()
+{
+    switch (state) {
+    case 1:
+        switch_out = a + 1.0f;
+        break;
+    }
+    for (int i = 0; i < n; i++) {
+        loop_out = b + 2.0f;
+    }
+    while (busy) {
+        while_out = c + 3.0f;
+    }
+    if (mode == 2) {
+        exact_out = d + 4.0f;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/modes.cpp"]
+    )
+    by_target = {a.target: a for a in assignments}
+
+    assert by_target["switch_out"].reachability_exact is False
+    assert by_target["loop_out"].reachability_exact is False
+    assert by_target["while_out"].reachability_exact is False
+    assert by_target["exact_out"].reachability_exact is True
+    assert by_target["exact_out"].control_predicates == ["mode == 2"]
