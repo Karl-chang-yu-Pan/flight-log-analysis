@@ -2117,3 +2117,83 @@ void Modes::update()
     assert by_target["while_out"].reachability_exact is False
     assert by_target["exact_out"].reachability_exact is True
     assert by_target["exact_out"].control_predicates == ["mode == 2"]
+
+
+def test_guard_clause_return_gates_the_remainder(tmp_path):
+    """A top-level return in an arm gates everything after the arm with
+    the arm's negation — braced and brace-less guards, including a
+    returning else arm mid-function."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "guards.cpp").write_text(
+        """
+void Guards::update()
+{
+    if (!valid) {
+        return;
+    }
+    braced_out = a + 1.0f;
+    if (busy) return;
+    braceless_out = b + 2.0f;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/guards.cpp"]
+    )
+    by_target = {a.target: a for a in assignments}
+
+    braced = by_target["braced_out"]
+    assert braced.control_predicates == ["!(!valid)"]
+    assert braced.reachability_exact is True
+    # the guard's site is the if statement, not the gated assignment
+    assert braced.control_predicate_lines[0] < braced.line
+
+    braceless = by_target["braceless_out"]
+    assert braceless.control_predicates == ["!(!valid)", "!(busy)"]
+    assert braceless.reachability_exact is True
+
+
+def test_conditionally_nested_return_marks_remainder_inexact(tmp_path):
+    """A return nested deeper inside an arm returns only conditionally:
+    the enclosing block's remainder is explicitly non-exact instead of
+    carrying a guessed or missing gate."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "nested.cpp").write_text(
+        """
+void Nested::update()
+{
+    before_out = a + 1.0f;
+    if (outer_cond) {
+        if (inner_cond) {
+            return;
+        }
+        inside_out = b + 2.0f;
+    }
+    after_out = c + 3.0f;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/nested.cpp"]
+    )
+    by_target = {a.target: a for a in assignments}
+
+    assert by_target["before_out"].reachability_exact is True
+    # inside the outer arm, after the inner guard: gated by !(inner_cond)
+    inside = by_target["inside_out"]
+    assert "outer_cond" in inside.control_predicates
+    assert "!(inner_cond)" in inside.control_predicates
+    assert inside.reachability_exact is True
+    # after the outer arm: reachable unless outer_cond && inner_cond —
+    # not modeled, so explicitly non-exact
+    assert by_target["after_out"].reachability_exact is False

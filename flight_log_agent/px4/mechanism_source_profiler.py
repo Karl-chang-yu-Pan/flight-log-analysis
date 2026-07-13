@@ -1224,6 +1224,7 @@ class MechanismSourceProfiler:
     _ELSE_BRACELESS_PATTERN = re.compile(r"^else\b(?!\s*if\b)(?!\s*\{)\s*(?P<rest>.*)$")
     _ELSE_IF_PATTERN = re.compile(r"^else\s+if\b")
     _OPAQUE_BLOCK_PATTERN = re.compile(r"\b(?:for|do)\s*[\(\{]")
+    _RETURN_STATEMENT_PATTERN = re.compile(r"\breturn\b")
 
     def _control_predicates_by_line(
         self, text: str
@@ -1235,20 +1236,30 @@ class MechanismSourceProfiler:
 
         The second return value is the set of lines whose reachability is
         NOT exact: lines governed by a control construct this scan does
-        not model (``switch``/``case``, loops). Their predicates list only
+        not model (``switch``/``case``, loops) or following a
+        conditionally nested early return. Their predicates list only
         what was derivable — consumers must mark them unresolved rather
         than present a partial predicate as exact.
+
+        Guard clauses ARE modeled: an arm whose body contains a
+        TOP-LEVEL ``return`` pushes the negation of its predicate over
+        the remainder of the enclosing block (``if (bad) { return; }``
+        gates everything after it with ``!(bad)``). A return nested
+        deeper inside the arm returns only conditionally — the enclosing
+        block's remainder is then explicitly non-exact, never guessed.
         """
         predicates_by_line: Dict[int, List[Tuple[str, int]]] = {}
         unresolved_lines: Set[int] = set()
-        # Active/pending arm tuples carry (combined predicate, site line,
-        # RAW arm condition, arm kind). The raw condition — never the
-        # combined form — feeds sibling negation, so an else-if chain
-        # emits ``!(A) && !(B) && (C)`` (mutually exclusive siblings)
-        # instead of negating an already-combined arm. Kind ``opaque``
-        # marks a block whose reachability this scan cannot model
-        # (switch, loops): every line it governs is non-exact.
-        active: List[Tuple[int, str, int, str, str]] = []
+        # Active arm entries are mutable records
+        # [depth, combined predicate, site line, RAW condition, kind,
+        #  has_top_level_return, has_nested_return]. The raw condition —
+        # never the combined form — feeds sibling negation, so an
+        # else-if chain emits ``!(A) && !(B) && (C)`` (mutually exclusive
+        # siblings) instead of negating an already-combined arm. Kind
+        # ``opaque`` marks a block whose reachability this scan cannot
+        # model (switch, loops): every line it governs is non-exact.
+        # Kind ``guard`` is a synthesized post-return negation.
+        active: List[list] = []
         # Predicates whose ``{`` hasn't been seen yet — first-in first-out
         # so multiple pending ifs pop in the same order the parser saw them.
         pending: List[Tuple[str, int, str, str]] = []
@@ -1265,9 +1276,8 @@ class MechanismSourceProfiler:
             leading_closes = len(stripped) - len(stripped.lstrip("}"))
             if leading_closes:
                 depth_after = max(brace_depth - leading_closes, 0)
-                for depth, _, _, raw, kind in active:
-                    if depth < depth_after:
-                        continue
+                dropped = [entry for entry in active if entry[0] >= depth_after]
+                for depth, _, _, raw, kind, _, _ in dropped:
                     if kind == "if":
                         chain_by_depth[depth] = [raw]
                     elif kind == "else if":
@@ -1276,6 +1286,21 @@ class MechanismSourceProfiler:
                         chain_by_depth.pop(depth, None)
                 brace_depth = depth_after
                 active = [entry for entry in active if entry[0] < brace_depth]
+                # Guard clauses: an arm that returned at its top level
+                # gates the enclosing block's remainder with its
+                # negation; a conditionally nested return makes that
+                # remainder explicitly non-exact instead.
+                for depth, predicate, site, _, kind, top_ret, nested_ret in dropped:
+                    if kind not in {"if", "else if", "else"}:
+                        continue
+                    if top_ret and predicate:
+                        active.append(
+                            [max(depth - 1, 0), f"!({predicate})", site, "", "guard", False, False]
+                        )
+                    elif nested_ret:
+                        active.append(
+                            [max(depth - 1, 0), "", site, "", "opaque", False, False]
+                        )
 
             def _negation_terms() -> str:
                 return " && ".join(
@@ -1318,6 +1343,11 @@ class MechanismSourceProfiler:
                         if rest and ";" in rest:
                             line_extras.append((negation, line_no))
                             _register_chain("else", "")
+                            if self._RETURN_STATEMENT_PATTERN.search(rest):
+                                active.append(
+                                    [max(brace_depth - 1, 0), f"!({negation})",
+                                     line_no, "", "guard", False, False]
+                                )
                         else:
                             is_control_line = True
                             braceless_pending.append((negation, line_no, "", "else"))
@@ -1380,13 +1410,23 @@ class MechanismSourceProfiler:
                         # Same-line governed statement — pending outer
                         # arms attach too (nested brace-less), outermost
                         # registering first so a following else binds to
-                        # the nearest unmatched if.
+                        # the nearest unmatched if. A governed return is
+                        # a guard: its arm's negation gates the rest of
+                        # the enclosing block.
+                        returns = bool(
+                            self._RETURN_STATEMENT_PATTERN.search(statement)
+                        )
                         for predicate, site, raw, kind in [
                             *braceless_pending,
                             *collected,
                         ]:
                             line_extras.append((predicate, site))
                             _register_chain(kind, raw)
+                            if returns and predicate:
+                                active.append(
+                                    [max(brace_depth - 1, 0), f"!({predicate})",
+                                     site, "", "guard", False, False]
+                                )
                         braceless_pending = []
                     else:
                         braceless_pending.extend(collected)
@@ -1399,7 +1439,8 @@ class MechanismSourceProfiler:
                 pending.append(("", line_no, "", "opaque"))
 
             # A plain statement consumes any pending brace-less arms —
-            # they govern exactly this statement.
+            # they govern exactly this statement. A governed return is a
+            # guard: its arm's negation gates the enclosing block's rest.
             if (
                 braceless_pending
                 and not is_control_line
@@ -1407,9 +1448,15 @@ class MechanismSourceProfiler:
                 and not stripped.startswith("//")
                 and not remainder_pre.startswith("{")
             ):
+                returns = bool(self._RETURN_STATEMENT_PATTERN.search(stripped))
                 for predicate, site, raw, kind in braceless_pending:
                     line_extras.append((predicate, site))
                     _register_chain(kind, raw)
+                    if returns and predicate:
+                        active.append(
+                            [max(brace_depth - 1, 0), f"!({predicate})",
+                             site, "", "guard", False, False]
+                        )
                 braceless_pending = []
 
             # Consume opens on THIS line: for each ``{``, pop a pending
@@ -1419,21 +1466,52 @@ class MechanismSourceProfiler:
             # own end-of-line before the body has opened.
             remainder = stripped[leading_closes:]
             opens_here = remainder.count("{")
+            pushed_this_line: List[list] = []
             for _ in range(opens_here):
                 if pending:
                     predicate, site, raw, kind = pending.pop(0)
-                    active.append((brace_depth, predicate, site, raw, kind))
+                    entry = [brace_depth, predicate, site, raw, kind, False, False]
+                    active.append(entry)
+                    pushed_this_line.append(entry)
                 brace_depth += 1
             brace_depth = max(brace_depth - remainder.count("}"), 0)
 
+            # Early-return bookkeeping for braced arms: a return at the
+            # arm's immediate depth is top-level (the arm ALWAYS
+            # returns); deeper is conditional. An arm opened-and-closed
+            # on this same line owns any return on it.
+            if (
+                self._RETURN_STATEMENT_PATTERN.search(stripped)
+                and not stripped.startswith("//")
+            ):
+                if pushed_this_line:
+                    pushed_this_line[-1][5] = True
+                else:
+                    for entry in active:
+                        if entry[4] in {"if", "else if", "else"}:
+                            if brace_depth == entry[0] + 1:
+                                entry[5] = True
+                            else:
+                                entry[6] = True
+
             # Snapshot AFTER remainder processing so assignments on the
-            # same line as the ``{`` see the predicate.
-            predicates_by_line[line_no] = [
-                (predicate, site)
-                for _, predicate, site, _, kind in active
-                if kind != "opaque"
-            ] + line_extras
-            if any(kind == "opaque" for _, _, _, _, kind in active):
+            # same line as the ``{`` see the predicate. Deduped on the
+            # predicate text: an else arm and the guard synthesized from
+            # its returning sibling carry the same negation.
+            snapshot: List[Tuple[str, int]] = []
+            seen_predicates: set = set()
+            for _, predicate, site, _, kind, _, _ in active:
+                if kind == "opaque" or not predicate:
+                    continue
+                if predicate not in seen_predicates:
+                    seen_predicates.add(predicate)
+                    snapshot.append((predicate, site))
+            for predicate, site in line_extras:
+                if predicate not in seen_predicates:
+                    seen_predicates.add(predicate)
+                    snapshot.append((predicate, site))
+            predicates_by_line[line_no] = snapshot
+            if any(entry[4] == "opaque" for entry in active):
                 unresolved_lines.add(line_no)
 
             active = [entry for entry in active if entry[0] < brace_depth]
