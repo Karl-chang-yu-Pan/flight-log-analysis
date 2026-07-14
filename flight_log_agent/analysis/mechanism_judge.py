@@ -20,7 +20,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, Optional, Union
+from typing import Any, Awaitable, Callable, Literal, Optional, Sequence, Union
 
 from agents import Agent
 from pydantic import BaseModel, Field
@@ -29,7 +29,10 @@ from flight_log_agent.expression_math import is_safe_math_function_name
 
 from flight_log_agent.analysis.mechanism_discovery import (
     DiscoveryResult,
+    SourceSurvey,
     discover_mechanism_dag,
+    survey_for_queries,
+    survey_source_files,
 )
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.utils import dedupe_keep_order
@@ -276,6 +279,30 @@ Output:
   HOLD the quantity the question asks about, each with the source file
   expected to write it. Order by likelihood; at most three.
 
+source_survey is the authority on what exists. Its anchors are the
+identifiers the question names AND the pinned tree confirms (declared
+parameters, observed signals, defined callables). Under each real file
+it lists the writes those anchors reach through source dataflow, each
+with the assignment expression, the writing function, and
+reaches_anchor_in_hops (0 = the write itself reads an anchor — the
+decision site; 1 = one dataflow step away). When source_survey lists
+any write target:
+
+- every candidate_terminals entry MUST be a symbol the survey lists,
+  spelled exactly as the survey spells it;
+- terminal_file MUST be the surveyed file that writes that symbol;
+- never propose a symbol or a file path the survey does not show,
+  however familiar it seems — recalled names and module layouts often
+  belong to a different release than the pinned tree, and a terminal
+  that does not exist yields no mechanism at all;
+- read the expressions: a hop-0 write whose expression combines the
+  anchored parameter with other quantities is usually the decision
+  site the question is about.
+
+rejected_terminals (when present) maps earlier proposals to the reason
+deterministic validation refused them. Do not repeat those symbols;
+choose different survey targets.
+
 Each terminal must be the bare variable name exactly as it appears on
 the LEFT side of its assignment in source — never class-qualified
 (``ClassName::member``) and never type-qualified
@@ -366,6 +393,11 @@ file. Never select them either. When proposing next_terminals, always
 include terminal_file (the file whose operations show the write) so
 validation can scope the slice.
 
+next_terminals entries must name a symbol that the rendering's
+operations show being written, or a write target listed in
+source_survey when one is given. A symbol that appears in neither does
+not exist in the pinned source and yields no mechanism.
+
 Never request raw source; never speculate beyond the rendering.
 """,
     tools=[],
@@ -399,6 +431,7 @@ class JudgedDiscovery:
     selected: Optional[DiscoveryResult] = None
     selected_annotated: Optional[Any] = None
     bonus_round_used: bool = False
+    reseeded: bool = False
 
 
 async def discover_with_judge(
@@ -410,6 +443,8 @@ async def discover_with_judge(
     run_agent: Optional[AgentRunnerFn] = None,
     context: Optional[dict[str, Any]] = None,
     max_terminals: int = 2,
+    max_terminal_attempts: int = 4,
+    survey_max_files: int = 8,
     seeds_override: Optional[DiscoverySeeds] = None,
     annotate: Optional[Callable[[DiscoveryResult], Any]] = None,
     condition_windows: Optional[Callable[["QuestionedCondition"], Any]] = None,
@@ -442,6 +477,45 @@ async def discover_with_judge(
 
     context_dict = dict(context or {})
     intent = dict(context_dict.get("question_intent") or {})
+
+    intent_seeds = [
+        *(str(value) for value in (intent.get("source_queries") or []) if value),
+        *(str(value) for value in (intent.get("likely_modules") or []) if value),
+        *(str(value) for value in (intent.get("likely_source_files") or []) if value),
+    ]
+
+    # Deterministic source survey BEFORE the seeder: the question intent
+    # names modules and files from model recall, which can describe a
+    # different release than the pinned tree. Surveying the tree turns
+    # terminal selection from recall into choice — a symbol absent from
+    # the survey cannot be proposed, so a stale module path or renamed
+    # member never reaches discovery. The survey anchors on identifiers
+    # the question names AND the tree confirms (declared parameters,
+    # observed signals, defined callables), so the menu holds the writes
+    # those anchors actually reach rather than every symbol in a file.
+    survey_texts = [
+        question,
+        *(str(value) for value in intent.values() if isinstance(value, str)),
+        *(
+            str(item)
+            for value in intent.values()
+            if isinstance(value, list)
+            for item in value
+        ),
+    ]
+    observed_signals = discovery_kwargs.get("logged_signals") or ()
+
+    survey = SourceSurvey()
+    survey_files: list[str] = []
+    if intent_seeds:
+        survey, survey_files = survey_for_queries(
+            profiler,
+            intent_seeds,
+            texts=survey_texts,
+            observed_signals=observed_signals,
+            max_files=survey_max_files,
+        )
+
     if seeds_override is None:
         authoritative_intent = {
             key: value
@@ -453,42 +527,15 @@ async def discover_with_judge(
             {
                 "question_intent": authoritative_intent,
                 "airframe": context_dict.get("airframe") or {},
+                "source_survey": survey.as_payload(),
             },
         )
     else:
         seeds = seeds_override
 
-    intent_seeds = [
-        *(str(value) for value in (intent.get("source_queries") or []) if value),
-        *(str(value) for value in (intent.get("likely_modules") or []) if value),
-        *(str(value) for value in (intent.get("likely_source_files") or []) if value),
-    ]
     seeds = seeds.model_copy(
         update={"seeds": dedupe_keep_order([*intent_seeds, *seeds.seeds])}
     )
-
-    results: dict[str, DiscoveryResult] = {}
-    for candidate in seeds.candidate_terminals[:max_terminals]:
-        results[candidate.terminal] = discover_mechanism_dag(
-            profiler,
-            cache_root,
-            seeds.seeds,
-            candidate.terminal,
-            source_hash,
-            terminal_file=candidate.terminal_file,
-            **discovery_kwargs,
-        )
-
-    # A candidate whose slice found nothing can't ground anything —
-    # keep it out of the judge's choices so an authoritative-sounding
-    # name doesn't outrank a smaller-but-real slice. If everything is
-    # empty the judge sees it all and must re-terminal.
-    non_empty = {
-        terminal: result
-        for terminal, result in results.items()
-        if result.dag is not None and result.dag.vertices
-    }
-    judged_candidates = non_empty or results
 
     annotated_by_terminal: dict[str, Any] = {}
 
@@ -508,6 +555,113 @@ async def discover_with_judge(
                 out[terminal] = validation.reason or validation.status
         return out
 
+    def _slice(candidate: TerminalCandidate) -> DiscoveryResult:
+        # A survey-known symbol carries its real write file even when the
+        # seeder named none (or named one the tree does not have).
+        terminal_file = candidate.terminal_file
+        known_files = survey.files_for(candidate.terminal)
+        if known_files and terminal_file not in known_files:
+            terminal_file = known_files[0]
+        return discover_mechanism_dag(
+            profiler,
+            cache_root,
+            seeds.seeds,
+            candidate.terminal,
+            source_hash,
+            terminal_file=terminal_file,
+            preranked_files=survey_files or None,
+            **discovery_kwargs,
+        )
+
+    def _is_valid(result: DiscoveryResult) -> bool:
+        return result.dag is not None and bool(result.dag.vertices)
+
+    results: dict[str, DiscoveryResult] = {}
+
+    def _slice_candidates(candidates: Sequence[TerminalCandidate]) -> int:
+        """Slice candidates in order until ``max_terminals`` VALID slices
+        exist. A rejected terminal costs an attempt, never a slot — the
+        flat head-of-list cut discarded viable later candidates whenever
+        the first proposals did not exist in the tree."""
+        valid = sum(1 for result in results.values() if _is_valid(result))
+        attempts = 0
+        for candidate in candidates:
+            if valid >= max_terminals or attempts >= max_terminal_attempts:
+                break
+            if not candidate.terminal or candidate.terminal in results:
+                continue
+            attempts += 1
+            result = _slice(candidate)
+            results[candidate.terminal] = result
+            if _is_valid(result):
+                valid += 1
+        return valid
+
+    valid_count = _slice_candidates(seeds.candidate_terminals)
+
+    # Rejection recovery: every proposal failed deterministic validation,
+    # so there is no graph for the judge to re-terminal from. Re-seed ONCE
+    # with the rejection reasons plus the survey, then slice again. The
+    # seeder can only answer with symbols the tree actually writes.
+    reseeded = False
+    if valid_count == 0 and seeds_override is None and results:
+        reseeded = True
+        if not survey.files:
+            # No intent queries seeded a survey, but the failed slices did
+            # load files — survey those rather than re-reading the tree.
+            loaded = dedupe_keep_order(
+                [file for result in results.values() for file in result.files_loaded]
+            )
+            survey = survey_source_files(
+                profiler,
+                loaded,
+                texts=[*survey_texts, *seeds.seeds],
+                observed_signals=observed_signals,
+            )
+        retry = await runner(
+            seeder_agent,
+            {
+                "question_intent": {
+                    key: value
+                    for key, value in intent.items()
+                    if key != "original_question"
+                }
+                or {"concise_intent": question},
+                "airframe": context_dict.get("airframe") or {},
+                "source_survey": survey.as_payload(),
+                "rejected_terminals": _rejected(results),
+                "note": (
+                    "every proposed terminal failed deterministic validation "
+                    "against the pinned source; propose terminals only from "
+                    "source_survey write targets"
+                ),
+            },
+        )
+        seeds = seeds.model_copy(
+            update={
+                "seeds": dedupe_keep_order([*seeds.seeds, *retry.seeds]),
+                "candidate_terminals": [
+                    *seeds.candidate_terminals,
+                    *retry.candidate_terminals,
+                ],
+                "questioned_condition": (
+                    seeds.questioned_condition or retry.questioned_condition
+                ),
+            }
+        )
+        _slice_candidates(retry.candidate_terminals)
+
+    # A candidate whose slice found nothing can't ground anything —
+    # keep it out of the judge's choices so an authoritative-sounding
+    # name doesn't outrank a smaller-but-real slice. If everything is
+    # empty the judge sees it all and must re-terminal.
+    non_empty = {
+        terminal: result
+        for terminal, result in results.items()
+        if _is_valid(result)
+    }
+    judged_candidates = non_empty or results
+
     deviation: Any = None
     if seeds.questioned_condition is not None and condition_windows is not None:
         deviation = condition_windows(seeds.questioned_condition, judged_candidates)
@@ -523,6 +677,11 @@ async def discover_with_judge(
             },
             "empty_candidates": sorted(set(results) - set(judged_candidates)),
             "rejected_terminals": _rejected(results),
+            **(
+                {"source_survey": survey.as_payload()}
+                if not non_empty and survey.files
+                else {}
+            ),
         },
     )
 
@@ -549,6 +708,12 @@ async def discover_with_judge(
                 ),
                 None,
             )
+        # A judge-proposed terminal is subject to the same source truth:
+        # when the survey knows the symbol, its real write file wins over
+        # a named one the tree does not have.
+        bonus_known_files = survey.files_for(bonus_terminal)
+        if bonus_known_files and bonus_file not in bonus_known_files:
+            bonus_file = bonus_known_files[0]
         # Gap entries are used verbatim as search queries — a prose
         # sentence greps nothing. Keep only symbol-shaped entries.
         symbol_gaps = [
@@ -597,4 +762,5 @@ async def discover_with_judge(
         selected=results.get(verdict.selected_terminal, selected),
         selected_annotated=selected_annotated,
         bonus_round_used=bonus_round_used,
+        reseeded=reseeded,
     )

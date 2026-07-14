@@ -358,15 +358,23 @@ def test_seeder_receives_authoritative_normalized_intent(tmp_path):
         )
     )
 
-    assert seeder_payloads == [
-        {
-            "question_intent": {
-                "concise_intent": "explain the selected output",
-                "source_queries": ["pick_altitude"],
-            },
-            "airframe": {},
-        }
-    ]
+    assert len(seeder_payloads) == 1
+    payload = seeder_payloads[0]
+    assert payload["question_intent"] == {
+        "concise_intent": "explain the selected output",
+        "source_queries": ["pick_altitude"],
+    }
+    assert payload["airframe"] == {}
+    # The seeder chooses terminals from source facts, not from recall:
+    # the survey lists writes the question's anchors actually reach.
+    survey = payload["source_survey"]
+    assert survey["anchors"]["callables"] == ["pick_altitude"]
+    surveyed = {
+        target["symbol"]
+        for entry in survey["files"]
+        for target in entry["write_targets"]
+    }
+    assert "_final_out" in surveyed
 
 
 def test_bonus_round_triggers_single_rejudge(tmp_path):
@@ -406,3 +414,128 @@ def test_bonus_round_triggers_single_rejudge(tmp_path):
                   if v.kind == "operation"}
     assert "_dest_val" in op_targets
     assert judged.verdict.essential_gaps == ["_never_acted_on"]
+
+
+AIRSPEED_SHAPED_TREE = {
+    "src/modules/ctrl/Controller.cpp": """
+void Controller::update()
+{
+    real_out = base_in + 1.0f;
+    _member_out = real_out * 2.0f;
+}
+""",
+}
+
+
+def test_rejected_candidates_do_not_consume_terminal_budget(tmp_path):
+    """The head-of-list cut discarded viable later candidates whenever the
+    first proposals did not exist in the tree (the measured airspeed dead
+    end). Slots are spent on VALID slices, not on attempts."""
+    profiler = _mini_tree(tmp_path, AIRSPEED_SHAPED_TREE)
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            return DiscoverySeeds(
+                seeds=["Controller"],
+                candidate_terminals=[
+                    TerminalCandidate(terminal="_ghost_one"),
+                    TerminalCandidate(terminal="_ghost_two"),
+                    TerminalCandidate(terminal="real_out"),
+                ],
+            )
+        return DiscoveryVerdict(sufficient=True, selected_terminal="real_out")
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler, tmp_path / "cache", "why?", "hash",
+            run_agent=stub_runner, max_terminals=1,
+            logged_signals={"base_in"},
+            context={"question_intent": {"source_queries": ["Controller"]}},
+        )
+    )
+
+    assert judged.reseeded is False
+    assert judged.selected is judged.results["real_out"]
+    assert judged.results["real_out"].dag.vertices
+    assert judged.results["_ghost_one"].terminal_validation.status == "absent"
+
+
+def test_total_rejection_triggers_one_reseed_with_survey(tmp_path):
+    """When every proposal fails validation there is no graph to
+    re-terminal from: the seeder is asked once more, with the rejection
+    reasons and the survey of symbols that actually exist."""
+    profiler = _mini_tree(tmp_path, AIRSPEED_SHAPED_TREE)
+    seeder_payloads: list[dict] = []
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            seeder_payloads.append(payload)
+            if len(seeder_payloads) == 1:
+                return DiscoverySeeds(
+                    seeds=["Controller"],
+                    candidate_terminals=[
+                        TerminalCandidate(
+                            terminal="_recalled_name",
+                            terminal_file="src/modules/old_path/Controller.cpp",
+                        )
+                    ],
+                )
+            return DiscoverySeeds(
+                seeds=["Controller"],
+                candidate_terminals=[TerminalCandidate(terminal="real_out")],
+            )
+        return DiscoveryVerdict(sufficient=True, selected_terminal="real_out")
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler, tmp_path / "cache", "why?", "hash",
+            run_agent=stub_runner, logged_signals={"base_in"},
+            context={"question_intent": {"source_queries": ["Controller"]}},
+        )
+    )
+
+    assert judged.reseeded is True
+    assert len(seeder_payloads) == 2
+    retry = seeder_payloads[1]
+    assert retry["rejected_terminals"] == {
+        "_recalled_name": "no write target in loaded facts"
+    }
+    surveyed = {
+        target["symbol"]
+        for entry in retry["source_survey"]["files"]
+        for target in entry["write_targets"]
+    }
+    assert {"real_out", "_member_out"} <= surveyed
+    assert judged.selected is judged.results["real_out"]
+    assert judged.results["real_out"].dag.vertices
+
+
+def test_survey_corrects_a_wrong_terminal_file(tmp_path):
+    """A candidate the survey knows is sliced from its REAL write file,
+    even when the seeder names a path the tree does not have."""
+    profiler = _mini_tree(tmp_path, AIRSPEED_SHAPED_TREE)
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            return DiscoverySeeds(
+                seeds=["Controller"],
+                candidate_terminals=[
+                    TerminalCandidate(
+                        terminal="real_out",
+                        terminal_file="src/modules/old_path/Controller.cpp",
+                    )
+                ],
+            )
+        return DiscoveryVerdict(sufficient=True, selected_terminal="real_out")
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler, tmp_path / "cache", "why?", "hash",
+            run_agent=stub_runner, logged_signals={"base_in"},
+            context={"question_intent": {"source_queries": ["Controller"]}},
+        )
+    )
+
+    result = judged.results["real_out"]
+    assert result.terminal_validation.status == "valid"
+    assert result.terminal_validation.resolved_file == "src/modules/ctrl/Controller.cpp"
