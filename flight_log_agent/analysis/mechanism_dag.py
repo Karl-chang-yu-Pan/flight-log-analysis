@@ -24,6 +24,7 @@ import re
 import math
 from bisect import bisect_right
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 
@@ -473,9 +474,9 @@ class _DAGBuilder:
 
         # Memoization tables.
         self._evidence_by_signal: dict[tuple[str, str], str] = {}
-        # Branch vertices key on (canonical predicate, file, line) — the
-        # source SITE is part of branch identity.
-        self._branch_by_site: dict[tuple[str, str, int], str] = {}
+        # Branch vertices key on predicate plus the parser's source-node ID.
+        # File/line remain the fallback for legacy facts.
+        self._branch_by_site: dict[tuple[str, str, int, str], str] = {}
         self._helper_subgraph_return_id: dict[tuple[str, str], str] = {}
         # helper_key -> ordered list of (formal_name, param_vertex_id).
         # Callers wire their i-th argument's producer to the i-th formal
@@ -1440,6 +1441,7 @@ class _DAGBuilder:
         # the branch's identity is where the control statement lives,
         # not where the gated assignment does.
         predicate_sites = binding.get("control_predicate_lines") or []
+        predicate_site_ids = binding.get("control_predicate_site_ids") or []
         for position, predicate in enumerate(binding.get("control_predicates") or []):
             site = (
                 int(predicate_sites[position])
@@ -1451,6 +1453,11 @@ class _DAGBuilder:
                 file=file,
                 line=site,
                 scope_function=self._binding_site_scope(binding)[1],
+                source_site_id=(
+                    str(predicate_site_ids[position])
+                    if position < len(predicate_site_ids)
+                    else ""
+                ),
             )
             self._add_edge(branch_id, op_id, kind="control")
 
@@ -2304,13 +2311,19 @@ class _DAGBuilder:
         file: Optional[str],
         line: Optional[int],
         scope_function: str = "",
+        source_site_id: str = "",
     ) -> str:
         canonical = _canonical_predicate(predicate)
         # Branch identity is the SOURCE SITE plus the canonical predicate
         # — identical text at two different sites is two branches. The
         # canonical text alone keys only predicate SEMANTICS (parameter-
         # predicate metadata, lowering), never vertex identity.
-        site_key = (canonical, str(file or ""), int(line or 0))
+        site_key = (
+            canonical,
+            str(file or ""),
+            int(line or 0),
+            str(source_site_id or ""),
+        )
         existing = self._branch_by_site.get(site_key)
         if existing is not None:
             return existing
@@ -2614,7 +2627,11 @@ class _DAGBuilder:
             if not condition:
                 continue
             branch_id = self._emit_branch(
-                condition, file=file, line=line, scope_function=scope_function
+                condition,
+                file=str(branch.get("file") or file or "") or None,
+                line=int(branch.get("line") or line or 0) or None,
+                scope_function=scope_function,
+                source_site_id=str(branch.get("source_site_id") or ""),
             )
             if terminal_id is not None:
                 self._add_edge(branch_id, terminal_id, kind="selection")
@@ -2870,7 +2887,8 @@ def _index_helpers(helpers: Sequence[Any]) -> dict[tuple[str, str], dict[str, An
             ]
         )
         owner, separator, _method = name.rpartition("::")
-        as_dict.setdefault("owner", owner if separator else "")
+        if not as_dict.get("owner"):
+            as_dict["owner"] = owner if separator else ""
         as_dict.setdefault("callable_id", callable_id)
         index[(short, callable_id)] = as_dict
     return index
@@ -3121,13 +3139,23 @@ def evaluate_feasibility(
 
         predicate = vertex.predicate_raw or vertex.predicate_lowered or ""
         evaluated_predicate = predicate
+        prepared_predicate: Optional[_PreparedPredicate] = None
         verdict = _reduce_predicate(predicate, params, enums)
         windows: list[tuple[float, float]] = []
 
         if verdict == "unknown":
+            if samples:
+                prepared_predicate = _prepare_predicate(
+                    predicate, samples, policies
+                )
             evaluated = (
                 _evaluate_predicate_intervals(
-                    predicate, params, enums, samples, policies
+                    predicate,
+                    params,
+                    enums,
+                    samples,
+                    policies,
+                    prepared=prepared_predicate,
                 )
                 if samples
                 else None
@@ -3144,14 +3172,29 @@ def evaluate_feasibility(
                     evaluated_predicate = grounded
                     verdict = _reduce_predicate(grounded, params, enums)
                     if verdict == "unknown" and samples:
+                        prepared_predicate = _prepare_predicate(
+                            grounded, samples, policies
+                        )
                         evaluated = _evaluate_predicate_intervals(
-                            grounded, params, enums, samples, policies
+                            grounded,
+                            params,
+                            enums,
+                            samples,
+                            policies,
+                            prepared=prepared_predicate,
                         )
             if verdict == "unknown" and evaluated is not None:
                 windows = evaluated
-                predicate_span = _predicate_sample_span(evaluated_predicate, samples)
+                if prepared_predicate is None:
+                    prepared_predicate = _prepare_predicate(
+                        evaluated_predicate, samples, policies
+                    )
+                predicate_span = prepared_predicate.span
                 policies_complete = _predicate_policies_complete(
-                    evaluated_predicate, samples, policies
+                    evaluated_predicate,
+                    samples,
+                    policies,
+                    prepared=prepared_predicate,
                 )
                 if not windows and policies_complete:
                     verdict = "always_false"
@@ -3164,11 +3207,18 @@ def evaluate_feasibility(
 
         verdicts[vertex.id] = verdict
         metadata = dict(vertex.metadata or {})
-        evaluation_span = _predicate_sample_span(evaluated_predicate, samples) if samples else None
+        if samples and prepared_predicate is None:
+            prepared_predicate = _prepare_predicate(
+                evaluated_predicate, samples, policies
+            )
+        evaluation_span = prepared_predicate.span if prepared_predicate else None
         if evaluation_span is not None:
             metadata["evaluation_domain"] = list(evaluation_span)
             metadata["sampling_policies"] = _predicate_policy_summary(
-                evaluated_predicate, samples, policies
+                evaluated_predicate,
+                samples,
+                policies,
+                prepared=prepared_predicate,
             )
         updated_vertices.append(
             vertex.model_copy(
@@ -3284,18 +3334,55 @@ def _predicate_signal_references(
     return alias_dotted_names(lowered, signal_samples.keys())
 
 
+@dataclass(frozen=True)
+class _PreparedPredicate:
+    text: str
+    alias_to_signal: dict[str, str]
+    referenced: tuple[str, ...]
+    span: Optional[tuple[float, float]]
+    policies: dict[str, Optional[dict[str, Any]]]
+
+
+def _prepare_predicate(
+    predicate: str,
+    signal_samples: dict[str, list[tuple[float, Any]]],
+    signal_policies: Optional[dict[str, Any]] = None,
+) -> _PreparedPredicate:
+    text, aliases = _predicate_signal_references(predicate, signal_samples)
+    referenced = tuple(dict.fromkeys(aliases.values()))
+    span: Optional[tuple[float, float]] = None
+    if referenced and all(signal_samples.get(signal) for signal in referenced):
+        start = max(
+            min(float(ts) for ts, _value in signal_samples[signal])
+            for signal in referenced
+        )
+        end = min(
+            max(float(ts) for ts, _value in signal_samples[signal])
+            for signal in referenced
+        )
+        if start <= end:
+            span = (start, end)
+    policies = {
+        signal: _signal_policy(signal, signal_policies or {})
+        for signal in referenced
+    }
+    return _PreparedPredicate(
+        text=text,
+        alias_to_signal=aliases,
+        referenced=referenced,
+        span=span,
+        policies=policies,
+    )
+
+
 def _predicate_sample_span(
     predicate: str,
     signal_samples: dict[str, list[tuple[float, Any]]],
+    *,
+    prepared: Optional[_PreparedPredicate] = None,
 ) -> Optional[tuple[float, float]]:
     """Common observed domain of the signals referenced by a predicate."""
-    _text, aliases = _predicate_signal_references(predicate, signal_samples)
-    referenced = list(dict.fromkeys(aliases.values()))
-    if not referenced or any(not signal_samples.get(signal) for signal in referenced):
-        return None
-    start = max(min(float(ts) for ts, _value in signal_samples[signal]) for signal in referenced)
-    end = min(max(float(ts) for ts, _value in signal_samples[signal]) for signal in referenced)
-    return (start, end) if start <= end else None
+    return (prepared or _prepare_predicate(predicate, signal_samples)).span
 
 
 def _signal_policy(
@@ -3319,11 +3406,15 @@ def _predicate_policies_complete(
     predicate: str,
     signal_samples: dict[str, list[tuple[float, Any]]],
     signal_policies: dict[str, Any],
+    *,
+    prepared: Optional[_PreparedPredicate] = None,
 ) -> bool:
-    _text, aliases = _predicate_signal_references(predicate, signal_samples)
-    referenced = list(dict.fromkeys(aliases.values()))
-    return bool(referenced) and all(
-        _signal_policy(signal, signal_policies) is not None for signal in referenced
+    prepared = prepared or _prepare_predicate(
+        predicate, signal_samples, signal_policies
+    )
+    return bool(prepared.referenced) and all(
+        prepared.policies.get(signal) is not None
+        for signal in prepared.referenced
     )
 
 
@@ -3331,11 +3422,15 @@ def _predicate_policy_summary(
     predicate: str,
     signal_samples: dict[str, list[tuple[float, Any]]],
     signal_policies: dict[str, Any],
+    *,
+    prepared: Optional[_PreparedPredicate] = None,
 ) -> dict[str, str]:
-    _text, aliases = _predicate_signal_references(predicate, signal_samples)
+    prepared = prepared or _prepare_predicate(
+        predicate, signal_samples, signal_policies
+    )
     return {
-        signal: str((_signal_policy(signal, signal_policies) or {}).get("method") or "unknown")
-        for signal in dict.fromkeys(aliases.values())
+        signal: str((prepared.policies.get(signal) or {}).get("method") or "unknown")
+        for signal in prepared.referenced
     }
 
 
@@ -3416,6 +3511,8 @@ def _evaluate_predicate_intervals(
     enum_values: dict[str, Any],
     signal_samples: dict[str, list[tuple[float, Any]]],
     signal_policies: Optional[dict[str, Any]] = None,
+    *,
+    prepared: Optional[_PreparedPredicate] = None,
 ) -> Optional[list[tuple[float, float]]]:
     """Evaluate ``predicate`` per timestamp, return True-intervals.
 
@@ -3433,14 +3530,18 @@ def _evaluate_predicate_intervals(
         eval_expression,
     )
 
-    text, alias_to_signal = _predicate_signal_references(predicate, signal_samples)
+    prepared = prepared or _prepare_predicate(
+        predicate, signal_samples, signal_policies
+    )
+    text = prepared.text
+    alias_to_signal = prepared.alias_to_signal
     signal_key_map = {signal: alias for alias, signal in alias_to_signal.items()}
-    referenced = list(dict.fromkeys(alias_to_signal.values()))
+    referenced = list(prepared.referenced)
 
     if not referenced:
         return None
 
-    span = _predicate_sample_span(predicate, signal_samples)
+    span = prepared.span
     if span is None:
         return None
 
@@ -3463,19 +3564,26 @@ def _evaluate_predicate_intervals(
 
     # Pre-sort each referenced series and resolve its policy ONCE — the
     # per-timestamp loop only bisects.
-    prepared: dict[str, tuple[list[tuple[float, Any]], list[float], Optional[dict[str, Any]]]] = {}
+    prepared_series: dict[
+        str,
+        tuple[
+            list[tuple[float, Any]],
+            list[float],
+            Optional[dict[str, Any]],
+        ],
+    ] = {}
     for signal in referenced:
         ordered = sorted(signal_samples[signal], key=lambda item: float(item[0]))
-        prepared[signal] = (
+        prepared_series[signal] = (
             ordered,
             [float(ts) for ts, _value in ordered],
-            _signal_policy(signal, signal_policies or {}),
+            prepared.policies.get(signal),
         )
 
     for t in ts_sorted:
         resampled = {
             signal_key_map[signal]: _sample_value_at(ordered, times, t, policy)
-            for signal, (ordered, times, policy) in prepared.items()
+            for signal, (ordered, times, policy) in prepared_series.items()
         }
         if any(value is None for value in resampled.values()):
             continue

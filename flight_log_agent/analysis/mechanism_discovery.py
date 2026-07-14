@@ -88,6 +88,9 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         "logged_signal": "",
         "control_predicates": list(ref.get("control_predicates") or []),
         "control_predicate_lines": list(ref.get("control_predicate_lines") or []),
+        "control_predicate_site_ids": list(
+            ref.get("control_predicate_site_ids") or []
+        ),
         "reachability_exact": bool(ref.get("reachability_exact", True)),
         "struct_variables": dict(ref.get("struct_variables") or {}),
         "symbol_bindings": dict(ref.get("symbol_bindings") or {}),
@@ -129,6 +132,32 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
 
     entries = [_as_dict(facts_entry) for facts_entry in facts]
 
+    class_bases: dict[str, list[str]] = {}
+    callable_owners: dict[str, str] = {}
+    for entry in entries:
+        for raw_class in entry.get("classes") or []:
+            class_ref = _as_dict(raw_class)
+            name = str(class_ref.get("name") or "")
+            if name:
+                class_bases[name] = [str(base) for base in class_ref.get("bases") or []]
+        for raw_callable in entry.get("callables") or []:
+            callable_ref = _as_dict(raw_callable)
+            callable_id = str(callable_ref.get("callable_id") or "")
+            owner = str(callable_ref.get("owner") or "")
+            if callable_id and owner:
+                callable_owners[callable_id] = owner
+
+    def owner_lineage(owner: str) -> set[str]:
+        lineage: set[str] = set()
+        pending = [owner] if owner else []
+        while pending:
+            current = pending.pop(0)
+            if not current or current in lineage:
+                continue
+            lineage.add(current)
+            pending.extend(class_bases.get(current, []))
+        return lineage
+
     topic_refs_by_variable: dict[str, list[dict[str, Any]]] = {}
     for entry in entries:
         for direction_key in ("subscribed_topics", "published_topics"):
@@ -149,6 +178,8 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                         "function": str(ref.get("function") or ""),
                         "callable_id": str(ref.get("callable_id") or ""),
                         "source_owner": str(ref.get("variable_owner") or ""),
+                        "endpoint_kind": str(ref.get("endpoint_kind") or ""),
+                        "source_site_id": str(ref.get("source_site_id") or ""),
                         "provenance": str(ref.get("api") or direction_key),
                     }
                 )
@@ -157,27 +188,39 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
         variable: str,
         direction: str,
         source_file: str,
+        callable_id: str,
+        caller_owner: str,
     ) -> tuple[str, Any] | None:
+        receiver = variable.replace("->", ".")
+        if receiver.startswith("this."):
+            receiver = receiver[5:]
+        lineage = owner_lineage(caller_owner)
         candidates = [
             item
-            for item in topic_refs_by_variable.get(variable, [])
+            for lookup in ({receiver, "this"} if not receiver else {receiver})
+            for item in topic_refs_by_variable.get(lookup, [])
             if item.get("direction") == direction and item.get("topic")
         ]
-        exact_file = [
-            item for item in candidates if str(item.get("file") or "") == source_file
-        ]
-        if exact_file:
-            candidates = exact_file
-        elif source_file:
-            source_directory = source_file.rpartition("/")[0]
-            same_directory = [
-                item
-                for item in candidates
-                if str(item.get("file") or "").rpartition("/")[0]
-                == source_directory
-            ]
-            if same_directory:
-                candidates = same_directory
+        scoped: list[dict[str, Any]] = []
+        for item in candidates:
+            endpoint_kind = str(item.get("endpoint_kind") or "")
+            item_owner = str(item.get("source_owner") or "")
+            item_callable = str(item.get("callable_id") or "")
+            item_file = str(item.get("file") or "")
+            if not endpoint_kind:
+                endpoint_kind = "member" if item_owner else "local" if item_callable else "global"
+            if endpoint_kind == "base":
+                if caller_owner and item_owner in lineage and receiver in {"", "this"}:
+                    scoped.append(item)
+            elif endpoint_kind == "member":
+                if caller_owner and item_owner in lineage:
+                    scoped.append(item)
+            elif endpoint_kind == "local":
+                if callable_id and item_callable == callable_id:
+                    scoped.append(item)
+            elif endpoint_kind == "global" and source_file and item_file == source_file:
+                scoped.append(item)
+        candidates = scoped
         placements = {
             (str(item.get("topic") or ""), item.get("instance"))
             for item in candidates
@@ -196,7 +239,7 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             name = str(call.get("name") or "").rsplit("::", 1)[-1]
             receiver = str(call.get("receiver") or "")
             args = [str(arg) for arg in (call.get("args") or [])]
-            if not receiver or not args:
+            if not args:
                 continue
             direction = "subscribe" if name in {"copy", "update"} else (
                 "publish" if name == "publish" else ""
@@ -204,7 +247,18 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             if not direction:
                 continue
             file = str(call.get("file") or entry.get("file") or "")
-            placement = unique_boundary(receiver, direction, file)
+            callable_id = str(call.get("callable_id") or "")
+            function = str(call.get("function") or "")
+            caller_owner = callable_owners.get(callable_id, "")
+            if not caller_owner and "::" in function:
+                caller_owner = function.rpartition("::")[0]
+            placement = unique_boundary(
+                receiver or "this",
+                direction,
+                file,
+                callable_id,
+                caller_owner,
+            )
             if not placement:
                 continue
             topic, instance = placement
@@ -219,8 +273,8 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                     "instance": instance,
                     "direction": direction,
                     "file": file,
-                    "function": str(call.get("function") or ""),
-                    "callable_id": str(call.get("callable_id") or ""),
+                    "function": function,
+                    "callable_id": callable_id,
                     "source_owner": str(
                         (call.get("argument_owners") or {}).get(root) or ""
                     ),

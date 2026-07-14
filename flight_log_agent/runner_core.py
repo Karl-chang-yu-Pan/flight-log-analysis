@@ -512,7 +512,12 @@ async def analyze_flight_log(
                 )
 
             dag_stage = await run_dag_discovery_stage(
-                MechanismSourceProfiler(source_snapshot),
+                MechanismSourceProfiler(
+                    source_snapshot,
+                    source_parser_backend=os.environ.get(
+                        "FLIGHT_LOG_SOURCE_PARSER", "legacy"
+                    ),
+                ),
                 Path(dag_cache_dir),
                 user_question,
                 source_snapshot.commit_sha,

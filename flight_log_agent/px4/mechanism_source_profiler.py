@@ -78,6 +78,11 @@ class TopicRef(BaseModel):
     # deliberately leave this unset so downstream scope checks cannot widen
     # them across methods based on spelling.
     variable_owner: Optional[str] = None
+    # Structural endpoint identity emitted by syntax-aware backends. ``member``
+    # and ``local`` endpoints are resolved by owner/callable scope; ``base``
+    # denotes an initialized base subobject and uses ``this`` as its receiver.
+    endpoint_kind: Optional[str] = None
+    source_site_id: Optional[str] = None
 
 
 class ParameterRef(BaseModel):
@@ -114,6 +119,7 @@ class FunctionCallRef(BaseModel):
     # ``control_predicates`` — the branch's own SITE identity, distinct
     # from this ref's ``line`` (the gated statement).
     control_predicate_lines: List[int] = Field(default_factory=list)
+    control_predicate_site_ids: List[str] = Field(default_factory=list)
     # False when a governing construct the extractor does not model
     # (switch, loops) makes ``control_predicates`` incomplete — the
     # reachability is then explicitly unresolved, never silently partial.
@@ -124,6 +130,7 @@ class FunctionCallRef(BaseModel):
     argument_owners: Dict[str, str] = Field(default_factory=dict)
     function: Optional[str] = None
     callable_id: Optional[str] = None
+    source_site_id: Optional[str] = None
 
 
 class SourceAssignmentRef(BaseModel):
@@ -144,6 +151,7 @@ class SourceAssignmentRef(BaseModel):
     # ``control_predicates`` — the branch's own SITE identity, distinct
     # from this ref's ``line`` (the gated statement).
     control_predicate_lines: List[int] = Field(default_factory=list)
+    control_predicate_site_ids: List[str] = Field(default_factory=list)
     # False when a governing construct the extractor does not model
     # (switch, loops) makes ``control_predicates`` incomplete — the
     # reachability is then explicitly unresolved, never silently partial.
@@ -154,10 +162,12 @@ class SourceAssignmentRef(BaseModel):
     # graph-natively via :func:`_derive_topic_from_return_type` instead of
     # depending on the pre-baked ``symbol_bindings`` dict.
     struct_variables: Dict[str, str] = Field(default_factory=dict)
+    source_site_id: Optional[str] = None
 
 
 class HelperExpressionRef(BaseModel):
     name: str
+    owner: Optional[str] = None
     file: str
     line: int
     evidence: str
@@ -167,7 +177,7 @@ class HelperExpressionRef(BaseModel):
     assignments: Dict[str, str] = Field(default_factory=dict)
     return_expression: Optional[str] = None
     lowered_return_expression: Optional[str] = None
-    branches: List[Dict[str, str]] = Field(default_factory=list)
+    branches: List[Dict[str, Any]] = Field(default_factory=list)
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
     call_resolutions: List[Dict[str, Any]] = Field(default_factory=list)
     helper_calls: List[str] = Field(default_factory=list)
@@ -196,6 +206,7 @@ class BranchConditionRef(BaseModel):
     file: str
     line: int
     evidence: str
+    source_site_id: Optional[str] = None
 
 
 class ParameterPredicateRef(BaseModel):
@@ -535,6 +546,7 @@ class MechanismSourceProfiler:
         rg_path: str = "rg",
         read_limit_bytes: int = 2_000_000,
         excludes: Optional[Sequence[str]] = None,
+        source_parser_backend: str = "legacy",
     ) -> None:
         source = source_handle(source_path)
         if source is None:
@@ -543,6 +555,12 @@ class MechanismSourceProfiler:
         self.rg_path = rg_path
         self.read_limit_bytes = read_limit_bytes
         self.excludes = tuple(excludes) if excludes is not None else self.DEFAULT_EXCLUDES
+        backend = str(source_parser_backend or "legacy").strip().lower()
+        if backend not in {"legacy", "tree_sitter", "compare"}:
+            raise ValueError(
+                "source_parser_backend must be 'legacy', 'tree_sitter', or 'compare'"
+            )
+        self.source_parser_backend = backend
         # Per-instance cache: the same file is hit by 10+ extraction
         # methods across multiple source_discovery iterations. Keyed by
         # the rel path string so the path-resolution variants converge.

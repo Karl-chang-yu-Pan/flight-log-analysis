@@ -26,6 +26,7 @@ where Layer 1 fits among Layers 2 (unresolved DAG per terminal), 3
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -33,7 +34,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -65,6 +66,8 @@ class SourceFileFacts(BaseModel):
 
     file: str
     source_hash: str
+    parser_backend: str = "legacy"
+    parse_diagnostics: Dict[str, Any] = Field(default_factory=dict)
     published_topics: List[TopicRef] = Field(default_factory=list)
     subscribed_topics: List[TopicRef] = Field(default_factory=list)
     unknown_direction_topics: List[TopicRef] = Field(default_factory=list)
@@ -332,15 +335,59 @@ def extract_facts_for_file(
     file_path: str,
     source_hash: str,
 ) -> SourceFileFacts:
-    """Run every per-file profiler extractor and return a bundled result.
+    """Extract one file through the profiler's selected syntax backend.
 
-    Invokes each ``extract_*_from_source`` method with the single-file
+    ``legacy`` keeps the existing scanner, ``tree_sitter`` emits a complete
+    payload from the AST backend, and ``compare`` runs both independently,
+    returns the Tree-sitter payload, and attaches a semantic diff. Compare mode
+    deliberately never unions facts: a DAG is always built from one parser's
+    output so missing or extra extraction remains measurable.
+
+    The legacy path invokes each ``extract_*_from_source`` method with the single-file
     list ``[file_path]``. The profiler's cross-file join steps
     (pointer-output routing, recursive helper resolution) may still fire
     but only against the single input file, so they collapse to the
     trivial single-file case — cross-file joins are the discovery
     loop's responsibility to reassemble across Layer 1 entries.
     """
+    backend = str(getattr(profiler, "source_parser_backend", "legacy"))
+    if backend in {"tree_sitter", "compare"}:
+        tree_facts = _extract_tree_sitter_facts(profiler, file_path, source_hash)
+        if backend == "tree_sitter":
+            return tree_facts
+        legacy_facts = _extract_legacy_facts(profiler, file_path, source_hash)
+        diagnostics = dict(tree_facts.parse_diagnostics)
+        diagnostics["legacy_comparison"] = compare_source_facts(
+            legacy_facts, tree_facts
+        )
+        return tree_facts.model_copy(
+            update={
+                "parser_backend": "compare:tree_sitter",
+                "parse_diagnostics": diagnostics,
+            }
+        )
+    return _extract_legacy_facts(profiler, file_path, source_hash)
+
+
+def _extract_tree_sitter_facts(
+    profiler: MechanismSourceProfiler,
+    file_path: str,
+    source_hash: str,
+) -> SourceFileFacts:
+    from flight_log_agent.px4.tree_sitter_source import TreeSitterSourceExtractor
+
+    extractor = getattr(profiler, "_tree_sitter_source_extractor", None)
+    if extractor is None:
+        extractor = TreeSitterSourceExtractor(profiler)
+        setattr(profiler, "_tree_sitter_source_extractor", extractor)
+    return extractor.extract(file_path, source_hash)
+
+
+def _extract_legacy_facts(
+    profiler: MechanismSourceProfiler,
+    file_path: str,
+    source_hash: str,
+) -> SourceFileFacts:
     files = [file_path]
 
     def from_exact_file(items):
@@ -355,6 +402,7 @@ def extract_facts_for_file(
     return SourceFileFacts(
         file=file_path,
         source_hash=source_hash,
+        parser_backend="legacy",
         published_topics=from_exact_file(uorb.get("published_topics", []) or []),
         subscribed_topics=from_exact_file(uorb.get("subscribed_topics", []) or []),
         unknown_direction_topics=from_exact_file(
@@ -387,3 +435,56 @@ def extract_facts_for_file(
         callables=list(structure.get("callables") or []),
         includes=list(structure.get("includes") or []),
     )
+
+
+_COMPARISON_PROVENANCE_FIELDS = {
+    "evidence",
+    "source_site_id",
+    "control_predicate_site_ids",
+}
+
+
+def _comparison_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(exclude_none=True)
+    if isinstance(value, dict):
+        return {
+            str(key): _comparison_value(item)
+            for key, item in value.items()
+            if key not in _COMPARISON_PROVENANCE_FIELDS
+        }
+    if isinstance(value, list):
+        return [_comparison_value(item) for item in value]
+    return value
+
+
+def compare_source_facts(
+    legacy: SourceFileFacts,
+    tree_sitter: SourceFileFacts,
+) -> Dict[str, Any]:
+    """Return an uncapped semantic per-collection diff between two backends."""
+    result: Dict[str, Any] = {}
+    excluded = {"file", "source_hash", "parser_backend", "parse_diagnostics"}
+    for field_name in SourceFileFacts.model_fields:
+        if field_name in excluded:
+            continue
+        legacy_items = getattr(legacy, field_name)
+        tree_items = getattr(tree_sitter, field_name)
+        if not isinstance(legacy_items, list) or not isinstance(tree_items, list):
+            continue
+        legacy_values = {
+            json.dumps(_comparison_value(item), sort_keys=True, separators=(",", ":"))
+            for item in legacy_items
+        }
+        tree_values = {
+            json.dumps(_comparison_value(item), sort_keys=True, separators=(",", ":"))
+            for item in tree_items
+        }
+        result[field_name] = {
+            "legacy_count": len(legacy_items),
+            "tree_sitter_count": len(tree_items),
+            "shared_count": len(legacy_values & tree_values),
+            "legacy_only": [json.loads(value) for value in sorted(legacy_values - tree_values)],
+            "tree_sitter_only": [json.loads(value) for value in sorted(tree_values - legacy_values)],
+        }
+    return result

@@ -1619,6 +1619,50 @@ def test_helper_branch_selects_value_without_gating_return_reachability():
     assert any(e.target_id == return_op.id for e in selection_out)
 
 
+def test_helper_branches_on_same_line_keep_parser_source_identity():
+    helper = _fake_helper(
+        name="Control::select",
+        file="control.cpp",
+        line=10,
+        evidence="float Control::select()",
+        assignments={},
+        return_expression="fallback",
+        branches=[
+            {
+                "condition": "valid",
+                "expression": "first",
+                "file": "control.cpp",
+                "line": 20,
+                "source_site_id": "control.cpp:100:120:return_statement",
+            },
+            {
+                "condition": "valid",
+                "expression": "second",
+                "file": "control.cpp",
+                "line": 20,
+                "source_site_id": "control.cpp:140:160:return_statement",
+            },
+        ],
+    )
+    dag = build_mechanism_dag(
+        [
+            _fake_binding(
+                binding_id="caller",
+                target="output",
+                expression="select()",
+                file="control.cpp",
+                line=1,
+            )
+        ],
+        "output",
+        helper_expressions=[helper],
+    )
+
+    branches = [vertex for vertex in dag.vertices if vertex.kind == "branch"]
+    assert len(branches) == 2
+    assert len({vertex.id for vertex in branches}) == 2
+
+
 def test_shared_producer_vertex_reused_across_two_consumers():
     """A symbol written once but read by two distinct consumers must resolve
     to a SINGLE producer operation vertex (graph-native reuse), with one data
