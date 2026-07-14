@@ -105,6 +105,71 @@ void Control::run()
     )
 
 
+def test_switch_exit_gates_later_case_statements_and_stops_unreachable_walk(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+void Control::run()
+{
+    switch (mode) {
+    case MODE_A: {
+        if (stop) {
+            break;
+        }
+        output = active;
+        break;
+        unreachable = value;
+    }
+    default:
+        output = fallback;
+    }
+}
+""",
+    )
+
+    active = next(
+        item
+        for item in facts.source_assignments
+        if item.target == "output" and item.expression == "active"
+    )
+    predicate = " ".join(active.control_predicates)
+    assert "mode == MODE_A" in predicate
+    assert "!(stop)" in predicate
+    assert active.reachability_exact is True
+    assert not any(
+        item.target == "unreachable" for item in facts.source_assignments
+    )
+
+
+def test_switch_continue_gates_rest_of_case_without_claiming_loop_exactness(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+void Control::run()
+{
+    while (running) {
+        switch (mode) {
+        case MODE_A:
+            if (retry) continue;
+            output = active;
+            break;
+        default:
+            break;
+        }
+    }
+}
+""",
+    )
+
+    active = next(
+        item
+        for item in facts.source_assignments
+        if item.target == "output"
+    )
+    assert "!(retry)" in " ".join(active.control_predicates)
+    assert active.reachability_exact is False
+
+
 def test_tree_sitter_helper_return_paths_keep_distinct_source_sites(tmp_path):
     facts = _facts(
         tmp_path,
@@ -193,6 +258,60 @@ float Control::run(float input)
     assert helper.owner == "Control"
     assert helper.parameters == ["scale", "value"]
     assert "scale * value" in str(helper.lowered_return_expression)
+    call = next(item for item in facts.function_calls if item.name == "apply")
+    assert call.args == ["scale", "input"]
+
+
+def test_lambda_default_and_initializer_captures_are_source_bound(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+float Control::run(float input)
+{
+    const float scale = 2.f;
+    const float offset = 1.f;
+    const auto apply = [&, bias = offset](float value) {
+        const float local = value + bias;
+        return scale * local;
+    };
+    return apply(input);
+}
+""",
+    )
+
+    helper = next(
+        item for item in facts.helper_expressions if item.name.endswith("::apply")
+    )
+    assert helper.unresolved_reason is None
+    assert helper.parameters == ["bias", "scale", "value"]
+    call = next(item for item in facts.function_calls if item.name == "apply")
+    assert call.args == ["offset", "scale", "input"]
+
+
+def test_lambda_local_shadow_only_applies_in_its_lexical_scope(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+float Control::run(float input)
+{
+    const float scale = 2.f;
+    const auto apply = [&](float value) {
+        float result = scale * value;
+        {
+            const float scale = 3.f;
+            result += scale;
+        }
+        return result;
+    };
+    return apply(input);
+}
+""",
+    )
+
+    helper = next(
+        item for item in facts.helper_expressions if item.name.endswith("::apply")
+    )
+    assert helper.parameters == ["scale", "value"]
     call = next(item for item in facts.function_calls if item.name == "apply")
     assert call.args == ["scale", "input"]
 

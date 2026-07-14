@@ -35,7 +35,6 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceMemberRef,
     TopicRef,
     _HelperLoweringFailed,
-    split_top_level_args,
     split_source_field,
 )
 
@@ -66,6 +65,7 @@ class _Callable:
     evidence: str
     parent_callable_id: Optional[str] = None
     captures: list[str] = field(default_factory=list)
+    capture_arguments: list[str] = field(default_factory=list)
     is_lambda: bool = False
     capture_exact: bool = True
 
@@ -548,7 +548,6 @@ class TreeSitterSourceExtractor:
     def _extract_lambdas(
         self, unit: _ParsedUnit, parent_definitions: Sequence[Node]
     ) -> None:
-        parents = list(unit.callables)
         bodies = [
             body
             for definition in parent_definitions
@@ -560,13 +559,17 @@ class TreeSitterSourceExtractor:
             for node in _walk(body)
             if node.type == "lambda_expression"
         ]
+        # Register outer lambdas before nested lambdas so the inner callable
+        # retains its immediate lexical parent.
+        lambda_nodes.sort(key=lambda item: (item.start_byte, -item.end_byte))
         for node in lambda_nodes:
             parent = min(
                 (
                     item
-                    for item in parents
+                    for item in unit.callables
                     if item.body.start_byte <= node.start_byte
                     and node.end_byte <= item.body.end_byte
+                    and item.node != node
                 ),
                 key=lambda item: item.body.end_byte - item.body.start_byte,
                 default=None,
@@ -589,25 +592,6 @@ class TreeSitterSourceExtractor:
             variable = self._canonical_symbol(unit.text(_last_identifier(target_node)))
             if not variable:
                 continue
-            captures_node = node.child_by_field_name("captures")
-            captures: list[str] = []
-            capture_exact = True
-            if captures_node is not None:
-                raw_captures = unit.text(captures_node).strip()[1:-1]
-                for raw in split_top_level_args(raw_captures):
-                    capture = raw.strip()
-                    if not capture:
-                        continue
-                    if capture in {"=", "&"}:
-                        capture_exact = False
-                        continue
-                    capture = capture.lstrip("&").strip()
-                    if capture in {"this", "*this"}:
-                        continue
-                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", capture):
-                        captures.append(capture)
-                    else:
-                        capture_exact = False
             declarator = node.child_by_field_name("declarator")
             parameters_node = (
                 declarator.child_by_field_name("parameters")
@@ -620,6 +604,13 @@ class TreeSitterSourceExtractor:
             body = node.child_by_field_name("body")
             if body is None:
                 continue
+            captures, capture_arguments, capture_exact = self._lambda_captures(
+                unit,
+                node,
+                parent,
+                body,
+                parameters,
+            )
             trailing = next(
                 (
                     child
@@ -657,10 +648,145 @@ class TreeSitterSourceExtractor:
                     evidence=unit.evidence(node),
                     parent_callable_id=parent.callable_id,
                     captures=captures,
+                    capture_arguments=capture_arguments,
                     is_lambda=True,
                     capture_exact=capture_exact,
                 )
             )
+
+    def _lambda_captures(
+        self,
+        unit: _ParsedUnit,
+        node: Node,
+        parent: _Callable,
+        body: Node,
+        parameters: Sequence[str],
+    ) -> tuple[list[str], list[str], bool]:
+        """Derive lambda formals and caller expressions from lexical syntax."""
+        captures_node = node.child_by_field_name("captures")
+        captures: list[str] = []
+        arguments: list[str] = []
+        exact = True
+        has_default = False
+
+        for capture_node in captures_node.named_children if captures_node else ():
+            if capture_node.type == "lambda_default_capture":
+                has_default = True
+                continue
+            if capture_node.type == "lambda_capture_initializer":
+                left = capture_node.child_by_field_name("left")
+                right = capture_node.child_by_field_name("right")
+                name = unit.text(_last_identifier(left)).strip()
+                expression = self.profiler._normalize_source_expression(
+                    unit.text(right)
+                )
+                if name and expression:
+                    captures.append(name)
+                    arguments.append(expression)
+                else:
+                    exact = False
+                continue
+
+            capture = unit.text(capture_node).strip().lstrip("&").strip()
+            if capture in {"this", "*this"}:
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", capture):
+                captures.append(capture)
+                arguments.append(capture)
+            else:
+                exact = False
+
+        if has_default:
+            explicit = set(captures)
+            for capture in self._implicit_lambda_captures(
+                unit, parent, node, body, parameters
+            ):
+                if capture in explicit:
+                    continue
+                captures.append(capture)
+                arguments.append(capture)
+                explicit.add(capture)
+
+        return captures, arguments, exact
+
+    def _implicit_lambda_captures(
+        self,
+        unit: _ParsedUnit,
+        parent: _Callable,
+        lambda_node: Node,
+        body: Node,
+        parameters: Sequence[str],
+    ) -> list[str]:
+        """Find referenced parent locals whose scope contains the lambda."""
+        visible = dict.fromkeys(parent.parameters)
+        for declaration in _walk_operations(parent.body):
+            if declaration.type != "declaration":
+                continue
+            if declaration.start_byte >= lambda_node.start_byte:
+                continue
+            if declaration.start_byte <= lambda_node.start_byte < declaration.end_byte:
+                continue
+            scope = self._declaration_scope(declaration, parent.body)
+            if scope is None or not (
+                scope.start_byte <= lambda_node.start_byte
+                and lambda_node.end_byte <= scope.end_byte
+            ):
+                continue
+            for declarator in _declaration_declarators(declaration):
+                name = unit.text(_last_identifier(declarator)).strip()
+                if name:
+                    visible.setdefault(name, None)
+
+        local_declarations: dict[str, list[tuple[int, Node]]] = {}
+        for declaration in _walk_operations(body):
+            if declaration.type != "declaration":
+                continue
+            scope = self._declaration_scope(declaration, body)
+            if scope is None:
+                continue
+            for declarator in _declaration_declarators(declaration):
+                name = unit.text(_last_identifier(declarator)).strip()
+                if name:
+                    local_declarations.setdefault(name, []).append(
+                        (declarator.start_byte, scope)
+                    )
+
+        captured: list[str] = []
+        seen: set[str] = set()
+        parameter_names = set(parameters)
+        for reference in _walk_operations(body):
+            if reference.type != "identifier":
+                continue
+            name = unit.text(reference).strip()
+            if name not in visible or name in parameter_names or name in seen:
+                continue
+            if any(
+                declaration_start <= reference.start_byte
+                and scope.start_byte <= reference.start_byte
+                and reference.end_byte <= scope.end_byte
+                for declaration_start, scope in local_declarations.get(name, ())
+            ):
+                continue
+            seen.add(name)
+            captured.append(name)
+        return captured
+
+    @staticmethod
+    def _declaration_scope(declaration: Node, callable_body: Node) -> Optional[Node]:
+        scope = declaration.parent
+        scope_types = {
+            "compound_statement",
+            "for_statement",
+            "for_range_loop",
+            "while_statement",
+            "if_statement",
+            "switch_statement",
+        }
+        while scope is not None and scope != callable_body:
+            if scope.type in scope_types:
+                return scope
+            scope = scope.parent
+        return callable_body if scope == callable_body else None
 
     def _parameter_list(
         self, unit: _ParsedUnit, parameters_node: Optional[Node]
@@ -806,6 +932,7 @@ class TreeSitterSourceExtractor:
         *,
         controls: list[_ControlTerm],
         exact: bool,
+        exit_context: Optional[str] = None,
     ) -> None:
         active_controls = list(controls)
         active_exact = exact
@@ -815,10 +942,16 @@ class TreeSitterSourceExtractor:
                 statement,
                 controls=active_controls,
                 exact=active_exact,
+                exit_context=exit_context,
             )
-            termination, termination_exact = self._termination_expression(
-                state.unit, statement
-            )
+            if exit_context == "switch":
+                termination, termination_exact = self._switch_exit_for_statement(
+                    state.unit, statement
+                )
+            else:
+                termination, termination_exact = self._termination_expression(
+                    state.unit, statement
+                )
             if termination == "true":
                 break
             if termination != "false":
@@ -839,12 +972,17 @@ class TreeSitterSourceExtractor:
         *,
         controls: list[_ControlTerm],
         exact: bool,
+        exit_context: Optional[str] = None,
     ) -> None:
         unit = state.unit
         exact = exact and not node.has_error
         if node.type == "compound_statement":
             self._walk_sequence(
-                state, node.named_children, controls=controls, exact=exact
+                state,
+                node.named_children,
+                controls=controls,
+                exact=exact,
+                exit_context=exit_context,
             )
             return
         if node.type == "if_statement":
@@ -866,6 +1004,7 @@ class TreeSitterSourceExtractor:
                     consequence,
                     controls=[*controls, term],
                     exact=exact,
+                    exit_context=exit_context,
                 )
             alternative = node.child_by_field_name("alternative")
             if alternative is not None:
@@ -886,6 +1025,7 @@ class TreeSitterSourceExtractor:
                         ),
                     ],
                     exact=exact,
+                    exit_context=exit_context,
                 )
             return
         if node.type == "switch_statement":
@@ -912,7 +1052,13 @@ class TreeSitterSourceExtractor:
             if body is not None:
                 body_controls = controls if node.type == "do_statement" else [*controls, term]
                 self._walk_statement(
-                    state, body, controls=body_controls, exact=False
+                    state,
+                    body,
+                    controls=body_controls,
+                    exact=False,
+                    # A transfer inside this loop belongs to the loop rather
+                    # than to a switch that happens to contain the loop.
+                    exit_context=None,
                 )
             self._collect_operations(
                 state, update, controls=[*controls, term], exact=False
@@ -971,7 +1117,11 @@ class TreeSitterSourceExtractor:
             kind = "default" if label is None else "case"
             self._record_branch(state, kind, term, site)
             self._walk_sequence(
-                state, statements, controls=[*controls, term], exact=exact
+                state,
+                statements,
+                controls=[*controls, term],
+                exact=exact,
+                exit_context="switch",
             )
             exit_expression, exit_exact = self._switch_exit_expression(
                 unit, statements
@@ -1121,6 +1271,7 @@ class TreeSitterSourceExtractor:
     ) -> tuple[str, bool]:
         if node.type in {
             "break_statement",
+            "continue_statement",
             "return_statement",
             "co_return_statement",
             "throw_statement",
@@ -1149,6 +1300,8 @@ class TreeSitterSourceExtractor:
                 then_exact and else_exact and not node.has_error,
             )
         if node.type in {"switch_statement", "for_statement", "while_statement", "do_statement"}:
+            return "false", False
+        if node.type == "goto_statement":
             return "false", False
         return "false", not node.has_error
 
@@ -1322,7 +1475,7 @@ class TreeSitterSourceExtractor:
         args = [unit.text(arg).strip() for arg in (arguments_node.named_children if arguments_node else [])]
         lambda_callable = state.lambda_bindings.get(name) if receiver is None else None
         if lambda_callable is not None:
-            args = [*lambda_callable.captures, *args]
+            args = [*lambda_callable.capture_arguments, *args]
         argument_topics: dict[str, str] = {}
         argument_owners: dict[str, str] = {}
         for arg in args:
@@ -1973,6 +2126,8 @@ class TreeSitterSourceExtractor:
     def _helper_from_state(self, state: _ExtractionState) -> HelperExpressionRef:
         statements = self._helper_statements(state.unit, state.callable.body)
         unresolved = self._helper_unsupported_reason(state.callable.body)
+        if state.callable.is_lambda and not state.callable.capture_exact:
+            unresolved = "lambda capture bindings are not structurally resolvable"
         lowered: Optional[str] = None
         if unresolved is None:
             try:
