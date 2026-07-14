@@ -282,9 +282,8 @@ def test_derived_expression_rejects_undeclared_dotted_reference():
     ), check.unresolved_dependencies
 
 
-def test_derived_expression_accepts_quaternion_paren_via_normalize_rewrite():
-    """q(0) in the source-style expression should be normalized to q[0] and
-    matched against a declared variable using the bracket form."""
+def test_derived_expression_accepts_declared_quaternion_paren_index():
+    """An explicit q[0] variable declaration proves q(0) is indexed access."""
     candidate = MechanismCandidate(
         name="Quaternion element check",
         summary="Vector element access via operator().",

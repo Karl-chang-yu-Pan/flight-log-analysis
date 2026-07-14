@@ -1,6 +1,7 @@
 from flight_log_agent.px4.msg_schema import (
     derive_signal_policy,
     is_valid_topic_field,
+    load_px4_declared_constant_registry,
     load_px4_msg_enum_registry,
     load_px4_msg_schema,
     load_px4_signal_policies,
@@ -99,6 +100,28 @@ uint8 MODE_STATE_BAZ_BAR = 2
     assert aliases["FOO_BAR"] == 1
     assert aliases["BAZ_BAR"] == 2
     assert "BAR" not in aliases
+
+
+def test_declared_constants_are_indexed_by_message_owner(tmp_path):
+    msg_dir = tmp_path / "PX4-Autopilot" / "msg"
+    msg_dir.mkdir(parents=True)
+    (msg_dir / "ModeStatus.msg").write_text(
+        """
+uint8 MODE_ACTIVE = 1
+uint8 MODE_INACTIVE = 2
+uint8 mode
+# TOPICS mode_status mode_status_alt
+""",
+        encoding="utf-8",
+    )
+
+    registry = load_px4_declared_constant_registry(
+        tmp_path / "PX4-Autopilot"
+    )
+
+    expected = {"MODE_ACTIVE": 1, "MODE_INACTIVE": 2}
+    assert registry["mode_status"] == expected
+    assert registry["mode_status_alt"] == expected
 
 
 def test_px4_msg_schema_and_enums_are_keyed_by_snapshot_commit(tmp_path):

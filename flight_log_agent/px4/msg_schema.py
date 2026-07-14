@@ -289,6 +289,26 @@ def load_px4_msg_enum_registry(source_path: SourceInput = None) -> dict[str, dic
     return _build_enum_registry(_load_messages(source))
 
 
+def load_px4_declared_constant_registry(
+    source_path: SourceInput = None,
+) -> dict[str, dict[str, int]]:
+    """Return constants by their source-declared message owner.
+
+    This registry is for resolving expressions such as
+    ``message_type_s::CONSTANT``. It is deliberately separate from
+    :func:`load_px4_msg_enum_registry`, whose ``topic.field`` keys serve
+    runtime value normalization.
+    """
+    if isinstance(source_path, SourceSnapshot):
+        return _load_px4_declared_constants_snapshot_cached(
+            str(source_path.repository_path), source_path.commit_sha
+        )
+    source = source_handle(source_path)
+    if source is None:
+        return {}
+    return _build_declared_constant_registry(_load_messages(source))
+
+
 def load_px4_signal_policies(source_path: SourceInput = None) -> dict[str, SignalPolicy]:
     """Return ``{topic.field: SignalPolicy}`` for every logged signal.
 
@@ -382,6 +402,15 @@ def _load_px4_msg_enum_registry_snapshot_cached(
 
 
 @lru_cache(maxsize=32)
+def _load_px4_declared_constants_snapshot_cached(
+    repository_path: str,
+    commit_sha: str,
+) -> dict[str, dict[str, int]]:
+    snapshot = SourceSnapshot(Path(repository_path), commit_sha)
+    return _build_declared_constant_registry(_load_messages(snapshot))
+
+
+@lru_cache(maxsize=32)
 def _load_px4_signal_policies_snapshot_cached(
     repository_path: str,
     commit_sha: str,
@@ -471,6 +500,29 @@ def _build_enum_registry(messages: dict[str, dict[str, Any]]) -> dict[str, dict[
                         "constants": {constant["name"]: constant["value"] for constant in constants},
                         "aliases": aliases,
                     }
+    return registry
+
+
+def _build_declared_constant_registry(
+    messages: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    registry: dict[str, dict[str, int]] = {}
+    ambiguous: dict[str, set[str]] = {}
+    for message_name, message in messages.items():
+        owners = {_camel_to_snake(message_name), *(message.get("topics") or [])}
+        constants = {
+            str(constant["name"]): int(constant["value"])
+            for constant in (message.get("constants") or [])
+        }
+        for owner in owners:
+            target = registry.setdefault(str(owner), {})
+            conflicts = ambiguous.setdefault(str(owner), set())
+            for name, value in constants.items():
+                if name in target and target[name] != value:
+                    conflicts.add(name)
+                    target.pop(name, None)
+                elif name not in conflicts:
+                    target[name] = value
     return registry
 
 

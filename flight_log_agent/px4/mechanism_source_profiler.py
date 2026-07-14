@@ -70,6 +70,7 @@ class TopicRef(BaseModel):
     struct: Optional[str] = None
     variable: Optional[str] = None
     api: Optional[str] = None
+    instance: Optional[int] = None
 
 
 class ParameterRef(BaseModel):
@@ -111,6 +112,8 @@ class FunctionCallRef(BaseModel):
     # reachability is then explicitly unresolved, never silently partial.
     reachability_exact: bool = True
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
+    function: Optional[str] = None
+    callable_id: Optional[str] = None
 
 
 class SourceAssignmentRef(BaseModel):
@@ -120,10 +123,12 @@ class SourceAssignmentRef(BaseModel):
     line: int
     evidence: str
     function: Optional[str] = None
+    callable_id: Optional[str] = None
     function_parameters: List[str] = Field(default_factory=list)
     target_topic: Optional[str] = None
     target_field: Optional[str] = None
     assignment_operator: Optional[str] = None
+    declaration_kind: Optional[str] = None
     control_predicates: List[str] = Field(default_factory=list)
     # Source line of each governing control statement, aligned with
     # ``control_predicates`` — the branch's own SITE identity, distinct
@@ -146,6 +151,7 @@ class HelperExpressionRef(BaseModel):
     file: str
     line: int
     evidence: str
+    callable_id: Optional[str] = None
     parameters: List[str] = Field(default_factory=list)
     statements: List[Dict[str, Any]] = Field(default_factory=list)
     assignments: Dict[str, str] = Field(default_factory=dict)
@@ -347,6 +353,14 @@ class MechanismSourceProfiler:
             "ORB_ID",
             re.compile(r"\bORB_ID\s*\(\s*(?P<topic>[A-Za-z_][A-Za-z0-9_]*)\s*\)"),
         ),
+    )
+    _UORB_OBJECT_DECL_PATTERN = re.compile(
+        r"\buORB::(?P<api>Publication(?:Data|Multi|Queued)?|"
+        r"Subscription(?:Data|Interval|CallbackWorkItem)?)"
+        r"(?:\s*<\s*(?P<struct>[A-Za-z_][A-Za-z0-9_]*_s)\s*>)?\s+"
+        r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*[\{(]\s*"
+        r"ORB_ID\s*\(\s*(?P<topic>[A-Za-z_][A-Za-z0-9_]*)\s*\)"
+        r"(?:\s*,\s*(?P<instance>\d+))?"
     )
 
     # Parameter reference patterns.
@@ -553,15 +567,39 @@ class MechanismSourceProfiler:
 
             rel_file = self._rel(path)
             for line_no, line in self._iter_code_lines(text):
+                object_declarations = list(self._UORB_OBJECT_DECL_PATTERN.finditer(line))
+                for match in object_declarations:
+                    api = match.group("api")
+                    direction = "publish" if api.startswith("Publication") else "subscribe"
+                    instance = match.group("instance")
+                    refs.append(
+                        TopicRef(
+                            topic=match.group("topic"),
+                            struct=match.group("struct") or self._struct_from_topic(match.group("topic")),
+                            variable=match.group("var"),
+                            direction=direction,
+                            api=f"uORB::{api}",
+                            instance=int(instance) if instance is not None else None,
+                            file=rel_file,
+                            line=line_no,
+                            evidence=line.strip(),
+                        )
+                    )
                 for direction, api, pattern in self._UORB_DECL_PATTERNS:
                     for match in pattern.finditer(line):
                         struct = match.group("struct")
                         topic = self._topic_from_struct(struct)
+                        variable = match.groupdict().get("var")
+                        if any(
+                            declaration.group("var") == variable
+                            for declaration in object_declarations
+                        ):
+                            continue
                         refs.append(
                             TopicRef(
                                 topic=topic,
                                 struct=struct,
-                                variable=match.groupdict().get("var"),
+                                variable=variable,
                                 direction=direction,
                                 api=api,
                                 file=rel_file,
@@ -874,11 +912,14 @@ class MechanismSourceProfiler:
                     # initializer) — join until parens balance so the
                     # assignment pattern can match the full statement.
                     for _, continuation in code_lines[index + 1 : index + 26]:
-                        line = line + " " + continuation.strip()
+                        continuation_code = continuation.split("//", 1)[0].strip()
+                        line = line + " " + continuation_code
                         if line.count("(") <= line.count(")"):
                             break
                     stripped = line.strip()
                 function_name = self._function_name_for_line(definitions, line_no)
+                definition = self._function_definition_for_line(definitions, line_no)
+                callable_id = self._callable_id(definition)
                 func_aliases = aliases_per_function.get(function_name or "", {})
                 predicate_entries = control_predicates.get(line_no, [])
                 predicates = [p for p, _ in predicate_entries]
@@ -904,6 +945,7 @@ class MechanismSourceProfiler:
                                     ctor.group("expr")
                                 ),
                                 function=function_name,
+                                callable_id=callable_id,
                                 assignment_operator="=",
                                 file=rel_file,
                                 line=line_no,
@@ -918,6 +960,11 @@ class MechanismSourceProfiler:
                     target = self._clean_field_path(match.group("target"))
                     target = self._apply_reference_alias(target, func_aliases)
                     expression = self._normalize_source_expression(match.group("expr"))
+                    declaration_kind = (
+                        "constexpr"
+                        if re.search(r"\bconstexpr\b", line[: match.start("target")])
+                        else None
+                    )
                     # Skip self-writes that the alias substitution produces.
                     # Two cases this covers:
                     #   1. The alias declaration line itself, which the
@@ -933,7 +980,6 @@ class MechanismSourceProfiler:
                     #      the self-write check still catch these.
                     if self._clean_field_path(expression.lstrip("&* ")) == target:
                         continue
-                    definition = self._function_definition_for_line(definitions, line_no)
                     root, field = split_source_field(target)
                     struct = var_to_struct.get(root)
                     target_topic = self._topic_from_struct(struct) if struct else None
@@ -944,8 +990,10 @@ class MechanismSourceProfiler:
                             target_topic=target_topic,
                             target_field=field if target_topic else None,
                             function=function_name,
+                            callable_id=callable_id,
                             function_parameters=list(definition.get("params", [])) if definition else [],
                             assignment_operator="=",
+                            declaration_kind=declaration_kind,
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
@@ -968,7 +1016,6 @@ class MechanismSourceProfiler:
                         operator,
                         self._normalize_source_expression(match.group("expr")),
                     )
-                    definition = self._function_definition_for_line(definitions, line_no)
                     root, field = split_source_field(target)
                     struct = var_to_struct.get(root)
                     target_topic = self._topic_from_struct(struct) if struct else None
@@ -979,6 +1026,7 @@ class MechanismSourceProfiler:
                             target_topic=target_topic,
                             target_field=field if target_topic else None,
                             function=function_name,
+                            callable_id=callable_id,
                             function_parameters=list(definition.get("params", [])) if definition else [],
                             assignment_operator=operator,
                             file=rel_file,
@@ -1187,6 +1235,7 @@ class MechanismSourceProfiler:
                         function=None,
                         function_parameters=[],
                         assignment_operator="=",
+                        declaration_kind="enum",
                         file=rel_file,
                         line=line_no,
                         evidence=f"{name} = {value}",
@@ -1210,6 +1259,7 @@ class MechanismSourceProfiler:
                     function=None,
                     function_parameters=[],
                     assignment_operator="=",
+                    declaration_kind="define",
                     file=rel_file,
                     line=line_no,
                     evidence=match.group(0).strip(),
@@ -1358,13 +1408,14 @@ class MechanismSourceProfiler:
             #         && long_b) {
             # Without this, the regex's ``[^;\n]*`` condition class stops
             # at the first newline and the predicate is dropped.
-            combined = line
-            paren_balance = line.count("(") - line.count(")")
+            combined = line.split("//", 1)[0]
+            paren_balance = combined.count("(") - combined.count(")")
             peek = index + 1
             while paren_balance > 0 and peek < len(lines):
                 _, next_line = lines[peek]
-                combined += " " + next_line.strip()
-                paren_balance += next_line.count("(") - next_line.count(")")
+                next_code = next_line.split("//", 1)[0].strip()
+                combined += " " + next_code
+                paren_balance += next_code.count("(") - next_code.count(")")
                 peek += 1
 
             match = self._BRANCH_CONDITION_PATTERN.search(combined)
@@ -1550,6 +1601,7 @@ class MechanismSourceProfiler:
 
             rel_file = self._rel(path)
             var_to_struct = self._extract_struct_variables(text)
+            definitions = self._extract_function_definitions(text, rel_file)
             control_predicates, unresolved_reach = self._control_predicates_by_line(text)
             code_lines = list(self._iter_code_lines(text))
             for index, (line_no, line) in enumerate(code_lines):
@@ -1558,6 +1610,8 @@ class MechanismSourceProfiler:
                     continue
                 if self._FUNCTION_SIGNATURE_PATTERN.search(" ".join(stripped.split())):
                     continue
+                definition = self._function_definition_for_line(definitions, line_no)
+                function_name = str(definition.get("name") or "") if definition else None
 
                 for match in self._FUNCTION_CALL_PATTERN.finditer(line):
                     name = match.group("name")
@@ -1597,6 +1651,8 @@ class MechanismSourceProfiler:
                                 " ".join([stripped, *predicates]),
                                 var_to_struct,
                             ),
+                            function=function_name,
+                            callable_id=self._callable_id(definition),
                         )
                     )
 
@@ -2246,6 +2302,19 @@ class MechanismSourceProfiler:
         return None
 
     @staticmethod
+    def _callable_id(definition: Optional[Dict[str, object]]) -> Optional[str]:
+        if not definition:
+            return None
+        return ":".join(
+            [
+                str(definition.get("file") or ""),
+                str(definition.get("line") or 0),
+                str(definition.get("name") or ""),
+                ",".join(str(p) for p in (definition.get("params") or [])),
+            ]
+        )
+
+    @staticmethod
     def _matching_brace(text: str, open_brace: int) -> Optional[int]:
         depth = 0
         for index in range(open_brace, len(text)):
@@ -2351,6 +2420,9 @@ class MechanismSourceProfiler:
             file=file,
             line=line,
             evidence=evidence,
+            callable_id=":".join(
+                [file, str(line), name, ",".join(str(param) for param in params)]
+            ),
             parameters=params,
             statements=statements if unresolved is None else [],
             assignments=assignments if unresolved is None else {},

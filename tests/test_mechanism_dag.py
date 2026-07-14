@@ -9,6 +9,7 @@ from flight_log_agent.analysis.mechanism_dag import (
     split_by_terminal,
     write_dag_to_cache,
 )
+from flight_log_agent.ulog.inventory import observed_signals_from_inventory
 
 
 def _fake_binding(
@@ -21,6 +22,7 @@ def _fake_binding(
     logged_signal: str | None = None,
     control_predicates: list[str] | None = None,
     function: str | None = None,
+    declaration_kind: str | None = None,
 ) -> dict:
     """A binding with ``logged_signal`` defaulted to the target — the
     BindingIndex backward walk starts from ``logged_signal``, so tests
@@ -34,6 +36,7 @@ def _fake_binding(
         "assignment_path": [{"file": file, "line": line, "expression": expression}],
         "control_predicates": control_predicates or [],
         "function": function or "",
+        "declaration_kind": declaration_kind or "",
     }
 
 
@@ -41,6 +44,26 @@ def _fake_inventory(topics: dict[str, list[str]] | None = None) -> dict:
     return {
         "topic_fields": topics or {},
         "available_topics": list((topics or {}).keys()),
+    }
+
+
+def _boundary(
+    source_symbol: str,
+    topic: str,
+    *,
+    file: str = "",
+    direction: str = "subscribe",
+    instance: int | None = None,
+) -> dict:
+    return {
+        "source_symbol": source_symbol,
+        "topic": topic,
+        "direction": direction,
+        "file": file,
+        "function": "",
+        "callable_id": "",
+        "instance": instance,
+        "provenance": "test source boundary",
     }
 
 
@@ -501,6 +524,7 @@ def test_signal_samples_mark_always_true_when_predicate_covers_whole_span():
         signal_samples={
             "vehicle_type": [(0.0, 1), (10.0, 1), (20.0, 1)],
         },
+        signal_policies={"vehicle_type": {"method": "discrete_hold"}},
         prune_dead=False,
     )
     branch = next(v for v in reduced.vertices if v.kind == "branch")
@@ -533,6 +557,7 @@ def test_signal_samples_prune_branch_when_predicate_never_true():
         signal_samples={
             "vehicle_type": [(0.0, 1), (10.0, 1), (20.0, 1)],  # never 2
         },
+        signal_policies={"vehicle_type": {"method": "discrete_hold"}},
         prune_dead=True,
     )
     # Cone-gated write pruned; else write survives.
@@ -723,6 +748,9 @@ def test_helper_chain_source_form_resolves_to_logged_evidence():
         "_rtl_alt",
         inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
         helper_expressions=[helper],
+        boundary_bindings=[
+            _boundary("_vehicle_status", "vehicle_status", file="navigator.cpp")
+        ],
     )
 
     logged = next(
@@ -733,7 +761,7 @@ def test_helper_chain_source_form_resolves_to_logged_evidence():
     )
     assert logged is not None
     assert logged.metadata.get("source_form")
-    assert logged.metadata.get("derivation") == "helper_return_type"
+    assert logged.metadata.get("derivation") == "source_boundary"
 
 
 def test_source_enum_resolution_stores_value_on_constant_vertex():
@@ -762,6 +790,7 @@ def test_source_enum_resolution_stores_value_on_constant_vertex():
             expression="0",
             file="rtl.cpp",
             line=1,
+            declaration_kind="enum",
         )
     )
 
@@ -1149,6 +1178,7 @@ def test_predicate_lowering_substitutes_enum_and_helper_chain_derivation():
             expression="1",
             file="rtl.cpp",
             line=1,
+            declaration_kind="enum",
         )
     )
 
@@ -1157,6 +1187,9 @@ def test_predicate_lowering_substitutes_enum_and_helper_chain_derivation():
         "_rtl_alt",
         inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
         helper_expressions=[helper],
+        boundary_bindings=[
+            _boundary("_vehicle_status", "vehicle_status", file="navigator.cpp")
+        ],
     )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
@@ -1230,6 +1263,9 @@ def test_helper_chain_resolves_via_return_type_and_schema():
         "_rtl_alt",
         inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
         helper_expressions=[helper],
+        boundary_bindings=[
+            _boundary("_vehicle_status", "vehicle_status", file="navigator.cpp")
+        ],
     )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
@@ -1318,10 +1354,8 @@ def test_derive_topic_from_return_type_variants():
     assert _derive_topic_from_return_type(None) is None
 
 
-def test_struct_var_field_resolves_via_return_type_convention():
-    """A ``vstatus.vehicle_type`` predicate should resolve graph-natively
-    when ``vstatus`` is struct-typed — same ``foo_s`` → topic convention
-    as helper return types, no flat symbol_bindings entry required."""
+def test_struct_var_field_resolves_via_source_boundary():
+    """A copied local resolves only through its source-proven subscription."""
     helper = _fake_helper(
         name="Example::check",
         file="example.cpp",
@@ -1347,15 +1381,17 @@ def test_struct_var_field_resolves_via_return_type_convention():
         "_rtl_alt",
         inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
         helper_expressions=[helper],
+        boundary_bindings=[
+            _boundary("vstatus", "vehicle_status", file="rtl.cpp")
+        ],
     )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
     assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
 
 
-def test_struct_var_from_source_assignment_reaches_dag():
-    """Struct-variable maps arriving via SourceAssignmentRef.struct_variables
-    (not just helper records) should also be aggregated by the DAG builder."""
+def test_struct_type_without_source_boundary_does_not_become_evidence():
+    """A ``*_s`` declaration proves schema shape, not uORB provenance."""
     predicate = "vstatus.vehicle_type == 1"
     binding = _fake_binding(
         binding_id="b1",
@@ -1375,7 +1411,12 @@ def test_struct_var_from_source_assignment_reaches_dag():
     )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
-    assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
+    assert "vehicle_status.vehicle_type" not in (branch.predicate_lowered or "")
+    assert not [
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "evidence" and vertex.sub_kind == "logged_signal"
+    ]
 
 
 def test_struct_var_field_skipped_when_topic_unknown():
@@ -1490,6 +1531,9 @@ def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
         helper_expressions=[helper],
         parameter_names={"RTL_CONE_ANG"},
         parameter_aliases={"_param_rtl_cone_half_angle_deg": "RTL_CONE_ANG"},
+        boundary_bindings=[
+            _boundary("_vstatus", "vehicle_status", file="navigator.h")
+        ],
     )
     params = {v.signal_name for v in dag.vertices
               if v.kind == "evidence" and v.sub_kind == "parameter"}
@@ -1499,11 +1543,8 @@ def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
     assert "vehicle_status.vehicle_type" in logged
 
 
-def test_helper_branch_gates_return_with_control_edge_not_orphan():
-    """A helper with a conditional return (``branches``) must wire a control
-    edge from the branch vertex to the helper return op — the branch gates
-    the return instead of floating disconnected, and the branch's alternate
-    return value's producers feed the return."""
+def test_helper_branch_selects_value_without_gating_return_reachability():
+    """Alternative helper return values are selection, not conjunction."""
     helper = _fake_helper(
         name="RTL::calc",
         file="rtl.cpp",
@@ -1531,16 +1572,20 @@ def test_helper_branch_gates_return_with_control_edge_not_orphan():
 
     branch = next((v for v in dag.vertices if v.kind == "branch"), None)
     assert branch is not None, "no branch vertex emitted from helper.branches"
-    control_out = [
-        e for e in dag.edges if e.source_id == branch.id and e.kind == "control"
+    selection_out = [
+        e for e in dag.edges if e.source_id == branch.id and e.kind == "selection"
     ]
-    assert control_out, "branch vertex is orphaned (no outgoing control edge to the return)"
+    assert selection_out
+    assert not [
+        edge
+        for edge in dag.edges
+        if edge.source_id == branch.id and edge.kind == "control"
+    ]
 
     # the branch's alternate return value's producer feeds the return op
     return_op = next(v for v in dag.vertices if v.kind == "operation"
                      and "__return__" in str(v.variable))
-    assert any(e.target_id == return_op.id for e in control_out), \
-        "control edge does not gate the helper return op"
+    assert any(e.target_id == return_op.id for e in selection_out)
 
 
 def test_shared_producer_vertex_reused_across_two_consumers():
@@ -1549,14 +1594,14 @@ def test_shared_producer_vertex_reused_across_two_consumers():
     edge from that shared producer into each consumer — not a duplicated
     producer per consumer (the flattened-BindingIndex failure mode)."""
     bindings = [
-        _fake_binding(binding_id="t", target="terminal",
-                      expression="consumer_a + consumer_b",
+        _fake_binding(binding_id="s", target="shared", expression="gpos.alt",
                       file="rtl.cpp", line=1),
         _fake_binding(binding_id="a", target="consumer_a", expression="shared * 2",
                       file="rtl.cpp", line=2),
         _fake_binding(binding_id="b", target="consumer_b", expression="shared + 3",
                       file="rtl.cpp", line=3),
-        _fake_binding(binding_id="s", target="shared", expression="gpos.alt",
+        _fake_binding(binding_id="t", target="terminal",
+                      expression="consumer_a + consumer_b",
                       file="rtl.cpp", line=4),
     ]
     dag = build_mechanism_dag(bindings, "terminal")
@@ -1721,11 +1766,11 @@ def test_local_symbols_never_fuse_across_files():
     A's file+function — B's same-named local is a different variable and
     its subtree (sensor_b) must not enter the slice."""
     bindings = [
-        _fake_binding(binding_id="t", target="_out_a", expression="spd + 1.0",
-                      file="a.cpp", line=1, function="Alpha::run"),
         _fake_binding(binding_id="wa", target="spd", expression="sensor_a",
-                      file="a.cpp", line=2, function="Alpha::run",
+                      file="a.cpp", line=1, function="Alpha::run",
                       logged_signal=""),
+        _fake_binding(binding_id="t", target="_out_a", expression="spd + 1.0",
+                      file="a.cpp", line=2, function="Alpha::run"),
         _fake_binding(binding_id="wb", target="spd", expression="sensor_b",
                       file="b.cpp", line=3, function="Beta::run",
                       logged_signal=""),
@@ -1839,7 +1884,7 @@ def test_grounding_substitutes_constant_values():
                       logged_signal=""),
         _fake_binding(binding_id="c", target="MODE_ON", expression="3",
                       file="a.cpp", line=3, function="",
-                      logged_signal=""),
+                      logged_signal="", declaration_kind="enum"),
     ]
     dag = build_mechanism_dag(bindings, "_out",
                               logged_signals={"vehicle_status.nav_mode"})
@@ -1860,15 +1905,15 @@ def test_logged_inputs_are_leaves_not_publisher_tunnels():
     walked. Only the terminal enters source through its publishers."""
     bindings = [
         # terminal enters source via its publisher (logged_signal set)
-        _fake_binding(binding_id="t", target="out_field",
-                      expression="gate_state + 1.0",
-                      file="fw.cpp", line=1, function="Fw::run",
-                      logged_signal="fw_status.out_field"),
         # mechanism reads a logged input topic field
         _fake_binding(binding_id="g", target="gate_state",
                       expression="vehicle_status.vehicle_type",
-                      file="fw.cpp", line=2, function="Fw::run",
+                      file="fw.cpp", line=1, function="Fw::run",
                       logged_signal=""),
+        _fake_binding(binding_id="t", target="out_field",
+                      expression="gate_state + 1.0",
+                      file="fw.cpp", line=2, function="Fw::run",
+                      logged_signal="fw_status.out_field"),
         # the FOREIGN publisher of that input topic — must stay out
         _fake_binding(binding_id="pub", target="vehicle_status.vehicle_type",
                       expression="commander_internal_state",
@@ -1955,6 +2000,9 @@ def test_schema_enum_resolves_scoped_constant_and_evaluates():
         dag,
         signal_samples={"position_setpoint.type": [
             (0.0, 0), (10.0, 3), (20.0, 0), (30.0, 0)]},
+        signal_policies={
+            "position_setpoint.type": {"method": "discrete_hold"}
+        },
         prune_dead=False,
     )
     branch = next(v for v in annotated.vertices if v.kind == "branch")
@@ -1978,6 +2026,7 @@ def test_px4_macro_predicates_evaluate():
         dag,
         signal_samples={"wind_speed.value": [
             (0.0, 0.0), (10.0, 2.0), (20.0, 0.1)]},
+        signal_policies={"wind_speed.value": {"method": "linear"}},
         prune_dead=False,
     )
     branch = next(v for v in annotated.vertices if v.kind == "branch")
@@ -1990,13 +2039,13 @@ def test_dotted_formal_rebinds_to_actual_nested_placement():
     message name (position_setpoint.type vs the logged
     position_setpoint_triplet.current.type)."""
     bindings = [
-        _fake_binding(binding_id="t", target="_out",
-                      expression="pos_sp_curr.type + 1",
-                      file="fw.cpp", line=1, function="Fw::run"),
         _fake_binding(binding_id="rebind", target="pos_sp_curr",
                       expression="_pos_sp_triplet.current",
-                      file="fw.cpp", line=2, function="Fw::run",
+                      file="fw.cpp", line=1, function="Fw::run",
                       logged_signal=""),
+        _fake_binding(binding_id="t", target="_out",
+                      expression="pos_sp_curr.type + 1",
+                      file="fw.cpp", line=2, function="Fw::run"),
     ]
     bindings[1]["struct_variables"] = {
         "_pos_sp_triplet": "position_setpoint_triplet_s"
@@ -2004,6 +2053,9 @@ def test_dotted_formal_rebinds_to_actual_nested_placement():
     dag = build_mechanism_dag(
         bindings, "_out",
         logged_signals={"position_setpoint_triplet.current.type"},
+        boundary_bindings=[
+            _boundary("_pos_sp_triplet", "position_setpoint_triplet", file="fw.cpp")
+        ],
     )
     leaves = {v.signal_name for v in dag.vertices
               if v.kind == "evidence" and v.sub_kind == "logged_signal"}
@@ -2014,19 +2066,19 @@ def test_rebinding_survives_passthrough_and_cycles():
     """Pass-through forwarding (formal bound to a same-named actual) is
     ignored as identity, and alias cycles must not recurse forever."""
     bindings = [
-        _fake_binding(binding_id="t", target="_out",
-                      expression="pos_sp_curr.type + 1",
-                      file="fw.cpp", line=1, function="Fw::run"),
         # identity pass-through from a forwarding call
         _fake_binding(binding_id="fwd", target="pos_sp_curr",
-                      expression="pos_sp_curr",
-                      file="fw.cpp", line=2, function="Fw::inner",
+                      expression="pos_sp_curr", file="fw.cpp", line=1,
+                      function="Fw::inner",
                       logged_signal=""),
         # the real rebinding
         _fake_binding(binding_id="rebind", target="pos_sp_curr",
                       expression="_trip.current",
-                      file="fw.cpp", line=3, function="Fw::run",
+                      file="fw.cpp", line=2, function="Fw::run",
                       logged_signal=""),
+        _fake_binding(binding_id="t", target="_out",
+                      expression="pos_sp_curr.type + 1",
+                      file="fw.cpp", line=3, function="Fw::run"),
         # alias cycle: a <-> b
         _fake_binding(binding_id="c1", target="alias_a",
                       expression="alias_b", file="fw.cpp", line=4,
@@ -2042,6 +2094,9 @@ def test_rebinding_survives_passthrough_and_cycles():
     dag = build_mechanism_dag(
         bindings, "_out",
         logged_signals={"position_setpoint_triplet.current.type"},
+        boundary_bindings=[
+            _boundary("_trip", "position_setpoint_triplet", file="fw.cpp")
+        ],
     )
     leaves = {v.signal_name for v in dag.vertices
               if v.kind == "evidence" and v.sub_kind == "logged_signal"}
@@ -2053,8 +2108,8 @@ def test_rebinding_survives_passthrough_and_cycles():
 
 def test_array_indices_are_distinct_terminal_identities():
     """``q[0]`` and ``q[1]`` are different values: slicing from one index
-    takes only that element's writer; an index-free reference still
-    reads every element writer (whole-object dependence)."""
+    takes only that element's writer; an index-free aggregate reference
+    must not collect element writers by fuzzy shape."""
     bindings = [
         _fake_binding(binding_id="e0", target="q[0]",
                       expression="a0 * 2", file="att.cpp", line=5,
@@ -2080,13 +2135,12 @@ def test_array_indices_are_distinct_terminal_identities():
         terminal_file="att.cpp",
     )
     ops = {v.variable for v in whole.vertices if v.kind == "operation"}
-    assert {"q[0]", "q[1]"} <= ops, "index-free read missed element writers"
+    assert "q[0]" not in ops and "q[1]" not in ops
+    assert "q" in whole.unresolved_symbols
 
 
-def test_member_copy_convention_grounds_on_logged_topic():
-    """The ONE retained naming equivalence, now explicit: a
-    ``_topic.field`` member copy grounds as evidence on the logged
-    ``topic.field`` instead of walking into the publisher module."""
+def test_member_copy_grounds_only_through_source_boundary():
+    """Member spelling alone does not prove a topic placement."""
     bindings = [
         _fake_binding(binding_id="b", target="out",
                       expression="_vehicle_status.nav_state + 1",
@@ -2095,18 +2149,20 @@ def test_member_copy_convention_grounds_on_logged_topic():
     dag = build_mechanism_dag(
         bindings, "out", terminal_file="mod.cpp",
         logged_signals={"vehicle_status.nav_state"},
+        boundary_bindings=[
+            _boundary("_vehicle_status", "vehicle_status", file="mod.cpp")
+        ],
     )
     leaves = {
         v.signal_name for v in dag.vertices
         if v.kind == "evidence" and v.sub_kind == "logged_signal"
     }
-    assert "_vehicle_status.nav_state" in leaves
+    assert "vehicle_status.nav_state" in leaves
     assert dag.unresolved_symbols == []
 
 
-def test_indexed_catalogue_entry_grounds_index_free_reference():
-    """A reference to ``state.q`` grounds when the log records
-    ``state.q[0]`` — shape-compatible membership, not identity fusion."""
+def test_indexed_catalogue_entry_does_not_ground_aggregate_reference():
+    """An observed array element is not evidence for the aggregate."""
     bindings = [
         _fake_binding(binding_id="b", target="out",
                       expression="state.q + 1", file="mod.cpp", line=4,
@@ -2120,8 +2176,8 @@ def test_indexed_catalogue_entry_grounds_index_free_reference():
         v.signal_name for v in dag.vertices
         if v.kind == "evidence" and v.sub_kind == "logged_signal"
     }
-    assert "state.q" in leaves
-    assert dag.unresolved_symbols == []
+    assert "state.q" not in leaves
+    assert dag.unresolved_symbols == ["state.q"]
 
 
 def test_branch_identity_is_the_source_site():
@@ -2172,6 +2228,7 @@ def test_logged_signal_leaves_carry_observation_status():
     declared_only = build_mechanism_dag(
         [dict(binding)], "out", terminal_file="mod.cpp",
         schema_signals={"gate_status.field_x"},
+        boundary_bindings=[_boundary("data", "gate_status", file="mod.cpp")],
     )
     leaf = next(
         v for v in declared_only.vertices
@@ -2179,11 +2236,14 @@ def test_logged_signal_leaves_carry_observation_status():
         and v.signal_name == "gate_status.field_x"
     )
     assert leaf.metadata.get("observation") == "unobserved"
+    assert leaf.metadata.get("declaration_status") == "valid"
+    assert leaf.metadata.get("boundary_status") == "source_proven"
 
     observed = build_mechanism_dag(
         [dict(binding)], "out", terminal_file="mod.cpp",
         schema_signals={"gate_status.field_x"},
         logged_signals={"gate_status.field_x"},
+        boundary_bindings=[_boundary("data", "gate_status", file="mod.cpp")],
     )
     leaf = next(
         v for v in observed.vertices
@@ -2191,6 +2251,89 @@ def test_logged_signal_leaves_carry_observation_status():
         and v.signal_name == "gate_status.field_x"
     )
     assert leaf.metadata.get("observation") == "observed"
+
+
+def test_inventory_observation_preserves_multi_instance_identity():
+    inventory = {
+        "topic_fields": {"sensor": ["value"]},
+        "topic_instances": {
+            "sensor": [
+                {"multi_id": 0, "fields": ["timestamp", "value"]},
+                {"multi_id": 1, "fields": ["timestamp", "value"]},
+            ]
+        },
+    }
+    dag = build_mechanism_dag(
+        [_fake_binding(
+            binding_id="b", target="out", expression="sensor[0].value",
+            file="mod.cpp", line=1,
+        )],
+        "out",
+        inventory=inventory,
+    )
+    leaves = {
+        (v.signal_name, v.metadata.get("observation"))
+        for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "logged_signal"
+    }
+    assert ("sensor[0].value", "observed") in leaves
+    assert ("sensor[1].value", "observed") not in leaves
+
+
+def test_observed_inventory_preserves_a_lone_nonzero_instance():
+    observed = observed_signals_from_inventory(
+        {
+            "topic_instances": {
+                "sensor": [
+                    {"multi_id": 3, "fields": ["timestamp", "value"]}
+                ]
+            }
+        }
+    )
+    assert observed == {"sensor[3].value"}
+
+
+def test_unqualified_signal_resolves_only_one_observed_instance():
+    binding = _fake_binding(
+        binding_id="b",
+        target="out",
+        expression="sensor.value",
+        file="mod.cpp",
+        line=1,
+        logged_signal="",
+    )
+    unique = build_mechanism_dag(
+        [binding], "out", logged_signals={"sensor[3].value"}
+    )
+    assert any(
+        vertex.kind == "evidence"
+        and vertex.signal_name == "sensor[3].value"
+        and vertex.metadata.get("observation") == "observed"
+        for vertex in unique.vertices
+    )
+
+    ambiguous = build_mechanism_dag(
+        [binding],
+        "out",
+        logged_signals={"sensor[0].value", "sensor[3].value"},
+    )
+    assert "sensor.value" in ambiguous.unresolved_symbols
+
+
+def test_explicit_sibling_index_is_not_observed_by_shape():
+    dag = build_mechanism_dag(
+        [_fake_binding(
+            binding_id="b", target="out", expression="state.q[0]",
+            file="mod.cpp", line=1,
+        )],
+        "out",
+        logged_signals={"state.q[1]"},
+    )
+    assert not any(
+        v.kind == "evidence" and v.sub_kind == "logged_signal"
+        for v in dag.vertices
+    )
+    assert "state.q[0]" in dag.unresolved_symbols
 
 
 def test_operation_carries_composed_reachability():
@@ -2276,6 +2419,7 @@ def test_failed_rebinding_falls_back_to_original_resolution():
     dag = build_mechanism_dag(
         bindings, "out", terminal_file="mod.cpp",
         schema_signals={"gate_status.alt"},
+        boundary_bindings=[_boundary("data", "gate_status", file="mod.cpp")],
     )
     leaves = {
         v.signal_name for v in dag.vertices
@@ -2283,3 +2427,137 @@ def test_failed_rebinding_falls_back_to_original_resolution():
     }
     assert "gate_status.alt" in leaves, "failed rewrite hijacked resolution"
     assert "other_thing.alt" not in dag.unresolved_symbols
+
+
+def test_aggregate_writer_can_reach_indexed_read_directionally():
+    bindings = [
+        _fake_binding(
+            binding_id="aggregate", target="state.q", expression="source_q",
+            file="att.cpp", line=1, logged_signal="", function="Att::run",
+        ),
+        _fake_binding(
+            binding_id="consumer", target="out", expression="state.q[0]",
+            file="att.cpp", line=2, logged_signal="", function="Att::run",
+        ),
+    ]
+    dag = build_mechanism_dag(bindings, "out", terminal_file="att.cpp")
+    aggregate = next(
+        vertex for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.variable == "state.q"
+    )
+    consumer = next(
+        vertex for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.variable == "out"
+    )
+    assert any(
+        edge.source_id == aggregate.id and edge.target_id == consumer.id
+        for edge in dag.edges
+    )
+
+
+def test_future_local_write_does_not_feed_earlier_read():
+    bindings = [
+        _fake_binding(
+            binding_id="consumer", target="out", expression="value + 1",
+            file="scope.cpp", line=10, logged_signal="", function="A::run",
+        ),
+        _fake_binding(
+            binding_id="future", target="value", expression="99",
+            file="scope.cpp", line=20, logged_signal="", function="A::run",
+        ),
+    ]
+    dag = build_mechanism_dag(bindings, "out", terminal_file="scope.cpp")
+    consumer = next(vertex for vertex in dag.vertices if vertex.variable == "out")
+    assert not [vertex for vertex in dag.vertices if vertex.variable == "value"]
+    incoming = [edge for edge in dag.edges if edge.target_id == consumer.id]
+    assert incoming
+    source = next(vertex for vertex in dag.vertices if vertex.id == incoming[0].source_id)
+    assert source.kind == "evidence" and source.sub_kind == "opaque_symbol"
+
+
+def test_conditional_reaching_writers_are_all_retained():
+    bindings = [
+        _fake_binding(
+            binding_id="base", target="value", expression="0",
+            file="scope.cpp", line=1, logged_signal="", function="A::run",
+        ),
+        _fake_binding(
+            binding_id="a", target="value", expression="1",
+            file="scope.cpp", line=2, logged_signal="", function="A::run",
+            control_predicates=["mode == 1"],
+        ),
+        _fake_binding(
+            binding_id="b", target="value", expression="2",
+            file="scope.cpp", line=3, logged_signal="", function="A::run",
+            control_predicates=["mode == 2"],
+        ),
+        _fake_binding(
+            binding_id="consumer", target="out", expression="value",
+            file="scope.cpp", line=4, logged_signal="", function="A::run",
+        ),
+    ]
+    dag = build_mechanism_dag(bindings, "out", terminal_file="scope.cpp")
+    consumer = next(vertex for vertex in dag.vertices if vertex.variable == "out")
+    producers = {
+        vertex.id
+        for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.variable == "value"
+    }
+    wired = {
+        edge.source_id
+        for edge in dag.edges
+        if edge.kind == "data" and edge.target_id == consumer.id
+    }
+    assert producers <= wired
+
+
+def test_false_conjunct_prunes_operation_even_when_other_gate_is_true():
+    binding = _fake_binding(
+        binding_id="gated", target="out", expression="1",
+        file="gate.cpp", line=3, control_predicates=["A", "B"],
+    )
+    dag = build_mechanism_dag([binding], "out")
+    reduced = evaluate_feasibility(
+        dag, enum_values={"A": 0, "B": 1}, prune_dead=True,
+    )
+    assert not [vertex for vertex in reduced.vertices if vertex.kind == "operation"]
+
+
+def test_unrelated_signal_span_does_not_change_branch_classification():
+    binding = _fake_binding(
+        binding_id="gated", target="out", expression="1",
+        file="gate.cpp", line=3, control_predicates=["mode == 1"],
+    )
+    dag = build_mechanism_dag([binding], "out")
+    reduced = evaluate_feasibility(
+        dag,
+        signal_samples={
+            "mode": [(10.0, 1), (20.0, 1)],
+            "unrelated": [(0.0, 0), (100.0, 0)],
+        },
+        signal_policies={
+            "mode": {"method": "discrete_hold"},
+            "unrelated": {"method": "discrete_hold"},
+        },
+        prune_dead=False,
+    )
+    branch = next(vertex for vertex in reduced.vertices if vertex.kind == "branch")
+    assert branch.feasibility_verdict == "always_true"
+    assert branch.metadata["evaluation_domain"] == [10.0, 20.0]
+
+
+def test_missing_signal_policy_keeps_dynamic_verdict_unknown():
+    binding = _fake_binding(
+        binding_id="gated", target="out", expression="1",
+        file="gate.cpp", line=3, control_predicates=["value > 0"],
+    )
+    dag = build_mechanism_dag([binding], "out")
+    reduced = evaluate_feasibility(
+        dag,
+        signal_samples={"value": [(0.0, 1.0), (10.0, 1.0)]},
+        prune_dead=False,
+    )
+    branch = next(vertex for vertex in reduced.vertices if vertex.kind == "branch")
+    assert branch.active_windows == [(0.0, 10.0)]
+    assert branch.feasibility_verdict == "unknown"
+    assert branch.metadata["sampling_policies"] == {"value": "unknown"}

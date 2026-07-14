@@ -650,6 +650,82 @@ bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
     assert by_target["sp.alt"].expression == "get_absolute_altitude_for_item(item)"
 
 
+def test_uorb_object_declaration_preserves_variable_and_instance(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "subscriptions.cpp").write_text(
+        """
+class Reader {
+    uORB::Subscription _default{ORB_ID(sensor_accel)};
+    uORB::Subscription _secondary{ORB_ID(sensor_accel), 1};
+};
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    refs = profiler.extract_uorb_io_from_source(
+        ["src/modules/example/subscriptions.cpp"]
+    )["subscribed_topics"]
+    by_variable = {ref.variable: ref for ref in refs if ref.variable}
+    assert by_variable["_default"].topic == "sensor_accel"
+    assert by_variable["_default"].instance is None
+    assert by_variable["_secondary"].instance == 1
+
+
+def test_callable_identity_distinguishes_same_named_definitions(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "scope.cpp").write_text(
+        """
+void First::update()
+{
+    value = first_input;
+}
+
+void Second::update()
+{
+    value = second_input;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/scope.cpp"]
+    )
+    values = [assignment for assignment in assignments if assignment.target == "value"]
+    assert len(values) == 2
+    assert values[0].callable_id != values[1].callable_id
+
+
+def test_constexpr_assignment_carries_declaration_provenance(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "constants.cpp").write_text(
+        """
+static constexpr float SCALE = 2.5f;
+
+void Example::run()
+{
+    output = SCALE * input;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/constants.cpp"]
+    )
+    scale = next(
+        assignment for assignment in assignments if assignment.target == "SCALE"
+    )
+
+    assert scale.declaration_kind == "constexpr"
+
+
 def test_multi_line_if_condition_attaches_predicate_to_body_assignment(tmp_path):
     """PX4's common ``if (long_a\n    && long_b) {`` pattern must attach
     the full multi-line condition as a control_predicate on assignments

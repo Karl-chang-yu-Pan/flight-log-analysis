@@ -37,7 +37,8 @@ def test_binding_from_assignment_maps_all_fields():
 
     assert binding["target_symbol"] == "_rtl_alt"
     assert binding["source_symbol"] == "_destination_alt + _param_rtl_return_alt.get()"
-    assert binding["logged_signal"] == "rtl_status.rtl_alt"
+    assert binding["declared_signal"] == "rtl_status.rtl_alt"
+    assert binding["logged_signal"] == ""
     assert binding["control_predicates"] == ["_param_rtl_type.get() == 1"]
     assert binding["struct_variables"] == {"gpos": "vehicle_global_position_s"}
     assert binding["assignment_path"] == [
@@ -716,3 +717,40 @@ def test_binding_carries_branch_sites_and_reachability():
     assert binding["control_predicates"] == ["a > 0"]
     assert binding["control_predicate_lines"] == [42]
     assert binding["reachability_exact"] is False
+
+
+def test_publication_proof_is_scoped_to_the_calling_callable(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/example.cpp": """
+uORB::Publication<alpha_s> _pub{ORB_ID(alpha)};
+
+void Example::publish_value()
+{
+    alpha_s msg{};
+    msg.value = input_value;
+    _pub.publish(msg);
+}
+
+void Example::calculate_only()
+{
+    alpha_s msg{};
+    msg.value = unrelated_value;
+}
+""",
+        },
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        ["src/modules/example/example.cpp"],
+        "hash",
+    )
+
+    inputs = dag_inputs_from_facts(facts)
+    by_expression = {
+        binding["source_symbol"]: binding for binding in inputs.bindings
+    }
+    assert by_expression["input_value"]["logged_signal"] == "alpha.value"
+    assert by_expression["unrelated_value"]["logged_signal"] == ""

@@ -52,14 +52,9 @@ def test_alias_dotted_names_handles_bracketed_index_as_identifier():
     assert list(aliases.values()) == ["vehicle_attitude.q[0]"]
 
 
-def test_normalize_source_expression_rewrites_paren_integer_index():
-    # Matrix/quaternion element access in PX4 source: q(0), P(2, 1) is
-    # rewritten only for the 1-D integer-literal case, since the 2-D flat
-    # index requires the matrix dimension to be known.
-    assert normalize_source_expression("q(0) + q(1)") == "q[0] + q[1]"
-    # No rewrite for function calls with identifier arguments.
+def test_normalize_source_expression_does_not_guess_call_as_indexing():
+    assert normalize_source_expression("q(0) + lookup(1)") == "q(0) + lookup(1)"
     assert normalize_source_expression("isfinite(x)") == "isfinite(x)"
-    # No rewrite for empty argument lists.
     assert normalize_source_expression("_param_x.get()") == "_param_x.get()"
 
 
@@ -85,11 +80,8 @@ def test_source_expression_evaluates_bracket_index_as_identifier():
     assert result == 1.5
 
 
-def test_source_expression_evaluates_quaternion_paren_index_via_rewrite():
-    # The (N) → [N] syntactic rewrite means a PX4-style q(0) reference still
-    # resolves when the env uses the ULog bracket form q[0].
-    result = evaluate_source_expression(
-        "q(0) + q(1)",
-        {"q[0]": 0.7, "q[1]": 0.3},
-    )
-    assert result == 1.0
+def test_source_expression_names_preserve_constant_indices():
+    assert source_expression_names("state.q[0] + state.q[1]") == [
+        "state.q[0]",
+        "state.q[1]",
+    ]

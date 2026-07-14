@@ -21,6 +21,8 @@ Sections:
 from __future__ import annotations
 
 import re
+import math
+from bisect import bisect_right
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Optional, Sequence
@@ -31,7 +33,10 @@ from flight_log_agent.analysis.parameter_lookup import (
     CXX_STDLIB_CONSTANTS,
     is_px4_parameter_name,
 )
-from flight_log_agent.analysis.source_expression import source_expression_names
+from flight_log_agent.analysis.source_expression import (
+    alias_dotted_names,
+    source_expression_names,
+)
 from flight_log_agent.expression_math import is_safe_math_function_name
 from flight_log_agent.px4.mechanism_source_profiler import substitute_expression_symbols
 from flight_log_agent.symbols import (
@@ -39,16 +44,18 @@ from flight_log_agent.symbols import (
     is_signal_reference,
     looks_like_enum_constant,
     normalize_symbol,
+    parse_signal_reference,
     strip_symbol_indices,
-    symbol_indices_compatible,
+    symbol_produces_reference,
 )
 from flight_log_agent.utils import dedupe_keep_order, stable_id
+from flight_log_agent.ulog.inventory import observed_signals_from_inventory
 
 
 VertexKind = Literal["evidence", "operation", "branch"]
 EvidenceSubKind = Literal["logged_signal", "parameter", "constant", "opaque_symbol"]
 OperationSubKind = Literal["assign", "reduction", "helper_call", "external_call", "unresolved"]
-EdgeKind = Literal["data", "control"]
+EdgeKind = Literal["data", "control", "selection"]
 
 
 class DAGVertex(BaseModel):
@@ -122,14 +129,7 @@ def _logged_signals_from_inventory(inventory: Optional[dict[str, Any]]) -> set[s
     Reimplemented here (not imported from BindingIndex) so the DAG builder
     has no dependency on that module.
     """
-    out: set[str] = set()
-    for topic, fields in ((inventory or {}).get("topic_fields") or {}).items():
-        if not isinstance(topic, str):
-            continue
-        for field in fields or []:
-            if isinstance(field, str) and field:
-                out.add(f"{topic}.{field}")
-    return out
+    return observed_signals_from_inventory(inventory)
 
 
 def _parse_numeric_literal(expression: str) -> Optional[Any]:
@@ -182,6 +182,7 @@ def build_mechanism_dag(
     snippet_context_lines: int = 3,
     terminal_file: Optional[str] = None,
     call_statements: Sequence[Any] = (),
+    boundary_bindings: Sequence[Any] = (),
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
@@ -222,11 +223,9 @@ def build_mechanism_dag(
     the caller actually asked about.
 
     Identity is the EXACT symbol spelling (``exact_symbol``): indices,
-    instances, and the leading-underscore member marker all distinguish;
-    the one naming-convention equivalence retained — a ``_topic.field``
-    member copy grounding on the logged ``topic.field`` — is applied
-    explicitly at the catalogue-membership checks (``_signal_known``),
-    never baked into the keys.
+    instances, and the leading-underscore member marker all distinguish.
+    Source-object to logged-topic equivalence requires an explicit
+    ``boundary_bindings`` entry.
     """
     builder = _DAGBuilder(
         source_bindings=[_as_binding_dict(b) for b in source_bindings],
@@ -243,6 +242,7 @@ def build_mechanism_dag(
         snippet_context_lines=snippet_context_lines,
         terminal_file=terminal_file,
         call_statements=[_as_binding_dict(c) for c in call_statements],
+        boundary_bindings=[_as_binding_dict(b) for b in boundary_bindings],
         enum_registry=dict(enum_registry or {}),
     )
     return builder.build()
@@ -271,12 +271,14 @@ class _DAGBuilder:
         snippet_context_lines: int,
         terminal_file: Optional[str] = None,
         call_statements: Optional[list[dict[str, Any]]] = None,
+        boundary_bindings: Optional[list[dict[str, Any]]] = None,
         enum_registry: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
         self.terminal_raw = terminal
         self.terminal = exact_symbol(terminal)
         self.terminal_file = str(terminal_file) if terminal_file else None
         self._call_statements = list(call_statements or [])
+        self._boundary_bindings = list(boundary_bindings or [])
         # Guards dotted-root rebinding recursion against alias cycles.
         self._rebinding_stack: set[str] = set()
         # Schema-derived message enums, scoped per message
@@ -289,11 +291,11 @@ class _DAGBuilder:
         # unknown name doesn't re-fetch on every backward-walk pass.
         self._helper_provider_probed: set[str] = set()
         self.source_root = source_root
-        # Catalogues key on the EXACT identity; the index-erased shape
-        # sets serve compatibility membership (``state.q`` grounds when
-        # the log records ``state.q[0]``), never identity.
+        # Catalogues key on exact identity. Schema shape lookup allows an
+        # aggregate declaration to validate an indexed element; observed
+        # placement resolution keeps field indices exact and permits an
+        # omitted topic instance only when the log has one candidate.
         self.logged_signals = {exact_symbol(s) for s in logged_signals if s}
-        self._logged_shapes = {strip_symbol_indices(s) for s in self.logged_signals}
         self.parameter_names = {p for p in parameter_names if p}
         # PX4 parameter member → canonical name (DEFINE_PARAMETERS map).
         # Keyed by both the raw member and its normalized form so
@@ -357,7 +359,11 @@ class _DAGBuilder:
             target = exact_symbol(
                 str(binding.get("target_symbol") or binding.get("target") or "")
             )
-            if not target or writes_per_target[target] != 1:
+            if (
+                not target
+                or writes_per_target[target] != 1
+                or binding.get("declaration_kind") not in {"enum", "define", "constexpr"}
+            ):
                 continue
             if binding.get("control_predicates"):
                 continue
@@ -438,7 +444,7 @@ class _DAGBuilder:
         return [
             key
             for key in shapes.get(strip_symbol_indices(symbol_exact), ())
-            if symbol_indices_compatible(key, symbol_exact)
+            if symbol_produces_reference(key, symbol_exact)
         ]
 
     def _targets_matching(self, symbol_exact: str) -> list[dict[str, Any]]:
@@ -475,21 +481,117 @@ class _DAGBuilder:
                     out.append(op_id)
         return out
 
-    def _signal_known(
-        self, symbol_exact: str, catalogue: set[str], shapes: set[str]
-    ) -> bool:
-        """Membership in a signal catalogue by exact identity or
-        index-compatible shape, with ONE documented convention fallback:
-        a leading-underscore member copy of a logged topic
-        (``_vehicle_status.x`` ↔ ``vehicle_status.x``). The convention is
-        naming-derived and lower-confidence, kept explicit here instead
-        of hiding inside a lossy normalization."""
-        if symbol_exact in catalogue or strip_symbol_indices(symbol_exact) in shapes:
+    def _declared_signal_known(self, symbol_exact: str) -> bool:
+        """Whether schema structure declares this exact value or aggregate."""
+        if symbol_exact in self._schema_signals:
             return True
-        if symbol_exact.startswith("_"):
-            stripped = symbol_exact[1:]
-            return stripped in catalogue or strip_symbol_indices(stripped) in shapes
-        return False
+        shape = strip_symbol_indices(symbol_exact)
+        return shape in self._schema_shapes and any(
+            strip_symbol_indices(candidate) == shape
+            and symbol_produces_reference(candidate, symbol_exact)
+            for candidate in self._schema_signals
+        )
+
+    def _observed_signal_placement(self, reference: str) -> Optional[str]:
+        """Resolve a reference to one exact observed topic-instance placement.
+
+        Field and array identity must match exactly. An omitted topic instance
+        may resolve only when the current log has one compatible instance;
+        multiple instances remain ambiguous.
+        """
+        symbol = exact_symbol(reference)
+        if symbol in self.logged_signals:
+            return symbol
+        parsed = parse_signal_reference(symbol)
+        if parsed is None:
+            return None
+        topic, requested_instance, field = parsed
+        candidates: list[str] = []
+        for candidate in self.logged_signals:
+            candidate_parts = parse_signal_reference(candidate)
+            if candidate_parts is None:
+                continue
+            candidate_topic, candidate_instance, candidate_field = candidate_parts
+            if candidate_topic != topic or candidate_field != field:
+                continue
+            if requested_instance is not None and candidate_instance != requested_instance:
+                continue
+            candidates.append(candidate)
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _boundary_topic_for(
+        self,
+        source_symbol: str,
+        *,
+        file: Optional[str] = None,
+        scope_function: str = "",
+        direction: str = "subscribe",
+    ) -> Optional[tuple[str, dict[str, Any]]]:
+        """Resolve a source object to a topic through profiler-proven uORB flow.
+
+        Ambiguous bindings remain unresolved. File/callable context narrows a
+        copied local; module-level subscription objects can still resolve from
+        companion headers when their variable-to-topic mapping is unique.
+        """
+        symbol = exact_symbol(source_symbol)
+        candidates = [
+            item
+            for item in self._boundary_bindings
+            if exact_symbol(str(item.get("source_symbol") or "")) == symbol
+            and str(item.get("direction") or "") == direction
+        ]
+        if file:
+            exact_file = [item for item in candidates if str(item.get("file") or "") == file]
+            if exact_file:
+                candidates = exact_file
+            else:
+                module = self._file_family(file)[0]
+                module_items = [
+                    item
+                    for item in candidates
+                    if self._file_family(str(item.get("file") or ""))[0] == module
+                ]
+                if module_items:
+                    candidates = module_items
+        if scope_function:
+            scoped = [
+                item
+                for item in candidates
+                if not item.get("function")
+                or str(item.get("function")) == scope_function
+                or str(item.get("callable_id") or "") == scope_function
+            ]
+            if scoped:
+                candidates = scoped
+            elif any(item.get("function") or item.get("callable_id") for item in candidates):
+                return None
+        placements = {
+            (str(item.get("topic") or ""), item.get("instance"))
+            for item in candidates
+            if item.get("topic")
+        }
+        if len(placements) != 1:
+            return None
+        topic, instance = next(iter(placements))
+        provenance = next(
+            item
+            for item in candidates
+            if str(item.get("topic") or "") == topic
+            and item.get("instance") == instance
+        )
+        if instance is not None:
+            topic = f"{topic}[{instance}]"
+        else:
+            observed_instances = {
+                parsed[1]
+                for signal in self.logged_signals
+                if (parsed := parse_signal_reference(signal)) is not None
+                and parsed[0] == topic
+                and parsed[1] is not None
+            }
+            if len(observed_instances) == 1:
+                topic = f"{topic}[{next(iter(observed_instances))}]"
+        return topic, provenance
 
     # ------------------------------------------------------------
     # Build
@@ -514,8 +616,8 @@ class _DAGBuilder:
         # referenced it — writers are then resolved under C++-faithful
         # visibility instead of a global by-name index, so a local named
         # ``dt`` in one module can never bind to another module's ``dt``.
-        Scope = tuple[str, str]  # (file, bare function)
-        terminal_scope: Scope = (self.terminal_file or "", "")
+        Scope = tuple[str, str, Optional[int]]  # (source unit, callable, read line)
+        terminal_scope: Scope = (self.terminal_file or "", "", None)
         frontier: deque[tuple[str, str, Scope]] = deque(
             [("symbol", self.terminal_raw, terminal_scope)]
         )
@@ -548,12 +650,13 @@ class _DAGBuilder:
                     # evidence leaves at wiring time; walking their single
                     # literal write would demote them to bare operations.
                     continue
-                if norm != self.terminal and self._signal_known(
-                    norm, self.logged_signals, self._logged_shapes
+                if (
+                    norm != self.terminal
+                    and self._observed_signal_placement(norm) is not None
                 ):
-                    # Known ground: the log records this signal (exactly,
-                    # by index-compatible shape, or as a member copy of
-                    # the topic), so it is an evidence leaf — walking its
+                    # Known ground: the log records this exact field at one
+                    # unambiguous topic-instance placement, so it is an
+                    # evidence leaf — walking its
                     # publisher would widen into another module.
                     continue
                 if norm == self.terminal:
@@ -580,14 +683,14 @@ class _DAGBuilder:
                             )
                         enqueue_expression(
                             str(binding.get("source_symbol") or binding.get("expression") or ""),
-                            self._binding_site_scope(binding),
+                            self._binding_walk_scope(binding),
                         )
                         # A branch's inputs are part of the mechanism:
                         # walking predicate symbols emits the internal-state
                         # writers that feasibility grounding later follows.
                         for predicate in binding.get("control_predicates") or []:
                             enqueue_expression(
-                                str(predicate), self._binding_site_scope(binding)
+                                str(predicate), self._binding_walk_scope(binding)
                             )
                 elif (
                     "." not in norm
@@ -614,7 +717,7 @@ class _DAGBuilder:
                                 (
                                     "symbol",
                                     field_target,
-                                    self._binding_site_scope(field_binding),
+                                    self._binding_walk_scope(field_binding),
                                 )
                             )
             else:  # helper
@@ -641,7 +744,8 @@ class _DAGBuilder:
                     body_expressions.append(str(pointer_write.get("expression") or ""))
                 body_scope: Scope = (
                     str(helper.get("file") or ""),
-                    self._bare_function(helper_key[0] if helper_key else helper_name),
+                    self._helper_callable_id(helper_key, helper),
+                    None,
                 )
                 for expression in body_expressions:
                     # The (b) fix: helper-body symbols drive the same frontier,
@@ -792,8 +896,11 @@ class _DAGBuilder:
                         # symbols resolve at the call site (see
                         # _binding_target_scope / _binding_site_scope).
                         "scope_file": str(helper.get("file") or ""),
-                        "scope_function": name,
-                        "function": "",
+                        "scope_function": self._helper_callable_id(helper_key, helper),
+                        "scope_line": int(helper.get("line") or 0),
+                        "function": str(call.get("function") or ""),
+                        "callable_id": str(call.get("callable_id") or ""),
+                        "synthetic_call_binding": True,
                     }
                 )
 
@@ -805,7 +912,32 @@ class _DAGBuilder:
 
     @staticmethod
     def _bare_function(name: Any) -> str:
-        return str(name or "").rsplit("::", 1)[-1].strip()
+        """Return a stable callable identity without erasing ownership.
+
+        Kept under the historical method name to avoid a broad mechanical
+        rename. Class qualification and profiler-generated callable IDs are
+        semantically significant and must not be reduced to a short name.
+        """
+        return str(name or "").strip()
+
+    @staticmethod
+    def _helper_callable_id(
+        helper_key: Optional[tuple[str, str]], helper: dict[str, Any]
+    ) -> str:
+        """Derive a callable identity from the helper definition record."""
+        if helper.get("callable_id"):
+            return str(helper["callable_id"])
+        context = str(helper.get("name") or "") or (
+            helper_key[1] if helper_key else ""
+        )
+        return ":".join(
+            [
+                str(helper.get("file") or ""),
+                str(helper.get("line") or 0),
+                context,
+                ",".join(str(p) for p in (helper.get("parameters") or [])),
+            ]
+        )
 
     @staticmethod
     def _file_family(path: str) -> tuple[str, str]:
@@ -824,7 +956,10 @@ class _DAGBuilder:
         """
         file = str(binding.get("scope_file") or self._binding_first_file(binding) or "")
         function = self._bare_function(
-            binding.get("scope_function") or binding.get("function") or ""
+            binding.get("scope_function")
+            or binding.get("callable_id")
+            or binding.get("function")
+            or ""
         )
         return (file, function)
 
@@ -833,14 +968,40 @@ class _DAGBuilder:
         referenced symbols are resolved in."""
         return (
             self._binding_first_file(binding),
-            self._bare_function(binding.get("function") or ""),
+            self._bare_function(
+                binding.get("callable_id") or binding.get("function") or ""
+            ),
         )
+
+    def _binding_walk_scope(
+        self, binding: dict[str, Any]
+    ) -> tuple[str, str, Optional[int]]:
+        file, callable_id = self._binding_site_scope(binding)
+        path = binding.get("assignment_path") or []
+        first = path[0] if path else {}
+        raw_line = (first or {}).get("line")
+        line = int(raw_line) if isinstance(raw_line, (int, float)) else None
+        return file, callable_id, line
+
+    def _binding_target_line(self, binding: dict[str, Any]) -> Optional[int]:
+        """Source-order position of the target in its visibility scope.
+
+        Ordinary assignments live and execute in the same callable, so their
+        assignment line is sufficient. A synthesized formal-to-actual binding
+        is visible from the callee entry even though its expression is
+        evaluated at the caller's call site; ``scope_line`` preserves that
+        distinction.
+        """
+        raw_line = binding.get("scope_line")
+        if isinstance(raw_line, (int, float)):
+            return int(raw_line)
+        return self._binding_walk_scope(binding)[2]
 
     def _scoped_writers(
         self,
         symbol_norm: str,
         symbol_raw: str,
-        scope: tuple[str, str],
+        scope: tuple[str, str, Optional[int]],
     ) -> list[dict[str, Any]]:
         """Writers of a symbol under C++-faithful visibility.
 
@@ -879,9 +1040,10 @@ class _DAGBuilder:
         self,
         target_writers: list[dict[str, Any]],
         symbol_raw: str,
-        scope: tuple[str, str],
+        scope: tuple[str, str] | tuple[str, str, Optional[int]],
     ) -> list[dict[str, Any]]:
-        scope_file, scope_function = scope
+        scope_file, scope_function = scope[:2]
+        scope_line = scope[2] if len(scope) > 2 else None
         if scope_file and target_writers:
             root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
             # PX4 marks members with a LEADING underscore in modules and a
@@ -916,7 +1078,28 @@ class _DAGBuilder:
                     if scope_function and b_function and b_function != scope_function:
                         continue
                     scoped.append(binding)
-                target_writers = scoped
+                if scope_line is None:
+                    target_writers = scoped
+                else:
+                    prior = [
+                        binding
+                        for binding in scoped
+                        if not self._binding_target_line(binding)
+                        or self._binding_target_line(binding) <= scope_line
+                    ]
+                    prior.sort(
+                        key=lambda binding: self._binding_target_line(binding) or 0,
+                        reverse=True,
+                    )
+                    reaching: list[dict[str, Any]] = []
+                    for binding in prior:
+                        reaching.append(binding)
+                        if (
+                            bool(binding.get("reachability_exact", True))
+                            and not binding.get("control_predicates")
+                        ):
+                            break
+                    target_writers = reaching
         return target_writers
 
     def _writers_of(self, symbol_norm: str) -> list[dict[str, Any]]:
@@ -978,11 +1161,30 @@ class _DAGBuilder:
                 ],
                 "exact": bool(binding.get("reachability_exact", True)),
             }
-            function = self._bare_function(binding.get("function") or "")
+            target_file, target_callable = self._binding_target_scope(binding)
+            site_file, site_callable = self._binding_site_scope(binding)
+            function = target_callable
             if function:
                 # The target's declaring callable — wiring visibility for
                 # locals compares against it.
                 metadata["function"] = function
+            metadata["target_scope"] = {
+                "file": target_file,
+                "callable": target_callable,
+            }
+            metadata["site_scope"] = {
+                "file": site_file,
+                "callable": site_callable,
+            }
+            if binding.get("synthetic_call_binding"):
+                metadata["synthetic_call_binding"] = True
+            logged_signal = exact_symbol(str(binding.get("logged_signal") or ""))
+            if logged_signal:
+                observed_placement = self._observed_signal_placement(logged_signal)
+                metadata["logged_signal"] = observed_placement or logged_signal
+                metadata["logged_observation"] = (
+                    "observed" if observed_placement is not None else "unobserved"
+                )
             self.vertices[op_id] = DAGVertex(
                 id=op_id,
                 kind="operation",
@@ -1010,21 +1212,26 @@ class _DAGBuilder:
                 if position < len(predicate_sites)
                 else line
             )
-            branch_id = self._emit_branch(str(predicate), file=file, line=site)
+            branch_id = self._emit_branch(
+                str(predicate),
+                file=file,
+                line=site,
+                scope_function=self._binding_site_scope(binding)[1],
+            )
             self._add_edge(branch_id, op_id, kind="control")
 
         # Wire each source-expression symbol as an incoming data edge,
         # resolved in the binding's own callable scope.
-        scope_function = self._bare_function(binding.get("function") or "")
+        scope_function = self._binding_site_scope(binding)[1]
         for symbol in self._wire_symbols(expression):
             normalized = exact_symbol(symbol)
             if not normalized or normalized == target_norm:
                 continue
-            producer_id = self._resolve_symbol_producer(
+            producer_ids = self._resolve_symbol_producers(
                 normalized, symbol, expression, file, line,
                 scope_function=scope_function,
             )
-            if producer_id is not None:
+            for producer_id in producer_ids:
                 self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
         # Helper-call inputs.
@@ -1043,7 +1250,13 @@ class _DAGBuilder:
                 )
             # Wire the caller's actual arguments to the helper's formal
             # parameter vertices — one edge per positional match.
-            self._wire_helper_call_arguments(helper_call, expression, file, line)
+            self._wire_helper_call_arguments(
+                helper_call,
+                expression,
+                file,
+                line,
+                scope_function=scope_function,
+            )
             # Emit pointer-output writes from the helper as ops with the
             # caller's actual arg substituted for the pointer formal. Ops
             # dedupe with any source_assignments-derived vertex that
@@ -1105,10 +1318,10 @@ class _DAGBuilder:
                 normalized = exact_symbol(symbol)
                 if not normalized or normalized == target_norm:
                     continue
-                producer_id = self._resolve_symbol_producer(
+                producer_ids = self._resolve_symbol_producers(
                     normalized, symbol, expression, file, line
                 )
-                if producer_id is not None:
+                for producer_id in producer_ids:
                     self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
     def _wire_helper_call_arguments(
@@ -1117,6 +1330,8 @@ class _DAGBuilder:
         caller_expression: str,
         file: Optional[str],
         line: Optional[int],
+        *,
+        scope_function: str = "",
     ) -> None:
         """Parse the ``helper_call(...)`` in ``caller_expression`` and wire
         each positional argument to the helper's matching formal parameter
@@ -1140,10 +1355,15 @@ class _DAGBuilder:
                 normalized = exact_symbol(symbol)
                 if not normalized:
                     continue
-                producer_id = self._resolve_symbol_producer(
-                    normalized, symbol, arg_text, file, line
+                producer_ids = self._resolve_symbol_producers(
+                    normalized,
+                    symbol,
+                    arg_text,
+                    file,
+                    line,
+                    scope_function=scope_function,
                 )
-                if producer_id is not None:
+                for producer_id in producer_ids:
                     self._add_edge(
                         producer_id,
                         formal_vertex_id,
@@ -1152,7 +1372,92 @@ class _DAGBuilder:
                         via=helper_call,
                     )
 
-    def _resolve_symbol_producer(
+    def _visible_reaching_producers(
+        self,
+        producers: list[str],
+        symbol_raw: str,
+        file: Optional[str],
+        line: Optional[int],
+        scope_function: str,
+    ) -> list[str]:
+        """Return source-visible definitions that may reach a read site.
+
+        Conditional definitions are alternatives and are all retained until
+        an unconditional prior definition dominates earlier source-order
+        candidates. A same-callable read can never bind to a later local
+        write. Member state is conservatively retained across methods because
+        textual order does not describe inter-method execution order.
+        """
+        if not producers or not file:
+            return list(producers)
+
+        root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
+        member_fallback = root.startswith("_") or root.endswith("_")
+
+        def metadata(vertex_id: str) -> dict[str, Any]:
+            return self.vertices[vertex_id].metadata or {}
+
+        if member_fallback:
+            family = self._file_family(file)
+            visible = [
+                producer_id
+                for producer_id in producers
+                if self._file_family(
+                    str((metadata(producer_id).get("target_scope") or {}).get("file")
+                        or self.vertices[producer_id].file
+                        or "")
+                ) == family
+            ]
+            if not visible:
+                visible = [
+                    producer_id
+                    for producer_id in producers
+                    if self._file_family(
+                        str((metadata(producer_id).get("target_scope") or {}).get("file")
+                            or self.vertices[producer_id].file
+                            or "")
+                    )[0] == family[0]
+                ]
+            return visible
+
+        visible: list[str] = []
+        for producer_id in producers:
+            target_scope = metadata(producer_id).get("target_scope") or {}
+            target_file = str(target_scope.get("file") or self.vertices[producer_id].file or "")
+            target_callable = str(
+                target_scope.get("callable") or metadata(producer_id).get("function") or ""
+            )
+            if target_file != file:
+                continue
+            if scope_function and target_callable and target_callable != scope_function:
+                continue
+            visible.append(producer_id)
+
+        if line is None:
+            return visible
+
+        prior: list[str] = []
+        unordered: list[str] = []
+        for producer_id in visible:
+            item = self.vertices[producer_id]
+            site_scope = metadata(producer_id).get("site_scope") or {}
+            site_file = str(site_scope.get("file") or item.file or "")
+            synthetic = bool(metadata(producer_id).get("synthetic_call_binding"))
+            if synthetic or site_file != file or item.line is None:
+                unordered.append(producer_id)
+            elif item.line <= line:
+                prior.append(producer_id)
+
+        prior.sort(key=lambda producer_id: int(self.vertices[producer_id].line or 0), reverse=True)
+        reaching: list[str] = []
+        for producer_id in prior:
+            reaching.append(producer_id)
+            reachability = metadata(producer_id).get("reachability") or {}
+            if reachability.get("exact") and not reachability.get("all_of"):
+                break
+        return reaching + [producer_id for producer_id in unordered if producer_id not in reaching]
+
+    def _resolve_symbol_producers(
         self,
         symbol_norm: str,
         symbol_raw: str,
@@ -1161,8 +1466,8 @@ class _DAGBuilder:
         line: Optional[int],
         scope_function: str = "",
         emit_opaque: bool = True,
-    ) -> Optional[str]:
-        """Link a source-expression symbol to a producer vertex.
+    ) -> list[str]:
+        """Resolve a source-expression symbol to all reaching producers.
 
         If a prior operation produces ``symbol_norm``, connect to it. Otherwise
         emit an evidence leaf. Classification order (each consults a
@@ -1191,52 +1496,15 @@ class _DAGBuilder:
         No flat ``symbol_bindings`` table is consulted anywhere — every
         source→logged mapping is derived from graph structure.
         """
-        producers = self._producers_matching(symbol_norm)
+        producers = self._visible_reaching_producers(
+            self._producers_matching(symbol_norm),
+            symbol_raw,
+            file,
+            line,
+            scope_function,
+        )
         if producers:
-            # Wiring applies the SAME visibility semantics as the walk
-            # (see _scoped_writers): locals never cross files, members
-            # widen family → module. A global last-producer fallback here
-            # re-linked navigator consumers to mavlink's same-named
-            # locals after the walk had correctly kept them apart. When
-            # no visible producer exists, fall through to evidence
-            # classification instead of linking across modules.
-            if not file:
-                return producers[-1]
-            root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
-            if root.startswith("_") or root.endswith("_"):
-                family = self._file_family(file)
-                visible = [
-                    p
-                    for p in producers
-                    if self._file_family(self.vertices[p].file or "") == family
-                ] or [
-                    p
-                    for p in producers
-                    if self._file_family(self.vertices[p].file or "")[0] == family[0]
-                ]
-            else:
-                # Locals resolve within their declaring callable: same
-                # file, and same function when both sides know theirs —
-                # the same visibility the walk applies, so wiring cannot
-                # fuse two functions' same-named locals.
-                def _producer_function(vertex_id: str) -> str:
-                    return str(
-                        (self.vertices[vertex_id].metadata or {}).get("function")
-                        or ""
-                    )
-
-                visible = [
-                    p
-                    for p in producers
-                    if self.vertices[p].file == file
-                    and (
-                        not scope_function
-                        or not _producer_function(p)
-                        or _producer_function(p) == scope_function
-                    )
-                ]
-            if visible:
-                return visible[-1]
+            return producers
 
         # 1b. Dotted reference whose ROOT is rebound by a unique simple
         # writer (a formal bound to its actual, a reference alias):
@@ -1252,7 +1520,7 @@ class _DAGBuilder:
                 for b in self._filter_visible_writers(
                     self._targets_matching(root_norm),
                     root_raw,
-                    (file or "", ""),
+                    (file or "", scope_function),
                 )
                 if not b.get("control_predicates")
                 and re.fullmatch(
@@ -1274,7 +1542,7 @@ class _DAGBuilder:
                         # the ORIGINAL symbol continues its own sequence
                         # below instead of surfacing the rewrite's dead
                         # end as the answer.
-                        rebound = self._resolve_symbol_producer(
+                        rebound = self._resolve_symbol_producers(
                             exact_symbol(rewritten),
                             rewritten,
                             source_expression,
@@ -1285,46 +1553,62 @@ class _DAGBuilder:
                         )
                     finally:
                         self._rebinding_stack.discard(symbol_norm)
-                    if rebound is not None:
+                    if rebound:
                         return rebound
 
         # 2a. Graph-native derivation: if ``source_expression`` contains a
         # ``symbol_raw().field`` chain, resolve it via the helper's
         # ``return_type`` and the PX4 msg schema.
-        chain_resolved = self._resolve_symbol_via_chain(symbol_raw, source_expression)
+        chain_resolved = self._resolve_symbol_via_chain(
+            symbol_raw, source_expression, file=file, scope_function=scope_function
+        )
         if chain_resolved is not None:
-            return self._emit_evidence(
+            signal, boundary = chain_resolved
+            return [self._emit_evidence(
                 "logged_signal",
-                chain_resolved,
+                signal,
                 file=None,
                 line=None,
-                metadata={"source_form": symbol_raw, "derivation": "helper_return_type"},
-            )
+                metadata={
+                    "source_form": symbol_raw,
+                    "derivation": "source_boundary",
+                    "boundary": "source_proven",
+                    "boundary_provenance": boundary.get("provenance"),
+                },
+            )]
 
         # 2b. Graph-native struct-variable derivation: ``var.field`` where
         # ``var`` is struct-typed (local declaration or class member).
         # Same PX4 ``foo_s`` convention as helper return types; no flat
         # side-table.
-        struct_resolved = self._resolve_symbol_via_struct_var(symbol_raw, source_expression)
+        struct_resolved = self._resolve_symbol_via_struct_var(
+            symbol_raw, source_expression, file=file, scope_function=scope_function
+        )
         if struct_resolved is not None:
-            return self._emit_evidence(
+            signal, boundary = struct_resolved
+            return [self._emit_evidence(
                 "logged_signal",
-                struct_resolved,
+                signal,
                 file=None,
                 line=None,
-                metadata={"source_form": symbol_raw, "derivation": "struct_variable"},
-            )
+                metadata={
+                    "source_form": symbol_raw,
+                    "derivation": "source_boundary",
+                    "boundary": "source_proven",
+                    "boundary_provenance": boundary.get("provenance"),
+                },
+            )]
 
         # 3. Source enum / #define resolution.
         enum_value = self._source_constants.get(symbol_norm)
         if enum_value is not None:
-            return self._emit_evidence(
+            return [self._emit_evidence(
                 "constant",
                 symbol_raw,
                 file=None,
                 line=None,
                 metadata={"value": enum_value, "source": "enum"},
-            )
+            )]
 
         # 3b. Schema message enum — the reference names its own scope
         # (``position_setpoint_s.SETPOINT_TYPE_LAND`` → message
@@ -1334,59 +1618,63 @@ class _DAGBuilder:
         if enum_root.endswith("_s") and enum_tail.isupper():
             schema_enum = self._enum_registry.get(enum_root[:-2], {}).get(enum_tail)
             if schema_enum is not None:
-                return self._emit_evidence(
+                return [self._emit_evidence(
                     "constant",
                     symbol_raw,
                     file=None,
                     line=None,
                     metadata={"value": schema_enum, "source": "msg_schema"},
-                )
+                )]
 
         # 4. C stdlib constant.
         cxx_value = CXX_STDLIB_CONSTANTS.get(symbol_raw.upper())
         if cxx_value is not None:
-            return self._emit_evidence(
+            return [self._emit_evidence(
                 "constant",
                 symbol_raw.upper(),
                 file=None,
                 line=None,
                 metadata={"value": cxx_value, "source": "cxx_stdlib"},
-            )
+            )]
 
-        # 5. Canonical logged signal (exact identity, index-compatible
-        # shape, or the explicit member-copy convention).
-        if self._signal_known(symbol_norm, self.logged_signals, self._logged_shapes):
-            return self._emit_evidence("logged_signal", symbol_raw, file=None, line=None)
+        # 5. Canonical logged signal at one exact observed placement.
+        observed_placement = self._observed_signal_placement(symbol_norm)
+        if observed_placement is not None:
+            return [
+                self._emit_evidence(
+                    "logged_signal", observed_placement, file=None, line=None
+                )
+            ]
 
         # 6. Parameter accessor heuristic.
         parameter_alias = self._match_parameter(symbol_raw)
         if parameter_alias is not None:
-            return self._emit_evidence("parameter", parameter_alias, file=None, line=None)
+            return [self._emit_evidence("parameter", parameter_alias, file=None, line=None)]
 
         # 7a. Bare PX4-parameter-shaped name resolved through the ULog
         # parameter inventory. Handles source RHSes like ``FW_AIRSPD_TRIM``
         # that aren't dotted (so ``looks_like_enum_constant`` skips them).
         parameter_value = self._parameter_values.get(symbol_raw.upper())
         if parameter_value is not None and is_px4_parameter_name(symbol_raw.upper()):
-            return self._emit_evidence(
+            return [self._emit_evidence(
                 "constant",
                 symbol_raw,
                 file=None,
                 line=None,
                 metadata={"value": parameter_value, "source": "parameter"},
-            )
+            )]
 
         # 7b. Enum-shaped name (no value known).
         if looks_like_enum_constant(symbol_raw):
-            return self._emit_evidence("constant", symbol_raw, file=None, line=None)
+            return [self._emit_evidence("constant", symbol_raw, file=None, line=None)]
 
         # 8. Unclassified. Callers probing an alternative spelling
         # (rebinding) suppress the fallback so the original symbol keeps
         # its own resolution sequence.
         if not emit_opaque:
-            return None
+            return []
         self.unresolved_symbols.add(symbol_raw)
-        return self._emit_evidence("opaque_symbol", symbol_raw, file=file, line=line)
+        return [self._emit_evidence("opaque_symbol", symbol_raw, file=file, line=line)]
 
     def _lower_predicate(
         self, canonical: str
@@ -1397,11 +1685,11 @@ class _DAGBuilder:
         Three passes:
 
         1. **Helper-chain resolution** — ``chain().field`` gets replaced with
-           ``topic.field`` by looking up the helper's ``return_type`` and
-           cross-referencing the PX4 msg schema.
-        2. **Struct-variable resolution** — ``var.field`` gets replaced when
-           ``var`` was declared struct-typed (local or class-member); the
-           topic is derived via the same PX4 ``foo_s`` convention.
+           ``topic.field`` only when source facts prove that the receiver is a
+           subscribed message boundary.
+        2. **Struct-variable resolution** — ``var.field`` gets replaced only
+           when a source-proven subscription copy/update binds ``var`` to a
+           topic.
         3. **Enum-shaped constants** → resolved values from source
            (``assignment_resolutions`` covers enum entries and object-like
            ``#define``) or the C-stdlib table.
@@ -1454,10 +1742,15 @@ class _DAGBuilder:
         doesn't overwrite a more specific match.
         """
         variables: dict[str, str] = {}
-        if not self._struct_variables:
+        if not self._boundary_bindings:
             return text, variables
 
-        for var in sorted(self._struct_variables, key=len, reverse=True):
+        subscribed_variables = {
+            str(binding.get("source_symbol") or "")
+            for binding in self._boundary_bindings
+            if binding.get("direction") == "subscribe"
+        }
+        for var in sorted(subscribed_variables, key=len, reverse=True):
             pattern = re.compile(
                 rf"(?<![A-Za-z0-9_])(?:_?)({re.escape(var)})\s*(?:\.|->)\s*"
                 rf"(?P<field>[A-Za-z_][A-Za-z0-9_]*)"
@@ -1468,8 +1761,9 @@ class _DAGBuilder:
                     resolved = self._resolve_struct_var_field(matched_var, field)
                     if resolved is None:
                         return match.group(0)
-                    variables[f"{matched_var}.{field}"] = resolved
-                    return resolved
+                    signal, _provenance = resolved
+                    variables[f"{matched_var}.{field}"] = signal
+                    return signal
                 return replace
             text = pattern.sub(make_replacement(var), text)
         return text, variables
@@ -1492,15 +1786,21 @@ class _DAGBuilder:
             resolved = self._resolve_helper_chain(chain, field)
             if resolved is None:
                 return match.group(0)
-            variables[match.group(0)] = resolved
-            return resolved
+            signal, _provenance = resolved
+            variables[match.group(0)] = signal
+            return signal
 
         substituted = _HELPER_CHAIN_RE.sub(replace, text)
         return substituted, variables
 
     def _resolve_symbol_via_struct_var(
-        self, symbol_raw: str, source_expression: str
-    ) -> Optional[str]:
+        self,
+        symbol_raw: str,
+        source_expression: str,
+        *,
+        file: Optional[str] = None,
+        scope_function: str = "",
+    ) -> Optional[tuple[str, dict[str, Any]]]:
         """Try to graph-derive a ``topic.field`` binding for ``symbol_raw``
         via the struct-variable map.
 
@@ -1516,14 +1816,18 @@ class _DAGBuilder:
         parts = symbol_raw.rsplit(".", 1)
         if len(parts) == 2:
             var_candidate, field = parts
-            resolved = self._resolve_struct_var_field(var_candidate, field)
+            resolved = self._resolve_struct_var_field(
+                var_candidate, field, file=file, scope_function=scope_function
+            )
             if resolved is not None:
                 return resolved
         # Nested placement: ``var.member.field`` — the struct variable is
         # the ROOT and the field path is everything after it.
         root, _, nested_tail = symbol_raw.partition(".")
         if nested_tail and "." in nested_tail:
-            resolved = self._resolve_struct_var_field(root, nested_tail)
+            resolved = self._resolve_struct_var_field(
+                root, nested_tail, file=file, scope_function=scope_function
+            )
             if resolved is not None:
                 return resolved
         if not source_expression:
@@ -1535,11 +1839,21 @@ class _DAGBuilder:
         match = pattern.search(source_expression)
         if not match:
             return None
-        return self._resolve_struct_var_field(symbol_raw, match.group("field"))
+        return self._resolve_struct_var_field(
+            symbol_raw,
+            match.group("field"),
+            file=file,
+            scope_function=scope_function,
+        )
 
     def _resolve_symbol_via_chain(
-        self, symbol_raw: str, source_expression: str
-    ) -> Optional[str]:
+        self,
+        symbol_raw: str,
+        source_expression: str,
+        *,
+        file: Optional[str] = None,
+        scope_function: str = "",
+    ) -> Optional[tuple[str, dict[str, Any]]]:
         """Try to graph-derive a ``topic.field`` binding for ``symbol_raw``.
 
         ``source_expression_names`` truncates at ``()``, so a symbol like
@@ -1560,35 +1874,50 @@ class _DAGBuilder:
         match = pattern.search(source_expression)
         if not match:
             return None
-        return self._resolve_helper_chain(symbol_raw, match.group("field"))
+        return self._resolve_helper_chain(
+            symbol_raw,
+            match.group("field"),
+            file=file,
+            scope_function=scope_function,
+        )
 
-    def _resolve_struct_var_field(self, var: str, field: str) -> Optional[str]:
+    def _resolve_struct_var_field(
+        self,
+        var: str,
+        field: str,
+        *,
+        file: Optional[str] = None,
+        scope_function: str = "",
+    ) -> Optional[tuple[str, dict[str, Any]]]:
         """Return ``topic.field`` when ``var.field`` is graph-derivable.
 
-        Looks up ``var`` in the aggregated struct-variables map, derives the
-        topic from the struct type via :func:`_derive_topic_from_return_type`
-        (identical convention to helper return types), and validates the
-        resulting ``topic.field`` against the trusted signal catalogue.
-        Returns ``None`` when ``var`` isn't struct-typed, when the type
-        doesn't follow the ``foo_s`` convention, or when the topic.field
-        isn't in the catalogue.
+        Resolves ``var`` through a source-proven subscription boundary and
+        validates the resulting ``topic.field`` against the trusted signal
+        catalogue. A struct declaration or naming convention alone is not a
+        message-boundary proof.
         """
-        struct_type = self._struct_variables.get(var)
-        if not struct_type:
-            struct_type = self._struct_variables.get(var.lstrip("_"))
-        if not struct_type:
+        boundary = self._boundary_topic_for(
+            var, file=file, scope_function=scope_function, direction="subscribe"
+        )
+        if boundary is None:
             return None
-        topic = _derive_topic_from_return_type(struct_type)
-        if not topic:
-            return None
+        topic, provenance = boundary
         signal = f"{topic}.{field}"
-        if self._signal_known(
-            signal, self.logged_signals, self._logged_shapes
-        ) or self._signal_known(signal, self._schema_signals, self._schema_shapes):
-            return signal
+        if (
+            self._observed_signal_placement(signal) is not None
+            or self._declared_signal_known(signal)
+        ):
+            return signal, provenance
         return None
 
-    def _resolve_helper_chain(self, chain: str, field: str) -> Optional[str]:
+    def _resolve_helper_chain(
+        self,
+        chain: str,
+        field: str,
+        *,
+        file: Optional[str] = None,
+        scope_function: str = "",
+    ) -> Optional[tuple[str, dict[str, Any]]]:
         """Return ``topic.field`` when ``chain().field`` is graph-derivable.
 
         Splits the chain on ``.``/``->``, takes the final segment as the
@@ -1601,6 +1930,18 @@ class _DAGBuilder:
         segments = [seg for seg in re.split(r"[.>]+", chain) if seg]
         if not segments:
             return None
+        receiver = segments[0]
+        boundary = self._boundary_topic_for(
+            receiver, file=file, scope_function=scope_function, direction="subscribe"
+        )
+        if boundary is not None:
+            topic, provenance = boundary
+            signal = f"{topic}.{field}"
+            if (
+                self._observed_signal_placement(signal) is not None
+                or self._declared_signal_known(signal)
+            ):
+                return signal, provenance
         helper_name = segments[-1]
         helper_key = self._pick_helper_key(helper_name)
         if helper_key is None:
@@ -1608,14 +1949,32 @@ class _DAGBuilder:
         helper = self.helper_index.get(helper_key)
         if not helper:
             return None
-        topic = _derive_topic_from_return_type(helper.get("return_type"))
-        if not topic:
-            return None
-        signal = f"{topic}.{field}"
-        if self._signal_known(
-            signal, self.logged_signals, self._logged_shapes
-        ) or self._signal_known(signal, self._schema_signals, self._schema_shapes):
-            return signal
+        return_expression = str(
+            helper.get("return_expression")
+            or helper.get("lowered_return_expression")
+            or ""
+        ).strip()
+        return_names = dedupe_keep_order(
+            source_expression_names(_normalize_cpp_expression(return_expression))
+        )
+        if len(return_names) == 1:
+            helper_boundary = self._boundary_topic_for(
+                return_names[0],
+                file=str(helper.get("file") or "") or None,
+                scope_function=self._helper_callable_id(helper_key, helper),
+                direction="subscribe",
+            )
+            if helper_boundary is not None:
+                topic, provenance = helper_boundary
+                signal = f"{topic}.{field}"
+                if (
+                    self._observed_signal_placement(signal) is not None
+                    or self._declared_signal_known(signal)
+                ):
+                    return signal, provenance
+        # A return type establishes schema compatibility, not that the value
+        # came from uORB. Helpers without source-proven boundary provenance
+        # remain unresolved.
         return None
 
     def _branch_metadata_from_parameter_predicate(self, canonical: str) -> dict[str, Any]:
@@ -1654,6 +2013,8 @@ class _DAGBuilder:
         line: Optional[int],
         metadata: Optional[dict[str, Any]] = None,
     ) -> str:
+        if sub_kind == "logged_signal":
+            signal = self._observed_signal_placement(signal) or signal
         key = (sub_kind, signal)
         existing = self._evidence_by_signal.get(key)
         if existing is not None:
@@ -1666,13 +2027,21 @@ class _DAGBuilder:
             # that may stop the walk, but only presence in THIS flight's
             # log makes it flight evidence. Downstream consumers must
             # never read an unobserved leaf as observed data.
-            vertex_metadata["observation"] = (
+            observation = (
                 "observed"
-                if self._signal_known(
-                    exact_symbol(signal), self.logged_signals, self._logged_shapes
-                )
+                if self._observed_signal_placement(exact_symbol(signal)) is not None
                 else "unobserved"
             )
+            declaration = (
+                "valid"
+                if self._declared_signal_known(exact_symbol(signal))
+                else "unknown"
+            )
+            boundary = str(vertex_metadata.get("boundary") or "not_proven")
+            vertex_metadata["observation"] = observation
+            vertex_metadata["observation_status"] = observation
+            vertex_metadata["declaration_status"] = declaration
+            vertex_metadata["boundary_status"] = boundary
         self.vertices[vertex_id] = DAGVertex(
             id=vertex_id,
             kind="evidence",
@@ -1692,6 +2061,7 @@ class _DAGBuilder:
         *,
         file: Optional[str],
         line: Optional[int],
+        scope_function: str = "",
     ) -> str:
         canonical = _canonical_predicate(predicate)
         # Branch identity is the SOURCE SITE plus the canonical predicate
@@ -1730,8 +2100,15 @@ class _DAGBuilder:
             normalized = exact_symbol(symbol)
             if not normalized:
                 continue
-            producer_id = self._resolve_symbol_producer(normalized, symbol, symbol_source, file, line)
-            if producer_id is not None:
+            producer_ids = self._resolve_symbol_producers(
+                normalized,
+                symbol,
+                symbol_source,
+                file,
+                line,
+                scope_function=scope_function,
+            )
+            for producer_id in producer_ids:
                 self._add_edge(producer_id, vertex_id, kind="data", role=symbol)
 
         return vertex_id
@@ -1807,6 +2184,7 @@ class _DAGBuilder:
         helper = self.helper_index[helper_key]
         file = helper.get("file")
         line = helper.get("line")
+        scope_function = self._helper_callable_id(helper_key, helper)
 
         # Emit a helper_parameter vertex for each formal so callers can
         # wire their actual arguments into shared entry points and helper
@@ -1844,6 +2222,12 @@ class _DAGBuilder:
                     variable=var,
                     expression=expression,
                     provenance=f"helper_body:{helper_key[0]}@{helper_key[1]}",
+                    metadata={
+                        "function": scope_function,
+                        "target_scope": {"file": str(file or ""), "callable": scope_function},
+                        "site_scope": {"file": str(file or ""), "callable": scope_function},
+                        "reachability": {"all_of": [], "exact": False},
+                    },
                 )
                 self._index_producer(var_norm, op_id)
 
@@ -1871,6 +2255,12 @@ class _DAGBuilder:
                 expression=return_expression,
                 lowered_expression=return_expression,
                 provenance=f"helper_return:{helper_key[0]}@{helper_key[1]}",
+                metadata={
+                    "function": scope_function,
+                    "target_scope": {"file": str(file or ""), "callable": scope_function},
+                    "site_scope": {"file": str(file or ""), "callable": scope_function},
+                    "reachability": {"all_of": [], "exact": False},
+                },
             )
         self._helper_subgraph_return_id[helper_key] = terminal_id
 
@@ -1884,6 +2274,7 @@ class _DAGBuilder:
             return
         file = helper.get("file")
         line = helper.get("line")
+        scope_function = self._helper_callable_id(helper_key, helper)
 
         # Helper-scoped local resolver: formal parameter names bind to
         # their formal-parameter vertex before falling back to the global
@@ -1901,10 +2292,19 @@ class _DAGBuilder:
                 normalized = exact_symbol(symbol)
                 if not normalized or normalized == var_norm:
                     continue
-                producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
-                    normalized, symbol, str(expression), file, line
+                producer_ids = (
+                    [local_scope[normalized]]
+                    if normalized in local_scope
+                    else self._resolve_symbol_producers(
+                        normalized,
+                        symbol,
+                        str(expression),
+                        file,
+                        line,
+                        scope_function=scope_function,
+                    )
                 )
-                if producer_id is not None:
+                for producer_id in producer_ids:
                     self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
         # Helper return operation, and its data inputs.
@@ -1922,10 +2322,19 @@ class _DAGBuilder:
                 normalized = exact_symbol(symbol)
                 if not normalized:
                     continue
-                producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
-                    normalized, symbol, str(return_expression), file, line
+                producer_ids = (
+                    [local_scope[normalized]]
+                    if normalized in local_scope
+                    else self._resolve_symbol_producers(
+                        normalized,
+                        symbol,
+                        str(return_expression),
+                        file,
+                        line,
+                        scope_function=scope_function,
+                    )
                 )
-                if producer_id is not None:
+                for producer_id in producer_ids:
                     self._add_edge(producer_id, terminal_id, kind="data", role=symbol)
 
         # Conditional returns: each branch GATES the helper return. Wire a
@@ -1937,9 +2346,11 @@ class _DAGBuilder:
             condition = str(branch.get("condition") or "").strip()
             if not condition:
                 continue
-            branch_id = self._emit_branch(condition, file=file, line=line)
+            branch_id = self._emit_branch(
+                condition, file=file, line=line, scope_function=scope_function
+            )
             if terminal_id is not None:
-                self._add_edge(branch_id, terminal_id, kind="control")
+                self._add_edge(branch_id, terminal_id, kind="selection")
             value_expression = str(branch.get("expression") or "")
             if terminal_id is None or not value_expression:
                 continue
@@ -1947,10 +2358,19 @@ class _DAGBuilder:
                 normalized = exact_symbol(symbol)
                 if not normalized:
                     continue
-                producer_id = local_scope.get(normalized) or self._resolve_symbol_producer(
-                    normalized, symbol, value_expression, file, line
+                producer_ids = (
+                    [local_scope[normalized]]
+                    if normalized in local_scope
+                    else self._resolve_symbol_producers(
+                        normalized,
+                        symbol,
+                        value_expression,
+                        file,
+                        line,
+                        scope_function=scope_function,
+                    )
                 )
-                if producer_id is not None:
+                for producer_id in producer_ids:
                     self._add_edge(producer_id, terminal_id, kind="data", role=f"branch:{symbol}")
 
     def _pick_helper_key(
@@ -2316,12 +2736,24 @@ def ground_expression_via_edges(
         # Edge roles carry the ``.``-collapsed form; align the text so
         # ``struct_s::NAME`` and ``obj->field`` references substitute.
         result = text.replace("->", ".").replace("::", ".")
+        edges_by_role: dict[str, list[DAGEdge]] = defaultdict(list)
         for edge in edges_by_target.get(target_id, []):
-            role = str(edge.role)
-            replacement = producer_form(edge.source_id, depth, seen)
-            if replacement is None:
-                continue
-            result = substitute_expression_symbols(result, [role], [replacement])
+            edges_by_role[str(edge.role)].append(edge)
+        for role, role_edges in edges_by_role.items():
+            replacements = {
+                replacement
+                for edge in role_edges
+                if (replacement := producer_form(edge.source_id, depth, seen)) is not None
+            }
+            # Multiple reaching definitions require piecewise replay. A flat
+            # grounded expression cannot choose one without losing control
+            # semantics, so leave the expression explicitly unevaluable.
+            if len(replacements) > 1:
+                return None
+            if len(replacements) == 1:
+                result = substitute_expression_symbols(
+                    result, [role], [next(iter(replacements))]
+                )
         return result
 
     grounded = ground(str(expression or ""), vertex_id, 0, frozenset({vertex_id}))
@@ -2334,6 +2766,7 @@ def evaluate_feasibility(
     parameter_values: Optional[dict[str, Any]] = None,
     enum_values: Optional[dict[str, Any]] = None,
     signal_samples: Optional[dict[str, list[tuple[float, Any]]]] = None,
+    signal_policies: Optional[dict[str, Any]] = None,
     prune_dead: bool = True,
 ) -> MechanismDAG:
     """Pre-evaluate each ``branch`` vertex against known constants and
@@ -2359,8 +2792,7 @@ def evaluate_feasibility(
     params = {k.upper(): v for k, v in (parameter_values or {}).items()}
     enums = dict(enum_values or {})
     samples = signal_samples or {}
-    full_span = _sample_span(samples)
-
+    policies = signal_policies or {}
     updated_vertices: list[DAGVertex] = []
     verdicts: dict[str, str] = {}
     for vertex in dag.vertices:
@@ -2369,12 +2801,15 @@ def evaluate_feasibility(
             continue
 
         predicate = vertex.predicate_raw or vertex.predicate_lowered or ""
+        evaluated_predicate = predicate
         verdict = _reduce_predicate(predicate, params, enums)
         windows: list[tuple[float, float]] = []
 
         if verdict == "unknown":
             evaluated = (
-                _evaluate_predicate_intervals(predicate, params, enums, samples)
+                _evaluate_predicate_intervals(
+                    predicate, params, enums, samples, policies
+                )
                 if samples
                 else None
             )
@@ -2387,28 +2822,51 @@ def evaluate_feasibility(
                     predicate, vertex.id, dag, enum_values=enums
                 )
                 if grounded and grounded != predicate:
+                    evaluated_predicate = grounded
                     verdict = _reduce_predicate(grounded, params, enums)
                     if verdict == "unknown" and samples:
                         evaluated = _evaluate_predicate_intervals(
-                            grounded, params, enums, samples
+                            grounded, params, enums, samples, policies
                         )
             if verdict == "unknown" and evaluated is not None:
                 windows = evaluated
-                if not windows:
+                predicate_span = _predicate_sample_span(evaluated_predicate, samples)
+                policies_complete = _predicate_policies_complete(
+                    evaluated_predicate, samples, policies
+                )
+                if not windows and policies_complete:
                     verdict = "always_false"
-                elif full_span is not None and _covers_span(windows, full_span):
+                elif (
+                    policies_complete
+                    and predicate_span is not None
+                    and _covers_span(windows, predicate_span)
+                ):
                     verdict = "always_true"
 
         verdicts[vertex.id] = verdict
+        metadata = dict(vertex.metadata or {})
+        evaluation_span = _predicate_sample_span(evaluated_predicate, samples) if samples else None
+        if evaluation_span is not None:
+            metadata["evaluation_domain"] = list(evaluation_span)
+            metadata["sampling_policies"] = _predicate_policy_summary(
+                evaluated_predicate, samples, policies
+            )
         updated_vertices.append(
-            vertex.model_copy(update={"feasibility_verdict": verdict, "active_windows": windows})
+            vertex.model_copy(
+                update={
+                    "feasibility_verdict": verdict,
+                    "active_windows": windows,
+                    "metadata": metadata,
+                }
+            )
         )
 
     updated_edges = list(dag.edges)
     kept_ids = {v.id for v in updated_vertices}
 
     if prune_dead:
-        # Find operations whose incoming control edges are ALL always_false.
+        # Incoming control edges encode the operation's reachability
+        # conjunction. One false conjunct makes the operation unreachable.
         control_by_op: dict[str, list[str]] = {}
         for edge in updated_edges:
             if edge.kind == "control":
@@ -2416,7 +2874,7 @@ def evaluate_feasibility(
 
         dead_op_ids: set[str] = set()
         for op_id, branch_ids in control_by_op.items():
-            if branch_ids and all(verdicts.get(bid) == "always_false" for bid in branch_ids):
+            if branch_ids and any(verdicts.get(bid) == "always_false" for bid in branch_ids):
                 dead_op_ids.add(op_id)
 
         # Also mark always_false branches as dead once every operation
@@ -2457,15 +2915,7 @@ def _reduce_predicate(
         eval_expression,
     )
 
-    # Substitute PX4 parameter accessors: `_param_rtl_cone_ang.get()` →
-    # bare identifier `RTL_CONE_ANG` that the eval env can bind.
-    text = _PARAM_ACCESSOR_RE.sub(lambda m: m.group("name").upper(), predicate)
-    # C++ boolean operators → Python.
-    text = text.replace("&&", " and ").replace("||", " or ")
-    # Unary not, but NOT `!=`.
-    text = re.sub(r"!(?!=)", " not ", text)
-    # C++ member and scope access → Python attribute.
-    text = text.replace("->", ".").replace("::", ".")
+    text = _substitute_predicate_syntax(predicate)
 
     env: dict[str, Any] = {}
     env.update(parameter_values)
@@ -2500,6 +2950,114 @@ def _sample_span(
     if not all_ts:
         return None
     return min(all_ts), max(all_ts)
+
+
+def _predicate_signal_references(
+    predicate: str,
+    signal_samples: dict[str, list[tuple[float, Any]]],
+) -> tuple[str, dict[str, str]]:
+    """Return a safe-eval expression and alias-to-signal references.
+
+    Exact token-boundary aliasing preserves array indices and prevents a
+    short signal name from matching inside an unrelated longer reference.
+    """
+    lowered = _substitute_predicate_syntax(predicate)
+    return alias_dotted_names(lowered, signal_samples.keys())
+
+
+def _predicate_sample_span(
+    predicate: str,
+    signal_samples: dict[str, list[tuple[float, Any]]],
+) -> Optional[tuple[float, float]]:
+    """Common observed domain of the signals referenced by a predicate."""
+    _text, aliases = _predicate_signal_references(predicate, signal_samples)
+    referenced = list(dict.fromkeys(aliases.values()))
+    if not referenced or any(not signal_samples.get(signal) for signal in referenced):
+        return None
+    start = max(min(float(ts) for ts, _value in signal_samples[signal]) for signal in referenced)
+    end = min(max(float(ts) for ts, _value in signal_samples[signal]) for signal in referenced)
+    return (start, end) if start <= end else None
+
+
+def _signal_policy(
+    signal: str,
+    signal_policies: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    policy = signal_policies.get(signal)
+    if policy is None:
+        schema_signal = re.sub(r"^([^.[\]]+)\[\d+\]", r"\1", signal)
+        policy = signal_policies.get(schema_signal)
+    if policy is None:
+        return None
+    if isinstance(policy, dict):
+        return policy
+    if hasattr(policy, "model_dump"):
+        return policy.model_dump()
+    return dict(vars(policy))
+
+
+def _predicate_policies_complete(
+    predicate: str,
+    signal_samples: dict[str, list[tuple[float, Any]]],
+    signal_policies: dict[str, Any],
+) -> bool:
+    _text, aliases = _predicate_signal_references(predicate, signal_samples)
+    referenced = list(dict.fromkeys(aliases.values()))
+    return bool(referenced) and all(
+        _signal_policy(signal, signal_policies) is not None for signal in referenced
+    )
+
+
+def _predicate_policy_summary(
+    predicate: str,
+    signal_samples: dict[str, list[tuple[float, Any]]],
+    signal_policies: dict[str, Any],
+) -> dict[str, str]:
+    _text, aliases = _predicate_signal_references(predicate, signal_samples)
+    return {
+        signal: str((_signal_policy(signal, signal_policies) or {}).get("method") or "unknown")
+        for signal in dict.fromkeys(aliases.values())
+    }
+
+
+def _sample_value_at(
+    samples: list[tuple[float, Any]],
+    timestamp: float,
+    policy: Optional[dict[str, Any]],
+) -> Optional[Any]:
+    """Resample one series according to its schema-derived policy."""
+    if not samples:
+        return None
+    ordered = sorted(samples, key=lambda item: item[0])
+    times = [float(ts) for ts, _value in ordered]
+    position = bisect_right(times, timestamp)
+    if position and times[position - 1] == timestamp:
+        return ordered[position - 1][1]
+    if position == 0 or position >= len(ordered):
+        return None
+
+    before_t, before = ordered[position - 1]
+    after_t, after = ordered[position]
+    method = str((policy or {}).get("method") or "discrete_hold")
+    if method == "discrete_hold":
+        return before
+    if method == "quaternion_slerp":
+        # Indexed quaternion components cannot be interpolated independently.
+        # A vector-aware evaluator is required for non-sample timestamps.
+        return None
+    if not isinstance(before, (int, float)) or not isinstance(after, (int, float)):
+        return None
+    before_f = float(before)
+    after_f = float(after)
+    if math.isnan(before_f) or math.isnan(after_f) or after_t == before_t:
+        return None
+    fraction = (timestamp - before_t) / (after_t - before_t)
+    if method == "angle_wrap":
+        delta = (after_f - before_f + math.pi) % (2 * math.pi) - math.pi
+        return (before_f + fraction * delta + math.pi) % (2 * math.pi) - math.pi
+    if method == "linear":
+        return before_f + fraction * (after_f - before_f)
+    return None
 
 
 def _covers_span(
@@ -2537,12 +3095,15 @@ def _evaluate_predicate_intervals(
     parameter_values: dict[str, Any],
     enum_values: dict[str, Any],
     signal_samples: dict[str, list[tuple[float, Any]]],
+    signal_policies: Optional[dict[str, Any]] = None,
 ) -> Optional[list[tuple[float, float]]]:
     """Evaluate ``predicate`` per timestamp, return True-intervals.
 
-    Uses hold-last policy: each signal's value between samples is the
-    last-observed value. Returns None when no referenced signal has any
-    sample or when the predicate fails to evaluate at every timestamp.
+    Uses the supplied schema-derived policy for each signal. A missing
+    policy falls back to hold-last for window construction, but callers
+    must not promote those windows to an always-true/false verdict.
+    Returns None when no referenced signal has samples or when the
+    predicate fails to evaluate at every timestamp.
     """
     if not predicate.strip():
         return None
@@ -2552,57 +3113,54 @@ def _evaluate_predicate_intervals(
         eval_expression,
     )
 
-    text = _substitute_predicate_syntax(predicate)
-
-    # Rewrite ``topic.field`` → ``topic__field`` so ``safe_eval`` can bind
-    # against a flat env key (attribute nodes are unsupported).
-    signal_key_map: dict[str, str] = {}
-    referenced: list[str] = []
-    for signal in signal_samples:
-        if signal in text:
-            flat = signal.replace(".", "__")
-            text = text.replace(signal, flat)
-            signal_key_map[signal] = flat
-            referenced.append(signal)
+    text, alias_to_signal = _predicate_signal_references(predicate, signal_samples)
+    signal_key_map = {signal: alias for alias, signal in alias_to_signal.items()}
+    referenced = list(dict.fromkeys(alias_to_signal.values()))
 
     if not referenced:
         return None
 
-    # Union of timestamps from referenced signals.
+    span = _predicate_sample_span(predicate, signal_samples)
+    if span is None:
+        return None
+
+    # Union of timestamps from referenced signals, restricted to their
+    # common observed domain.
     all_ts: set[float] = set()
     for signal in referenced:
         for ts, _ in signal_samples[signal]:
-            all_ts.add(ts)
+            if span[0] <= ts <= span[1]:
+                all_ts.add(ts)
+    all_ts.update(span)
     if not all_ts:
         return None
     ts_sorted = sorted(all_ts)
 
-    # Hold-last cursors per signal.
-    cursor: dict[str, int] = {signal: 0 for signal in referenced}
-    hold_last: dict[str, Any] = {}
-
     intervals: list[tuple[float, float]] = []
     current_start: Optional[float] = None
     ever_evaluated = False
+    last_evaluated: Optional[float] = None
 
     for t in ts_sorted:
-        for signal in referenced:
-            samples = signal_samples[signal]
-            while cursor[signal] < len(samples) and samples[cursor[signal]][0] <= t:
-                hold_last[signal_key_map[signal]] = samples[cursor[signal]][1]
-                cursor[signal] += 1
-
-        # Skip timestamps before we have any value for a referenced signal.
-        if any(signal_key_map[s] not in hold_last for s in referenced):
+        resampled = {
+            signal_key_map[signal]: _sample_value_at(
+                signal_samples[signal],
+                t,
+                _signal_policy(signal, signal_policies or {}),
+            )
+            for signal in referenced
+        }
+        if any(value is None for value in resampled.values()):
             continue
 
-        env = {**parameter_values, **enum_values, **hold_last}
+        env = {**parameter_values, **enum_values, **resampled}
         try:
             result = eval_expression(text, env)
         except (ExpressionEvaluationError, TypeError, ValueError, ZeroDivisionError):
             return None
 
         ever_evaluated = True
+        last_evaluated = t
         truthy = bool(result) if isinstance(result, (bool, int, float)) else False
 
         if truthy and current_start is None:
@@ -2613,8 +3171,8 @@ def _evaluate_predicate_intervals(
 
     if not ever_evaluated:
         return None
-    if current_start is not None:
-        intervals.append((current_start, ts_sorted[-1]))
+    if current_start is not None and last_evaluated is not None:
+        intervals.append((current_start, last_evaluated))
     return intervals
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from flight_log_agent.analysis.dag_pipeline import (
     build_report_from_dag,
     layer4_cache_path,
@@ -24,13 +26,40 @@ TREE = {
     "src/modules/example/rtl.cpp": """
 void Rtl::pick_altitude()
 {
+    _dest_val = gspeed;
     if (_param_rtl_type.get() == 1) {
         _final_out = _dest_val + 1.0f;
     }
-    _dest_val = 5.0f;
 }
 """,
 }
+
+
+@pytest.fixture(autouse=True)
+def _stub_stage_signal_samples(monkeypatch):
+    from flight_log_agent.analysis import dag_pipeline
+
+    class _Sample:
+        def __init__(self, timestamp, value):
+            self.time_s = timestamp
+            self.value = value
+
+    class _Series:
+        samples = [_Sample(0.0, 5.0), _Sample(10.0, 5.0)]
+
+    class _Resolution:
+        status = "observed"
+        series = _Series()
+
+    class _StubIndex:
+        @classmethod
+        def from_path(cls, _path, _references):
+            return cls()
+
+        def resolve_signal(self, _name):
+            return _Resolution()
+
+    monkeypatch.setattr(dag_pipeline, "ULogEvidenceIndex", _StubIndex)
 
 
 def _mini_tree(tmp_path) -> MechanismSourceProfiler:
@@ -51,10 +80,11 @@ def _stub_runner(calls: list[str]):
                 candidate_terminals=[TerminalCandidate(terminal="_final_out")],
             )
         assert agent is judge_agent
+        branch_id = payload["candidates"]["_final_out"]["branches"][0]["id"]
         return DiscoveryVerdict(
             sufficient=True,
             selected_terminal="_final_out",
-            explaining_branches=["_param_rtl_type.get() == 1"],
+            explaining_branches=[branch_id],
             reasoning="terminal grounded in constant and parameter gate",
         )
 
@@ -90,6 +120,7 @@ def test_stage_writes_layers_and_reuses_seeds(tmp_path):
         inventory={"parameters": {"RTL_TYPE": 1}},
         ulog_hash="ulog0",
         run_agent=_stub_runner(calls),
+        logged_signals={"gspeed"},
     )
 
     stage = asyncio.run(
@@ -109,7 +140,8 @@ def test_stage_writes_layers_and_reuses_seeds(tmp_path):
     assert read_seeds_from_cache(
         layer4_cache_path(cache_root, "why did final_out increase?")
     ) is not None
-    assert stage.report.ranked_hypotheses[0].confidence == "medium"
+    assert stage.report.ranked_hypotheses[0].confidence == "low"
+    assert stage.report.confirmed == []
 
     # second run: Layer 4 hit skips the seeder; judge still consulted
     again = asyncio.run(
@@ -140,13 +172,16 @@ def test_stage_report_maps_feasibility_into_applicability(tmp_path):
             inventory={"parameters": {"RTL_TYPE": 1}},
             ulog_hash="ulog0",
             run_agent=_stub_runner(calls),
+            logged_signals={"gspeed"},
         )
     )
 
     hypothesis = stage.report.ranked_hypotheses[0]
     assert hypothesis.known_px4_mechanism == "_final_out"
     assert hypothesis.mechanism.startswith("terminal grounded")
-    assert stage.report.confirmed == [hypothesis.title]
+    assert hypothesis.confidence == "low"
+    assert stage.report.confirmed == []
+    assert stage.report.unconfirmed == [hypothesis.title]
     conditions = (
         hypothesis.applicability.supported_conditions
         + hypothesis.applicability.unresolved_conditions
@@ -175,6 +210,7 @@ def test_insufficient_verdict_yields_unresolved_report(tmp_path):
             Path("/nonexistent.ulg"),
             ulog_hash="ulog0",
             run_agent=run,
+            logged_signals={"gspeed"},
         )
     )
 
@@ -184,7 +220,7 @@ def test_insufficient_verdict_yields_unresolved_report(tmp_path):
     assert stage.report.confirmed == []
 
 
-def _run_with_verdict(tmp_path, verdict_kwargs):
+def _run_with_verdict(tmp_path, verdict_kwargs, *, use_valid_branch=False):
     from flight_log_agent.analysis.mechanism_judge import (
         DiscoverySeeds as Seeds,
         DiscoveryVerdict as Verdict,
@@ -198,13 +234,19 @@ def _run_with_verdict(tmp_path, verdict_kwargs):
         if agent is seeder:
             return Seeds(seeds=["pick_altitude"],
                          candidate_terminals=[Cand(terminal="_final_out")])
+        kwargs = dict(verdict_kwargs)
+        if use_valid_branch:
+            kwargs["explaining_branches"] = [
+                payload["candidates"]["_final_out"]["branches"][0]["id"]
+            ]
         return Verdict(sufficient=True, selected_terminal="_final_out",
-                       **verdict_kwargs)
+                       **kwargs)
 
     return asyncio.run(
         run_dag_discovery_stage(
             profiler, tmp_path / "cache", "why?", "srchash",
             Path("/nonexistent.ulg"), ulog_hash="u", run_agent=run,
+            logged_signals={"gspeed"},
         )
     )
 
@@ -215,6 +257,7 @@ def test_sufficient_with_unmatched_branch_is_downgraded(tmp_path):
     )
     h = stage.report.ranked_hypotheses[0]
     assert h.confidence == "low"
+    assert h.applicability.applicable is False
     assert stage.report.confirmed == []
     assert any("feasibility-dead" in u or "absent" in u for u in h.unresolved_evidence)
 
@@ -227,13 +270,11 @@ def test_sufficient_without_named_branch_is_downgraded(tmp_path):
     assert any("without naming" in u for u in h.unresolved_evidence)
 
 
-def test_sufficient_with_live_matching_branch_stays_confirmed(tmp_path):
-    stage = _run_with_verdict(
-        tmp_path, {"explaining_branches": ["_param_rtl_type.get() == 1"]}
-    )
+def test_sufficient_with_valid_branch_stays_unconfirmed_without_replay(tmp_path):
+    stage = _run_with_verdict(tmp_path, {}, use_valid_branch=True)
     h = stage.report.ranked_hypotheses[0]
-    assert h.confidence == "medium"
-    assert stage.report.confirmed == [h.title]
+    assert h.confidence == "low"
+    assert stage.report.confirmed == []
 
 
 def test_layer4_path_includes_seeder_fingerprint_and_prunes_stale(tmp_path):
@@ -256,26 +297,15 @@ def test_layer4_path_includes_seeder_fingerprint_and_prunes_stale(tmp_path):
     assert not stale.exists()
 
 
-def test_explaining_branch_matches_despite_render_suffix_and_truncation(tmp_path):
-    """The judge copies branch entries verbatim from the rendering,
-    including the trailing feasibility tag and truncation ellipsis."""
+def test_explaining_predicate_text_is_not_accepted_as_branch_identity(tmp_path):
     stage = _run_with_verdict(
         tmp_path,
-        {"explaining_branches": ["_param_rtl_type.get() ==… [unknown]"]},
+        {"explaining_branches": ["_param_rtl_type.get() == 1"]},
     )
     h = stage.report.ranked_hypotheses[0]
-    assert h.confidence == "medium"
-    assert stage.report.confirmed == [h.title]
-
-
-def test_explaining_branch_matches_despite_windowed_tag(tmp_path):
-    stage = _run_with_verdict(
-        tmp_path,
-        {"explaining_branches": ["_param_rtl_type.get() == 1 [unknown; active 2w 1.0-2.0s]"]},
-    )
-    h = stage.report.ranked_hypotheses[0]
-    assert h.confidence == "medium"
-    assert stage.report.confirmed == [h.title]
+    assert h.confidence == "low"
+    assert h.applicability.applicable is False
+    assert stage.report.confirmed == []
 
 
 def test_replay_status_gates_the_confidence_upgrade(tmp_path):
@@ -291,12 +321,19 @@ def test_replay_status_gates_the_confidence_upgrade(tmp_path):
 
     profiler = _mini_tree(tmp_path)
     result = discover_mechanism_dag(
-        profiler, tmp_path / "cache", ["pick_altitude"], "_final_out", "hash")
+        profiler,
+        tmp_path / "cache",
+        ["pick_altitude"],
+        "_final_out",
+        "hash",
+        logged_signals={"gspeed"},
+    )
+    branch_id = next(v.id for v in result.dag.vertices if v.kind == "branch")
     from flight_log_agent.analysis.mechanism_judge import JudgedDiscovery
     judged = JudgedDiscovery(
         seeds=Seeds(seeds=[], candidate_terminals=[Cand(terminal="_final_out")]),
         verdict=Verdict(sufficient=True, selected_terminal="_final_out",
-                        explaining_branches=["_param_rtl_type.get() == 1"]),
+                        explaining_branches=[branch_id]),
         results={"_final_out": result}, selected=result,
     )
     matched = {"status": "matched", "complete": True, "observed": "x.y",
@@ -315,9 +352,26 @@ def test_replay_status_gates_the_confidence_upgrade(tmp_path):
     skipped = build_report_from_dag(
         "why?", judged, result.dag,
         replay={"status": "not_attempted", "complete": False, "reason": "r"})
-    assert skipped.ranked_hypotheses[0].confidence == "medium"
+    assert skipped.ranked_hypotheses[0].confidence == "low"
     assert not any("expression replay" in e
                    for e in skipped.ranked_hypotheses[0].evidence)
+
+    mismatched = {
+        "status": "mismatched",
+        "complete": True,
+        "observed": "x.y",
+        "results": [
+            {"grounded": "a+b", "evaluable": True, "match_fraction": 0.1}
+        ],
+    }
+    contradicted = build_report_from_dag(
+        "why?", judged, result.dag, replay=mismatched
+    )
+    item = contradicted.ranked_hypotheses[0]
+    assert item.confidence == "unresolved"
+    assert item.applicability.applicable is False
+    assert item.contradicting_evidence
+    assert contradicted.confirmed == []
 
 
 def test_seeds_not_cached_when_selected_slice_is_empty(tmp_path):
@@ -393,10 +447,27 @@ def test_questioned_hint_never_resolves_by_containment():
     assert cands == ["topic_a.mode", "topic_a.true_value_sp"]
 
 
-def test_replay_observed_signal_resolves_exactly_or_skips():
-    """The replayed observed signal must be an exact catalogue member —
-    suffix uniqueness would compare the mechanism against a guessed
-    signal, so an unresolved hint skips replay entirely."""
+def test_questioned_hint_resolves_only_one_exact_topic_instance():
+    from flight_log_agent.analysis.dag_pipeline import resolve_questioned_signal
+
+    unique = {"topic_a[3].value"}
+    signal, error, candidates = resolve_questioned_signal(
+        "topic_a.value", unique, []
+    )
+    assert signal == "topic_a[3].value"
+    assert error is None
+    assert candidates == []
+
+    ambiguous = {"topic_a[0].value", "topic_a[3].value"}
+    signal, error, candidates = resolve_questioned_signal(
+        "topic_a.value", ambiguous, []
+    )
+    assert signal is None
+    assert "ambiguous" in error
+    assert candidates == ["topic_a[0].value", "topic_a[3].value"]
+
+
+def test_replay_requires_source_proven_terminal_publication():
     from flight_log_agent.analysis.dag_pipeline import replay_terminal_expressions
     from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
 
@@ -412,13 +483,10 @@ def test_replay_observed_signal_resolves_exactly_or_skips():
         observed_hint="wrong_topic.alt",
     )
     assert replay["status"] == "not_attempted"
-    assert "did not resolve" in replay["reason"]
+    assert "publication provenance" in replay["reason"]
 
 
-def test_whole_log_match_caps_at_partial(monkeypatch):
-    """The current comparison runs writers over the whole log without
-    reachability domains, ordering, or coverage — a perfect match is
-    therefore still incomplete evidence: ``partial``, never ``matched``."""
+def test_complete_replay_distinguishes_match_mismatch_and_missing_policy(monkeypatch):
     from flight_log_agent.analysis import dag_pipeline
     from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
 
@@ -437,7 +505,10 @@ def test_whole_log_match_caps_at_partial(monkeypatch):
             self.series = series
 
     class _StubIndex:
-        _table = {"topic_b.alt": [_Sample(0.0, 5.0), _Sample(10.0, 5.0)]}
+        _table = {
+            "topic_in.value": [_Sample(0.0, 5.0), _Sample(10.0, 5.0)],
+            "topic_out.value": [_Sample(0.0, 5.0), _Sample(10.0, 5.0)],
+        }
 
         @classmethod
         def from_path(cls, path, references):
@@ -450,20 +521,206 @@ def test_whole_log_match_caps_at_partial(monkeypatch):
     monkeypatch.setattr(dag_pipeline, "ULogEvidenceIndex", _StubIndex)
 
     dag = build_mechanism_dag(
-        [{"target_symbol": "_x", "source_symbol": "topic_b.alt",
+        [{"target_symbol": "_x", "source_symbol": "topic_in.value",
           "assignment_path": [{"file": "a.cpp", "line": 1,
-                               "expression": "topic_b.alt"}],
-          "logged_signal": "", "control_predicates": [], "function": "A::run"}],
-        "_x", logged_signals={"topic_b.alt"},
+                               "expression": "topic_in.value"}],
+          "logged_signal": "topic_out.value", "control_predicates": [],
+          "function": "A::run"}],
+        "_x", logged_signals={"topic_in.value", "topic_out.value"},
     )
-    replay = dag_pipeline.replay_terminal_expressions(
-        dag, Path("/stubbed.ulg"), {}, {"topic_b.alt"},
-        observed_hint="topic_b.alt",
+    policies = {
+        "topic_in.value": {"method": "linear"},
+        "topic_out.value": {"method": "linear"},
+    }
+    matched = dag_pipeline.replay_terminal_expressions(
+        dag,
+        Path("/stubbed.ulg"),
+        {},
+        {"topic_in.value", "topic_out.value"},
+        signal_policies=policies,
+    )
+    assert matched["status"] == "matched"
+    assert matched["complete"] is True
+
+    _StubIndex._table["topic_out.value"] = [
+        _Sample(0.0, 8.0),
+        _Sample(10.0, 8.0),
+    ]
+    mismatched = dag_pipeline.replay_terminal_expressions(
+        dag,
+        Path("/stubbed.ulg"),
+        {},
+        {"topic_in.value", "topic_out.value"},
+        signal_policies=policies,
+    )
+    assert mismatched["status"] == "mismatched"
+    assert mismatched["complete"] is True
+
+    partial = dag_pipeline.replay_terminal_expressions(
+        dag,
+        Path("/stubbed.ulg"),
+        {},
+        {"topic_in.value", "topic_out.value"},
+    )
+    assert partial["status"] == "partial"
+    assert partial["complete"] is False
+
+
+def test_replay_combines_mutually_exclusive_writers_piecewise(monkeypatch):
+    from flight_log_agent.analysis import dag_pipeline
+    from flight_log_agent.analysis.mechanism_dag import (
+        build_mechanism_dag,
+        evaluate_feasibility,
     )
 
-    assert replay["status"] == "partial"
-    assert replay["complete"] is False
-    assert any(
-        r.get("evaluable") and r.get("match_fraction", 0) >= 0.99
-        for r in replay["results"]
-    ), "the writer should have matched the whole log"
+    class _Sample:
+        def __init__(self, timestamp, value):
+            self.time_s = timestamp
+            self.value = value
+
+    class _Series:
+        def __init__(self, samples):
+            self.samples = samples
+
+    class _Resolution:
+        def __init__(self, samples):
+            self.status = "observed" if samples else "unavailable"
+            self.series = _Series(samples) if samples else None
+
+    class _StubIndex:
+        table = {
+            "mode.state": [
+                _Sample(0.0, 0),
+                _Sample(5.0, 1),
+                _Sample(10.0, 1),
+            ],
+            "input.first": [_Sample(0.0, 1.0), _Sample(10.0, 1.0)],
+            "input.second": [_Sample(0.0, 2.0), _Sample(10.0, 2.0)],
+            "output.value": [
+                _Sample(0.0, 1.0),
+                _Sample(5.0, 2.0),
+                _Sample(10.0, 2.0),
+            ],
+        }
+
+        @classmethod
+        def from_path(cls, _path, _references):
+            return cls()
+
+        def resolve_signal(self, name):
+            return _Resolution(self.table.get(name))
+
+    monkeypatch.setattr(dag_pipeline, "ULogEvidenceIndex", _StubIndex)
+    logged = set(_StubIndex.table)
+    policies = {
+        "mode.state": {"method": "discrete_hold"},
+        "input.first": {"method": "linear"},
+        "input.second": {"method": "linear"},
+        "output.value": {"method": "linear"},
+    }
+    bindings = [
+        {
+            "target_symbol": "_out",
+            "source_symbol": "input.first",
+            "assignment_path": [
+                {"file": "a.cpp", "line": 10, "expression": "input.first"}
+            ],
+            "logged_signal": "output.value",
+            "control_predicates": ["mode.state == 0"],
+            "control_predicate_lines": [9],
+            "function": "A::run",
+        },
+        {
+            "target_symbol": "_out",
+            "source_symbol": "input.second",
+            "assignment_path": [
+                {"file": "a.cpp", "line": 12, "expression": "input.second"}
+            ],
+            "logged_signal": "output.value",
+            "control_predicates": ["mode.state == 1"],
+            "control_predicate_lines": [11],
+            "function": "A::run",
+        },
+    ]
+    dag = build_mechanism_dag(bindings, "_out", logged_signals=logged)
+    samples = {
+        name: [(sample.time_s, sample.value) for sample in values]
+        for name, values in _StubIndex.table.items()
+    }
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples=samples,
+        signal_policies=policies,
+        prune_dead=False,
+    )
+
+    replay = dag_pipeline.replay_terminal_expressions(
+        annotated,
+        Path("/stubbed.ulg"),
+        {},
+        logged,
+        signal_policies=policies,
+    )
+
+    assert replay["status"] == "matched"
+    assert replay["complete"] is True
+    assert len(replay["results"]) == 2
+    assert all(result["match_fraction"] == 1.0 for result in replay["results"])
+
+
+def test_validation_downgrade_resynchronizes_confirmation_lists():
+    from flight_log_agent.analysis.report_validation import (
+        enforce_validation_downgrades,
+    )
+    from flight_log_agent.models import (
+        ApplicabilityReport,
+        CodeRef,
+        ExpectedSignatureItem,
+        FlightLogReport,
+        HypothesisReportItem,
+        RelationshipCheckSpec,
+        ValidationIssue,
+        ValidationResult,
+    )
+
+    title = "Mechanism slice"
+    hypothesis = HypothesisReportItem(
+        title=title,
+        known_px4_mechanism="terminal",
+        mechanism="source and numeric evidence",
+        source_refs=[CodeRef(file="a.cpp")],
+        expected_logged_signature=[
+            ExpectedSignatureItem(name="output.value", description="output")
+        ],
+        applicability=ApplicabilityReport(applicable=True),
+        evidence=[],
+        contradicting_evidence=[],
+        exclusion_checks=[],
+        numeric_checks=[RelationshipCheckSpec(type="derived_expression")],
+        confidence="medium",
+    )
+    report = FlightLogReport(
+        airframe_summary="",
+        question_intent_summary="question",
+        ranked_hypotheses=[hypothesis],
+        excluded_mechanisms=[],
+        confirmed=[title],
+        unconfirmed=[],
+        final_summary="",
+    )
+    validation = ValidationResult(
+        passed=False,
+        issues=[
+            ValidationIssue(
+                severity="error",
+                path="ranked_hypotheses[0].numeric_checks",
+                message="numeric evidence invalid",
+            )
+        ],
+    )
+
+    downgraded = enforce_validation_downgrades(report, validation)
+
+    assert downgraded.ranked_hypotheses[0].confidence == "low"
+    assert downgraded.confirmed == []
+    assert downgraded.unconfirmed == [title]

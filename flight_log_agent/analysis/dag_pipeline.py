@@ -29,6 +29,7 @@ from flight_log_agent.analysis.mechanism_discovery import DiscoveryResult
 from flight_log_agent.analysis.mechanism_judge import (
     DiscoverySeeds,
     JudgedDiscovery,
+    SEEDER_ADAPTER_VERSION,
     discover_with_judge,
     render_discovery_compact,
 )
@@ -39,8 +40,10 @@ from flight_log_agent.models import (
     FlightLogReport,
     HypothesisReportItem,
     ParameterValue,
+    RelationshipCheckSpec,
 )
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
+from flight_log_agent.symbols import parse_signal_reference
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +66,7 @@ def seeder_fingerprint() -> str:
 
     import json as _json
 
-    payload = seeder_agent.instructions + _json.dumps(
+    payload = SEEDER_ADAPTER_VERSION + seeder_agent.instructions + _json.dumps(
         DiscoverySeeds.model_json_schema(), sort_keys=True
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -163,8 +166,9 @@ def resolve_questioned_signal(
     """Resolve the seeder's signal hint against the log catalogue and the
     discovered slices — never by string fuzz.
 
-    Exact schema match wins. Otherwise the hint's TOPIC (which must
-    exist) is intersected with the fields the candidate DAGs actually
+    Exact topic/field identity wins; an omitted topic instance resolves only
+    when one observed placement matches. Otherwise the hint's topic is
+    intersected with the fields the candidate DAGs actually
     connect to (their logged-evidence leaves): the publish-site facts in
     the slice carry the true field name even when the hinted field was
     renamed across versions. Unique intersection resolves; anything else
@@ -175,7 +179,39 @@ def resolve_questioned_signal(
         return None, "empty signal hint", []
     if hint in logged_set:
         return hint, None, []
-    topic = hint.split(".", 1)[0]
+    parsed_hint = parse_signal_reference(hint)
+    if parsed_hint is None:
+        return None, f"signal hint {hint!r} is not a canonical signal reference", []
+    topic, requested_instance, field = parsed_hint
+
+    def compatible_placement(signal: str, *, require_field: bool) -> bool:
+        parsed = parse_signal_reference(signal)
+        if parsed is None:
+            return False
+        candidate_topic, candidate_instance, candidate_field = parsed
+        return (
+            candidate_topic == topic
+            and (not require_field or candidate_field == field)
+            and (
+                requested_instance is None
+                or candidate_instance == requested_instance
+            )
+        )
+
+    exact_placements = sorted(
+        signal
+        for signal in logged_set
+        if compatible_placement(signal, require_field=True)
+    )
+    if len(exact_placements) == 1:
+        return exact_placements[0], None, []
+    if len(exact_placements) > 1:
+        return (
+            None,
+            f"hint {hint!r} is ambiguous across observed topic instances",
+            exact_placements,
+        )
+
     connected = {
         str(v.signal_name)
         for dag in dags
@@ -183,7 +219,8 @@ def resolve_questioned_signal(
         for v in dag.vertices
         if v.kind == "evidence"
         and v.sub_kind == "logged_signal"
-        and str(v.signal_name or "").startswith(topic + ".")
+        and (v.metadata or {}).get("observation") == "observed"
+        and compatible_placement(str(v.signal_name or ""), require_field=False)
     }
     if len(connected) == 1:
         return next(iter(connected)), None, []
@@ -193,7 +230,11 @@ def resolve_questioned_signal(
     # against the schema is name guessing, not resolution — fields on
     # the topic are returned only as CANDIDATES for the judge, never
     # auto-picked, however few there are.
-    candidates = sorted(s for s in logged_set if s.startswith(topic + "."))
+    candidates = sorted(
+        signal
+        for signal in logged_set
+        if compatible_placement(signal, require_field=False)
+    )
     if candidates:
         return None, f"hint {hint!r} did not resolve exactly", candidates
     return None, f"signal hint {hint!r} did not resolve", []
@@ -202,13 +243,67 @@ def resolve_questioned_signal(
 # The five distinct replay states (core correctness invariant):
 # ``matched`` is supporting evidence and ``mismatched`` contradictory
 # evidence ONLY when replay completeness (writer reachability domains,
-# ordering, retained state, alignment, coverage) is trustworthy —
-# neither is reachable from the current whole-log any-writer comparison,
-# which caps at ``partial``. ``partial`` and ``unevaluable`` are
-# unresolved evidence; ``not_attempted`` is neutral.
+# ordering, retained state, alignment, coverage) is trustworthy.
+# ``partial`` and ``unevaluable`` are unresolved evidence;
+# ``not_attempted`` is neutral.
 ReplayStatus = Literal[
     "not_attempted", "unevaluable", "partial", "matched", "mismatched"
 ]
+
+
+def _intersect_windows(
+    first: list[tuple[float, float]],
+    second: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    intersections: list[tuple[float, float]] = []
+    for first_start, first_end in first:
+        for second_start, second_end in second:
+            start = max(first_start, second_start)
+            end = min(first_end, second_end)
+            if start <= end:
+                intersections.append((start, end))
+    return _merge_windows(intersections)
+
+
+def _merge_windows(windows: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[list[float]] = []
+    for start, end in sorted(windows):
+        if end < start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def _window_duration(windows: list[tuple[float, float]]) -> float:
+    return sum(max(0.0, end - start) for start, end in _merge_windows(windows))
+
+
+def _replay_tolerance(
+    samples: list[tuple[float, Any]],
+    policy: Optional[Any],
+) -> float:
+    """Derive a numerical tolerance from data scale and declared policy."""
+    values = [
+        float(value)
+        for _timestamp, value in samples
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+    if not values:
+        return 1e-9
+    if policy is not None and hasattr(policy, "model_dump"):
+        policy = policy.model_dump()
+    if str((policy or {}).get("method") or "") == "discrete_hold":
+        return 1e-9
+    ordered = sorted(abs(value) for value in values)
+    scale = ordered[len(ordered) // 2]
+    sorted_values = sorted(values)
+    median_value = sorted_values[len(sorted_values) // 2]
+    deviations = sorted(abs(value - median_value) for value in values)
+    robust_variation = deviations[len(deviations) // 2]
+    return max(1e-6, 1e-3 * max(scale, robust_variation))
 
 
 def replay_terminal_expressions(
@@ -217,37 +312,28 @@ def replay_terminal_expressions(
     parameter_values: dict[str, Any],
     logged_set: set[str],
     observed_hint: Optional[str] = None,
+    signal_policies: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Numerically compare the mechanism against the log: ground each
     terminal write's expression through the graph, evaluate it over the
     log, and measure how long it matches the observed signal within
     tolerance.
 
-    Fully structural — grounding walks the DAG, the observed signal
-    resolves from the logged catalogue (hint first, then the terminal),
-    and the match check reuses the interval evaluator as the predicate
-    ``abs(grounded - observed) <= tol``. The result's ``status`` is one
-    of :data:`ReplayStatus`; because writers are compared over the WHOLE
-    log without their reachability domains or ordering, the strongest
-    status this implementation can honestly emit is ``partial``.
+    Fully structural: grounding walks DAG edges, the observed signal must
+    have exact terminal-publication provenance, and each writer is compared
+    only inside the intersection of its gating branch windows. A definitive
+    match/mismatch is emitted only when exact writer domains are non-
+    overlapping and cover the observed output domain.
     """
     from flight_log_agent.analysis.mechanism_dag import (
         _evaluate_predicate_intervals,
+        _predicate_policies_complete,
         ground_expression_via_edges,
     )
 
     def not_attempted(reason: str) -> dict[str, Any]:
         return {"status": "not_attempted", "complete": False, "reason": reason}
 
-    def resolve(hint: str) -> Optional[str]:
-        # Exact catalogue membership only — suffix uniqueness is name
-        # guessing; an unresolved observed signal skips replay rather
-        # than comparing against a guessed one.
-        return hint if hint and hint in logged_set else None
-
-    observed = resolve(observed_hint or "") or resolve(str(annotated.terminal or ""))
-    if observed is None:
-        return not_attempted("observed signal did not resolve exactly")
     terminal_ops = [
         v
         for v in annotated.vertices
@@ -255,6 +341,24 @@ def replay_terminal_expressions(
     ]
     if not terminal_ops:
         return not_attempted("no terminal writes in the graph")
+    published = {
+        str((op.metadata or {}).get("logged_signal") or "")
+        for op in terminal_ops
+        if (op.metadata or {}).get("logged_signal")
+    }
+    terminal = str(annotated.terminal or "")
+    if len(published) == 1:
+        observed = next(iter(published))
+    elif terminal in logged_set:
+        observed = terminal
+    elif observed_hint and observed_hint in published:
+        observed = observed_hint
+    else:
+        return not_attempted(
+            "observed output lacks unique exact terminal-publication provenance"
+        )
+    if observed not in logged_set:
+        return not_attempted(f"terminal output {observed!r} is not in the observed catalogue")
     index = ULogEvidenceIndex.from_path(log_path, [observed])
     resolution = index.resolve_signal(observed)
     if resolution.status != "observed" or resolution.series is None:
@@ -264,57 +368,144 @@ def replay_terminal_expressions(
         return not_attempted(f"{observed} has too few samples")
     samples = dict(_signal_samples_for_dag(annotated, log_path))
     samples[observed] = observed_samples
-    magnitudes = [
-        abs(float(v)) for _, v in observed_samples if isinstance(v, (int, float))
-    ]
-    tolerance = 0.05 * (sum(magnitudes) / len(magnitudes)) if magnitudes else 1e-3
-    span = observed_samples[-1][0] - observed_samples[0][0]
+    observed_policy = (signal_policies or {}).get(observed)
+    tolerance = _replay_tolerance(observed_samples, observed_policy)
+    observed_span = (observed_samples[0][0], observed_samples[-1][0])
+    span_duration = observed_span[1] - observed_span[0]
+
+    vertices = {vertex.id: vertex for vertex in annotated.vertices}
+    controls_by_op: dict[str, list[str]] = {}
+    for edge in annotated.edges:
+        if edge.kind == "control":
+            controls_by_op.setdefault(edge.target_id, []).append(edge.source_id)
 
     results: list[dict[str, Any]] = []
+    writer_domains: list[tuple[str, list[tuple[float, float]]]] = []
+    complete = True
     for op in terminal_ops:
+        reachability = (op.metadata or {}).get("reachability") or {}
+        domain = [observed_span]
+        writer_complete = bool(reachability.get("exact", False))
+        for branch_id in controls_by_op.get(op.id, []):
+            branch = vertices.get(branch_id)
+            if branch is None or branch.kind != "branch":
+                writer_complete = False
+                continue
+            if branch.feasibility_verdict == "always_false":
+                domain = []
+            elif branch.feasibility_verdict == "always_true":
+                branch_domain = [observed_span]
+            elif branch.active_windows:
+                branch_domain = list(branch.active_windows)
+                policies_used = (branch.metadata or {}).get("sampling_policies") or {}
+                if not policies_used or "unknown" in policies_used.values():
+                    writer_complete = False
+            else:
+                branch_domain = []
+                writer_complete = False
+            if domain:
+                domain = _intersect_windows(domain, branch_domain)
+
         grounded = ground_expression_via_edges(
             str(op.expression or ""), op.id, annotated
         )
         if not grounded:
+            results.append(
+                {
+                    "operation_id": op.id,
+                    "expression": op.expression,
+                    "grounded": None,
+                    "evaluable": False,
+                    "active_windows": domain,
+                }
+            )
+            complete = False
             continue
-        windows = _evaluate_predicate_intervals(
+        match_windows = _evaluate_predicate_intervals(
             f"abs(({grounded}) - ({observed})) <= {tolerance}",
             parameter_values,
             {},
             samples,
+            signal_policies,
         )
-        if windows is None:
+        if match_windows is None:
             results.append(
-                {"expression": op.expression, "grounded": grounded, "evaluable": False}
+                {
+                    "operation_id": op.id,
+                    "expression": op.expression,
+                    "grounded": grounded,
+                    "evaluable": False,
+                    "active_windows": domain,
+                }
             )
+            complete = False
             continue
-        matched = sum(end - start for start, end in windows)
+        if not _predicate_policies_complete(
+            f"abs(({grounded}) - ({observed})) <= {tolerance}",
+            samples,
+            signal_policies or {},
+        ):
+            writer_complete = False
+        active_duration = _window_duration(domain)
+        matched_duration = _window_duration(_intersect_windows(match_windows, domain))
         results.append(
             {
+                "operation_id": op.id,
                 "expression": op.expression,
                 "grounded": grounded,
                 "evaluable": True,
-                "match_fraction": round(matched / span, 3) if span else 0.0,
+                "active_windows": domain,
+                "active_duration": round(active_duration, 6),
+                "matched_duration": round(matched_duration, 6),
+                "match_fraction": (
+                    round(matched_duration / active_duration, 3)
+                    if active_duration
+                    else None
+                ),
             }
         )
+        writer_domains.append((op.id, domain))
+        complete = complete and writer_complete
+
+    merged_domain = _merge_windows(
+        [window for _operation_id, domain in writer_domains for window in domain]
+    )
+    summed_writer_duration = sum(
+        _window_duration(domain) for _operation_id, domain in writer_domains
+    )
+    covered_duration = _window_duration(merged_domain)
+    non_overlapping = abs(summed_writer_duration - covered_duration) <= 1e-6
+    covers_output = (
+        len(merged_domain) == 1
+        and merged_domain[0][0] <= observed_span[0]
+        and merged_domain[0][1] >= observed_span[1]
+    )
+    complete = complete and non_overlapping and covers_output and span_duration > 0
+
     if not results:
         status: ReplayStatus = "unevaluable"
         reason = "no terminal expression grounded through the graph"
     elif not any(r.get("evaluable") for r in results):
         status = "unevaluable"
         reason = "no grounded expression was evaluable over the log"
-    else:
-        # Writers were compared over the whole log without reachability
-        # domains, ordering, or coverage criteria — the comparison is
-        # incomplete by construction, so the evidence stays unresolved.
+    elif not complete:
         status = "partial"
         reason = (
-            "writers compared over the whole log without reachability "
-            "domains, ordering, or coverage"
+            "writer reachability, policy, non-overlap, or output-domain "
+            "coverage is incomplete"
         )
+    else:
+        matched_duration = sum(
+            float(result.get("matched_duration") or 0.0)
+            for result in results
+            if result.get("evaluable")
+        )
+        match_fraction = matched_duration / covered_duration if covered_duration else 0.0
+        status = "matched" if match_fraction >= 0.95 else "mismatched"
+        reason = f"complete piecewise replay match fraction {match_fraction:.3f}"
     return {
         "status": status,
-        "complete": False,
+        "complete": complete,
         "reason": reason,
         "observed": observed,
         "tolerance": round(tolerance, 6),
@@ -330,13 +521,34 @@ def build_report_from_dag(
 ) -> FlightLogReport:
     """Deterministic FlightLogReport from the verdict + annotated DAG.
 
-    Confidence is capped at ``medium``: this path runs no legacy numeric
-    checks, so ``high`` would overclaim. Branch feasibility maps to the
-    applicability report (``always_true`` → supported, ``always_false``
-    → excluded, ``unknown`` → unresolved).
+    Complete deterministic replay can establish ``high`` confidence;
+    partial numeric replay can establish at most ``medium``. Structural
+    evidence alone remains low. Branch feasibility maps to applicability
+    (``always_true`` -> supported, ``always_false`` -> excluded,
+    ``unknown`` -> unresolved).
     """
     verdict = judged.verdict
     dag = annotated_dag or (judged.selected.dag if judged.selected else None)
+    if dag is None or not dag.vertices:
+        validation = (
+            getattr(judged.selected, "terminal_validation", None)
+            if judged.selected is not None
+            else None
+        )
+        reason = str(
+            getattr(validation, "reason", "")
+            or verdict.reasoning
+            or "no validated mechanism DAG was produced"
+        )
+        return FlightLogReport(
+            airframe_summary="",
+            question_intent_summary=question,
+            ranked_hypotheses=[],
+            excluded_mechanisms=[],
+            confirmed=[],
+            unconfirmed=[],
+            final_summary=f"Mechanism discovery could not produce a report: {reason}",
+        )
 
     supported: list[str] = []
     excluded: list[str] = []
@@ -360,14 +572,28 @@ def build_report_from_dag(
                 ParameterValue(name=str(vertex.signal_name), value=str(value))
             )
         elif vertex.kind == "evidence" and vertex.sub_kind == "logged_signal":
-            signature.append(
-                ExpectedSignatureItem(
-                    name=str(vertex.signal_name),
-                    description="logged signal grounding the mechanism slice",
-                    signal=str(vertex.signal_name),
+            if (vertex.metadata or {}).get("observation") == "observed":
+                signature.append(
+                    ExpectedSignatureItem(
+                        name=str(vertex.signal_name),
+                        description="observed signal grounding the mechanism slice",
+                        signal=str(vertex.signal_name),
+                    )
                 )
-            )
         elif vertex.kind == "operation" and vertex.file and vertex.metadata.get("is_terminal"):
+            logged_output = str((vertex.metadata or {}).get("logged_signal") or "")
+            if (
+                logged_output
+                and (vertex.metadata or {}).get("logged_observation") == "observed"
+                and all(item.signal != logged_output for item in signature)
+            ):
+                signature.append(
+                    ExpectedSignatureItem(
+                        name=logged_output,
+                        description="observed output written by the terminal operation",
+                        signal=logged_output,
+                    )
+                )
             source_refs.append(
                 CodeRef(
                     file=str(vertex.file),
@@ -378,6 +604,20 @@ def build_report_from_dag(
                 )
             )
 
+    if not signature:
+        return FlightLogReport(
+            airframe_summary="",
+            question_intent_summary=question,
+            ranked_hypotheses=[],
+            excluded_mechanisms=[],
+            confirmed=[],
+            unconfirmed=[],
+            final_summary=(
+                "Mechanism discovery produced source structure but no observed "
+                "signal grounding for this flight."
+            ),
+        )
+
     # Cross-check the judge's claimed mechanism against flight-data
     # feasibility: a sufficient verdict must name explaining branches,
     # and at least one must exist in the DAG without being feasibility-
@@ -386,40 +626,20 @@ def build_report_from_dag(
     unresolved_evidence = list(dag.unresolved_symbols) if dag else []
     branches_verified = False
     if verdict.sufficient and verdict.explaining_branches and dag is not None:
-        dag_predicates = {
-            (v.predicate_raw or "", v.feasibility_verdict or "unknown")
-            for v in dag.vertices
-            if v.kind == "branch"
-        } | {
-            (v.predicate_lowered or "", v.feasibility_verdict or "unknown")
-            for v in dag.vertices
-            if v.kind == "branch"
+        dag_branches = {
+            vertex.id: vertex
+            for vertex in dag.vertices
+            if vertex.kind == "branch"
         }
-        for named in verdict.explaining_branches:
-            # The judge copies entries from the rendering verbatim — strip
-            # the trailing feasibility tag and the truncation ellipsis so
-            # long predicates still match (prefix containment).
-            needle = " ".join(str(named).split())
-            needle = re.sub(r"\s*\[[^\]]*\]\s*$", "", needle).rstrip("… ").strip()
-            for predicate, feasibility in dag_predicates:
-                haystack = " ".join(predicate.split())
-                if not needle or not haystack:
-                    continue
-                if feasibility == "always_false":
-                    continue
-                if (
-                    needle in haystack
-                    or haystack in needle
-                    or haystack.startswith(needle)
-                ):
-                    branches_verified = True
-                    break
-            if branches_verified:
-                break
+        branches_verified = all(
+            branch_id in dag_branches
+            and dag_branches[branch_id].feasibility_verdict != "always_false"
+            for branch_id in verdict.explaining_branches
+        )
         if not branches_verified:
             unresolved_evidence.insert(
                 0,
-                "judge-named explaining branch(es) absent from the DAG or "
+                "judge-named explaining branch ID(s) absent from the DAG or "
                 "feasibility-dead: " + "; ".join(verdict.explaining_branches[:3]),
             )
     elif verdict.sufficient:
@@ -427,7 +647,14 @@ def build_report_from_dag(
             0, "judge confirmed the mechanism without naming an explaining branch"
         )
 
-    if (
+    replay_status = str((replay or {}).get("status") or "not_attempted")
+    replay_mismatch = replay_status == "mismatched"
+    has_numeric_replay = any(
+        result.get("evaluable") for result in (replay or {}).get("results", [])
+    )
+    if replay_mismatch:
+        confidence = "unresolved"
+    elif (
         verdict.sufficient
         and branches_verified
         and replay
@@ -435,16 +662,39 @@ def build_report_from_dag(
     ):
         # Structure confirmed AND a COMPLETE replay numerically
         # reproduces the observed signal — the honest "high". A
-        # ``partial`` replay is unresolved evidence and never upgrades;
-        # the current whole-log comparison caps at partial, so this
-        # branch stays unreachable until replay completeness lands.
+        # ``partial`` replay is unresolved evidence and never upgrades
+        # this path to high.
         confidence = "high"
-    elif verdict.sufficient and branches_verified:
+    elif verdict.sufficient and branches_verified and has_numeric_replay:
         confidence = "medium"
     elif verdict.sufficient:
         confidence = "low"
     else:
         confidence = "unresolved"
+
+    replay_checks = [
+        RelationshipCheckSpec(
+            type="derived_expression",
+            actual=str(replay.get("observed") or ""),
+            expression=str(result.get("grounded") or ""),
+            metric="match_fraction",
+            value=result.get("match_fraction"),
+            description=f"DAG replay status: {replay_status}",
+        )
+        for result in (replay or {}).get("results", [])
+        if result.get("evaluable")
+    ]
+
+    if dag is not None:
+        for vertex in dag.vertices:
+            if (
+                vertex.kind == "evidence"
+                and vertex.sub_kind == "logged_signal"
+                and (vertex.metadata or {}).get("observation") != "observed"
+            ):
+                unresolved_evidence.append(
+                    f"source-proven but unobserved signal: {vertex.signal_name}"
+                )
 
     hypothesis = HypothesisReportItem(
         title=f"Mechanism slice for {verdict.selected_terminal or 'unknown terminal'}",
@@ -453,7 +703,7 @@ def build_report_from_dag(
         source_refs=source_refs[:8],
         expected_logged_signature=signature[:12],
         applicability=ApplicabilityReport(
-            applicable=verdict.sufficient,
+            applicable=verdict.sufficient and branches_verified and not replay_mismatch,
             supported_conditions=supported[:12],
             excluded_by=excluded[:12],
             unresolved_conditions=unresolved_conditions[:12],
@@ -480,14 +730,23 @@ def build_report_from_dag(
                 else []
             ),
         ],
-        contradicting_evidence=[],
+        contradicting_evidence=(
+            ["complete deterministic DAG replay mismatched the observed terminal"]
+            if replay_mismatch
+            else []
+        ),
         unresolved_evidence=unresolved_evidence[:12],
         exclusion_checks=[],
-        numeric_checks=[],
+        numeric_checks=replay_checks[:12],
         confidence=confidence,
     )
 
-    confirmed = verdict.sufficient and branches_verified
+    confirmed = (
+        verdict.sufficient
+        and branches_verified
+        and not replay_mismatch
+        and confidence in {"high", "medium"}
+    )
     return FlightLogReport(
         airframe_summary="",
         question_intent_summary=question,
@@ -510,6 +769,7 @@ async def run_dag_discovery_stage(
     ulog_hash: Optional[str] = None,
     run_agent: Any = None,
     context: Optional[dict[str, Any]] = None,
+    signal_policies: Optional[dict[str, Any]] = None,
     **discovery_kwargs: Any,
 ) -> DagStageResult:
     """Layer 4 lookup → discover_with_judge → feasibility → Layer 2/3/4.
@@ -532,6 +792,7 @@ async def run_dag_discovery_stage(
             result.dag,
             parameter_values=parameter_values,
             signal_samples=samples,
+            signal_policies=signal_policies,
         )
 
     logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
@@ -543,6 +804,7 @@ async def run_dag_discovery_stage(
         where the condition held."""
         from flight_log_agent.analysis.mechanism_dag import (
             _evaluate_predicate_intervals,
+            _signal_policy,
         )
 
         dags = [
@@ -553,6 +815,33 @@ async def run_dag_discovery_stage(
         )
         if signal is None:
             return {"error": error, "candidates": options, "windows": None}
+        policy = _signal_policy(signal, signal_policies or {})
+        if policy is None:
+            return {
+                "error": f"no schema-derived signal policy for {signal}",
+                "windows": None,
+            }
+        if policy.get("confidence") == "low" and not policy.get("unit"):
+            return {
+                "error": f"units for {signal} are not derivable from schema metadata",
+                "windows": None,
+            }
+        expected_unit = str(policy.get("unit") or "unitless")
+        stated_unit = str(condition.units or "").strip()
+        stated_frame = str(condition.frame or "").strip()
+        if not stated_unit or not stated_frame:
+            return {
+                "error": "questioned condition lacks explicit units or frame",
+                "windows": None,
+            }
+        if expected_unit and stated_unit.lower() != expected_unit.lower():
+            return {
+                "error": (
+                    f"questioned condition unit {stated_unit!r} is incompatible "
+                    f"with schema unit {expected_unit!r}"
+                ),
+                "windows": None,
+            }
         reference: Any = parameter_values.get(str(condition.reference).upper())
         if reference is None:
             try:
@@ -567,12 +856,19 @@ async def run_dag_discovery_stage(
             signal: [(s.time_s, s.value) for s in resolution.series.samples]
         }
         windows = _evaluate_predicate_intervals(
-            f"{signal} {condition.op} {reference}", {}, {}, samples
+            f"{signal} {condition.op} {reference}",
+            {},
+            {},
+            samples,
+            signal_policies,
         )
         return {
             "signal": signal,
             "op": condition.op,
             "reference": reference,
+            "units": stated_unit,
+            "frame": stated_frame,
+            "assumptions": list(condition.assumptions),
             "windows": windows,
         }
 
@@ -628,6 +924,7 @@ async def run_dag_discovery_stage(
                 if judged.seeds.questioned_condition
                 else None
             ),
+            signal_policies=signal_policies,
         )
 
     report = build_report_from_dag(question, judged, annotated, replay=replay)

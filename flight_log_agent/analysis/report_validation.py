@@ -40,6 +40,7 @@ def validate_report(report: FlightLogReport) -> ValidationResult:
 
 
 def enforce_validation_downgrades(report: FlightLogReport, validation: ValidationResult) -> FlightLogReport:
+    downgraded_titles: set[str] = set()
     for issue in validation.issues:
         if issue.severity != "error":
             continue
@@ -55,4 +56,12 @@ def enforce_validation_downgrades(report: FlightLogReport, validation: Validatio
             if hyp.confidence in ("high", "medium"):
                 hyp.confidence = "low"
                 hyp.contradicting_evidence.append(f"Confidence downgraded by validation: {issue.message}")
+                downgraded_titles.add(hyp.title)
+    if downgraded_titles:
+        report.confirmed = [
+            title for title in report.confirmed if title not in downgraded_titles
+        ]
+        for title in downgraded_titles:
+            if title not in report.unconfirmed:
+                report.unconfirmed.append(title)
     return report

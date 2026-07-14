@@ -393,6 +393,24 @@ def compile_check_plan(
         variables.append(variable_data)
     data["variables"] = variables
 
+    # Legacy verification checks sometimes carry C++ vector element syntax
+    # (``q(0)``) while their explicit variable declaration uses ``q[0]``.
+    # Rewrite only when that declaration proves the indexed identity. The
+    # shared source-expression normalizer intentionally cannot guess whether
+    # ``name(integer)`` is a function call or an index operation.
+    if check.type == "derived_expression":
+        declared_variables = {
+            str(variable.get("name") or "")
+            for variable in variables
+            if variable.get("name")
+        }
+        for field in ("expression", "expected_expression"):
+            value = data.get(field)
+            if isinstance(value, str) and value:
+                data[field] = _rewrite_declared_index_calls(
+                    value, declared_variables
+                )
+
     # Source-derived helper substitution: if a registry is in scope and
     # the LLM wrote helper calls into expression / expected_expression,
     # rewrite them now (before validation). This also lets the verifier
@@ -522,6 +540,29 @@ def validate_derived_expression(check: dict[str, Any], inventory: dict[str, Any]
         if missing:
             unresolved.append(f"{field} has unresolved variables: {missing}")
     return unresolved
+
+
+def _rewrite_declared_index_calls(
+    expression: str,
+    declared_variables: set[str],
+) -> str:
+    """Translate C++ ``value(index)`` only when variables prove the index.
+
+    This compatibility path is deliberately scoped to the retiring legacy
+    verification-plan compiler. An unproven ``lookup(1)`` remains a call.
+    """
+
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_.])"
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
+        r"\(\s*(?P<index>\d+)\s*\)"
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        indexed = f"{match.group('name')}[{match.group('index')}]"
+        return indexed if indexed in declared_variables else match.group(0)
+
+    return pattern.sub(replace, expression)
 
 
 def check_role(check: RelationshipCheckSpec) -> str:

@@ -94,6 +94,31 @@ def symbol_indices_compatible(a: str, b: str) -> bool:
     return True
 
 
+def symbol_produces_reference(producer: str, reference: str) -> bool:
+    """Directional exact-shape compatibility for DAG data flow.
+
+    An aggregate producer may supply one of its indexed elements, but an
+    explicit element never proves the aggregate or a sibling element.
+    """
+    producer_parts = exact_symbol(producer).split(".")
+    reference_parts = exact_symbol(reference).split(".")
+    if len(producer_parts) != len(reference_parts):
+        return False
+    for producer_part, reference_part in zip(producer_parts, reference_parts):
+        producer_base = _BRACKET_INDEX_RE.sub("", producer_part)
+        reference_base = _BRACKET_INDEX_RE.sub("", reference_part)
+        if producer_base != reference_base:
+            return False
+        producer_index = _BRACKET_INDEX_RE.search(producer_part)
+        reference_index = _BRACKET_INDEX_RE.search(reference_part)
+        if producer_index and (
+            not reference_index
+            or producer_index.group(0) != reference_index.group(0)
+        ):
+            return False
+    return True
+
+
 def _topic_is_struct_type(reference: str) -> bool:
     """PX4 struct type names end in ``_s``; topic names do not.
 

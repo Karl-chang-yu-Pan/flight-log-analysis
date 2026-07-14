@@ -42,9 +42,6 @@ ALLOWED_EXPRESSION_NODES: tuple[type[ast.AST], ...] = (
 )
 
 
-_PAREN_INDEX_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(\d+)\s*\)")
-
-
 class SourceExpressionError(ValueError):
     pass
 
@@ -87,21 +84,7 @@ def normalize_source_expression(expression: str) -> str:
     normalized = re.sub(r"(?P<number>\d+)\.[fF]\b", r"\g<number>.0", normalized)
     normalized = re.sub(r"(?<=\d)[fF]\b", "", normalized)
     normalized = normalize_simple_ternary(normalized)
-    normalized = _rewrite_paren_integer_index(normalized)
     return normalized.strip()
-
-
-def _rewrite_paren_integer_index(expression: str) -> str:
-    """Rewrite ``var(N)`` to ``var[N]`` for integer-literal ``N``.
-
-    PX4 matrix/vector types like ``matrix::Vector3f`` and ``matrix::Quatf``
-    overload ``operator()(size_t)`` for element access, but the ULog logs the
-    same data as bracket-indexed array fields. The rewrite is syntactic and
-    only fires when the argument is a digit sequence, so function calls with
-    non-literal arguments (e.g. ``isfinite(x)`` or ``fabs(value)``) are
-    untouched. Calls with no arguments (``x.get()``) also do not match.
-    """
-    return _PAREN_INDEX_RE.sub(r"\1[\2]", expression)
 
 
 def normalize_simple_ternary(expression: str) -> str:
@@ -131,31 +114,63 @@ def top_level_operator_index(expression: str, operator: str, *, start: int = 0) 
 
 
 def source_expression_names(expression: str) -> list[str]:
+    normalized = normalize_source_expression(expression)
     try:
-        tree = ast.parse(normalize_source_expression(expression), mode="eval")
+        tree = ast.parse(normalized, mode="eval")
     except SyntaxError:
         return []
-    names: list[tuple[int, int, str]] = []
-    attribute_roots = set()
-    for node in ast.walk(tree):
+
+    parents: dict[ast.AST, ast.AST] = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def reference_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
         if isinstance(node, ast.Attribute):
-            name = attribute_name(node)
-            if name:
-                names.append((node.lineno, node.col_offset, name))
-                attribute_roots.add(name.split(".", 1)[0])
+            base = reference_name(node.value)
+            return f"{base}.{node.attr}" if base else None
+        if isinstance(node, ast.Subscript):
+            base = reference_name(node.value)
+            if not base:
+                return None
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
+                return f"{base}[{node.slice.value}]"
+            # A dynamic index reads the aggregate value; the index expression
+            # is walked independently and remains another dependency.
+            return base
+        return None
+
+    def is_reference_child(node: ast.AST) -> bool:
+        parent = parents.get(node)
+        return bool(
+            (isinstance(parent, ast.Attribute) and parent.value is node)
+            or (isinstance(parent, ast.Subscript) and parent.value is node)
+        )
+
+    names: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
+            continue
+        if is_reference_child(node):
+            continue
+        name = reference_name(node)
+        if name:
+            names.append(
+                (getattr(node, "lineno", 0), getattr(node, "col_offset", 0), name)
+            )
     function_names = {
         node.func.id
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
-    names.extend(
-        (node.lineno, node.col_offset, node.id)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Name)
-        and node.id not in function_names
-        and node.id not in attribute_roots
+    return list(
+        dict.fromkeys(
+            name for _, _, name in sorted(names) if name not in function_names
+        )
     )
-    return list(dict.fromkeys(name for _, _, name in sorted(names)))
 
 
 def evaluate_source_expression(expression: str, env: dict[str, Any]) -> Any:

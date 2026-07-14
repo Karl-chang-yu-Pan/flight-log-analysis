@@ -61,11 +61,16 @@ def test_render_discovery_compact_carries_the_facts(tmp_path):
 
     assert render["terminal"] == "_final_out"
     assert any(
-        op.startswith("_final_out <- _dest_val + 1.0 @ src/modules/example/rtl.cpp:")
+        op["target"] == "_final_out"
+        and op["expression"] == "_dest_val + 1.0"
+        and op["file"] == "src/modules/example/rtl.cpp"
         for op in render["operations"]
     )
-    assert any("_param_rtl_type" in b for b in render["branches"])
-    assert "gspeed" in render["evidence"]["logged_signal"]
+    assert any("_param_rtl_type" in b["predicate"] for b in render["branches"])
+    assert any(
+        item["signal"] == "gspeed" and item["observation"] == "observed"
+        for item in render["evidence"]["logged_signal"]
+    )
     # No DEFINE_PARAMETERS block in the fixture, so the param member has
     # no canonical name and honestly renders as unresolved.
     assert render["unresolved_symbols"] == ["_param_rtl_type.get"]
@@ -314,8 +319,54 @@ def test_judge_sees_annotated_render_and_selected_annotated_returned(tmp_path):
     )
 
     branches = payloads[0]["candidates"]["_final_out"]["branches"]
-    assert any("always_true; active 1w 10.0-50.0s" in b for b in branches)
+    assert any(
+        b["feasibility"] == "always_true"
+        and b["active_windows"] == [[10.0, 50.0]]
+        for b in branches
+    )
     assert judged.selected_annotated is annotated_dags[-1]
+
+
+def test_seeder_receives_authoritative_normalized_intent(tmp_path):
+    profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
+    seeder_payloads: list[dict] = []
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            seeder_payloads.append(payload)
+            return DiscoverySeeds(
+                seeds=["pick_altitude"],
+                candidate_terminals=[TerminalCandidate(terminal="_final_out")],
+            )
+        return DiscoveryVerdict(sufficient=True, selected_terminal="_final_out")
+
+    asyncio.run(
+        discover_with_judge(
+            profiler,
+            tmp_path / "cache",
+            "ambiguous raw wording",
+            "hash",
+            run_agent=stub_runner,
+            context={
+                "question_intent": {
+                    "original_question": "ambiguous raw wording",
+                    "concise_intent": "explain the selected output",
+                    "source_queries": ["pick_altitude"],
+                }
+            },
+            logged_signals={"gspeed"},
+        )
+    )
+
+    assert seeder_payloads == [
+        {
+            "question_intent": {
+                "concise_intent": "explain the selected output",
+                "source_queries": ["pick_altitude"],
+            },
+            "airframe": {},
+        }
+    ]
 
 
 def test_bonus_round_triggers_single_rejudge(tmp_path):

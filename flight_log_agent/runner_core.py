@@ -116,10 +116,12 @@ from flight_log_agent.px4.source_mechanism_resolver import (
 )
 from flight_log_agent.px4.msg_schema import (
     load_px4_msg_schema,
+    load_px4_signal_policies,
     resolve_topic_field,
     is_valid_topic_field,
 )
 from flight_log_agent.analysis.dag_pipeline import run_dag_discovery_stage
+from flight_log_agent.ulog.inventory import observed_signals_from_inventory
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 
 from flight_log_agent.audit import (
@@ -491,11 +493,13 @@ async def analyze_flight_log(
         )
         if dag_discovery_enabled and source_snapshot is not None:
             schema = load_px4_msg_schema(source_snapshot)
-            dag_logged_signals = {
+            dag_signal_policies = load_px4_signal_policies(source_snapshot)
+            dag_schema_signals = {
                 f"{topic}.{field}"
                 for topic, fields in schema.items()
                 for field in fields
             }
+            dag_observed_signals = observed_signals_from_inventory(inventory)
 
             async def run_dag_agent(agent: Any, payload: dict[str, Any]) -> Any:
                 return await _run_agent(
@@ -519,9 +523,10 @@ async def analyze_flight_log(
                     "airframe": airframe_context.model_dump(),
                     "question_intent": question_intent.model_dump(),
                 },
+                signal_policies=dag_signal_policies,
                 source_root=source_snapshot.repository_path,
-                logged_signals=dag_logged_signals,
-                schema_signals=dag_logged_signals,
+                logged_signals=dag_observed_signals,
+                schema_signals=dag_schema_signals,
             )
             audit_logger.log_event(
                 "dag_discovery.finished",

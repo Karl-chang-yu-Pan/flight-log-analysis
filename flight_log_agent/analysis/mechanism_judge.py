@@ -20,7 +20,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional, Union
+from typing import Any, Awaitable, Callable, Literal, Optional, Union
 
 from agents import Agent
 from pydantic import BaseModel, Field
@@ -32,6 +32,10 @@ from flight_log_agent.analysis.mechanism_discovery import (
     discover_mechanism_dag,
 )
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
+from flight_log_agent.utils import dedupe_keep_order
+
+
+SEEDER_ADAPTER_VERSION = "question-intent-authoritative-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +65,7 @@ def render_discovery_compact(
 ) -> dict[str, Any]:
     """JSON-able compact view of one discovery result.
 
-    Operations render as ``target <- expression @ file:line``; evidence
+    Operations render with stable IDs and explicit adjacency; evidence
     groups by kind; the per-round trace shows how the fixpoint converged
     so the judge can see whether gaps were shrinking or churning.
     ``dag`` (optional) substitutes a feasibility-annotated graph for
@@ -75,16 +79,47 @@ def render_discovery_compact(
     """
     dag = dag if dag is not None else result.dag
     validation = getattr(result, "terminal_validation", None)
-    operations: list[str] = []
-    branches: list[str] = []
+    operations: list[dict[str, Any]] = []
+    branches: list[dict[str, Any]] = []
     helper_returns: list[str] = []
     call_heads: set[str] = set()
-    evidence: dict[str, list[str]] = {}
+    evidence: dict[str, list[dict[str, Any]]] = {}
+    incoming_data: dict[str, list[dict[str, str]]] = {}
+    incoming_controls: dict[str, list[str]] = {}
+    incoming_selections: dict[str, list[str]] = {}
+    outgoing: dict[str, list[str]] = {}
+    control_outgoing: dict[str, list[str]] = {}
+    selection_outgoing: dict[str, list[str]] = {}
+    for edge in dag.edges if dag else []:
+        outgoing.setdefault(edge.source_id, []).append(edge.target_id)
+        if edge.kind == "data":
+            incoming_data.setdefault(edge.target_id, []).append(
+                {
+                    "source_id": edge.source_id,
+                    "role": str(edge.role or ""),
+                }
+            )
+        elif edge.kind == "control":
+            incoming_controls.setdefault(edge.target_id, []).append(edge.source_id)
+            control_outgoing.setdefault(edge.source_id, []).append(edge.target_id)
+        elif edge.kind == "selection":
+            incoming_selections.setdefault(edge.target_id, []).append(edge.source_id)
+            selection_outgoing.setdefault(edge.source_id, []).append(edge.target_id)
 
     for vertex in dag.vertices if dag else []:
         if vertex.kind == "operation":
-            location = f"{vertex.file}:{vertex.line}" if vertex.file else "?"
-            entry = f"{vertex.variable} <- {_truncate(vertex.expression or '')} @ {location}"
+            entry = {
+                "id": vertex.id,
+                "target": str(vertex.variable or ""),
+                "expression": _truncate(vertex.expression or ""),
+                "file": vertex.file,
+                "line": vertex.line,
+                "inputs": incoming_data.get(vertex.id, []),
+                "controls": incoming_controls.get(vertex.id, []),
+                "value_selectors": incoming_selections.get(vertex.id, []),
+                "feeds": sorted(set(outgoing.get(vertex.id, []))),
+                "reachability": (vertex.metadata or {}).get("reachability"),
+            }
             if vertex.provenance and vertex.provenance.startswith("helper_return"):
                 helper_returns.append(str(vertex.variable))
             for head in re.findall(
@@ -95,19 +130,33 @@ def render_discovery_compact(
             operations.append(entry)
         elif vertex.kind == "branch":
             predicate = vertex.predicate_lowered or vertex.predicate_raw or ""
-            tag = vertex.feasibility_verdict or "unknown"
-            if vertex.active_windows:
-                first = vertex.active_windows[0][0]
-                last = vertex.active_windows[-1][1]
-                tag += f"; active {len(vertex.active_windows)}w {first:.1f}-{last:.1f}s"
-            branches.append(f"{_truncate(predicate)} [{tag}]")
+            branches.append(
+                {
+                    "id": vertex.id,
+                    "predicate": _truncate(predicate),
+                    "feasibility": vertex.feasibility_verdict or "unknown",
+                    "active_windows": [list(window) for window in vertex.active_windows],
+                    "evaluation_domain": (vertex.metadata or {}).get("evaluation_domain"),
+                    "gates": sorted(set(control_outgoing.get(vertex.id, []))),
+                    "selects_values_for": sorted(
+                        set(selection_outgoing.get(vertex.id, []))
+                    ),
+                    "inputs": incoming_data.get(vertex.id, []),
+                }
+            )
         elif vertex.kind == "evidence":
             kind = str(vertex.sub_kind or "other")
-            label = str(vertex.signal_name or "")
-            value = (vertex.metadata or {}).get("value")
-            if value is not None:
-                label = f"{label}={value}"
-            evidence.setdefault(kind, []).append(label)
+            metadata = vertex.metadata or {}
+            evidence.setdefault(kind, []).append(
+                {
+                    "id": vertex.id,
+                    "signal": str(vertex.signal_name or ""),
+                    "value": metadata.get("value"),
+                    "observation": metadata.get("observation"),
+                    "boundary": metadata.get("boundary"),
+                    "feeds": sorted(set(outgoing.get(vertex.id, []))),
+                }
+            )
 
     return {
         "terminal": dag.terminal if dag else None,
@@ -136,7 +185,7 @@ def render_discovery_compact(
             max_unresolved,
         ),
         "evidence": {
-            kind: _capped(sorted(set(items)), max_evidence)
+            kind: _capped(sorted(items, key=lambda item: str(item.get("id") or "")), max_evidence)
             for kind, items in sorted(evidence.items())
         },
         "unresolved_symbols": _capped(
@@ -176,8 +225,11 @@ class QuestionedCondition(BaseModel):
     deviation windows against branch active-windows."""
 
     signal_hint: str
-    op: str
+    op: Literal[">", ">=", "<", "<=", "==", "!="]
     reference: str
+    units: str
+    frame: str
+    assumptions: list[str] = Field(default_factory=list)
 
 
 class DiscoverySeeds(BaseModel):
@@ -210,8 +262,8 @@ seeder_agent = Agent(
     name="Mechanism Discovery Seeder",
     model="gpt-5.5",
     instructions="""
-Convert a PX4 flight-log question into inputs for deterministic source
-discovery.
+Convert an authoritative normalized PX4 question intent into inputs for
+deterministic source discovery. Do not reinterpret or broaden the intent.
 
 Output:
 - seeds: concrete grep-able queries for the PX4 source tree — exact
@@ -234,8 +286,11 @@ merely logs it; list the published field as a secondary candidate.
 If the question asserts a comparison (a quantity above/below/equal to a
 parameter or value), fill questioned_condition with the LOGGED signal
 that records the quantity (topic.field), the comparison operator, and
-the reference (a parameter name or number). It is evaluated over the
-log to find when the questioned behavior actually occurred.
+the reference (a parameter name or number). State the signal/reference
+units and coordinate/reference frame; use "unitless" or "not_applicable"
+when those concepts genuinely do not apply. Record any assumption
+explicitly. It is evaluated over the log to find when the questioned
+behavior actually occurred.
 
 Do not use log data, do not verify anything, do not draft hypotheses.
 """,
@@ -274,10 +329,10 @@ When sufficient is false you MUST fill at least one of essential_gaps,
 expand_calls, or next_terminals — or leave all empty only if no further
 discovery could possibly help. One follow-up round is granted at most.
 
-Branch entries end with a flight-data feasibility tag: [always_false]
-means the predicate never held in THIS flight — treat that path as
-inactive and do NOT demand its grounding; [always_true] held
-throughout; "active Nw A-Bs" lists when it held. For questions about
+Branch entries contain a stable id, predicate, flight-data feasibility,
+and the exact active_windows. always_false means the predicate never held
+in THIS flight — treat that path as inactive and do NOT demand its
+grounding; always_true held throughout. For questions about
 behavior that occurs only sometimes, prefer the branch whose active
 windows can explain WHEN it occurred.
 
@@ -286,11 +341,11 @@ QUESTIONED condition itself held in the log. The explaining branch's
 active windows should overlap them; a branch active only outside them
 cannot be the answer.
 
-When sufficient is true you MUST fill explaining_branches with the
-branch predicate string(s), copied verbatim from the rendering's
-branches, whose taking explains the questioned behavior. They are
-cross-checked against flight-data feasibility — a mechanism whose
-explaining branch never fired cannot be the answer.
+When sufficient is true you MUST fill explaining_branches with the stable
+branch id(s), copied exactly from the rendering's branches, whose taking
+explains the questioned behavior. They are cross-checked against
+flight-data feasibility — a mechanism whose explaining branch never
+fired cannot be the answer.
 
 essential_gaps and expand_calls entries are BARE symbol or function
 names copied from unresolved_symbols / unexpanded_calls / operation
@@ -381,9 +436,31 @@ async def discover_with_judge(
     """
     runner = run_agent or _default_run_agent
 
-    seeds = seeds_override or await runner(
-        seeder_agent,
-        {"question": question, "context": context or {}},
+    context_dict = dict(context or {})
+    intent = dict(context_dict.get("question_intent") or {})
+    if seeds_override is None:
+        authoritative_intent = {
+            key: value
+            for key, value in intent.items()
+            if key != "original_question"
+        } or {"concise_intent": question}
+        seeds = await runner(
+            seeder_agent,
+            {
+                "question_intent": authoritative_intent,
+                "airframe": context_dict.get("airframe") or {},
+            },
+        )
+    else:
+        seeds = seeds_override
+
+    intent_seeds = [
+        *(str(value) for value in (intent.get("source_queries") or []) if value),
+        *(str(value) for value in (intent.get("likely_modules") or []) if value),
+        *(str(value) for value in (intent.get("likely_source_files") or []) if value),
+    ]
+    seeds = seeds.model_copy(
+        update={"seeds": dedupe_keep_order([*intent_seeds, *seeds.seeds])}
     )
 
     results: dict[str, DiscoveryResult] = {}

@@ -79,6 +79,49 @@ def _empty_inventory() -> dict:
     }
 
 
+def observed_signals_from_inventory(inventory: dict[str, Any] | None) -> set[str]:
+    """Return unambiguous signal references actually present in one ULog.
+
+    ``topic_fields`` intentionally contains a few UI-derived fields and merges
+    all multi instances, so it cannot be the canonical evidence inventory.
+    ``topic_instances`` is lossless, so every reference retains its
+    ``topic[multi_id].field`` identity. Consumers may resolve an unqualified
+    source reference only when exactly one observed instance is compatible.
+
+    The ``topic_fields`` fallback supports older serialized inventories that
+    predate ``topic_instances``. It is deliberately used only when no instance
+    inventory is available.
+    """
+    payload = inventory or {}
+    topic_instances = payload.get("topic_instances") or {}
+    observed: set[str] = set()
+    if isinstance(topic_instances, dict) and topic_instances:
+        for topic, raw_instances in topic_instances.items():
+            if not isinstance(topic, str) or not topic:
+                continue
+            instances = [item for item in (raw_instances or []) if isinstance(item, dict)]
+            if not instances:
+                continue
+            for instance in instances:
+                try:
+                    multi_id = int(instance.get("multi_id", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                prefix = f"{topic}[{multi_id}]"
+                for field in instance.get("fields") or []:
+                    if isinstance(field, str) and field and field != "timestamp":
+                        observed.add(f"{prefix}.{field}")
+        return observed
+
+    for topic, fields in (payload.get("topic_fields") or {}).items():
+        if not isinstance(topic, str) or not topic:
+            continue
+        for field in fields or []:
+            if isinstance(field, str) and field and field != "timestamp":
+                observed.add(f"{topic}.{field}")
+    return observed
+
+
 
 
 def _extract_topic_names(ulog: Any) -> list[str]:

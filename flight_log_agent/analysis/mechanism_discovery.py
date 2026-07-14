@@ -33,7 +33,7 @@ from flight_log_agent.px4.source_facts_cache import (
 from flight_log_agent.symbols import (
     exact_symbol,
     strip_symbol_indices,
-    symbol_indices_compatible,
+    symbol_produces_reference,
 )
 from flight_log_agent.utils import dedupe_keep_order
 
@@ -51,10 +51,10 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
 
     The DAG builder reads ``target_symbol`` / ``source_symbol`` /
     ``assignment_path`` / ``logged_signal`` — not the profiler's flat
-    ``target`` / ``expression`` / ``file`` / ``line``. ``logged_signal``
-    composes from ``target_topic`` + ``target_field`` when the profiler
-    resolved the write to a published topic; otherwise it stays empty and
-    the binding participates only via ``target_symbol``.
+    ``target`` / ``expression`` / ``file`` / ``line``. A profiler-derived
+    topic/field pair establishes declaration compatibility only. The
+    aggregation pass fills ``logged_signal`` only after source structure
+    proves that the target object crosses a publication boundary.
     """
     ref = _as_dict(assignment)
     topic = ref.get("target_topic")
@@ -63,6 +63,9 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         "target_symbol": str(ref.get("target") or ""),
         "source_symbol": str(ref.get("expression") or ""),
         "function": str(ref.get("function") or ""),
+        "callable_id": str(ref.get("callable_id") or ""),
+        "function_parameters": list(ref.get("function_parameters") or []),
+        "declaration_kind": str(ref.get("declaration_kind") or ""),
         "assignment_path": [
             {
                 "file": str(ref.get("file") or ""),
@@ -70,11 +73,16 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
                 "expression": str(ref.get("expression") or ""),
             }
         ],
-        "logged_signal": f"{topic}.{field_name}" if topic and field_name else "",
+        # A struct type proves declaration compatibility, not publication.
+        # ``dag_inputs_from_facts`` fills this only after a publish boundary
+        # ties the target object to a topic.
+        "declared_signal": f"{topic}.{field_name}" if topic and field_name else "",
+        "logged_signal": "",
         "control_predicates": list(ref.get("control_predicates") or []),
         "control_predicate_lines": list(ref.get("control_predicate_lines") or []),
         "reachability_exact": bool(ref.get("reachability_exact", True)),
         "struct_variables": dict(ref.get("struct_variables") or {}),
+        "symbol_bindings": dict(ref.get("symbol_bindings") or {}),
     }
 
 
@@ -92,6 +100,7 @@ class DAGInputs:
     parameter_aliases: dict[str, str] = field(default_factory=dict)
     parameter_names: set[str] = field(default_factory=set)
     call_statements: list[dict[str, Any]] = field(default_factory=list)
+    boundary_bindings: list[dict[str, Any]] = field(default_factory=list)
 
 
 def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
@@ -109,8 +118,122 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
     seen_predicates: set[tuple[str, str, int]] = set()
     seen_calls: set[tuple[str, str, str, int]] = set()
 
-    for facts_entry in facts:
-        entry = _as_dict(facts_entry)
+    entries = [_as_dict(facts_entry) for facts_entry in facts]
+
+    topic_refs_by_variable: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        for direction_key in ("subscribed_topics", "published_topics"):
+            direction = "subscribe" if direction_key == "subscribed_topics" else "publish"
+            for raw_ref in entry.get(direction_key) or []:
+                ref = _as_dict(raw_ref)
+                variable = str(ref.get("variable") or "")
+                topic = str(ref.get("topic") or "")
+                if not variable or not topic:
+                    continue
+                topic_refs_by_variable.setdefault(variable, []).append(
+                    {
+                        "source_symbol": variable,
+                        "topic": topic,
+                        "instance": ref.get("instance"),
+                        "direction": direction,
+                        "file": str(ref.get("file") or entry.get("file") or ""),
+                        "function": "",
+                        "callable_id": "",
+                        "provenance": str(ref.get("api") or direction_key),
+                    }
+                )
+
+    def unique_boundary(
+        variable: str,
+        direction: str,
+        source_file: str,
+    ) -> tuple[str, Any] | None:
+        candidates = [
+            item
+            for item in topic_refs_by_variable.get(variable, [])
+            if item.get("direction") == direction and item.get("topic")
+        ]
+        exact_file = [
+            item for item in candidates if str(item.get("file") or "") == source_file
+        ]
+        if exact_file:
+            candidates = exact_file
+        elif source_file:
+            source_directory = source_file.rpartition("/")[0]
+            same_directory = [
+                item
+                for item in candidates
+                if str(item.get("file") or "").rpartition("/")[0]
+                == source_directory
+            ]
+            if same_directory:
+                candidates = same_directory
+        placements = {
+            (str(item.get("topic") or ""), item.get("instance"))
+            for item in candidates
+        }
+        return next(iter(placements)) if len(placements) == 1 else None
+
+    inputs.boundary_bindings.extend(
+        item
+        for refs in topic_refs_by_variable.values()
+        for item in refs
+    )
+
+    for entry in entries:
+        for raw_call in entry.get("function_calls") or []:
+            call = _as_dict(raw_call)
+            name = str(call.get("name") or "").rsplit("::", 1)[-1]
+            receiver = str(call.get("receiver") or "")
+            args = [str(arg) for arg in (call.get("args") or [])]
+            if not receiver or not args:
+                continue
+            direction = "subscribe" if name in {"copy", "update"} else (
+                "publish" if name == "publish" else ""
+            )
+            if not direction:
+                continue
+            file = str(call.get("file") or entry.get("file") or "")
+            placement = unique_boundary(receiver, direction, file)
+            if not placement:
+                continue
+            topic, instance = placement
+            source_symbol = args[0].lstrip("&*").strip()
+            if not source_symbol:
+                continue
+            inputs.boundary_bindings.append(
+                {
+                    "source_symbol": source_symbol,
+                    "topic": topic,
+                    "instance": instance,
+                    "direction": direction,
+                    "file": file,
+                    "function": str(call.get("function") or ""),
+                    "callable_id": str(call.get("callable_id") or ""),
+                    "provenance": f"{receiver}.{name}",
+                }
+            )
+
+    publish_candidates: dict[tuple[str, str, str], set[tuple[str, Any]]] = {}
+    for item in inputs.boundary_bindings:
+        callable_id = str(item.get("callable_id") or "")
+        if item.get("direction") != "publish" or not callable_id:
+            continue
+        key = (
+            str(item.get("source_symbol") or ""),
+            str(item.get("file") or ""),
+            callable_id,
+        )
+        publish_candidates.setdefault(key, set()).add(
+            (str(item.get("topic") or ""), item.get("instance"))
+        )
+    publish_roots = {
+        key: next(iter(placements))
+        for key, placements in publish_candidates.items()
+        if len(placements) == 1
+    }
+
+    for entry in entries:
 
         for assignment in entry.get("source_assignments") or []:
             ref = _as_dict(assignment)
@@ -123,7 +246,19 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             if key in seen_bindings:
                 continue
             seen_bindings.add(key)
-            inputs.bindings.append(binding_from_assignment(ref))
+            binding = binding_from_assignment(ref)
+            target = str(binding.get("target_symbol") or "")
+            root, dot, field_path = target.replace("->", ".").partition(".")
+            file = str(ref.get("file") or entry.get("file") or "")
+            callable_id = str(ref.get("callable_id") or "")
+            placement = publish_roots.get((root, file, callable_id))
+            if placement and dot and field_path:
+                topic, instance = placement
+                topic_identity = (
+                    f"{topic}[{instance}]" if instance is not None else topic
+                )
+                binding["logged_signal"] = f"{topic_identity}.{field_path}"
+            inputs.bindings.append(binding)
 
         for helper in entry.get("helper_expressions") or []:
             helper_dict = _as_dict(helper)
@@ -300,7 +435,7 @@ def validate_terminal(
         )
         published = exact_symbol(str(binding.get("logged_signal") or ""))
         for candidate in (target, published):
-            if strip_symbol_indices(candidate) == shape and symbol_indices_compatible(
+            if strip_symbol_indices(candidate) == shape and symbol_produces_reference(
                 candidate, norm
             ):
                 matches.append(binding)
@@ -607,20 +742,12 @@ def discover_mechanism_dag(
     if enum_registry is None:
         # Schema-derived message enums, flattened PER MESSAGE (the scope
         # the reference itself carries) — loaded once per discovery.
-        from flight_log_agent.px4.msg_schema import load_px4_msg_enum_registry
+        from flight_log_agent.px4.msg_schema import load_px4_declared_constant_registry
 
         try:
-            raw_registry = load_px4_msg_enum_registry(profiler.source)
+            enum_registry = load_px4_declared_constant_registry(profiler.source)
         except Exception:
-            raw_registry = {}
-        enum_registry = {
-            message: {
-                name: value
-                for enum_map in (enums or {}).values()
-                for name, value in (enum_map or {}).items()
-            }
-            for message, enums in raw_registry.items()
-        }
+            enum_registry = {}
 
     seed_queries = dedupe_keep_order([*(str(s) for s in seeds if s), terminal])
     hits = profiler.search_related_source_files(
@@ -712,6 +839,7 @@ def discover_mechanism_dag(
             parameter_aliases=inputs.parameter_aliases,
             terminal_file=validation.resolved_file or terminal_file,
             call_statements=inputs.call_statements,
+            boundary_bindings=inputs.boundary_bindings,
             enum_registry=enum_registry,
         )
 
