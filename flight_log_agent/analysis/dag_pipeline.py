@@ -19,7 +19,9 @@ from typing import Any, Literal, Optional, Union
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.mechanism_dag import (
     MechanismDAG,
+    PreparedSignalSeries,
     evaluate_feasibility,
+    prepare_signal_series,
 )
 from flight_log_agent.analysis.mechanism_discovery import DiscoveryResult
 from flight_log_agent.analysis.mechanism_judge import (
@@ -542,6 +544,8 @@ def replay_terminal_expressions(
     logged_set: set[str],
     observed_hint: Optional[str] = None,
     signal_policies: Optional[dict[str, Any]] = None,
+    signal_samples: Optional[dict[str, list[tuple[float, Any]]]] = None,
+    prepared_signal_series: Optional[dict[str, PreparedSignalSeries]] = None,
 ) -> dict[str, Any]:
     """Numerically compare the mechanism against the log: ground each
     terminal write's expression through the graph, evaluate it over the
@@ -588,15 +592,32 @@ def replay_terminal_expressions(
         )
     if observed not in logged_set:
         return not_attempted(f"terminal output {observed!r} is not in the observed catalogue")
-    index = ULogEvidenceIndex.from_path(log_path, [observed])
-    resolution = index.resolve_signal(observed)
-    if resolution.status != "observed" or resolution.series is None:
-        return not_attempted(f"{observed} not observed in this log")
-    observed_samples = [(s.time_s, s.value) for s in resolution.series.samples]
+    samples = (
+        dict(signal_samples)
+        if signal_samples is not None
+        else dict(_signal_samples_for_dag(annotated, log_path))
+    )
+    observed_samples = samples.get(observed)
+    if observed_samples is None:
+        index = ULogEvidenceIndex.from_path(log_path, [observed])
+        resolution = index.resolve_signal(observed)
+        if resolution.status != "observed" or resolution.series is None:
+            return not_attempted(f"{observed} not observed in this log")
+        observed_samples = [(s.time_s, s.value) for s in resolution.series.samples]
+        samples[observed] = observed_samples
     if len(observed_samples) < 2:
         return not_attempted(f"{observed} has too few samples")
-    samples = dict(_signal_samples_for_dag(annotated, log_path))
-    samples[observed] = observed_samples
+    prepared_series = dict(prepared_signal_series or {})
+    missing_samples = {
+        signal: series
+        for signal, series in samples.items()
+        if signal not in prepared_series
+    }
+    if missing_samples:
+        prepared_series.update(
+            prepare_signal_series(missing_samples, signal_policies)
+        )
+    observed_samples = list(prepared_series[observed].samples)
     observed_policy = (signal_policies or {}).get(observed)
     tolerance = _replay_tolerance(observed_samples, observed_policy)
     observed_span = (observed_samples[0][0], observed_samples[-1][0])
@@ -656,6 +677,7 @@ def replay_terminal_expressions(
             {},
             samples,
             signal_policies,
+            prepared_series=prepared_series,
         )
         if match_windows is None:
             results.append(
@@ -673,6 +695,7 @@ def replay_terminal_expressions(
             f"abs(({grounded}) - ({observed})) <= {tolerance}",
             samples,
             signal_policies or {},
+            prepared_series=prepared_series,
         ):
             writer_complete = False
         active_duration = _window_duration(domain)
@@ -1016,16 +1039,30 @@ async def run_dag_discovery_stage(
     cached_seeds = None
 
     parameter_values = dict((inventory or {}).get("parameters") or {})
+    signal_data: dict[
+        int,
+        tuple[
+            dict[str, list[tuple[float, Any]]],
+            dict[str, PreparedSignalSeries],
+        ],
+    ] = {}
 
     def annotate(result: DiscoveryResult) -> Optional[MechanismDAG]:
         if result.dag is None:
             return None
-        samples = _signal_samples_for_dag(result.dag, log_path)
+        prepared_data = signal_data.get(id(result))
+        if prepared_data is None:
+            samples = _signal_samples_for_dag(result.dag, log_path)
+            prepared_series = prepare_signal_series(samples, signal_policies)
+            signal_data[id(result)] = (samples, prepared_series)
+        else:
+            samples, prepared_series = prepared_data
         return evaluate_feasibility(
             result.dag,
             parameter_values=parameter_values,
             signal_samples=samples,
             signal_policies=signal_policies,
+            prepared_signal_series=prepared_series,
         )
 
     logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
@@ -1063,6 +1100,7 @@ async def run_dag_discovery_stage(
 
     replay: Optional[dict[str, Any]] = None
     if annotated is not None:
+        selected_signal_data = signal_data.get(id(selected))
         replay = replay_terminal_expressions(
             annotated,
             log_path,
@@ -1074,6 +1112,12 @@ async def run_dag_discovery_stage(
                 else None
             ),
             signal_policies=signal_policies,
+            signal_samples=(
+                selected_signal_data[0] if selected_signal_data is not None else None
+            ),
+            prepared_signal_series=(
+                selected_signal_data[1] if selected_signal_data is not None else None
+            ),
         )
 
     report = build_report_from_dag(question, judged, annotated, replay=replay)

@@ -5,6 +5,7 @@ from flight_log_agent.analysis.mechanism_dag import (
     evaluate_feasibility,
     layer2_cache_path,
     layer3_cache_path,
+    prepare_signal_series,
     read_dag_from_cache,
     split_by_terminal,
     write_dag_to_cache,
@@ -378,6 +379,53 @@ def test_feasibility_marks_always_true_for_satisfied_predicate():
     )
     branch = next(v for v in reduced.vertices if v.kind == "branch")
     assert branch.feasibility_verdict == "always_true"
+
+
+def test_feasibility_reuses_prepared_signal_series(monkeypatch):
+    from flight_log_agent.analysis import mechanism_dag as mechanism_dag_module
+
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="output",
+            expression="1",
+            file="src/modules/example/ctrl.cpp",
+            line=10,
+            control_predicates=["topic.flag > 0"],
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="output",
+            expression="2",
+            file="src/modules/example/ctrl.cpp",
+            line=20,
+            control_predicates=["topic.flag <= 0"],
+        ),
+    ]
+    dag = build_mechanism_dag(
+        bindings,
+        "output",
+        logged_signals={"topic.flag"},
+    )
+    samples = {"topic.flag": [(2.0, 1), (0.0, 0), (1.0, 1)]}
+    policies = {"topic.flag": {"method": "discrete_hold"}}
+    prepared = prepare_signal_series(samples, policies)
+    assert prepared["topic.flag"].times == (0.0, 1.0, 2.0)
+
+    def unexpected_prepare(*_args, **_kwargs):
+        raise AssertionError("prepared DAG signals must not be sorted again")
+
+    monkeypatch.setattr(
+        mechanism_dag_module, "prepare_signal_series", unexpected_prepare
+    )
+    reduced = evaluate_feasibility(
+        dag,
+        signal_samples=samples,
+        signal_policies=policies,
+        prepared_signal_series=prepared,
+        prune_dead=False,
+    )
+    assert len([vertex for vertex in reduced.vertices if vertex.kind == "branch"]) == 2
 
 
 def test_feasibility_prunes_always_false_gated_operation():

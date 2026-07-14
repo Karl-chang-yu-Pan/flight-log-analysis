@@ -46,6 +46,33 @@ class SourceSymbolIdentity(BaseModel):
             self.declaring_class,
         )
 
+    def storage_key(self) -> tuple[str, ...]:
+        """Identity of the storage location, independent of use site.
+
+        A local belongs to one callable, while a member remains the same
+        storage when different methods of its declaring class write it.
+        Globals are source-unit scoped. Unknown identities retain every
+        available scope component rather than being merged by spelling.
+        """
+        if self.kind == "local":
+            return (self.kind, self.symbol, self.file, self.callable_id)
+        if self.kind == "member":
+            return (
+                self.kind,
+                self.symbol,
+                self.declaring_class or self.class_owner,
+            )
+        if self.kind == "global":
+            return (self.kind, self.symbol, self.file)
+        return (
+            self.kind,
+            self.symbol,
+            self.file,
+            self.callable_id,
+            self.class_owner,
+            self.declaring_class,
+        )
+
 
 class UnresolvedSourceReference(BaseModel):
     """A typed DAG frontier item with its originating source context."""
@@ -87,13 +114,14 @@ class SourceStructureIndex:
     @classmethod
     def from_facts(cls, facts: Iterable[Any]) -> "SourceStructureIndex":
         index = cls()
+        raw_bases: dict[str, set[str]] = {}
         for raw in facts:
             entry = raw.model_dump(exclude_none=True) if hasattr(raw, "model_dump") else dict(raw)
             for class_ref in entry.get("classes") or []:
                 item = _as_dict(class_ref)
                 name = str(item.get("name") or "")
                 if name:
-                    index.direct_bases.setdefault(name, set()).update(
+                    raw_bases.setdefault(name, set()).update(
                         str(base) for base in item.get("bases") or [] if base
                     )
             for member_ref in entry.get("members") or []:
@@ -122,6 +150,23 @@ class SourceStructureIndex:
                 included = str(item.get("included_file") or "")
                 if source and included:
                     index.includes.setdefault(source, set()).add(included)
+        declared = set(raw_bases)
+        for owner, bases in raw_bases.items():
+            owner_parts = owner.split("::")[:-1]
+            for raw_base in bases:
+                base = re.sub(r"^virtual\s+", "", raw_base.strip().lstrip(":"))
+                base_name = base.split("<", 1)[0].strip()
+                candidates = [
+                    "::".join([*owner_parts[:depth], base_name])
+                    for depth in range(len(owner_parts), -1, -1)
+                    if base_name
+                ]
+                resolved = next(
+                    (candidate for candidate in candidates if candidate in declared),
+                    base,
+                )
+                if resolved:
+                    index.direct_bases.setdefault(owner, set()).add(resolved)
         return index
 
     def lineage(self, class_name: str) -> list[str]:
@@ -251,6 +296,32 @@ class SourceStructureIndex:
         if reference.kind == producer.kind == "global":
             return True
         return reference.file == producer.file and bool(reference.file)
+
+    @staticmethod
+    def storage_compatible(
+        reference: SourceSymbolIdentity,
+        producer: SourceSymbolIdentity,
+    ) -> bool:
+        """Whether ``producer`` writes the requested storage location."""
+        if not symbol_produces_reference(producer.symbol, reference.symbol):
+            return False
+        if reference.kind != producer.kind:
+            return False
+        if reference.kind == "local":
+            return (
+                bool(reference.file)
+                and reference.file == producer.file
+                and bool(reference.callable_id)
+                and reference.callable_id == producer.callable_id
+            )
+        if reference.kind == "member":
+            return (
+                bool(reference.declaring_class)
+                and reference.declaring_class == producer.declaring_class
+            )
+        if reference.kind == "global":
+            return bool(reference.file) and reference.file == producer.file
+        return reference.storage_key() == producer.storage_key()
 
     def enrich_bindings(self, bindings: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         enriched: list[dict[str, Any]] = []

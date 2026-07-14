@@ -224,6 +224,7 @@ def build_mechanism_dag(
     parameter_aliases: Optional[dict[str, str]] = None,
     snippet_context_lines: int = 3,
     terminal_file: Optional[str] = None,
+    terminal_identity: Optional[SourceSymbolIdentity | dict[str, Any]] = None,
     call_statements: Sequence[Any] = (),
     boundary_bindings: Sequence[Any] = (),
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
@@ -285,6 +286,7 @@ def build_mechanism_dag(
         parameter_aliases=dict(parameter_aliases or {}),
         snippet_context_lines=snippet_context_lines,
         terminal_file=terminal_file,
+        terminal_identity=terminal_identity,
         call_statements=[_as_binding_dict(c) for c in call_statements],
         boundary_bindings=[_as_binding_dict(b) for b in boundary_bindings],
         enum_registry=dict(enum_registry or {}),
@@ -315,6 +317,7 @@ class _DAGBuilder:
         parameter_aliases: dict[str, str],
         snippet_context_lines: int,
         terminal_file: Optional[str] = None,
+        terminal_identity: Optional[SourceSymbolIdentity | dict[str, Any]] = None,
         call_statements: Optional[list[dict[str, Any]]] = None,
         boundary_bindings: Optional[list[dict[str, Any]]] = None,
         enum_registry: Optional[dict[str, dict[str, Any]]] = None,
@@ -323,6 +326,13 @@ class _DAGBuilder:
         self.terminal_raw = terminal
         self.terminal = exact_symbol(terminal)
         self.terminal_file = str(terminal_file) if terminal_file else None
+        self.terminal_identity = (
+            terminal_identity
+            if isinstance(terminal_identity, SourceSymbolIdentity)
+            else SourceSymbolIdentity.model_validate(terminal_identity)
+            if terminal_identity
+            else None
+        )
         self._call_statements = list(call_statements or [])
         self._boundary_bindings = list(boundary_bindings or [])
         # Guards dotted-root rebinding recursion against alias cycles.
@@ -735,7 +745,17 @@ class _DAGBuilder:
         # visibility instead of a global by-name index, so a local named
         # ``dt`` in one module can never bind to another module's ``dt``.
         Scope = tuple[str, str, Optional[int]]  # (source unit, callable, read line)
-        terminal_scope: Scope = (self.terminal_file or "", "", None)
+        terminal_scope: Scope = (
+            self.terminal_file
+            or (self.terminal_identity.file if self.terminal_identity else ""),
+            (
+                self.terminal_identity.callable_id
+                if self.terminal_identity
+                and self.terminal_identity.kind == "local"
+                else ""
+            ),
+            None,
+        )
         frontier: deque[tuple[str, str, Scope]] = deque(
             [("symbol", self.terminal_raw, terminal_scope)]
         )
@@ -784,7 +804,19 @@ class _DAGBuilder:
                     continue
                 if norm == self.terminal:
                     writers = self._writers_of(norm)
-                    if writers and self.terminal_file:
+                    if writers and self.terminal_identity is not None:
+                        writers = [
+                            binding
+                            for binding in writers
+                            if (
+                                producer := self._binding_target_identity(binding)
+                            )
+                            is not None
+                            and self._source_structure.storage_compatible(
+                                self.terminal_identity, producer
+                            )
+                        ]
+                    elif writers and self.terminal_file:
                         # Scope the terminal to its module; fall back to
                         # all writers when none live in the hinted file.
                         scoped = [
@@ -3104,6 +3136,7 @@ def evaluate_feasibility(
     enum_values: Optional[dict[str, Any]] = None,
     signal_samples: Optional[dict[str, list[tuple[float, Any]]]] = None,
     signal_policies: Optional[dict[str, Any]] = None,
+    prepared_signal_series: Optional[dict[str, "PreparedSignalSeries"]] = None,
     prune_dead: bool = True,
 ) -> MechanismDAG:
     """Pre-evaluate each ``branch`` vertex against known constants and
@@ -3130,6 +3163,11 @@ def evaluate_feasibility(
     enums = dict(enum_values or {})
     samples = signal_samples or {}
     policies = signal_policies or {}
+    prepared_series = (
+        prepared_signal_series
+        if prepared_signal_series is not None
+        else prepare_signal_series(samples, policies)
+    )
     updated_vertices: list[DAGVertex] = []
     verdicts: dict[str, str] = {}
     for vertex in dag.vertices:
@@ -3146,7 +3184,7 @@ def evaluate_feasibility(
         if verdict == "unknown":
             if samples:
                 prepared_predicate = _prepare_predicate(
-                    predicate, samples, policies
+                    predicate, samples, policies, prepared_series=prepared_series
                 )
             evaluated = (
                 _evaluate_predicate_intervals(
@@ -3156,6 +3194,7 @@ def evaluate_feasibility(
                     samples,
                     policies,
                     prepared=prepared_predicate,
+                    prepared_series=prepared_series,
                 )
                 if samples
                 else None
@@ -3173,7 +3212,10 @@ def evaluate_feasibility(
                     verdict = _reduce_predicate(grounded, params, enums)
                     if verdict == "unknown" and samples:
                         prepared_predicate = _prepare_predicate(
-                            grounded, samples, policies
+                            grounded,
+                            samples,
+                            policies,
+                            prepared_series=prepared_series,
                         )
                         evaluated = _evaluate_predicate_intervals(
                             grounded,
@@ -3182,12 +3224,16 @@ def evaluate_feasibility(
                             samples,
                             policies,
                             prepared=prepared_predicate,
+                            prepared_series=prepared_series,
                         )
             if verdict == "unknown" and evaluated is not None:
                 windows = evaluated
                 if prepared_predicate is None:
                     prepared_predicate = _prepare_predicate(
-                        evaluated_predicate, samples, policies
+                        evaluated_predicate,
+                        samples,
+                        policies,
+                        prepared_series=prepared_series,
                     )
                 predicate_span = prepared_predicate.span
                 policies_complete = _predicate_policies_complete(
@@ -3209,7 +3255,10 @@ def evaluate_feasibility(
         metadata = dict(vertex.metadata or {})
         if samples and prepared_predicate is None:
             prepared_predicate = _prepare_predicate(
-                evaluated_predicate, samples, policies
+                evaluated_predicate,
+                samples,
+                policies,
+                prepared_series=prepared_series,
             )
         evaluation_span = prepared_predicate.span if prepared_predicate else None
         if evaluation_span is not None:
@@ -3335,35 +3384,81 @@ def _predicate_signal_references(
 
 
 @dataclass(frozen=True)
+class PreparedSignalSeries:
+    """One required signal normalized once for all branch evaluations."""
+
+    samples: tuple[tuple[float, Any], ...]
+    times: tuple[float, ...]
+    span: Optional[tuple[float, float]]
+    policy: Optional[dict[str, Any]]
+
+
+def prepare_signal_series(
+    signal_samples: dict[str, list[tuple[float, Any]]],
+    signal_policies: Optional[dict[str, Any]] = None,
+) -> dict[str, PreparedSignalSeries]:
+    """Sort only supplied DAG signals, once per analysis run."""
+    policies = signal_policies or {}
+    prepared: dict[str, PreparedSignalSeries] = {}
+    for signal, samples in signal_samples.items():
+        ordered = tuple(sorted(samples, key=lambda item: float(item[0])))
+        times = tuple(float(timestamp) for timestamp, _value in ordered)
+        prepared[signal] = PreparedSignalSeries(
+            samples=ordered,
+            times=times,
+            span=(times[0], times[-1]) if times else None,
+            policy=_signal_policy(signal, policies),
+        )
+    return prepared
+
+
+@dataclass(frozen=True)
 class _PreparedPredicate:
     text: str
     alias_to_signal: dict[str, str]
     referenced: tuple[str, ...]
     span: Optional[tuple[float, float]]
     policies: dict[str, Optional[dict[str, Any]]]
+    series: dict[str, PreparedSignalSeries]
 
 
 def _prepare_predicate(
     predicate: str,
     signal_samples: dict[str, list[tuple[float, Any]]],
     signal_policies: Optional[dict[str, Any]] = None,
+    *,
+    prepared_series: Optional[dict[str, PreparedSignalSeries]] = None,
 ) -> _PreparedPredicate:
     text, aliases = _predicate_signal_references(predicate, signal_samples)
     referenced = tuple(dict.fromkeys(aliases.values()))
     span: Optional[tuple[float, float]] = None
-    if referenced and all(signal_samples.get(signal) for signal in referenced):
-        start = max(
-            min(float(ts) for ts, _value in signal_samples[signal])
-            for signal in referenced
-        )
-        end = min(
-            max(float(ts) for ts, _value in signal_samples[signal])
-            for signal in referenced
-        )
+    available_series = prepared_series or {}
+    missing = {
+        signal: signal_samples.get(signal, [])
+        for signal in referenced
+        if signal not in available_series
+    }
+    newly_prepared = (
+        prepare_signal_series(missing, signal_policies or {}) if missing else {}
+    )
+    referenced_series = {
+        signal: available_series.get(signal) or newly_prepared[signal]
+        for signal in referenced
+        if signal in available_series or signal in newly_prepared
+    }
+    if referenced and all(
+        referenced_series.get(signal) is not None
+        and referenced_series[signal].span is not None
+        for signal in referenced
+    ):
+        start = max(referenced_series[signal].span[0] for signal in referenced)
+        end = min(referenced_series[signal].span[1] for signal in referenced)
         if start <= end:
             span = (start, end)
     policies = {
-        signal: _signal_policy(signal, signal_policies or {})
+        signal: referenced_series[signal].policy
+        if signal in referenced_series
+        else _signal_policy(signal, signal_policies or {})
         for signal in referenced
     }
     return _PreparedPredicate(
@@ -3372,6 +3467,7 @@ def _prepare_predicate(
         referenced=referenced,
         span=span,
         policies=policies,
+        series=referenced_series,
     )
 
 
@@ -3408,9 +3504,13 @@ def _predicate_policies_complete(
     signal_policies: dict[str, Any],
     *,
     prepared: Optional[_PreparedPredicate] = None,
+    prepared_series: Optional[dict[str, PreparedSignalSeries]] = None,
 ) -> bool:
     prepared = prepared or _prepare_predicate(
-        predicate, signal_samples, signal_policies
+        predicate,
+        signal_samples,
+        signal_policies,
+        prepared_series=prepared_series,
     )
     return bool(prepared.referenced) and all(
         prepared.policies.get(signal) is not None
@@ -3435,8 +3535,8 @@ def _predicate_policy_summary(
 
 
 def _sample_value_at(
-    ordered: list[tuple[float, Any]],
-    times: list[float],
+    ordered: Sequence[tuple[float, Any]],
+    times: Sequence[float],
     timestamp: float,
     policy: Optional[dict[str, Any]],
 ) -> Optional[Any]:
@@ -3513,6 +3613,7 @@ def _evaluate_predicate_intervals(
     signal_policies: Optional[dict[str, Any]] = None,
     *,
     prepared: Optional[_PreparedPredicate] = None,
+    prepared_series: Optional[dict[str, PreparedSignalSeries]] = None,
 ) -> Optional[list[tuple[float, float]]]:
     """Evaluate ``predicate`` per timestamp, return True-intervals.
 
@@ -3531,7 +3632,10 @@ def _evaluate_predicate_intervals(
     )
 
     prepared = prepared or _prepare_predicate(
-        predicate, signal_samples, signal_policies
+        predicate,
+        signal_samples,
+        signal_policies,
+        prepared_series=prepared_series,
     )
     text = prepared.text
     alias_to_signal = prepared.alias_to_signal
@@ -3549,7 +3653,7 @@ def _evaluate_predicate_intervals(
     # common observed domain.
     all_ts: set[float] = set()
     for signal in referenced:
-        for ts, _ in signal_samples[signal]:
+        for ts, _ in prepared.series[signal].samples:
             if span[0] <= ts <= span[1]:
                 all_ts.add(ts)
     all_ts.update(span)
@@ -3562,28 +3666,12 @@ def _evaluate_predicate_intervals(
     ever_evaluated = False
     last_evaluated: Optional[float] = None
 
-    # Pre-sort each referenced series and resolve its policy ONCE — the
-    # per-timestamp loop only bisects.
-    prepared_series: dict[
-        str,
-        tuple[
-            list[tuple[float, Any]],
-            list[float],
-            Optional[dict[str, Any]],
-        ],
-    ] = {}
-    for signal in referenced:
-        ordered = sorted(signal_samples[signal], key=lambda item: float(item[0]))
-        prepared_series[signal] = (
-            ordered,
-            [float(ts) for ts, _value in ordered],
-            prepared.policies.get(signal),
-        )
-
     for t in ts_sorted:
         resampled = {
-            signal_key_map[signal]: _sample_value_at(ordered, times, t, policy)
-            for signal, (ordered, times, policy) in prepared_series.items()
+            signal_key_map[signal]: _sample_value_at(
+                series.samples, series.times, t, series.policy
+            )
+            for signal, series in prepared.series.items()
         }
         if any(value is None for value in resampled.values()):
             continue

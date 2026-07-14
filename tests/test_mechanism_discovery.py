@@ -1189,6 +1189,114 @@ void Ctrl::update()
     assert target["published_signal"] == "status.speed_sp"
 
 
+def test_survey_preserves_same_named_locals_in_distinct_callables(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import survey_source_files
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/ctrl.cpp": """
+void Ctrl::first()
+{
+    value = first_input;
+}
+
+void Ctrl::second()
+{
+    value = second_input;
+}
+""",
+    })
+
+    survey = survey_source_files(
+        profiler,
+        ["src/modules/example/ctrl.cpp"],
+        texts=["no source anchor"],
+        source_hash="hash",
+    )
+
+    targets = [
+        target
+        for entry in survey.files
+        for target in entry.targets
+        if target.symbol == "value"
+    ]
+    assert len(targets) == 2
+    assert len({target.source_target_id for target in targets}) == 2
+    assert {target.identity["kind"] for target in targets} == {"local"}
+    assert len({target.identity["callable_id"] for target in targets}) == 2
+
+
+def test_terminal_identity_separates_locals_but_unifies_class_members():
+    from flight_log_agent.analysis.mechanism_discovery import validate_terminal
+
+    local_structure = SourceStructureIndex()
+    local_bindings = local_structure.enrich_bindings([
+        _vt_binding("value", "src/modules/example/ctrl.cpp", function="Ctrl::first"),
+        _vt_binding("value", "src/modules/example/ctrl.cpp", function="Ctrl::second"),
+    ])
+    assert validate_terminal(
+        "value",
+        local_bindings,
+        [],
+        terminal_file="src/modules/example/ctrl.cpp",
+        source_structure=local_structure,
+    ).status == "ambiguous"
+
+    first_identity = local_bindings[0]["target_identity"]
+    scoped = validate_terminal(
+        "value",
+        local_bindings,
+        [],
+        terminal_file="src/modules/example/ctrl.cpp",
+        source_structure=local_structure,
+        terminal_identity=first_identity,
+    )
+    assert scoped.status == "valid"
+    dag = build_mechanism_dag(
+        local_bindings,
+        "value",
+        terminal_file="src/modules/example/ctrl.cpp",
+        terminal_identity=scoped.resolved_identity,
+        source_structure=local_structure,
+    )
+    terminal_ops = [
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.metadata.get("is_terminal")
+    ]
+    assert len(terminal_ops) == 1
+    assert terminal_ops[0].metadata["function"] == "Ctrl::first"
+
+    member_structure = SourceStructureIndex(
+        direct_bases={"Ctrl": set()},
+        members={("Ctrl", "value"): {"name": "value", "owner": "Ctrl"}},
+    )
+    member_bindings = member_structure.enrich_bindings([
+        _vt_binding("value", "src/modules/example/ctrl.cpp", function="Ctrl::first"),
+        _vt_binding("value", "src/modules/example/ctrl.cpp", function="Ctrl::second"),
+    ])
+    member = validate_terminal(
+        "value", member_bindings, [], source_structure=member_structure
+    )
+    assert member.status == "valid"
+    assert member.resolved_identity["kind"] == "member"
+
+    base_writer = SourceSymbolIdentity(
+        kind="member",
+        symbol="value",
+        root="value",
+        class_owner="Base",
+        declaring_class="Base",
+    )
+    derived_writer = SourceSymbolIdentity(
+        kind="member",
+        symbol="value",
+        root="value",
+        class_owner="Derived",
+        declaring_class="Base",
+    )
+    assert SourceStructureIndex.storage_compatible(base_writer, derived_writer)
+
+
 
 def test_discovery_accepts_preranked_files(tmp_path):
     """A declared terminal file can reuse its survey-ranked candidate set."""

@@ -80,6 +80,7 @@ class _ParsedUnit:
     callables: list[_Callable] = field(default_factory=list)
     includes: list[SourceIncludeRef] = field(default_factory=list)
     class_ranges: list[tuple[int, int, str]] = field(default_factory=list)
+    namespace_ranges: list[tuple[int, int, str]] = field(default_factory=list)
 
     def text(self, node: Optional[Node]) -> str:
         if node is None:
@@ -101,6 +102,16 @@ class _ParsedUnit:
         candidates = [
             item
             for item in self.class_ranges
+            if item[0] <= node.start_byte and node.end_byte <= item[1]
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[1] - item[0])[2]
+
+    def namespace_owner(self, node: Node) -> Optional[str]:
+        candidates = [
+            item
+            for item in self.namespace_ranges
             if item[0] <= node.start_byte and node.end_byte <= item[1]
         ]
         if not candidates:
@@ -290,6 +301,7 @@ class TreeSitterSourceExtractor:
                 parse_diagnostics={"error": "source file could not be read"},
             )
 
+        self._resolve_class_bases(units)
         context = _SourceContext(units)
         self._index_parameter_members(context)
         states = [self._extract_callable(primary, context, item) for item in primary.callables]
@@ -361,7 +373,7 @@ class TreeSitterSourceExtractor:
         return unit
 
     def _extract_structure(self, unit: _ParsedUnit, path: Path) -> None:
-        self._extract_classes(unit, unit.tree.root_node, None)
+        self._extract_classes(unit, unit.tree.root_node, None, ())
         existing_members = {(item.owner, item.name) for item in unit.members}
         for name, member, owner, template in self._parameter_declarations(unit):
             if not owner or not member or (owner, member) in existing_members:
@@ -402,15 +414,78 @@ class TreeSitterSourceExtractor:
                     )
                 )
 
+    @staticmethod
+    def _resolve_class_bases(units: Sequence[_ParsedUnit]) -> None:
+        """Resolve base names against source-declared lexical scopes."""
+        declared = {
+            item.name
+            for unit in units
+            for item in unit.classes
+            if item.name
+        }
+        for unit in units:
+            resolved_classes: list[SourceClassRef] = []
+            for item in unit.classes:
+                owner_parts = item.name.split("::")[:-1]
+                bases: list[str] = []
+                for raw_base in item.bases:
+                    base = raw_base.strip().lstrip(":")
+                    base = re.sub(r"^virtual\s+", "", base)
+                    base_name = base.split("<", 1)[0].strip()
+                    candidates = [
+                        "::".join([*owner_parts[:depth], base_name])
+                        for depth in range(len(owner_parts), -1, -1)
+                        if base_name
+                    ]
+                    matches = [candidate for candidate in candidates if candidate in declared]
+                    resolved = matches[0] if matches else base
+                    if resolved and resolved not in bases:
+                        bases.append(resolved)
+                resolved_classes.append(item.model_copy(update={"bases": bases}))
+            unit.classes = resolved_classes
+
     def _extract_classes(
-        self, unit: _ParsedUnit, node: Node, lexical_owner: Optional[str]
+        self,
+        unit: _ParsedUnit,
+        node: Node,
+        lexical_owner: Optional[str],
+        namespace_scope: tuple[str, ...],
     ) -> None:
+        if node.type == "namespace_definition":
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                components = (f"(anonymous@{unit.file})",)
+            else:
+                components = tuple(
+                    part
+                    for part in unit.text(name_node).replace(" ", "").split("::")
+                    if part
+                )
+            nested_scope = (*namespace_scope, *components)
+            body = node.child_by_field_name("body")
+            if body is not None and nested_scope:
+                unit.namespace_ranges.append(
+                    (body.start_byte, body.end_byte, "::".join(nested_scope))
+                )
+                for child in body.named_children:
+                    self._extract_classes(
+                        unit, child, lexical_owner, nested_scope
+                    )
+            return
+
         owner = lexical_owner
         if node.type in {"class_specifier", "struct_specifier"}:
             name_node = node.child_by_field_name("name")
             short_name = unit.text(name_node).strip()
             if short_name:
-                owner = f"{lexical_owner}::{short_name}" if lexical_owner else short_name
+                namespace = "::".join(namespace_scope)
+                owner = (
+                    f"{lexical_owner}::{short_name}"
+                    if lexical_owner
+                    else f"{namespace}::{short_name}"
+                    if namespace
+                    else short_name
+                )
                 bases: list[str] = []
                 base_clause = next(
                     (child for child in node.named_children if child.type == "base_class_clause"),
@@ -440,7 +515,7 @@ class TreeSitterSourceExtractor:
                                 self._members_from_declaration(unit, child, owner)
                             )
         for child in node.named_children:
-            self._extract_classes(unit, child, owner)
+            self._extract_classes(unit, child, owner, namespace_scope)
 
     def _members_from_declaration(
         self, unit: _ParsedUnit, node: Node, owner: str
@@ -491,9 +566,23 @@ class TreeSitterSourceExtractor:
             name_node = function_declarator.child_by_field_name("declarator")
             raw_name = unit.text(name_node).strip()
             lexical_owner = unit.class_owner(node)
+            namespace_owner = unit.namespace_owner(node)
             qualified_owner, separator, short_name = raw_name.rpartition("::")
-            owner = qualified_owner if separator else lexical_owner
-            name = f"{owner}::{short_name or raw_name}" if owner else raw_name
+            if separator:
+                owner = qualified_owner.strip(":")
+                if namespace_owner and not owner.startswith(f"{namespace_owner}::"):
+                    owner = f"{namespace_owner}::{owner}"
+                name = f"{owner}::{short_name}"
+            elif lexical_owner:
+                owner = lexical_owner
+                name = f"{owner}::{raw_name}"
+            else:
+                owner = None
+                name = (
+                    f"{namespace_owner}::{raw_name}"
+                    if namespace_owner
+                    else raw_name
+                )
             parameters_node = function_declarator.child_by_field_name("parameters")
             parameters: list[str] = []
             parameter_types: list[str] = []

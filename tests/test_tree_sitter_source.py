@@ -66,6 +66,99 @@ class Reader
     assert by_topic["c_api_topic"].api == "orb_copy"
 
 
+def test_tree_sitter_qualifies_namespace_ownership_and_bases(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+namespace first {
+class Control
+{
+    int value;
+public:
+    void update() { value = 1; }
+};
+}
+
+namespace second {
+class Control
+{
+    int value;
+public:
+    void update() { value = 2; }
+};
+}
+
+namespace nav {
+class Base { protected: int inherited; };
+class Derived : public Base { public: void update(); };
+void Derived::update() { inherited = 3; }
+}
+""",
+    )
+
+    classes = {item.name: item for item in facts.classes}
+    assert {"first::Control", "second::Control", "nav::Base", "nav::Derived"} <= set(classes)
+    assert classes["nav::Derived"].bases == ["nav::Base"]
+
+    callables = {item.name: item for item in facts.callables}
+    assert callables["first::Control::update"].owner == "first::Control"
+    assert callables["second::Control::update"].owner == "second::Control"
+    assert callables["nav::Derived::update"].owner == "nav::Derived"
+
+    inputs = dag_inputs_from_facts([facts])
+    values = [
+        binding["target_identity"]
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "value"
+    ]
+    assert {identity["declaring_class"] for identity in values} == {
+        "first::Control",
+        "second::Control",
+    }
+    inherited = next(
+        binding["target_identity"]
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "inherited"
+    )
+    assert inherited["class_owner"] == "nav::Derived"
+    assert inherited["declaring_class"] == "nav::Base"
+
+
+def test_anonymous_namespace_ownership_is_source_unit_scoped(tmp_path):
+    root = tmp_path / "PX4-Autopilot"
+    files = [
+        "src/modules/example/first.cpp",
+        "src/modules/example/second.cpp",
+    ]
+    for index, relative in enumerate(files):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"namespace {{ class Control {{ int value; void run() {{ value = {index}; }} }}; }}",
+            encoding="utf-8",
+        )
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+    facts = [
+        extract_facts_for_file(profiler, relative, "source-hash")
+        for relative in files
+    ]
+
+    owners = {entry.classes[0].name for entry in facts}
+    assert len(owners) == 2
+    assert all("(anonymous@" in owner for owner in owners)
+    inputs = dag_inputs_from_facts(facts)
+    identities = [
+        binding["target_identity"]
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "value"
+    ]
+    assert len({identity["declaring_class"] for identity in identities}) == 2
+
+
 def test_tree_sitter_switch_reachability_is_exact_and_site_scoped(tmp_path):
     facts = _facts(
         tmp_path,

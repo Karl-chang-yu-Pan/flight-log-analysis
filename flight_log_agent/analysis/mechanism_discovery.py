@@ -17,15 +17,16 @@ frontier. No LLM code belongs in this file.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
-from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.analysis.source_expansion import (
     SourceExpansionResolver,
     SourceStructureIndex,
+    SourceSymbolIdentity,
     UnresolvedSourceReference,
 )
 from flight_log_agent.analysis.mechanism_dag import (
@@ -444,6 +445,9 @@ class SurveyedTarget:
     """One symbol written in one source file, reached from an anchor."""
 
     symbol: str
+    source_target_id: str = ""
+    callable_id: str = ""
+    identity: dict[str, Any] = field(default_factory=dict)
     function: str = ""
     line: int = 0
     expression: str = ""
@@ -488,6 +492,23 @@ class SourceSurvey:
             if any(target.symbol == symbol for target in entry.targets)
         ]
 
+    def targets_for(
+        self,
+        symbol: str,
+        *,
+        source_target_id: str = "",
+        file: Optional[str] = None,
+    ) -> list[tuple[str, SurveyedTarget]]:
+        """Return exact surveyed storage candidates for a model proposal."""
+        return [
+            (entry.file, target)
+            for entry in self.files
+            for target in entry.targets
+            if target.symbol == symbol
+            and (not source_target_id or target.source_target_id == source_target_id)
+            and (not file or entry.file == file)
+        ]
+
     def as_payload(self) -> dict[str, Any]:
         return {
             "anchors": {
@@ -501,6 +522,9 @@ class SourceSurvey:
                     "write_targets": [
                         {
                             "symbol": target.symbol,
+                            "source_target_id": target.source_target_id,
+                            "callable_id": target.callable_id,
+                            "identity": target.identity,
                             "function": target.function,
                             "line": target.line,
                             "expression": target.expression,
@@ -563,12 +587,12 @@ def survey_source_files(
     texts: Sequence[str] = (),
     observed_signals: Iterable[str] = (),
     max_hops: int = 1,
+    source_hash: str = "",
 ) -> SourceSurvey:
     """Write targets that a question anchor reaches through source dataflow.
 
-    Deliberately NOT :func:`load_facts`: a survey needs assignments and
-    parameter declarations, and the full per-file fact bundle costs
-    several times more for facts nothing here reads.
+    Facts are extracted through the configured source backend so the survey
+    uses the same callable/member identities as DAG construction.
 
     Selection is structural, in dataflow hops from an anchor:
 
@@ -590,21 +614,37 @@ def survey_source_files(
     if not file_list:
         return SourceSurvey()
 
-    assignments = [_as_dict(a) for a in
-                   profiler.extract_source_assignments_from_source(file_list)]
+    resolver = SourceExpansionResolver(profiler, source_hash)
+    fact_files = dedupe_keep_order(
+        [
+            *file_list,
+            *(
+                companion
+                for file_path in file_list
+                for companion in resolver.companion_files(file_path)
+            ),
+        ]
+    )
+    facts = [
+        extract_facts_for_file(profiler, file_path, source_hash)
+        for file_path in fact_files
+    ]
+    inputs = dag_inputs_from_facts(facts)
+    assignments = list(inputs.bindings)
     if not assignments:
         return SourceSurvey()
 
     declared_parameters: dict[str, set[str]] = {}
-    for parameter in profiler.extract_params_from_source(file_list):
-        ref = _as_dict(parameter)
-        name = str(ref.get("name") or "")
-        if not name:
-            continue
-        members = declared_parameters.setdefault(name, set())
-        member = str(ref.get("member") or "")
-        if member:
-            members.add(member)
+    for facts_entry in facts:
+        for parameter in facts_entry.referenced_parameters:
+            ref = _as_dict(parameter)
+            name = str(ref.get("name") or "")
+            if not name:
+                continue
+            members = declared_parameters.setdefault(name, set())
+            member = str(ref.get("member") or "")
+            if member:
+                members.add(member)
 
     known_callables = {
         _bare_callable(a.get("function")) for a in assignments if a.get("function")
@@ -617,7 +657,9 @@ def survey_source_files(
     )
 
     def reads_anchor(assignment: dict[str, Any]) -> bool:
-        expression = str(assignment.get("expression") or "")
+        expression = str(
+            assignment.get("source_symbol") or assignment.get("expression") or ""
+        )
         if any(member in expression for member in anchors.parameter_members):
             return True
         if any(name in expression for name in anchors.parameters):
@@ -637,52 +679,88 @@ def survey_source_files(
             }
             if not frontier:
                 break
-            written = {str(assignments[i].get("target") or "") for i in frontier}
-            read: set[str] = set()
+            written = {
+                SourceSymbolIdentity.model_validate(
+                    assignments[i].get("target_identity") or {}
+                ).storage_key()
+                for i in frontier
+                if assignments[i].get("target_identity")
+            }
+            read: set[tuple[str, ...]] = set()
             for i in frontier:
-                read.update(
-                    source_expression_names(
-                        str(assignments[i].get("expression") or "")
+                for raw_identity in (
+                    assignments[i].get("reference_identities") or {}
+                ).values():
+                    read.add(
+                        SourceSymbolIdentity.model_validate(raw_identity).storage_key()
                     )
-                )
             for index, assignment in enumerate(assignments):
                 if index in selected:
                     continue
-                target = str(assignment.get("target") or "")
-                expression = str(assignment.get("expression") or "")
-                produces_input = target in read
-                consumes_output = any(
-                    symbol and symbol in expression for symbol in written
+                raw_target_identity = assignment.get("target_identity") or {}
+                target_identity = (
+                    SourceSymbolIdentity.model_validate(raw_target_identity)
+                    if raw_target_identity
+                    else None
                 )
+                reference_keys = {
+                    SourceSymbolIdentity.model_validate(raw).storage_key()
+                    for raw in (
+                        assignment.get("reference_identities") or {}
+                    ).values()
+                }
+                produces_input = bool(
+                    target_identity and target_identity.storage_key() in read
+                )
+                consumes_output = bool(reference_keys & written)
                 if produces_input or consumes_output:
                     selected[index] = hop
     else:
         selected = {index: 0 for index in range(len(assignments))}
 
-    per_file: dict[str, dict[str, SurveyedTarget]] = {}
+    per_file: dict[str, dict[tuple[str, ...], SurveyedTarget]] = {}
     for index, distance in sorted(selected.items(), key=lambda kv: (kv[1], kv[0])):
         assignment = assignments[index]
-        file = str(assignment.get("file") or "")
-        symbol = str(assignment.get("target") or "").strip()
+        path = assignment.get("assignment_path") or []
+        site = path[0] if path else {}
+        file = str((site or {}).get("file") or "")
+        symbol = str(
+            assignment.get("target_symbol") or assignment.get("target") or ""
+        ).strip()
         if not file or not symbol:
             continue
+        identity = SourceSymbolIdentity.model_validate(
+            assignment.get("target_identity") or {}
+        )
+        storage_key = identity.storage_key()
+        source_target_id = hashlib.sha256(
+            repr(storage_key).encode("utf-8")
+        ).hexdigest()[:24]
         targets = per_file.setdefault(file, {})
-        target = targets.get(symbol)
+        target = targets.get(storage_key)
         if target is None:
             target = SurveyedTarget(
                 symbol=symbol,
+                source_target_id=source_target_id,
+                callable_id=str(assignment.get("callable_id") or ""),
+                identity=identity.model_dump(),
                 function=str(assignment.get("function") or ""),
-                line=int(assignment.get("line") or 0),
-                expression=str(assignment.get("expression") or "")[:120],
+                line=int((site or {}).get("line") or 0),
+                expression=str(
+                    assignment.get("source_symbol")
+                    or assignment.get("expression")
+                    or ""
+                )[:120],
                 distance=distance,
             )
-            targets[symbol] = target
+            targets[storage_key] = target
         target.writes += 1
         target.distance = min(target.distance, distance)
-        topic = assignment.get("target_topic")
-        field_name = assignment.get("target_field")
-        if topic and field_name and not target.published_signal:
-            target.published_signal = f"{topic}.{field_name}"
+        published = str(
+            assignment.get("logged_signal") or assignment.get("declared_signal") or ""
+        )
+        if published and not target.published_signal:
+            target.published_signal = published
 
     ordered_files = dedupe_keep_order([*file_list, *per_file])
     return SourceSurvey(
@@ -708,6 +786,7 @@ def survey_for_queries(
     texts: Sequence[str] = (),
     observed_signals: Iterable[str] = (),
     max_files: int = 8,
+    source_hash: str = "",
 ) -> tuple[SourceSurvey, list[str]]:
     """Rank source files for ``queries`` and survey their anchored targets.
 
@@ -724,6 +803,7 @@ def survey_for_queries(
         files,
         texts=[*texts, *query_list],
         observed_signals=observed_signals,
+        source_hash=source_hash,
     )
     return survey, files
 
@@ -777,6 +857,7 @@ class TerminalValidation:
     logged: bool = False
     write_files: list[str] = field(default_factory=list)
     resolved_file: Optional[str] = None
+    resolved_identity: Optional[dict[str, Any]] = None
     reason: Optional[str] = None
 
 
@@ -786,6 +867,7 @@ def validate_terminal(
     logged_signals: Iterable[str],
     terminal_file: Optional[str] = None,
     source_structure: Optional[SourceStructureIndex] = None,
+    terminal_identity: Optional[SourceSymbolIdentity | dict[str, Any]] = None,
 ) -> TerminalValidation:
     """Validate a candidate terminal against actual write targets and
     the observed catalogue — never by prompt trust or name shape.
@@ -803,6 +885,13 @@ def validate_terminal(
     """
     qualifier, canonical = split_terminal_qualifier(terminal)
     structure = source_structure or SourceStructureIndex()
+    requested_identity = (
+        terminal_identity
+        if isinstance(terminal_identity, SourceSymbolIdentity)
+        else SourceSymbolIdentity.model_validate(terminal_identity)
+        if terminal_identity
+        else None
+    )
     norm = exact_symbol(canonical)
     if not norm:
         return TerminalValidation(
@@ -825,14 +914,15 @@ def validate_terminal(
                 matches.append(binding)
                 break
 
+    all_matches = list(matches)
     writes_per_file: dict[str, int] = {}
-    for binding in matches:
+    for binding in all_matches:
         file = _DAGBuilder._binding_first_file(binding)
         if file:
             writes_per_file[file] = writes_per_file.get(file, 0) + 1
     write_files = sorted(writes_per_file)
 
-    if not matches:
+    if not all_matches:
         if logged:
             return TerminalValidation(
                 terminal=canonical,
@@ -850,6 +940,32 @@ def validate_terminal(
         ranked = sorted(set(files), key=lambda f: (-writes_per_file.get(f, 0), f))
         return ranked[0] if ranked else None
 
+    def binding_identity(binding: dict[str, Any]) -> Optional[SourceSymbolIdentity]:
+        raw = binding.get("target_identity")
+        if not raw:
+            return None
+        try:
+            return SourceSymbolIdentity.model_validate(raw)
+        except (TypeError, ValueError):
+            return None
+
+    if requested_identity is not None:
+        matches = [
+            binding
+            for binding in matches
+            if (producer := binding_identity(binding)) is not None
+            and structure.storage_compatible(requested_identity, producer)
+        ]
+        if not matches:
+            return TerminalValidation(
+                terminal=canonical,
+                status="absent_in_scope",
+                logged=logged,
+                write_files=write_files,
+                resolved_identity=requested_identity.model_dump(),
+                reason="no write target matches the surveyed source storage identity",
+            )
+
     if qualifier and not terminal_file:
         lineage = set(structure.lineage(qualifier))
         class_files = []
@@ -865,61 +981,75 @@ def validate_terminal(
                 if file:
                     class_files.append(file)
         if class_files:
-            return TerminalValidation(
-                terminal=canonical,
-                status="valid",
-                logged=logged,
-                write_files=write_files,
-                resolved_file=best_file(class_files),
-            )
+            class_file_set = set(class_files)
+            matches = [
+                binding
+                for binding in matches
+                if _DAGBuilder._binding_first_file(binding) in class_file_set
+            ]
+            terminal_file = best_file(class_files)
 
     if terminal_file:
-        if terminal_file in writes_per_file:
-            return TerminalValidation(
-                terminal=canonical,
-                status="valid",
-                logged=logged,
-                write_files=write_files,
-                resolved_file=terminal_file,
-            )
-        declared_family = _DAGBuilder._file_family(terminal_file)
-        family_files = [
-            f
-            for f in write_files
-            if _DAGBuilder._file_family(f) == declared_family
+        scoped_matches = [
+            binding
+            for binding in matches
+            if _DAGBuilder._binding_first_file(binding) == terminal_file
         ]
-        if family_files:
+        if not scoped_matches:
+            declared_family = _DAGBuilder._file_family(terminal_file)
+            scoped_matches = [
+                binding
+                for binding in matches
+                if _DAGBuilder._file_family(
+                    _DAGBuilder._binding_first_file(binding)
+                )
+                == declared_family
+            ]
+        if not scoped_matches:
             return TerminalValidation(
                 terminal=canonical,
-                status="valid",
+                status="absent_in_scope",
                 logged=logged,
                 write_files=write_files,
-                resolved_file=best_file(family_files),
+                resolved_identity=(
+                    requested_identity.model_dump() if requested_identity else None
+                ),
+                reason=(
+                    f"no write target in declared file {terminal_file};"
+                    f" written in: {', '.join(write_files[:4])}"
+                ),
             )
-        return TerminalValidation(
-            terminal=canonical,
-            status="absent_in_scope",
-            logged=logged,
-            write_files=write_files,
-            reason=(
-                f"no write target in declared file {terminal_file};"
-                f" written in: {', '.join(write_files[:4])}"
-            ),
-        )
+        # A source identity already supplies the storage scope. Keep every
+        # compatible member writer across methods/files; the file is only
+        # proof that the proposed survey site exists. Without an identity,
+        # the file remains the only safe narrowing evidence.
+        if requested_identity is None:
+            matches = scoped_matches
 
-    identities = {
-        tuple(sorted((binding.get("target_identity") or {}).items()))
-        for binding in matches
-        if binding.get("target_identity")
-    }
-    if (identities and len(identities) == 1) or (
-        not identities and len(write_files) == 1
+    identities: dict[tuple[str, ...], SourceSymbolIdentity] = {}
+    for binding in matches:
+        identity = binding_identity(binding)
+        if identity is not None:
+            identities.setdefault(identity.storage_key(), identity)
+
+    if len(identities) == 1 or (
+        not identities
+        and len({_DAGBuilder._binding_first_file(binding) for binding in matches}) == 1
     ):
+        resolved_identity = next(iter(identities.values()), requested_identity)
         return TerminalValidation(
             terminal=canonical,
             status="valid",
             logged=logged,
             write_files=write_files,
+            resolved_file=(
+                best_file(_DAGBuilder._binding_first_file(binding) for binding in matches)
+                if terminal_file
+                else None
+            ),
+            resolved_identity=(
+                resolved_identity.model_dump() if resolved_identity is not None else None
+            ),
         )
     if logged:
         # An exact observed logged output is resolvable through the
@@ -929,6 +1059,9 @@ def validate_terminal(
             status="valid",
             logged=True,
             write_files=write_files,
+            resolved_identity=(
+                requested_identity.model_dump() if requested_identity else None
+            ),
         )
     return TerminalValidation(
         terminal=canonical,
@@ -1083,6 +1216,7 @@ def discover_mechanism_dag(
     *,
     source_root: Optional[Union[str, Path]] = None,
     terminal_file: Optional[str] = None,
+    terminal_identity: Optional[SourceSymbolIdentity | dict[str, Any]] = None,
     max_rounds: int = 3,
     max_files_per_round: int = 8,
     max_files_total: int = 24,
@@ -1115,6 +1249,13 @@ def discover_mechanism_dag(
     _ = (cache_root, source_root, max_rounds, max_files_per_round, max_files_total)
     terminal_as_given = str(terminal or "").strip()
     terminal = canonicalize_terminal(terminal)
+    requested_terminal_identity = (
+        terminal_identity
+        if isinstance(terminal_identity, SourceSymbolIdentity)
+        else SourceSymbolIdentity.model_validate(terminal_identity)
+        if terminal_identity
+        else None
+    )
     if logged_signals is not None:
         # Materialized once: consumed by per-round validation AND the
         # builder, so a one-shot iterable must not exhaust in between.
@@ -1170,7 +1311,10 @@ def discover_mechanism_dag(
         if file_path in explicit_set or writes_terminal(facts):
             pending.append(file_path)
             pending.extend(resolver.companion_files(file_path))
-    if not terminal_file:
+    if not terminal_file or (
+        requested_terminal_identity is not None
+        and requested_terminal_identity.kind in {"member", "global"}
+    ):
         # A ranked survey is not an exhaustive declaration index. Unscoped
         # terminals must inspect every exact writer so ambiguity cannot depend
         # on ranking order. A declared terminal file already supplies scope.
@@ -1215,6 +1359,7 @@ def discover_mechanism_dag(
                 logged_signals or (),
                 terminal_file,
                 source_structure=inputs.structure,
+                terminal_identity=requested_terminal_identity,
             )
         if validation.status != "valid":
             dag = None
@@ -1249,6 +1394,7 @@ def discover_mechanism_dag(
             parameter_names=inputs.parameter_names,
             parameter_aliases=inputs.parameter_aliases,
             terminal_file=validation.resolved_file or terminal_file,
+            terminal_identity=validation.resolved_identity,
             call_statements=inputs.call_statements,
             boundary_bindings=inputs.boundary_bindings,
             enum_registry=enum_registry,

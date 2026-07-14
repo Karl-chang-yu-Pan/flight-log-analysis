@@ -664,6 +664,56 @@ def test_complete_replay_distinguishes_match_mismatch_and_missing_policy(monkeyp
     assert partial["complete"] is False
 
 
+def test_replay_reuses_supplied_dag_signal_data(monkeypatch):
+    from flight_log_agent.analysis import dag_pipeline
+    from flight_log_agent.analysis.mechanism_dag import (
+        build_mechanism_dag,
+        prepare_signal_series,
+    )
+
+    dag = build_mechanism_dag(
+        [{
+            "target_symbol": "output",
+            "source_symbol": "topic_in.value",
+            "assignment_path": [{
+                "file": "a.cpp",
+                "line": 1,
+                "expression": "topic_in.value",
+            }],
+            "logged_signal": "topic_out.value",
+            "control_predicates": [],
+            "function": "A::run",
+        }],
+        "output",
+        logged_signals={"topic_in.value", "topic_out.value"},
+    )
+    samples = {
+        "topic_in.value": [(10.0, 5.0), (0.0, 5.0)],
+        "topic_out.value": [(10.0, 5.0), (0.0, 5.0)],
+    }
+    policies = {
+        "topic_in.value": {"method": "linear"},
+        "topic_out.value": {"method": "linear"},
+    }
+    prepared = prepare_signal_series(samples, policies)
+
+    def unexpected_load(*_args, **_kwargs):
+        raise AssertionError("replay must reuse the selected DAG's signal data")
+
+    monkeypatch.setattr(dag_pipeline, "_signal_samples_for_dag", unexpected_load)
+    replay = dag_pipeline.replay_terminal_expressions(
+        dag,
+        Path("/nonexistent.ulg"),
+        {},
+        {"topic_in.value", "topic_out.value"},
+        signal_policies=policies,
+        signal_samples=samples,
+        prepared_signal_series=prepared,
+    )
+    assert replay["status"] == "matched"
+    assert replay["complete"] is True
+
+
 def test_replay_combines_mutually_exclusive_writers_piecewise(monkeypatch):
     from flight_log_agent.analysis import dag_pipeline
     from flight_log_agent.analysis.mechanism_dag import (

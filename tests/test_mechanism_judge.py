@@ -540,3 +540,69 @@ def test_survey_corrects_a_wrong_terminal_file(tmp_path):
     result = judged.results["real_out"]
     assert result.terminal_validation.status == "valid"
     assert result.terminal_validation.resolved_file == "src/modules/ctrl/Controller.cpp"
+
+
+def test_judge_candidates_keep_same_named_local_scopes_distinct(tmp_path):
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/ctrl/Controller.cpp": """
+void Controller::first()
+{
+    value = first_input;
+}
+
+void Controller::second()
+{
+    value = second_input;
+}
+""",
+    })
+
+    async def stub_runner(agent, payload):
+        if agent is seeder_agent:
+            targets = [
+                target
+                for entry in payload["source_survey"]["files"]
+                for target in entry["write_targets"]
+                if target["symbol"] == "value"
+            ]
+            assert len(targets) == 2
+            return DiscoverySeeds(
+                seeds=["Controller"],
+                candidate_terminals=[
+                    TerminalCandidate(
+                        terminal="value",
+                        terminal_file="src/modules/ctrl/Controller.cpp",
+                        source_target_id=target["source_target_id"],
+                    )
+                    for target in targets
+                ],
+            )
+        keys = list(payload["candidates"])
+        assert len(keys) == 2
+        assert all(key.startswith("value@") for key in keys)
+        return DiscoveryVerdict(sufficient=True, selected_terminal=keys[0])
+
+    judged = asyncio.run(
+        discover_with_judge(
+            profiler,
+            tmp_path / "cache",
+            "which value is selected?",
+            "hash",
+            run_agent=stub_runner,
+            context={"question_intent": {"source_queries": ["Controller"]}},
+        )
+    )
+
+    assert len(judged.results) == 2
+    terminal_functions = {
+        next(
+            vertex.metadata["function"]
+            for vertex in result.dag.vertices
+            if vertex.kind == "operation" and vertex.metadata.get("is_terminal")
+        )
+        for result in judged.results.values()
+    }
+    assert {value.split(":")[-2] for value in terminal_functions} == {
+        "first",
+        "second",
+    }

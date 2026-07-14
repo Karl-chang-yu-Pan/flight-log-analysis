@@ -28,8 +28,10 @@ from pydantic import BaseModel, Field
 from flight_log_agent.expression_math import is_safe_math_function_name
 
 from flight_log_agent.analysis.mechanism_discovery import (
+    DAGInputs,
     DiscoveryResult,
     SourceSurvey,
+    TerminalValidation,
     discover_mechanism_dag,
     survey_for_queries,
     survey_source_files,
@@ -219,6 +221,7 @@ class TerminalCandidate(BaseModel):
 
     terminal: str
     terminal_file: Optional[str] = None
+    source_target_id: Optional[str] = None
     reason: str = ""
 
 
@@ -291,6 +294,7 @@ any write target:
 
 - every candidate_terminals entry MUST be a symbol the survey lists,
   spelled exactly as the survey spells it;
+- source_target_id MUST be copied exactly from that same surveyed write;
 - terminal_file MUST be the surveyed file that writes that symbol;
 - never propose a symbol or a file path the survey does not show,
   however familiar it seems — recalled names and module layouts often
@@ -346,6 +350,8 @@ Decide from these facts only:
 - sufficient: does the selected DAG connect the terminal to logged
   signals / parameters / constants well enough to answer the question?
 - selected_terminal: which candidate terminal matches the question.
+  Copy the exact key from the candidates object; scoped same-named locals
+  have distinct keys.
 - essential_gaps: unresolved symbols that MUST be resolved to answer
   (they carry the questioned quantity or gate it). Everything else —
   bookkeeping counters, foreign-module noise, display-only values — is
@@ -354,8 +360,8 @@ Decide from these facts only:
   body must be inlined to answer (the function computing or adapting
   the questioned quantity).
 - next_terminals: when NO given candidate holds the questioned quantity
-  at its decision site, name a better bare variable (with file) from
-  the rendering's operations.
+  at its decision site, name a better bare variable (with file and surveyed
+  source_target_id when available) from the rendering's operations.
 
 When sufficient is false, use essential_gaps and expand_calls as diagnostics
 over the completed fixed-point graph. Fill next_terminals only when a shown
@@ -516,6 +522,7 @@ async def discover_with_judge(
             texts=survey_texts,
             observed_signals=observed_signals,
             max_files=survey_max_files,
+            source_hash=source_hash,
         )
 
     if seeds_override is None:
@@ -557,13 +564,58 @@ async def discover_with_judge(
                 out[terminal] = validation.reason or validation.status
         return out
 
+    def _resolved_survey_target(
+        candidate: TerminalCandidate,
+    ) -> tuple[Optional[str], Optional[dict[str, Any]], Optional[str]]:
+        matches = survey.targets_for(
+            candidate.terminal,
+            source_target_id=str(candidate.source_target_id or ""),
+            file=candidate.terminal_file,
+        )
+        if not matches:
+            matches = survey.targets_for(
+                candidate.terminal,
+                source_target_id=str(candidate.source_target_id or ""),
+            )
+        identities = {target.source_target_id for _file, target in matches}
+        if len(identities) != 1:
+            return candidate.terminal_file, None, None
+        preferred = next(
+            (
+                (file, target)
+                for file, target in matches
+                if file == candidate.terminal_file
+            ),
+            matches[0],
+        )
+        return preferred[0], preferred[1].identity, preferred[1].source_target_id
+
+    def _candidate_key(candidate: TerminalCandidate) -> str:
+        _file, _identity, source_target_id = _resolved_survey_target(candidate)
+        same_spelling = {
+            target.source_target_id
+            for _file, target in survey.targets_for(candidate.terminal)
+        }
+        if source_target_id and len(same_spelling) > 1:
+            return f"{candidate.terminal}@{source_target_id}"
+        return candidate.terminal
+
     def _slice(candidate: TerminalCandidate) -> DiscoveryResult:
-        # A survey-known symbol carries its real write file even when the
-        # seeder named none (or named one the tree does not have).
-        terminal_file = candidate.terminal_file
-        known_files = survey.files_for(candidate.terminal)
-        if known_files and terminal_file not in known_files:
-            terminal_file = known_files[0]
+        terminal_file, terminal_identity, source_target_id = _resolved_survey_target(
+            candidate
+        )
+        if candidate.source_target_id and source_target_id is None:
+            return DiscoveryResult(
+                dag=None,
+                inputs=DAGInputs(),
+                files_loaded=[],
+                rounds=[],
+                terminal_validation=TerminalValidation(
+                    terminal=candidate.terminal,
+                    status="absent_in_scope",
+                    reason="source_target_id is not present in the source survey",
+                ),
+            )
         return discover_mechanism_dag(
             profiler,
             cache_root,
@@ -571,6 +623,7 @@ async def discover_with_judge(
             candidate.terminal,
             source_hash,
             terminal_file=terminal_file,
+            terminal_identity=terminal_identity,
             preranked_files=survey_files or None,
             **discovery_kwargs,
         )
@@ -594,11 +647,12 @@ async def discover_with_judge(
         for candidate in candidates:
             if valid >= max_terminals or attempts >= max_terminal_attempts:
                 break
-            if not candidate.terminal or candidate.terminal in results:
+            candidate_key = _candidate_key(candidate)
+            if not candidate.terminal or candidate_key in results:
                 continue
             attempts += 1
             result = _slice(candidate)
-            results[candidate.terminal] = result
+            results[candidate_key] = result
             if _is_valid(result):
                 valid += 1
         return valid
@@ -623,6 +677,7 @@ async def discover_with_judge(
                 loaded,
                 texts=[*survey_texts, *seeds.seeds],
                 observed_signals=observed_signals,
+                source_hash=source_hash,
             )
         retry = await runner(
             seeder_agent,
@@ -699,13 +754,10 @@ async def discover_with_judge(
         # full graph payload. It is not a source-expansion depth limit.
         target = verdict.next_terminals[0]
         bonus_terminal = target.terminal
-        bonus_file = target.terminal_file
-        # A judge-proposed terminal is subject to the same source truth:
-        # when the survey knows the symbol, its real write file wins over
-        # a named one the tree does not have.
-        bonus_known_files = survey.files_for(bonus_terminal)
-        if bonus_known_files and bonus_file not in bonus_known_files:
-            bonus_file = bonus_known_files[0]
+        bonus_file, bonus_identity, _bonus_source_target_id = _resolved_survey_target(
+            target
+        )
+        bonus_key = _candidate_key(target)
         if bonus_terminal:
             selected = discover_mechanism_dag(
                 profiler,
@@ -714,9 +766,10 @@ async def discover_with_judge(
                 bonus_terminal,
                 source_hash,
                 terminal_file=bonus_file,
+                terminal_identity=bonus_identity,
                 **discovery_kwargs,
             )
-            results[bonus_terminal] = selected
+            results[bonus_key] = selected
             bonus_round_used = True
             # Re-judge once so the verdict describes the replacement graph.
             # Further replacements are not acted on because each additional
@@ -726,9 +779,9 @@ async def discover_with_judge(
                 {
                     "question": question,
                     "questioned_windows": deviation,
-                    "candidates": {bonus_terminal: _render(bonus_terminal, selected)},
+                    "candidates": {bonus_key: _render(bonus_key, selected)},
                     "empty_candidates": [],
-                    "rejected_terminals": _rejected({bonus_terminal: selected}),
+                    "rejected_terminals": _rejected({bonus_key: selected}),
                     "note": "post-follow-up render; no further discovery rounds remain",
                 },
             )
