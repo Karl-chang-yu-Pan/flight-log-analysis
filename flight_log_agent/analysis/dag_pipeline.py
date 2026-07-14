@@ -1,12 +1,11 @@
 """Flag-gated DAG discovery pipeline (#73 Stage 4).
 
-Replaces runner Stages 3–5 when enabled: Layer 4 intent cache instead of
-``mechanism_cache`` retrieval, :func:`discover_with_judge` instead of the
-SourceDiscoveryDecision loop, and DAG ``evaluate_feasibility`` over ULog
-parameters/samples instead of the verification-plan checks. The final
-report is constructed deterministically from the verdict and the
-annotated DAG — the legacy report agent keeps its VerifiedMechanismResult
-contract untouched until the retirement stage rewrites it.
+Replaces runner Stages 3–5 when enabled: fresh DAG discovery and judging
+instead of mechanism-cache retrieval and the SourceDiscoveryDecision loop,
+then DAG ``evaluate_feasibility`` over ULog parameters/samples instead of the
+verification-plan checks. The final report is constructed deterministically
+from the verdict and annotated DAG. Persistent DAG caches are deliberately
+dormant until construction semantics are accepted.
 """
 
 from __future__ import annotations
@@ -21,9 +20,6 @@ from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.mechanism_dag import (
     MechanismDAG,
     evaluate_feasibility,
-    layer2_cache_path,
-    layer3_cache_path,
-    write_dag_to_cache,
 )
 from flight_log_agent.analysis.mechanism_discovery import DiscoveryResult
 from flight_log_agent.analysis.mechanism_judge import (
@@ -43,6 +39,7 @@ from flight_log_agent.models import (
     RelationshipCheckSpec,
 )
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
+from flight_log_agent.px4.msg_schema import canonicalize_unit
 from flight_log_agent.symbols import parse_signal_reference
 
 
@@ -238,6 +235,238 @@ def resolve_questioned_signal(
     if candidates:
         return None, f"hint {hint!r} did not resolve exactly", candidates
     return None, f"signal hint {hint!r} did not resolve", []
+
+
+@dataclass(frozen=True)
+class _QuestionedUnits:
+    signal: str
+    reference: str
+
+
+def _parse_questioned_units(value: Any) -> tuple[Optional[_QuestionedUnits], Optional[str]]:
+    """Parse the condition's explicit left/right unit contract.
+
+    A single unit applies to both sides for backward compatibility. A typed
+    condition may instead use ``signal: <unit>; reference: <unit>``. Both
+    labels are required in the typed form so a partially specified expression
+    never inherits a unit silently.
+    """
+    text = str(value or "").strip()
+    direct = canonicalize_unit(text)
+    if direct is not None:
+        return _QuestionedUnits(signal=direct, reference=direct), None
+
+    matches = {
+        side.lower(): unit.strip()
+        for side, unit in re.findall(
+            r"\b(signal|reference)\s*:\s*([^;,]+)", text, flags=re.IGNORECASE
+        )
+    }
+    if set(matches) != {"signal", "reference"}:
+        return None, (
+            "questioned condition units must be one supported unit or "
+            "'signal: <unit>; reference: <unit>'"
+        )
+    signal_unit = canonicalize_unit(matches["signal"])
+    reference_unit = canonicalize_unit(matches["reference"])
+    if signal_unit is None or reference_unit is None:
+        return None, f"questioned condition contains unsupported units {text!r}"
+    return _QuestionedUnits(signal=signal_unit, reference=reference_unit), None
+
+
+def _resolve_question_expression(
+    expression: Any,
+    *,
+    logged_set: set[str],
+    parameter_values: dict[str, Any],
+    dags: list[Optional[MechanismDAG]],
+    allow_slice_resolution: bool,
+) -> tuple[Optional[str], list[str], Optional[str], list[str]]:
+    """Resolve every operand in a questioned expression without fuzzy names.
+
+    Dotted/indexed operands must resolve to an observed signal, while bare
+    operands may resolve to an exact ULog parameter name. The primary signal
+    hint retains the existing slice-proven rename fallback, but operands in a
+    compound expression require exact topic/field identity (with at most one
+    observed instance). Returns a rewritten expression containing canonical
+    observed signal placements.
+    """
+    from flight_log_agent.analysis.source_expression import (
+        alias_dotted_names,
+        normalize_source_expression,
+        source_expression_names,
+    )
+
+    normalized = normalize_source_expression(str(expression or "").strip())
+    if not normalized:
+        return None, [], "empty questioned expression", []
+    names = source_expression_names(normalized)
+    if not names:
+        try:
+            float(normalized)
+        except (TypeError, ValueError):
+            return None, [], f"questioned expression {expression!r} is invalid", []
+        return normalized, [], None, []
+
+    resolved_signals: dict[str, str] = {}
+    options: list[str] = []
+    single_primary = allow_slice_resolution and len(names) == 1 and normalized == names[0]
+    for name in names:
+        is_parameter = name in parameter_values
+        signal, signal_error, candidates = resolve_questioned_signal(
+            name,
+            logged_set,
+            dags if single_primary else [],
+        )
+        if signal is not None and is_parameter:
+            return None, [], f"operand {name!r} is ambiguous between signal and parameter", []
+        if signal is not None:
+            resolved_signals[name] = signal
+            continue
+        if is_parameter:
+            continue
+        options.extend(candidates)
+        detail = signal_error or "did not resolve"
+        return None, [], f"operand {name!r} did not resolve: {detail}", sorted(set(options))
+
+    rewritten, alias_to_name = alias_dotted_names(normalized, resolved_signals)
+    for alias, name in alias_to_name.items():
+        rewritten = rewritten.replace(alias, resolved_signals[name])
+    return rewritten, list(dict.fromkeys(resolved_signals.values())), None, []
+
+
+def _validate_question_expression_units(
+    signals: list[str],
+    stated_unit: str,
+    signal_policies: dict[str, Any],
+) -> Optional[str]:
+    """Validate observed operands against one explicitly typed expression.
+
+    Parameters and numeric literals have no unit metadata in ULog, so their
+    type comes from the explicit side contract. Every observed signal operand
+    must independently agree with that contract; missing metadata fails
+    closed rather than turning an untyped value into evidence.
+    """
+    from flight_log_agent.analysis.mechanism_dag import _signal_policy
+
+    for signal in signals:
+        policy = _signal_policy(signal, signal_policies)
+        if policy is None:
+            return f"no schema-derived signal policy for {signal}"
+        raw_unit = str(policy.get("unit") or "")
+        derived = canonicalize_unit(raw_unit)
+        if derived is None:
+            # Preserve the established treatment of schema-classified
+            # booleans/enums/discrete states: a high-confidence policy with no
+            # physical unit is explicitly compatible with ``unitless``. A
+            # low-confidence untyped scalar remains unresolved.
+            if stated_unit == "unitless" and policy.get("confidence", "high") != "low":
+                continue
+            return f"units for {signal} are not derivable from schema metadata"
+        if derived != stated_unit:
+            return (
+                f"questioned condition unit {stated_unit!r} is incompatible "
+                f"with schema unit {derived!r} for {signal}"
+            )
+    return None
+
+
+def evaluate_questioned_condition_windows(
+    condition: Any,
+    *,
+    candidates: Any,
+    logged_set: set[str],
+    log_path: Path,
+    parameter_values: dict[str, Any],
+    signal_policies: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate a typed, multi-signal questioned comparison over a ULog."""
+    from flight_log_agent.analysis.mechanism_dag import _evaluate_predicate_intervals
+
+    dags = [
+        result.dag
+        for result in (candidates or {}).values()
+        if result is not None and getattr(result, "dag", None) is not None
+    ] if isinstance(candidates, dict) else []
+    units, unit_error = _parse_questioned_units(condition.units)
+    stated_frame = str(condition.frame or "").strip()
+    if unit_error:
+        return {"error": unit_error, "windows": None}
+    if not stated_frame:
+        return {"error": "questioned condition lacks an explicit frame", "windows": None}
+    assert units is not None
+
+    left, left_signals, error, options = _resolve_question_expression(
+        condition.signal_hint,
+        logged_set=logged_set,
+        parameter_values=parameter_values,
+        dags=dags,
+        allow_slice_resolution=True,
+    )
+    if left is None:
+        return {"error": error, "candidates": options, "windows": None}
+    right, right_signals, error, options = _resolve_question_expression(
+        condition.reference,
+        logged_set=logged_set,
+        parameter_values=parameter_values,
+        dags=[],
+        allow_slice_resolution=False,
+    )
+    if right is None:
+        return {"error": error, "candidates": options, "windows": None}
+
+    error = _validate_question_expression_units(
+        left_signals, units.signal, signal_policies
+    ) or _validate_question_expression_units(
+        right_signals, units.reference, signal_policies
+    )
+    if error:
+        return {"error": error, "windows": None}
+    if units.signal != units.reference:
+        return {
+            "error": (
+                f"questioned comparison has incompatible side units "
+                f"{units.signal!r} and {units.reference!r}"
+            ),
+            "windows": None,
+        }
+
+    references = list(dict.fromkeys([*left_signals, *right_signals]))
+    if not references:
+        return {"error": "questioned comparison contains no observed signal", "windows": None}
+    index = ULogEvidenceIndex.from_path(log_path, references)
+    samples: dict[str, list[tuple[float, Any]]] = {}
+    for signal in references:
+        resolution = index.resolve_signal(signal)
+        if resolution.status != "observed" or resolution.series is None:
+            return {"error": f"{signal} not observed in log", "windows": None}
+        samples[signal] = [
+            (sample.time_s, sample.value) for sample in resolution.series.samples
+        ]
+
+    predicate = f"({left}) {condition.op} ({right})"
+    windows = _evaluate_predicate_intervals(
+        predicate,
+        parameter_values,
+        {},
+        samples,
+        signal_policies,
+    )
+    if windows is None:
+        return {"error": "questioned comparison was not evaluable", "windows": None}
+    return {
+        "signal": left,
+        "op": condition.op,
+        "reference": right,
+        "units": str(condition.units or "").strip(),
+        "resolved_units": {
+            "signal": units.signal,
+            "reference": units.reference,
+        },
+        "frame": stated_frame,
+        "assumptions": list(condition.assumptions),
+        "windows": windows,
+    }
 
 
 # The five distinct replay states (core correctness invariant):
@@ -772,15 +1001,19 @@ async def run_dag_discovery_stage(
     signal_policies: Optional[dict[str, Any]] = None,
     **discovery_kwargs: Any,
 ) -> DagStageResult:
-    """Layer 4 lookup → discover_with_judge → feasibility → Layer 2/3/4.
+    """Run fresh DAG discovery, feasibility, replay, and report construction.
 
-    ``ulog_hash`` keys the Layer 3 entry; defaults to a digest of the log
-    file name + size so distinct logs don't collide.
+    DAG cache use is intentionally dormant while constructor semantics are
+    still being validated. The Layer 1-4 cache helpers remain in the codebase
+    for later reactivation, but this production path neither reads, writes,
+    prunes, nor reports a cache hit. Re-enable cache call sites only after the
+    DAG correctness acceptance criteria are satisfied.
+
+    ``ulog_hash`` and ``cache_root`` remain in the stable call contract for
+    that future reactivation and for the discovery API, respectively.
     """
     cache_root = Path(cache_root)
-    _prune_stale_intent(cache_root, seeder_fingerprint())
-    seeds_path = layer4_cache_path(cache_root, question)
-    cached_seeds = read_seeds_from_cache(seeds_path)
+    cached_seeds = None
 
     parameter_values = dict((inventory or {}).get("parameters") or {})
 
@@ -798,79 +1031,14 @@ async def run_dag_discovery_stage(
     logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
 
     def condition_windows(condition: Any, candidates: Any = None) -> Optional[dict[str, Any]]:
-        """Evaluate the questioned comparison over the log: resolve the
-        signal hint via the schema and the discovered slices, the
-        reference against ULog parameters, then compute the intervals
-        where the condition held."""
-        from flight_log_agent.analysis.mechanism_dag import (
-            _evaluate_predicate_intervals,
-            _signal_policy,
+        return evaluate_questioned_condition_windows(
+            condition,
+            candidates=candidates,
+            logged_set=logged_set,
+            log_path=log_path,
+            parameter_values=parameter_values,
+            signal_policies=signal_policies or {},
         )
-
-        dags = [
-            r.dag for r in (candidates or {}).values() if r is not None
-        ] if isinstance(candidates, dict) else []
-        signal, error, options = resolve_questioned_signal(
-            condition.signal_hint, logged_set, dags
-        )
-        if signal is None:
-            return {"error": error, "candidates": options, "windows": None}
-        policy = _signal_policy(signal, signal_policies or {})
-        if policy is None:
-            return {
-                "error": f"no schema-derived signal policy for {signal}",
-                "windows": None,
-            }
-        if policy.get("confidence") == "low" and not policy.get("unit"):
-            return {
-                "error": f"units for {signal} are not derivable from schema metadata",
-                "windows": None,
-            }
-        expected_unit = str(policy.get("unit") or "unitless")
-        stated_unit = str(condition.units or "").strip()
-        stated_frame = str(condition.frame or "").strip()
-        if not stated_unit or not stated_frame:
-            return {
-                "error": "questioned condition lacks explicit units or frame",
-                "windows": None,
-            }
-        if expected_unit and stated_unit.lower() != expected_unit.lower():
-            return {
-                "error": (
-                    f"questioned condition unit {stated_unit!r} is incompatible "
-                    f"with schema unit {expected_unit!r}"
-                ),
-                "windows": None,
-            }
-        reference: Any = parameter_values.get(str(condition.reference).upper())
-        if reference is None:
-            try:
-                reference = float(condition.reference)
-            except (TypeError, ValueError):
-                return {"error": f"reference {condition.reference!r} did not resolve", "windows": None}
-        index = ULogEvidenceIndex.from_path(log_path, [signal])
-        resolution = index.resolve_signal(signal)
-        if resolution.status != "observed" or resolution.series is None:
-            return {"error": f"{signal} not observed in log", "windows": None}
-        samples = {
-            signal: [(s.time_s, s.value) for s in resolution.series.samples]
-        }
-        windows = _evaluate_predicate_intervals(
-            f"{signal} {condition.op} {reference}",
-            {},
-            {},
-            samples,
-            signal_policies,
-        )
-        return {
-            "signal": signal,
-            "op": condition.op,
-            "reference": reference,
-            "units": stated_unit,
-            "frame": stated_frame,
-            "assumptions": list(condition.assumptions),
-            "windows": windows,
-        }
 
     judged = await discover_with_judge(
         profiler,
@@ -890,27 +1058,8 @@ async def run_dag_discovery_stage(
     annotated: Optional[MechanismDAG] = judged.selected_annotated
     selected: Optional[DiscoveryResult] = judged.selected
     if selected is not None and selected.dag is not None and selected.dag.vertices:
-        terminal = selected.dag.terminal
-        write_dag_to_cache(
-            selected.dag, layer2_cache_path(cache_root, source_hash, terminal)
-        )
         if annotated is None:
             annotated = annotate(selected)
-        if ulog_hash is None:
-            stat = log_path.stat()
-            ulog_hash = hashlib.sha256(
-                f"{log_path.name}:{stat.st_size}".encode("utf-8")
-            ).hexdigest()[:16]
-        write_dag_to_cache(
-            annotated,
-            layer3_cache_path(cache_root, source_hash, ulog_hash, terminal),
-        )
-        # Seeds are cached only when they EARNED it — a seeder sample
-        # whose discovery produced an empty selected slice must not
-        # become the question's replayed answer; the next run retries
-        # the seeder instead.
-        if cached_seeds is None:
-            write_seeds_to_cache(judged.seeds, seeds_path)
 
     replay: Optional[dict[str, Any]] = None
     if annotated is not None:
@@ -932,7 +1081,7 @@ async def run_dag_discovery_stage(
         judged=judged,
         annotated_dag=annotated,
         render=render_discovery_compact(selected) if selected else {},
-        layer4_hit=cached_seeds is not None,
+        layer4_hit=False,
         report=report,
         replay=replay,
     )

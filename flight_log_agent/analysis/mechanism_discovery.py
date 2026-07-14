@@ -1,9 +1,10 @@
 """Deterministic mechanism discovery — the profiler→DAG production seam.
 
 Stage 1 of the discovery rework (#73): adapt the profiler's per-file facts
-(Layer 1 ``SourceFileFacts``) into the inputs :func:`build_mechanism_dag`
-expects, and load those facts through the Layer 1 disk cache so repeated
-discovery never re-parses an unchanged PX4 file.
+(``SourceFileFacts``) into the inputs :func:`build_mechanism_dag` expects.
+Persistent fact-cache use is intentionally suspended until DAG construction
+semantics are accepted; discovery currently extracts every requested file
+fresh.
 
 The binding mapping was validated end-to-end against real PX4 v1.14.3
 source (airspeed / NPFG / weathervane / terrain mechanisms) before being
@@ -28,7 +29,7 @@ from flight_log_agent.analysis.mechanism_dag import (
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.px4.source_facts_cache import (
     SourceFileFacts,
-    get_or_extract_facts,
+    extract_facts_for_file,
 )
 from flight_log_agent.symbols import (
     exact_symbol,
@@ -137,8 +138,9 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                         "instance": ref.get("instance"),
                         "direction": direction,
                         "file": str(ref.get("file") or entry.get("file") or ""),
-                        "function": "",
-                        "callable_id": "",
+                        "function": str(ref.get("function") or ""),
+                        "callable_id": str(ref.get("callable_id") or ""),
+                        "source_owner": str(ref.get("variable_owner") or ""),
                         "provenance": str(ref.get("api") or direction_key),
                     }
                 )
@@ -201,6 +203,7 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             source_symbol = args[0].lstrip("&*").strip()
             if not source_symbol:
                 continue
+            root = source_symbol.replace("->", ".").split(".", 1)[0]
             inputs.boundary_bindings.append(
                 {
                     "source_symbol": source_symbol,
@@ -210,6 +213,9 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                     "file": file,
                     "function": str(call.get("function") or ""),
                     "callable_id": str(call.get("callable_id") or ""),
+                    "source_owner": str(
+                        (call.get("argument_owners") or {}).get(root) or ""
+                    ),
                     "provenance": f"{receiver}.{name}",
                 }
             )
@@ -320,12 +326,15 @@ def load_facts(
     source_root: Optional[Union[str, Path]] = None,
     git_path: str = "git",
 ) -> list[SourceFileFacts]:
-    """Load Layer 1 facts for ``files``, extracting-and-caching on miss.
+    """Extract fresh per-file facts for ``files`` without disk-cache use.
 
-    Thin loop over :func:`get_or_extract_facts` — the production consumer
-    the Layer 1 cache was built for. Duplicate paths in ``files`` load
-    once; order is preserved.
+    Layer 1 cache helpers remain available in ``source_facts_cache`` for later
+    reactivation, but constructor development must not consume or create stale
+    facts. ``cache_root``, ``source_root``, and ``git_path`` remain in this
+    stable API so cache use can be restored after DAG correctness is accepted.
+    Duplicate paths load once and order is preserved.
     """
+    _ = (cache_root, source_root, git_path)
     facts: list[SourceFileFacts] = []
     seen: set[str] = set()
     for file_path in files:
@@ -333,16 +342,7 @@ def load_facts(
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
-        facts.append(
-            get_or_extract_facts(
-                profiler,
-                cache_root,
-                normalized,
-                source_hash,
-                source_root=source_root,
-                git_path=git_path,
-            )
-        )
+        facts.append(extract_facts_for_file(profiler, normalized, source_hash))
     return facts
 
 

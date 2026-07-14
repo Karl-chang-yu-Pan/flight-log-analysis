@@ -7,15 +7,16 @@ import pytest
 
 from flight_log_agent.analysis.dag_pipeline import (
     build_report_from_dag,
+    evaluate_questioned_condition_windows,
     layer4_cache_path,
     read_seeds_from_cache,
     run_dag_discovery_stage,
     write_seeds_to_cache,
 )
-from flight_log_agent.analysis.mechanism_dag import layer2_cache_path, layer3_cache_path
 from flight_log_agent.analysis.mechanism_judge import (
     DiscoverySeeds,
     DiscoveryVerdict,
+    QuestionedCondition,
     TerminalCandidate,
     judge_agent,
     seeder_agent,
@@ -112,7 +113,7 @@ def test_layer4_roundtrip_and_miss(tmp_path):
     assert read_seeds_from_cache(path) is None
 
 
-def test_stage_writes_layers_and_reuses_seeds(tmp_path):
+def test_stage_bypasses_all_dag_cache_layers(tmp_path):
     profiler = _mini_tree(tmp_path)
     cache_root = tmp_path / "cache"
     calls: list[str] = []
@@ -135,15 +136,14 @@ def test_stage_writes_layers_and_reuses_seeds(tmp_path):
     )
 
     assert stage.layer4_hit is False
-    assert layer2_cache_path(cache_root, "srchash", "_final_out").exists()
-    assert layer3_cache_path(cache_root, "srchash", "ulog0", "_final_out").exists()
+    assert not cache_root.exists()
     assert read_seeds_from_cache(
         layer4_cache_path(cache_root, "why did final_out increase?")
-    ) is not None
+    ) is None
     assert stage.report.ranked_hypotheses[0].confidence == "low"
     assert stage.report.confirmed == []
 
-    # second run: Layer 4 hit skips the seeder; judge still consulted
+    # The second run performs fresh seeding and discovery as well.
     again = asyncio.run(
         run_dag_discovery_stage(
             profiler,
@@ -154,8 +154,14 @@ def test_stage_writes_layers_and_reuses_seeds(tmp_path):
             **kwargs,
         )
     )
-    assert again.layer4_hit is True
-    assert calls == [seeder_agent.name, judge_agent.name, judge_agent.name]
+    assert again.layer4_hit is False
+    assert calls == [
+        seeder_agent.name,
+        judge_agent.name,
+        seeder_agent.name,
+        judge_agent.name,
+    ]
+    assert not cache_root.exists()
 
 
 def test_stage_report_maps_feasibility_into_applicability(tmp_path):
@@ -277,7 +283,7 @@ def test_sufficient_with_valid_branch_stays_unconfirmed_without_replay(tmp_path)
     assert stage.report.confirmed == []
 
 
-def test_layer4_path_includes_seeder_fingerprint_and_prunes_stale(tmp_path):
+def test_layer4_helpers_remain_available_but_stage_does_not_prune_or_use_them(tmp_path):
     from flight_log_agent.analysis.dag_pipeline import seeder_fingerprint
 
     path = layer4_cache_path(tmp_path, "why?")
@@ -294,7 +300,7 @@ def test_layer4_path_includes_seeder_fingerprint_and_prunes_stale(tmp_path):
             Path("/nonexistent.ulg"), ulog_hash="u", run_agent=_stub_runner(calls),
         )
     )
-    assert not stale.exists()
+    assert stale.exists()
 
 
 def test_explaining_predicate_text_is_not_accepted_as_branch_identity(tmp_path):
@@ -465,6 +471,98 @@ def test_questioned_hint_resolves_only_one_exact_topic_instance():
     assert signal is None
     assert "ambiguous" in error
     assert candidates == ["topic_a[0].value", "topic_a[3].value"]
+
+
+def test_questioned_condition_evaluates_signal_plus_parameter_reference(
+    monkeypatch, tmp_path
+):
+    from flight_log_agent.analysis import dag_pipeline
+
+    values = {
+        "position_setpoint_triplet[0].current.alt": [(0.0, 110.0), (10.0, 130.0)],
+        "home_position[0].alt": [(0.0, 100.0), (10.0, 100.0)],
+    }
+
+    class Sample:
+        def __init__(self, time_s, value):
+            self.time_s = time_s
+            self.value = value
+
+    class Resolution:
+        status = "observed"
+
+        def __init__(self, samples):
+            self.series = type(
+                "Series", (), {"samples": [Sample(*sample) for sample in samples]}
+            )()
+
+    class Index:
+        @classmethod
+        def from_path(cls, _path, references):
+            assert set(references) == set(values)
+            return cls()
+
+        def resolve_signal(self, name):
+            return Resolution(values[name])
+
+    monkeypatch.setattr(dag_pipeline, "ULogEvidenceIndex", Index)
+    condition = QuestionedCondition(
+        signal_hint="position_setpoint_triplet.current.alt",
+        op=">",
+        reference="home_position.alt + RTL_RETURN_ALT",
+        units="signal: meters; reference: m",
+        frame="AMSL altitude",
+    )
+    policies = {
+        "position_setpoint_triplet.current.alt": {
+            "method": "linear", "unit": "m", "confidence": "high"
+        },
+        "home_position.alt": {
+            "method": "linear", "unit": "m", "confidence": "high"
+        },
+    }
+
+    result = evaluate_questioned_condition_windows(
+        condition,
+        candidates={},
+        logged_set=set(values),
+        log_path=tmp_path / "flight.ulg",
+        parameter_values={"RTL_RETURN_ALT": 20.0},
+        signal_policies=policies,
+    )
+
+    assert "error" not in result
+    assert result["signal"] == "position_setpoint_triplet[0].current.alt"
+    assert result["reference"] == "home_position[0].alt + RTL_RETURN_ALT"
+    assert result["units"] == "signal: meters; reference: m"
+    assert result["resolved_units"] == {"signal": "m", "reference": "m"}
+    assert result["windows"] == [(10.0, 10.0)]
+
+
+def test_questioned_condition_rejects_unresolved_expression_operand(tmp_path):
+    condition = QuestionedCondition(
+        signal_hint="position_setpoint_triplet.current.alt",
+        op=">",
+        reference="home_position.alt + UNKNOWN_OFFSET",
+        units="m",
+        frame="AMSL altitude",
+    )
+    result = evaluate_questioned_condition_windows(
+        condition,
+        candidates={},
+        logged_set={
+            "position_setpoint_triplet.current.alt",
+            "home_position.alt",
+        },
+        log_path=tmp_path / "flight.ulg",
+        parameter_values={},
+        signal_policies={
+            "position_setpoint_triplet.current.alt": {"method": "linear", "unit": "m"},
+            "home_position.alt": {"method": "linear", "unit": "m"},
+        },
+    )
+    assert result["windows"] is None
+    assert "UNKNOWN_OFFSET" in result["error"]
 
 
 def test_replay_requires_source_proven_terminal_publication():

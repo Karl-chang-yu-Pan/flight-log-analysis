@@ -110,21 +110,50 @@ _UNIT_ALIASES = {
     "pa": "Pa", "hpa": "hPa", "a": "A", "v": "V", "w": "W", "rpm": "rpm", "hz": "Hz",
 }
 _RATE_UNITS = {"rad/s", "deg/s"}
+_UNIT_ALIAS_PATTERN = "|".join(
+    re.escape(alias) for alias in sorted(_UNIT_ALIASES, key=len, reverse=True)
+)
+_UNIT_PROSE_PATTERN = re.compile(
+    rf"\b(?:in|units?\s*:)\s*(?P<unit>{_UNIT_ALIAS_PATTERN})"
+    r"(?![A-Za-z0-9_/^])",
+    flags=re.IGNORECASE,
+)
 
 
 def _normalize_unit_token(token: str) -> str:
     return re.sub(r"\s+", " ", token.strip().lower())
 
 
+def canonicalize_unit(unit: str) -> Optional[str]:
+    """Return the canonical spelling for a supported unit label.
+
+    This uses the same registry as schema-comment parsing so questioned
+    conditions and interpolation policies cannot disagree merely because one
+    side says ``meters`` and the other says ``m``. ``unitless`` and
+    ``not_applicable`` are semantic labels rather than physical units, but are
+    preserved for explicit condition contracts.
+    """
+    normalized = _normalize_unit_token(unit)
+    if normalized in {"unitless", "not_applicable"}:
+        return normalized
+    return _UNIT_ALIASES.get(normalized)
+
+
 def _iter_unit_tokens(comment: str) -> Iterable[str]:
-    """Yield bracketed then parenthesized comment groups (e.g. ``[m/s]``,
-    ``(metres)``). Bracket style is unambiguous; paren style is noisier
-    (prose like ``(negative altitude)``), so callers only accept a group
-    that normalizes to a known unit."""
+    """Yield structurally marked unit candidates from a schema comment.
+
+    PX4 uses bracketed and parenthesized units, but many nested message fields
+    use prose such as ``altitude AMSL, in m``. Prose candidates are accepted
+    only after an ``in`` or ``unit:`` marker and are later checked against the
+    closed unit registry, avoiding substring guesses for short units such as
+    ``m`` and ``s``.
+    """
     for match in re.finditer(r"\[([^\]]+)\]", comment):
         yield match.group(1)
     for match in re.finditer(r"\(([^)]+)\)", comment):
         yield match.group(1)
+    for match in _UNIT_PROSE_PATTERN.finditer(comment):
+        yield match.group("unit")
 
 
 def _parse_unit_kind(comment: str) -> tuple[Optional[str], str]:
@@ -132,7 +161,7 @@ def _parse_unit_kind(comment: str) -> tuple[Optional[str], str]:
     ``"angle"`` (absolute radians), ``"rate"`` (rad/s, deg/s),
     ``"physical"`` (any other recognized unit), or ``"none"``."""
     for token in _iter_unit_tokens(comment):
-        canonical = _UNIT_ALIASES.get(_normalize_unit_token(token))
+        canonical = canonicalize_unit(token)
         if canonical is None:
             continue
         if canonical in _RATE_UNITS:

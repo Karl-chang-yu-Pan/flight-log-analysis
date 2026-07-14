@@ -222,7 +222,9 @@ class TerminalCandidate(BaseModel):
 class QuestionedCondition(BaseModel):
     """The comparison the question asserts, when it asserts one —
     evaluated deterministically over the log so the judge can compare
-    deviation windows against branch active-windows."""
+    deviation windows against branch active-windows. ``signal_hint`` and
+    ``reference`` may be arithmetic expressions over exact logged signal
+    references, ULog parameters, and numeric literals."""
 
     signal_hint: str
     op: Literal[">", ">=", "<", "<=", "==", "!="]
@@ -284,13 +286,15 @@ quantity is computed or adapted — over the published topic field that
 merely logs it; list the published field as a secondary candidate.
 
 If the question asserts a comparison (a quantity above/below/equal to a
-parameter or value), fill questioned_condition with the LOGGED signal
-that records the quantity (topic.field), the comparison operator, and
-the reference (a parameter name or number). State the signal/reference
-units and coordinate/reference frame; use "unitless" or "not_applicable"
-when those concepts genuinely do not apply. Record any assumption
-explicitly. It is evaluated over the log to find when the questioned
-behavior actually occurred.
+reference), fill questioned_condition with the LOGGED signal that records
+the quantity (topic.field), the comparison operator, and the reference. The
+reference may be a parameter, numeric literal, or an arithmetic expression
+composed only from logged topic.field signals and parameters justified by the
+question/context. State both side units as
+"signal: <unit>; reference: <unit>" and state the coordinate/reference frame;
+use "unitless" or "not_applicable" only when those concepts genuinely do not
+apply. Record any assumption explicitly. It is evaluated over the log to find
+when the questioned behavior actually occurred.
 
 Do not use log data, do not verify anything, do not draft hypotheses.
 """,

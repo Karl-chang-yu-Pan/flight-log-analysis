@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
 from flight_log_agent.analysis.mechanism_discovery import (
     binding_from_assignment,
@@ -111,7 +113,7 @@ def test_dag_inputs_from_facts_aggregates_and_dedupes():
     assert inputs.parameter_names == {"RTL_RETURN_ALT", "RTL_TYPE"}
 
 
-def test_load_facts_populates_layer1_and_reuses_it(tmp_path):
+def test_load_facts_extracts_fresh_without_populating_layer1(tmp_path):
     module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
     file_rel = "src/modules/example/helper.cpp"
@@ -125,11 +127,17 @@ def test_load_facts_populates_layer1_and_reuses_it(tmp_path):
     facts = load_facts(profiler, cache_root, [file_rel, file_rel], "hash")
     assert len(facts) == 1
     assert {a.target for a in facts[0].source_assignments} == {"_x"}
+    assert not cache_root.exists()
 
-    # rewrite on disk; same hash must serve the cached extraction
+    # A fresh profiler sees the rewrite even under the same source hash: the
+    # production discovery path must not consume a persistent Layer 1 entry.
     file_abs.write_text("void bar() { _y = 2; }\n", encoding="utf-8")
-    again = load_facts(profiler, cache_root, [file_rel], "hash")
-    assert {a.target for a in again[0].source_assignments} == {"_x"}
+    fresh_profiler = MechanismSourceProfiler(
+        tmp_path / "PX4-Autopilot", rg_path="missing-rg"
+    )
+    again = load_facts(fresh_profiler, cache_root, [file_rel], "hash")
+    assert {a.target for a in again[0].source_assignments} == {"_y"}
+    assert not cache_root.exists()
 
 
 def test_facts_to_dag_end_to_end(tmp_path):
@@ -184,6 +192,118 @@ void Rtl::pick()
         if v.kind == "evidence" and v.sub_kind == "logged_signal"
     }
     assert "gpos_alt" in logged
+
+
+@pytest.mark.parametrize(
+    "copy_statement",
+    [
+        "_status_sub.copy(&_status);",
+        "orb_copy(ORB_ID(vehicle_status), _status_handle, &_status);",
+    ],
+)
+def test_class_owned_copy_grounds_a_sibling_method(tmp_path, copy_statement):
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/reader.cpp": """
+class Reader {
+    vehicle_status_s _status{};
+    uORB::Subscription _status_sub{ORB_ID(vehicle_status)};
+    void poll();
+    void calculate();
+};
+
+void Reader::poll()
+{
+    COPY_STATEMENT
+}
+
+void Reader::calculate()
+{
+    output = _status.nav_state + 1;
+}
+""".replace("COPY_STATEMENT", copy_statement),
+    })
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        ["src/modules/example/reader.cpp"],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+    copied = next(
+        boundary
+        for boundary in inputs.boundary_bindings
+        if boundary["source_symbol"] == "_status"
+    )
+    assert copied["source_owner"] == "Reader"
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/example/reader.cpp",
+        boundary_bindings=inputs.boundary_bindings,
+        call_statements=inputs.call_statements,
+        logged_signals={"vehicle_status.nav_state"},
+    )
+    leaves = {
+        vertex.signal_name
+        for vertex in dag.vertices
+        if vertex.kind == "evidence" and vertex.sub_kind == "logged_signal"
+    }
+    assert "vehicle_status.nav_state" in leaves
+    assert "_status.nav_state" not in dag.unresolved_symbols
+
+
+def test_method_local_copy_does_not_ground_same_named_local_in_sibling_method(tmp_path):
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/reader.cpp": """
+class Reader {
+    uORB::Subscription _status_sub{ORB_ID(vehicle_status)};
+    void poll();
+    void calculate();
+};
+
+void Reader::poll()
+{
+    vehicle_status_s status{};
+    _status_sub.copy(&status);
+}
+
+void Reader::calculate()
+{
+    vehicle_status_s status{};
+    output = status.nav_state + 1;
+}
+""",
+    })
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        ["src/modules/example/reader.cpp"],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+    copied = next(
+        boundary
+        for boundary in inputs.boundary_bindings
+        if boundary["source_symbol"] == "status"
+    )
+    assert copied["source_owner"] == ""
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/example/reader.cpp",
+        boundary_bindings=inputs.boundary_bindings,
+        call_statements=inputs.call_statements,
+        logged_signals={"vehicle_status.nav_state"},
+    )
+    leaves = {
+        vertex.signal_name
+        for vertex in dag.vertices
+        if vertex.kind == "evidence" and vertex.sub_kind == "logged_signal"
+    }
+    assert "vehicle_status.nav_state" not in leaves
+    assert "status.nav_state" in dag.unresolved_symbols
 
 
 def _mini_tree(tmp_path, files: dict[str, str]):

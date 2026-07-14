@@ -203,6 +203,11 @@ class TestDeriveSignalPolicy:
         assert derive_signal_policy("float32", "vx", "North velocity (metres/sec)").method == "linear"
         assert derive_signal_policy("float32", "x", "North position [m]").method == "linear"
 
+    def test_prose_unit_after_in_marker_is_derived(self):
+        policy = derive_signal_policy("float32", "alt", "altitude AMSL, in m")
+        assert policy.method == "linear"
+        assert policy.unit == "m"
+
     def test_absolute_angle_bracketed_unit_wraps(self):
         p = derive_signal_policy("float32", "heading", "Euler yaw angle ... -PI..+PI,  (radians)")
         assert p.method == "angle_wrap"

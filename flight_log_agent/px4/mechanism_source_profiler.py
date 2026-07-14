@@ -71,6 +71,12 @@ class TopicRef(BaseModel):
     variable: Optional[str] = None
     api: Optional[str] = None
     instance: Optional[int] = None
+    function: Optional[str] = None
+    callable_id: Optional[str] = None
+    # Structurally proven owner when ``variable`` is a class member. Locals
+    # deliberately leave this unset so downstream scope checks cannot widen
+    # them across methods based on spelling.
+    variable_owner: Optional[str] = None
 
 
 class ParameterRef(BaseModel):
@@ -112,6 +118,9 @@ class FunctionCallRef(BaseModel):
     # reachability is then explicitly unresolved, never silently partial.
     reachability_exact: bool = True
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
+    # Call argument root -> owning class, populated only when the root is
+    # declared as a member of the callable's class.
+    argument_owners: Dict[str, str] = Field(default_factory=dict)
     function: Optional[str] = None
     callable_id: Optional[str] = None
 
@@ -355,12 +364,18 @@ class MechanismSourceProfiler:
         ),
     )
     _UORB_OBJECT_DECL_PATTERN = re.compile(
-        r"\buORB::(?P<api>Publication(?:Data|Multi|Queued)?|"
-        r"Subscription(?:Data|Interval|CallbackWorkItem)?)"
-        r"(?:\s*<\s*(?P<struct>[A-Za-z_][A-Za-z0-9_]*_s)\s*>)?\s+"
-        r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*[\{(]\s*"
-        r"ORB_ID\s*\(\s*(?P<topic>[A-Za-z_][A-Za-z0-9_]*)\s*\)"
-        r"(?:\s*,\s*(?P<instance>\d+))?"
+        r"\buORB::(?P<api>(?:Publication|Subscription)[A-Za-z0-9_]*)"
+        r"(?:\s*<\s*(?P<template>[^;{}]+?)\s*>)?\s+"
+        r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*[\{(]"
+        r"(?P<initializer>[^;\n]*)"
+    )
+    _ORB_ID_REFERENCE_PATTERN = re.compile(
+        r"\bORB_ID\s*(?:\(\s*(?P<call>[A-Za-z_][A-Za-z0-9_]*)\s*\)|"
+        r"::\s*(?P<scope>[A-Za-z_][A-Za-z0-9_]*))"
+    )
+    _CLASS_DECL_PATTERN = re.compile(
+        r"\b(?:class|struct)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:\s+final)?(?:\s*:[^{]+)?\s*\{"
     )
 
     # Parameter reference patterns.
@@ -558,7 +573,6 @@ class MechanismSourceProfiler:
         """
         refs: List[TopicRef] = []
         expanded_files = self._expand_companion_files(files)
-        member_to_param = self._collect_param_member_map(expanded_files)
 
         for path in expanded_files:
             text = self._read_text(path)
@@ -566,20 +580,48 @@ class MechanismSourceProfiler:
                 continue
 
             rel_file = self._rel(path)
+            definitions = self._extract_function_definitions(text, rel_file)
+            class_definitions = self._extract_class_definitions(text)
             for line_no, line in self._iter_code_lines(text):
                 object_declarations = list(self._UORB_OBJECT_DECL_PATTERN.finditer(line))
                 for match in object_declarations:
                     api = match.group("api")
                     direction = "publish" if api.startswith("Publication") else "subscribe"
-                    instance = match.group("instance")
+                    topic_matches = list(
+                        self._ORB_ID_REFERENCE_PATTERN.finditer(match.group("initializer"))
+                    )
+                    topics = {
+                        topic_match.group("call") or topic_match.group("scope")
+                        for topic_match in topic_matches
+                    }
+                    if len(topics) != 1:
+                        continue
+                    topic = next(iter(topics))
+                    topic_match = topic_matches[0]
+                    initializer_tail = match.group("initializer")[topic_match.end():]
+                    instance_match = re.match(r"\s*,\s*(?P<instance>\d+)\b", initializer_tail)
+                    instance = instance_match.group("instance") if instance_match else None
+                    template = str(match.group("template") or "")
+                    struct_match = re.search(
+                        r"\b(?P<struct>[A-Za-z_][A-Za-z0-9_]*_s)\b", template
+                    )
+                    definition = self._function_definition_for_line(definitions, line_no)
+                    owner = None if definition else self._class_owner_for_line(
+                        class_definitions, line_no
+                    )
                     refs.append(
                         TopicRef(
-                            topic=match.group("topic"),
-                            struct=match.group("struct") or self._struct_from_topic(match.group("topic")),
+                            topic=topic,
+                            struct=(
+                                struct_match.group("struct")
+                                if struct_match
+                                else self._struct_from_topic(topic)
+                            ),
                             variable=match.group("var"),
                             direction=direction,
                             api=f"uORB::{api}",
                             instance=int(instance) if instance is not None else None,
+                            variable_owner=owner,
                             file=rel_file,
                             line=line_no,
                             evidence=line.strip(),
@@ -648,6 +690,43 @@ class MechanismSourceProfiler:
                                 evidence=line.strip(),
                             )
                         )
+
+        # C uORB APIs carry the message object in the call arguments instead
+        # of a wrapper declaration. Reuse the token-aware call extraction so
+        # multi-line calls and callable identity stay consistent.
+        for call in self.extract_function_calls_from_source(files):
+            short_name = call.name.rsplit("::", 1)[-1]
+            topic_arg: Optional[int] = None
+            data_arg: Optional[int] = None
+            direction = ""
+            if short_name == "orb_copy" and len(call.args) >= 3:
+                direction, topic_arg, data_arg = "subscribe", 0, 2
+            elif short_name.startswith("orb_publish") and len(call.args) >= 3:
+                direction, topic_arg, data_arg = "publish", 0, 2
+            elif short_name.startswith("orb_advertise") and len(call.args) >= 2:
+                direction, topic_arg, data_arg = "publish", 0, 1
+            if topic_arg is None or data_arg is None:
+                continue
+            topic = self._topic_from_orb_reference(call.args[topic_arg])
+            source_symbol = self._boundary_argument_symbol(call.args[data_arg])
+            if not topic or not source_symbol:
+                continue
+            root = source_symbol.replace("->", ".").split(".", 1)[0]
+            refs.append(
+                TopicRef(
+                    topic=topic,
+                    struct=self._struct_from_topic(topic),
+                    variable=source_symbol,
+                    direction=direction,
+                    api=short_name,
+                    file=call.file,
+                    line=call.line,
+                    evidence=call.evidence,
+                    function=call.function,
+                    callable_id=call.callable_id,
+                    variable_owner=call.argument_owners.get(root),
+                )
+            )
 
         refs = self._dedupe_topic_refs(refs)
         return {
@@ -1594,7 +1673,9 @@ class MechanismSourceProfiler:
             "dynamic_cast",
         }
 
-        for path in self._expand_companion_files(files):
+        expanded_files = self._expand_companion_files(files)
+        member_owners = self._collect_class_member_owners(expanded_files)
+        for path in expanded_files:
             text = self._read_text(path)
             if text is None:
                 continue
@@ -1633,6 +1714,9 @@ class MechanismSourceProfiler:
                                 break
                         args = self._call_args(joined, match.end() - 1)
                     argument_topics = self._argument_topics(args, var_to_struct)
+                    argument_owners = self._argument_member_owners(
+                        args, function_name, member_owners
+                    )
                     predicate_entries = control_predicates.get(line_no, [])
                     predicates = [p for p, _ in predicate_entries]
                     refs.append(
@@ -1651,6 +1735,7 @@ class MechanismSourceProfiler:
                                 " ".join([stripped, *predicates]),
                                 var_to_struct,
                             ),
+                            argument_owners=argument_owners,
                             function=function_name,
                             callable_id=self._callable_id(definition),
                         )
@@ -2172,6 +2257,156 @@ class MechanismSourceProfiler:
                     mapping[var] = struct
         return mapping
 
+    def _extract_class_definitions(self, text: str) -> List[Dict[str, object]]:
+        """Return named class/struct body spans with nested ownership."""
+        stripped = self._strip_block_comments_preserve_lines(text)
+        definitions: List[Dict[str, object]] = []
+        for match in self._CLASS_DECL_PATTERN.finditer(stripped):
+            open_brace = stripped.find("{", match.start(), match.end())
+            close_brace = self._matching_brace(stripped, open_brace)
+            if open_brace < 0 or close_brace is None:
+                continue
+            definitions.append(
+                {
+                    "name": match.group("name"),
+                    "line": stripped.count("\n", 0, match.start()) + 1,
+                    "end_line": stripped.count("\n", 0, close_brace) + 1,
+                    "open_index": open_brace,
+                    "end_index": close_brace,
+                }
+            )
+        for definition in definitions:
+            containers = [
+                candidate
+                for candidate in definitions
+                if int(candidate["open_index"]) < int(definition["open_index"])
+                and int(candidate["end_index"]) > int(definition["end_index"])
+            ]
+            if containers:
+                parent = min(
+                    containers,
+                    key=lambda candidate: int(candidate["end_index"])
+                    - int(candidate["open_index"]),
+                )
+                definition["name"] = f"{parent['name']}::{definition['name']}"
+        return definitions
+
+    @staticmethod
+    def _class_owner_for_line(
+        definitions: Sequence[Dict[str, object]], line_no: int
+    ) -> Optional[str]:
+        candidates = [
+            definition
+            for definition in definitions
+            if int(definition.get("line") or 0) <= line_no
+            <= int(definition.get("end_line") or 0)
+        ]
+        if not candidates:
+            return None
+        owner = min(
+            candidates,
+            key=lambda definition: int(definition.get("end_line") or 0)
+            - int(definition.get("line") or 0),
+        )
+        return str(owner.get("name") or "") or None
+
+    @staticmethod
+    def _direct_class_body(body: str) -> str:
+        """Blank nested bodies while preserving direct member declarations."""
+        out: List[str] = []
+        depth = 0
+        for char in body:
+            if char == "{":
+                depth += 1
+                out.append(" ")
+            elif char == "}":
+                depth = max(depth - 1, 0)
+                out.append(" ")
+            elif depth == 0:
+                out.append(char)
+            else:
+                out.append("\n" if char == "\n" else " ")
+        return "".join(out)
+
+    def _extract_class_member_owners(self, text: str) -> Dict[str, Set[str]]:
+        mapping: Dict[str, Set[str]] = {}
+        stripped = self._strip_block_comments_preserve_lines(text)
+        for definition in self._extract_class_definitions(stripped):
+            start = int(definition.get("open_index") or 0) + 1
+            end = int(definition.get("end_index") or start)
+            direct_body = self._direct_class_body(stripped[start:end])
+            owner = str(definition.get("name") or "")
+            for _, line in self._iter_code_lines(direct_body):
+                for pattern in self._STRUCT_VAR_PATTERNS:
+                    for match in pattern.finditer(line):
+                        mapping.setdefault(match.group("var"), set()).add(owner)
+        return mapping
+
+    def _collect_class_member_owners(
+        self, files: Sequence[Path]
+    ) -> Dict[str, Set[str]]:
+        mapping: Dict[str, Set[str]] = {}
+        for path in files:
+            text = self._read_text(path)
+            if text is None:
+                continue
+            for variable, owners in self._extract_class_member_owners(text).items():
+                mapping.setdefault(variable, set()).update(owners)
+        return mapping
+
+    @staticmethod
+    def _function_owner(function_name: Optional[str]) -> Optional[str]:
+        text = str(function_name or "")
+        owner, separator, _method = text.rpartition("::")
+        return owner if separator else None
+
+    def _argument_member_owners(
+        self,
+        args: Sequence[str],
+        function_name: Optional[str],
+        member_owners: Dict[str, Set[str]],
+    ) -> Dict[str, str]:
+        function_owner = self._function_owner(function_name)
+        if not function_owner:
+            return {}
+        resolved: Dict[str, str] = {}
+        for arg in args:
+            symbol = self._boundary_argument_symbol(arg)
+            if not symbol:
+                continue
+            root = symbol.replace("->", ".").split(".", 1)[0]
+            matching = {
+                owner
+                for owner in member_owners.get(root, set())
+                if owner == function_owner or function_owner.endswith(f"::{owner}")
+            }
+            if len(matching) == 1:
+                resolved[root] = function_owner
+        return resolved
+
+    @classmethod
+    def _topic_from_orb_reference(cls, expression: str) -> Optional[str]:
+        matches = list(cls._ORB_ID_REFERENCE_PATTERN.finditer(str(expression or "")))
+        topics = {
+            match.group("call") or match.group("scope") for match in matches
+        }
+        return next(iter(topics)) if len(topics) == 1 else None
+
+    @classmethod
+    def _boundary_argument_symbol(cls, expression: str) -> Optional[str]:
+        text = str(expression or "").strip()
+        text = re.sub(
+            r"^\(\s*[A-Za-z_][A-Za-z0-9_:<>\s*&]*\s*\)\s*", "", text
+        )
+        text = text.lstrip("&* ").strip()
+        text = cls._clean_field_path(text)
+        if not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*)*",
+            text,
+        ):
+            return None
+        return text
+
     def _collect_param_member_map(self, files: Sequence[Path]) -> Dict[str, str]:
         member_to_param: Dict[str, str] = {}
         for path in files:
@@ -2222,6 +2457,7 @@ class MechanismSourceProfiler:
     def _extract_function_definitions(self, text: str, rel_file: str) -> List[Dict[str, object]]:
         text = self._strip_block_comments_preserve_lines(text)
         definitions: List[Dict[str, object]] = []
+        class_definitions = self._extract_class_definitions(text)
         ignored = {"if", "for", "while", "switch", "catch"}
         for open_brace in (match.start() for match in re.finditer(r"\{", text)):
             signature_start = max(
@@ -2242,6 +2478,9 @@ class MechanismSourceProfiler:
                 continue
             line_start = signature_start + len(text[signature_start:open_brace]) - len(text[signature_start:open_brace].lstrip())
             line_no = text.count("\n", 0, line_start) + 1
+            lexical_owner = self._class_owner_for_line(class_definitions, line_no)
+            if lexical_owner and "::" not in name:
+                name = f"{lexical_owner}::{name}"
             definitions.append(
                 {
                     "name": name,

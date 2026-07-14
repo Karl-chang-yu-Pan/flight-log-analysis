@@ -563,8 +563,26 @@ class _DAGBuilder:
             ]
             if scoped:
                 candidates = scoped
-            elif any(item.get("function") or item.get("callable_id") for item in candidates):
-                return None
+            else:
+                consumer_owner = self._callable_owner(scope_function)
+                owner_scoped = [
+                    item
+                    for item in candidates
+                    if consumer_owner
+                    and self._same_source_owner(
+                        str(item.get("source_owner") or ""), consumer_owner
+                    )
+                ]
+                if owner_scoped:
+                    candidates = owner_scoped
+                elif any(
+                    item.get("function") or item.get("callable_id")
+                    for item in candidates
+                ):
+                    # A method-scoped copy with no structurally proven common
+                    # class owner is a local. It must not cross methods merely
+                    # because the destination has the same spelling.
+                    return None
         placements = {
             (str(item.get("topic") or ""), item.get("instance"))
             for item in candidates
@@ -592,6 +610,35 @@ class _DAGBuilder:
             if len(observed_instances) == 1:
                 topic = f"{topic}[{next(iter(observed_instances))}]"
         return topic, provenance
+
+    @staticmethod
+    def _callable_owner(callable_identity: str) -> str:
+        """Extract a qualified callable's owner from a profiler identity."""
+        matches = re.findall(
+            r"(?<![A-Za-z0-9_])"
+            r"(?P<qualified>[A-Za-z_][A-Za-z0-9_]*"
+            r"(?:::[A-Za-z_][A-Za-z0-9_]*)+)",
+            str(callable_identity or ""),
+        )
+        if not matches:
+            return ""
+        owner, separator, _method = matches[-1].rpartition("::")
+        return owner if separator else ""
+
+    @staticmethod
+    def _same_source_owner(proven_owner: str, consumer_owner: str) -> bool:
+        """Compare source-derived owners while tolerating namespace context."""
+        left = str(proven_owner or "").strip(":")
+        right = str(consumer_owner or "").strip(":")
+        return bool(
+            left
+            and right
+            and (
+                left == right
+                or left.endswith(f"::{right}")
+                or right.endswith(f"::{left}")
+            )
+        )
 
     # ------------------------------------------------------------
     # Build

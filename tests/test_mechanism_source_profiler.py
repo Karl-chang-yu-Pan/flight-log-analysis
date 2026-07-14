@@ -673,6 +673,52 @@ class Reader {
     assert by_variable["_secondary"].instance == 1
 
 
+def test_uorb_callback_and_c_api_copy_preserve_data_boundary_owner(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "reader.cpp").write_text(
+        """
+class Reader {
+    vehicle_status_s _status{};
+    uORB::SubscriptionCallbackWorkItem _trigger{this, ORB_ID(vehicle_command)};
+    void poll();
+};
+
+void Reader::poll()
+{
+    orb_copy(ORB_ID(vehicle_status), _status_sub, &_status);
+    vehicle_status_s local_status{};
+    orb_copy(ORB_ID(vehicle_status), _status_sub, &local_status);
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    refs = profiler.extract_uorb_io_from_source(
+        ["src/modules/example/reader.cpp"]
+    )["subscribed_topics"]
+
+    callback = next(ref for ref in refs if ref.variable == "_trigger")
+    assert callback.topic == "vehicle_command"
+
+    member_copy = next(
+        ref for ref in refs if ref.api == "orb_copy" and ref.variable == "_status"
+    )
+    assert member_copy.topic == "vehicle_status"
+    assert member_copy.function == "Reader::poll"
+    assert member_copy.callable_id
+    assert member_copy.variable_owner == "Reader"
+
+    local_copy = next(
+        ref
+        for ref in refs
+        if ref.api == "orb_copy" and ref.variable == "local_status"
+    )
+    assert local_copy.variable_owner is None
+
+
 def test_callable_identity_distinguishes_same_named_definitions(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
