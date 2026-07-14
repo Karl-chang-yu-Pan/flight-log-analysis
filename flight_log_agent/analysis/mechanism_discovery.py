@@ -17,10 +17,12 @@ checkpoints. No LLM code belongs in this file.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
+from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.analysis.mechanism_dag import (
     MechanismDAG,
     _DAGBuilder,
@@ -344,6 +346,323 @@ def load_facts(
         seen.add(normalized)
         facts.append(extract_facts_for_file(profiler, normalized, source_hash))
     return facts
+
+# ---------------------------------------------------------------------------
+# Source survey (Phase 0: propose terminals from source, not from memory)
+# ---------------------------------------------------------------------------
+
+
+_PARAMETER_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
+_SIGNAL_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_]*(?:\[\d+\])?\.[A-Za-z_][A-Za-z0-9_.\[\]]*")
+_IDENTIFIER_TOKEN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b")
+
+
+@dataclass
+class SurveyAnchors:
+    """Exact identifiers the question names, verified against the tree.
+
+    Nothing here is a name-similarity guess: a parameter anchor exists
+    only if the source declares that parameter, a signal anchor only if
+    the flight actually recorded it, a callable anchor only if the tree
+    defines a function with that name.
+    """
+
+    parameters: set[str] = field(default_factory=set)
+    parameter_members: set[str] = field(default_factory=set)
+    signals: set[str] = field(default_factory=set)
+    callables: set[str] = field(default_factory=set)
+
+    def __bool__(self) -> bool:
+        return bool(self.parameters or self.signals or self.callables)
+
+
+@dataclass
+class SurveyedTarget:
+    """One symbol written in one source file, reached from an anchor."""
+
+    symbol: str
+    function: str = ""
+    line: int = 0
+    expression: str = ""
+    writes: int = 0
+    published_signal: str = ""
+    # 0 = the write reads an anchor directly; 1 = one dataflow hop away.
+    distance: int = 0
+
+
+@dataclass
+class SurveyedFile:
+    file: str
+    targets: list[SurveyedTarget] = field(default_factory=list)
+
+
+@dataclass
+class SourceSurvey:
+    """Deterministic menu of terminals that EXIST in the pinned source.
+
+    Search + two extractors (assignments, parameters) — no fact bundle,
+    no cache. Two jobs:
+
+    * remove identifier RECALL from terminal selection — a symbol absent
+      from the tree cannot be proposed, so a member or module path
+      remembered from another release never reaches discovery;
+    * keep the menu ACCURATE — targets are those a question anchor
+      actually reaches through source dataflow, not every symbol a file
+      happens to write. A whole file's write list is a dump, and
+      truncating a dump discards evidence at random.
+    """
+
+    files: list[SurveyedFile] = field(default_factory=list)
+    anchors: SurveyAnchors = field(default_factory=SurveyAnchors)
+
+    def symbols(self) -> set[str]:
+        return {target.symbol for entry in self.files for target in entry.targets}
+
+    def files_for(self, symbol: str) -> list[str]:
+        return [
+            entry.file
+            for entry in self.files
+            if any(target.symbol == symbol for target in entry.targets)
+        ]
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "anchors": {
+                "parameters": sorted(self.anchors.parameters),
+                "signals": sorted(self.anchors.signals),
+                "callables": sorted(self.anchors.callables),
+            },
+            "files": [
+                {
+                    "file": entry.file,
+                    "write_targets": [
+                        {
+                            "symbol": target.symbol,
+                            "function": target.function,
+                            "line": target.line,
+                            "expression": target.expression,
+                            "writes": target.writes,
+                            "reaches_anchor_in_hops": target.distance,
+                            **(
+                                {"published_signal": target.published_signal}
+                                if target.published_signal
+                                else {}
+                            ),
+                        }
+                        for target in entry.targets
+                    ],
+                }
+                for entry in self.files
+            ],
+        }
+
+
+def derive_survey_anchors(
+    texts: Sequence[str],
+    *,
+    declared_parameters: dict[str, set[str]],
+    observed_signals: Iterable[str] = (),
+    known_callables: Iterable[str] = (),
+) -> SurveyAnchors:
+    """Anchors the question names AND the tree confirms.
+
+    ``declared_parameters`` maps a canonical parameter name to the source
+    members that read it (the ``DEFINE_PARAMETERS`` map) — the parameter
+    a question names resolves to the exact member its writes reference.
+    """
+    blob = " ".join(str(t) for t in texts if t)
+    observed = {str(s) for s in observed_signals if s}
+    callables = {str(c) for c in known_callables if c}
+
+    anchors = SurveyAnchors()
+    for token in _PARAMETER_TOKEN_RE.findall(blob):
+        members = declared_parameters.get(token)
+        if members is not None:
+            anchors.parameters.add(token)
+            anchors.parameter_members.update(members)
+    for token in _SIGNAL_TOKEN_RE.findall(blob):
+        if token in observed:
+            anchors.signals.add(token)
+    for token in _IDENTIFIER_TOKEN_RE.findall(blob):
+        if token in callables:
+            anchors.callables.add(token)
+    return anchors
+
+
+def _bare_callable(name: Any) -> str:
+    return str(name or "").rsplit("::", 1)[-1].strip()
+
+
+def survey_source_files(
+    profiler: MechanismSourceProfiler,
+    files: Sequence[str],
+    *,
+    texts: Sequence[str] = (),
+    observed_signals: Iterable[str] = (),
+    max_hops: int = 1,
+) -> SourceSurvey:
+    """Write targets that a question anchor reaches through source dataflow.
+
+    Deliberately NOT :func:`load_facts`: a survey needs assignments and
+    parameter declarations, and the full per-file fact bundle costs
+    several times more for facts nothing here reads.
+
+    Selection is structural, in dataflow hops from an anchor:
+
+    * hop 0 — the write READS an anchor (a parameter's declared member,
+      an observed signal, or any write inside an anchored callable):
+      these are the decision sites where the questioned quantity is
+      computed;
+    * hop 1..``max_hops`` — writes one dataflow step away: producers of
+      what an anchored write reads, and consumers that read what it
+      wrote.
+
+    Writes that resolve to a published topic field are kept whenever they
+    are reached, since a published placement is how the questioned
+    quantity appears in the log. With no anchor at all the survey reports
+    every write target of the ranked files — honest breadth rather than a
+    silent cut.
+    """
+    file_list = dedupe_keep_order([str(f) for f in files if f])
+    if not file_list:
+        return SourceSurvey()
+
+    assignments = [_as_dict(a) for a in
+                   profiler.extract_source_assignments_from_source(file_list)]
+    if not assignments:
+        return SourceSurvey()
+
+    declared_parameters: dict[str, set[str]] = {}
+    for parameter in profiler.extract_params_from_source(file_list):
+        ref = _as_dict(parameter)
+        name = str(ref.get("name") or "")
+        if not name:
+            continue
+        members = declared_parameters.setdefault(name, set())
+        member = str(ref.get("member") or "")
+        if member:
+            members.add(member)
+
+    known_callables = {
+        _bare_callable(a.get("function")) for a in assignments if a.get("function")
+    }
+    anchors = derive_survey_anchors(
+        texts,
+        declared_parameters=declared_parameters,
+        observed_signals=observed_signals,
+        known_callables=known_callables,
+    )
+
+    def reads_anchor(assignment: dict[str, Any]) -> bool:
+        expression = str(assignment.get("expression") or "")
+        if any(member in expression for member in anchors.parameter_members):
+            return True
+        if any(name in expression for name in anchors.parameters):
+            return True
+        if any(signal in expression for signal in anchors.signals):
+            return True
+        return _bare_callable(assignment.get("function")) in anchors.callables
+
+    selected: dict[int, int] = {}  # index -> hop distance
+    if anchors:
+        for index, assignment in enumerate(assignments):
+            if reads_anchor(assignment):
+                selected[index] = 0
+        for hop in range(1, max_hops + 1):
+            frontier = {
+                index for index, distance in selected.items() if distance == hop - 1
+            }
+            if not frontier:
+                break
+            written = {str(assignments[i].get("target") or "") for i in frontier}
+            read: set[str] = set()
+            for i in frontier:
+                read.update(
+                    source_expression_names(
+                        str(assignments[i].get("expression") or "")
+                    )
+                )
+            for index, assignment in enumerate(assignments):
+                if index in selected:
+                    continue
+                target = str(assignment.get("target") or "")
+                expression = str(assignment.get("expression") or "")
+                produces_input = target in read
+                consumes_output = any(
+                    symbol and symbol in expression for symbol in written
+                )
+                if produces_input or consumes_output:
+                    selected[index] = hop
+    else:
+        selected = {index: 0 for index in range(len(assignments))}
+
+    per_file: dict[str, dict[str, SurveyedTarget]] = {}
+    for index, distance in sorted(selected.items(), key=lambda kv: (kv[1], kv[0])):
+        assignment = assignments[index]
+        file = str(assignment.get("file") or "")
+        symbol = str(assignment.get("target") or "").strip()
+        if not file or not symbol:
+            continue
+        targets = per_file.setdefault(file, {})
+        target = targets.get(symbol)
+        if target is None:
+            target = SurveyedTarget(
+                symbol=symbol,
+                function=str(assignment.get("function") or ""),
+                line=int(assignment.get("line") or 0),
+                expression=str(assignment.get("expression") or "")[:120],
+                distance=distance,
+            )
+            targets[symbol] = target
+        target.writes += 1
+        target.distance = min(target.distance, distance)
+        topic = assignment.get("target_topic")
+        field_name = assignment.get("target_field")
+        if topic and field_name and not target.published_signal:
+            target.published_signal = f"{topic}.{field_name}"
+
+    ordered_files = dedupe_keep_order([*file_list, *per_file])
+    return SourceSurvey(
+        files=[
+            SurveyedFile(
+                file=file,
+                targets=sorted(
+                    per_file[file].values(),
+                    key=lambda t: (t.distance, -t.writes, t.symbol),
+                ),
+            )
+            for file in ordered_files
+            if per_file.get(file)
+        ],
+        anchors=anchors,
+    )
+
+
+def survey_for_queries(
+    profiler: MechanismSourceProfiler,
+    queries: Sequence[str],
+    *,
+    texts: Sequence[str] = (),
+    observed_signals: Iterable[str] = (),
+    max_files: int = 8,
+) -> tuple[SourceSurvey, list[str]]:
+    """Rank source files for ``queries`` and survey their anchored targets.
+
+    Returns the survey and the ranked file list, so the caller can hand
+    the same files to discovery instead of repeating the search.
+    """
+    query_list = [str(q) for q in queries if str(q).strip()]
+    if not query_list:
+        return SourceSurvey(), []
+    hits = profiler.search_related_source_files(query_list, max_files=max_files)
+    files = [hit.file for hit in hits if hit.score > 0]
+    survey = survey_source_files(
+        profiler,
+        files,
+        texts=[*texts, *query_list],
+        observed_signals=observed_signals,
+    )
+    return survey, files
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +1028,7 @@ def discover_mechanism_dag(
     logged_signals: Optional[Iterable[str]] = None,
     parameter_values: Optional[dict[str, Any]] = None,
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
+    preranked_files: Optional[Sequence[str]] = None,
 ) -> DiscoveryResult:
     """Deterministic discovery fixpoint: the DAG's own gaps drive the search.
 
@@ -731,6 +1051,9 @@ def discover_mechanism_dag(
     terminal keeps loading pending files but never builds; an ambiguous
     or out-of-scope one stops the fixpoint with the structured reason in
     ``terminal_validation`` — building would fuse unrelated modules.
+
+    ``preranked_files`` supplies round 0's file set directly (the source
+    survey already ranked the same seeds), skipping a repeat search.
     """
     terminal_as_given = str(terminal or "").strip()
     terminal = canonicalize_terminal(terminal)
@@ -749,11 +1072,14 @@ def discover_mechanism_dag(
         except Exception:
             enum_registry = {}
 
-    seed_queries = dedupe_keep_order([*(str(s) for s in seeds if s), terminal])
-    hits = profiler.search_related_source_files(
-        seed_queries, max_files=max_files_per_round
-    )
-    pending: list[str] = [hit.file for hit in hits]
+    if preranked_files:
+        pending: list[str] = [str(f) for f in preranked_files if f]
+    else:
+        seed_queries = dedupe_keep_order([*(str(s) for s in seeds if s), terminal])
+        hits = profiler.search_related_source_files(
+            seed_queries, max_files=max_files_per_round
+        )
+        pending = [hit.file for hit in hits]
     if terminal_file:
         # The declared write file is provenance, not a search guess —
         # load it first so validation decides with it in evidence.

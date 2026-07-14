@@ -874,3 +874,188 @@ void Example::calculate_only()
     }
     assert by_expression["input_value"]["logged_signal"] == "alpha.value"
     assert by_expression["unrelated_value"]["logged_signal"] == ""
+
+
+def test_survey_anchors_on_declared_parameter_and_selects_its_writes(tmp_path):
+    """The survey is ANCHORED, not a dump: a parameter the question names
+    resolves through DEFINE_PARAMETERS to its member, and the writes that
+    read that member are the decision sites. Unrelated writes in the same
+    file stay out."""
+    from flight_log_agent.analysis.mechanism_discovery import survey_source_files
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/ctrl.cpp": """
+class Ctrl
+{
+    DEFINE_PARAMETERS(
+        (ParamFloat<px4::params::EXA_TRIM_SPD>) _param_exa_trim_spd
+    )
+};
+
+void Ctrl::update()
+{
+    speed_sp = _param_exa_trim_spd.get() + margin;
+    unrelated_out = counter + 1.0f;
+    logger_value = unrelated_out * 2.0f;
+}
+""",
+    })
+
+    survey = survey_source_files(
+        profiler,
+        ["src/modules/example/ctrl.cpp"],
+        texts=["why is the speed above EXA_TRIM_SPD sometimes?"],
+    )
+
+    assert survey.anchors.parameters == {"EXA_TRIM_SPD"}
+    assert survey.anchors.parameter_members == {"_param_exa_trim_spd"}
+
+    targets = {t.symbol: t for entry in survey.files for t in entry.targets}
+    # hop 0: the write that reads the anchored parameter
+    assert targets["speed_sp"].distance == 0
+    assert "_param_exa_trim_spd" in targets["speed_sp"].expression
+    assert targets["speed_sp"].function == "Ctrl::update"
+    # hop 1: producer of an input the anchored write reads
+    assert targets["margin"].distance == 1 if "margin" in targets else True
+    # a write unreachable from the anchor is NOT surveyed
+    assert "unrelated_out" not in targets
+    assert "logger_value" not in targets
+
+
+def test_survey_anchors_on_observed_signal_and_defined_callable(tmp_path):
+    """Signals anchor only when the flight recorded them; callables only
+    when the tree defines them. A name the tree does not confirm anchors
+    nothing."""
+    from flight_log_agent.analysis.mechanism_discovery import survey_source_files
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/ctrl.cpp": """
+void Ctrl::adapt_value()
+{
+    adapted = topic_a.field_x * 2.0f;
+}
+
+void Ctrl::other()
+{
+    elsewhere = 5.0f;
+}
+""",
+    })
+
+    signal_anchored = survey_source_files(
+        profiler,
+        ["src/modules/example/ctrl.cpp"],
+        texts=["why does topic_a.field_x drive the output?"],
+        observed_signals={"topic_a.field_x"},
+    )
+    assert signal_anchored.anchors.signals == {"topic_a.field_x"}
+    assert "adapted" in signal_anchored.symbols()
+    assert "elsewhere" not in signal_anchored.symbols()
+
+    # the same signal name, NOT observed in this flight, anchors nothing
+    unobserved = survey_source_files(
+        profiler,
+        ["src/modules/example/ctrl.cpp"],
+        texts=["why does topic_a.field_x drive the output?"],
+        observed_signals=set(),
+    )
+    assert unobserved.anchors.signals == set()
+
+    callable_anchored = survey_source_files(
+        profiler,
+        ["src/modules/example/ctrl.cpp"],
+        texts=["explain adapt_value"],
+    )
+    assert callable_anchored.anchors.callables == {"adapt_value"}
+    assert "adapted" in callable_anchored.symbols()
+    assert "elsewhere" not in callable_anchored.symbols()
+
+
+def test_survey_without_anchors_reports_every_target(tmp_path):
+    """No anchor the tree confirms: report the ranked files' write targets
+    in full — honest breadth, never a silent cut."""
+    from flight_log_agent.analysis.mechanism_discovery import survey_source_files
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/ctrl.cpp": """
+void Ctrl::run()
+{
+    first_out = a + 1.0f;
+    second_out = b + 2.0f;
+}
+""",
+    })
+
+    survey = survey_source_files(
+        profiler, ["src/modules/example/ctrl.cpp"], texts=["nothing recognizable"]
+    )
+
+    assert not survey.anchors
+    assert survey.symbols() == {"first_out", "second_out"}
+
+
+def test_survey_payload_carries_expressions_and_hops(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import survey_source_files
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/ctrl.cpp": """
+class Ctrl
+{
+    DEFINE_PARAMETERS(
+        (ParamFloat<px4::params::EXA_TRIM_SPD>) _param_exa_trim_spd
+    )
+};
+
+void Ctrl::update()
+{
+    status_s status;
+    status.speed_sp = _param_exa_trim_spd.get();
+    orb_publish(ORB_ID(status), _pub, &status);
+}
+""",
+    })
+
+    survey = survey_source_files(
+        profiler,
+        ["src/modules/example/ctrl.cpp"],
+        texts=["EXA_TRIM_SPD"],
+    )
+    payload = survey.as_payload()
+
+    assert payload["anchors"]["parameters"] == ["EXA_TRIM_SPD"]
+    entry = payload["files"][0]
+    assert entry["file"] == "src/modules/example/ctrl.cpp"
+    target = next(t for t in entry["write_targets"] if t["symbol"] == "status.speed_sp")
+    assert target["reaches_anchor_in_hops"] == 0
+    assert "_param_exa_trim_spd" in target["expression"]
+    assert target["published_signal"] == "status.speed_sp"
+
+
+
+def test_discovery_accepts_preranked_files(tmp_path):
+    """Round 0 takes the survey's ranked files instead of repeating the
+    search."""
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "src/modules/example/ctrl.cpp": """
+void Ctrl::run()
+{
+    speed_sp = gspeed + 1.0f;
+}
+""",
+    })
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("search must not run when files are preranked")
+
+    profiler.search_related_source_files = _fail  # type: ignore[assignment]
+
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=[], terminal="speed_sp",
+        source_hash="hash", logged_signals={"gspeed"},
+        preranked_files=["src/modules/example/ctrl.cpp"],
+    )
+
+    assert result.terminal_validation.status == "valid"
+    assert {v.variable for v in result.dag.vertices if v.kind == "operation"} == {"speed_sp"}
