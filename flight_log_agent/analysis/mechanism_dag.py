@@ -3021,15 +3021,16 @@ def _predicate_policy_summary(
 
 
 def _sample_value_at(
-    samples: list[tuple[float, Any]],
+    ordered: list[tuple[float, Any]],
+    times: list[float],
     timestamp: float,
     policy: Optional[dict[str, Any]],
 ) -> Optional[Any]:
-    """Resample one series according to its schema-derived policy."""
-    if not samples:
+    """Resample one time-ordered series according to its schema-derived
+    policy. ``ordered``/``times`` are pre-sorted ONCE by the caller — a
+    per-timestamp sort made interval evaluation quadratic on real logs."""
+    if not ordered:
         return None
-    ordered = sorted(samples, key=lambda item: item[0])
-    times = [float(ts) for ts, _value in ordered]
     position = bisect_right(times, timestamp)
     if position and times[position - 1] == timestamp:
         return ordered[position - 1][1]
@@ -3141,14 +3142,21 @@ def _evaluate_predicate_intervals(
     ever_evaluated = False
     last_evaluated: Optional[float] = None
 
+    # Pre-sort each referenced series and resolve its policy ONCE — the
+    # per-timestamp loop only bisects.
+    prepared: dict[str, tuple[list[tuple[float, Any]], list[float], Optional[dict[str, Any]]]] = {}
+    for signal in referenced:
+        ordered = sorted(signal_samples[signal], key=lambda item: float(item[0]))
+        prepared[signal] = (
+            ordered,
+            [float(ts) for ts, _value in ordered],
+            _signal_policy(signal, signal_policies or {}),
+        )
+
     for t in ts_sorted:
         resampled = {
-            signal_key_map[signal]: _sample_value_at(
-                signal_samples[signal],
-                t,
-                _signal_policy(signal, signal_policies or {}),
-            )
-            for signal in referenced
+            signal_key_map[signal]: _sample_value_at(ordered, times, t, policy)
+            for signal, (ordered, times, policy) in prepared.items()
         }
         if any(value is None for value in resampled.values()):
             continue
