@@ -37,12 +37,19 @@ from flight_log_agent.analysis.source_expression import (
     alias_dotted_names,
     source_expression_names,
 )
+from flight_log_agent.analysis.source_expansion import (
+    SourceStructureIndex,
+    SourceSymbolIdentity,
+    UnresolvedSourceReference,
+)
 from flight_log_agent.expression_math import is_safe_math_function_name
-from flight_log_agent.px4.mechanism_source_profiler import substitute_expression_symbols
+from flight_log_agent.px4.mechanism_source_profiler import (
+    split_top_level_args,
+    substitute_expression_symbols,
+)
 from flight_log_agent.symbols import (
     exact_symbol,
     is_signal_reference,
-    looks_like_enum_constant,
     normalize_symbol,
     parse_signal_reference,
     strip_symbol_indices,
@@ -56,6 +63,36 @@ VertexKind = Literal["evidence", "operation", "branch"]
 EvidenceSubKind = Literal["logged_signal", "parameter", "constant", "opaque_symbol"]
 OperationSubKind = Literal["assign", "reduction", "helper_call", "external_call", "unresolved"]
 EdgeKind = Literal["data", "control", "selection"]
+
+# Fixed language/evaluator grammar, not domain semantics. These tokens can be
+# followed by parentheses in lowered source but never identify source helpers.
+_NON_CALL_SYNTAX = {
+    "and",
+    "bool",
+    "catch",
+    "char",
+    "const_cast",
+    "double",
+    "dynamic_cast",
+    "else",
+    "float",
+    "for",
+    "if",
+    "int",
+    "long",
+    "not",
+    "or",
+    "reinterpret_cast",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static_cast",
+    "switch",
+    "unsigned",
+    "void",
+    "while",
+}
 
 
 class DAGVertex(BaseModel):
@@ -108,6 +145,11 @@ class MechanismDAG(BaseModel):
     vertices: list[DAGVertex] = Field(default_factory=list)
     edges: list[DAGEdge] = Field(default_factory=list)
     unresolved_symbols: list[str] = Field(default_factory=list)
+    # Internal expansion frontier. Excluded from serialized DAG/report schemas;
+    # ``unresolved_symbols`` remains the stable external representation.
+    unresolved_references: list[UnresolvedSourceReference] = Field(
+        default_factory=list, exclude=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +226,7 @@ def build_mechanism_dag(
     call_statements: Sequence[Any] = (),
     boundary_bindings: Sequence[Any] = (),
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
+    source_structure: Optional[SourceStructureIndex] = None,
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
 
@@ -244,6 +287,7 @@ def build_mechanism_dag(
         call_statements=[_as_binding_dict(c) for c in call_statements],
         boundary_bindings=[_as_binding_dict(b) for b in boundary_bindings],
         enum_registry=dict(enum_registry or {}),
+        source_structure=source_structure or SourceStructureIndex(),
     )
     return builder.build()
 
@@ -273,6 +317,7 @@ class _DAGBuilder:
         call_statements: Optional[list[dict[str, Any]]] = None,
         boundary_bindings: Optional[list[dict[str, Any]]] = None,
         enum_registry: Optional[dict[str, dict[str, Any]]] = None,
+        source_structure: Optional[SourceStructureIndex] = None,
     ) -> None:
         self.terminal_raw = terminal
         self.terminal = exact_symbol(terminal)
@@ -285,11 +330,15 @@ class _DAGBuilder:
         # (``{message: {CONSTANT: value}}``) — resolved at wiring time
         # like every other constant, never as a flat global table.
         self._enum_registry = dict(enum_registry or {})
+        self._source_structure = source_structure or SourceStructureIndex()
         self.helper_index = helper_index
+        self._helper_keys_by_name: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for helper_key in helper_index:
+            self._helper_keys_by_name[helper_key[0]].append(helper_key)
         self.helper_body_provider = helper_body_provider
         # Helpers already probed via the provider so a repeated call for an
         # unknown name doesn't re-fetch on every backward-walk pass.
-        self._helper_provider_probed: set[str] = set()
+        self._helper_provider_probed: set[tuple[str, str, str, Optional[int]]] = set()
         self.source_root = source_root
         # Catalogues key on exact identity. Schema shape lookup allows an
         # aggregate declaration to validate an indexed element; observed
@@ -337,6 +386,18 @@ class _DAGBuilder:
         self._by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._target_shapes: dict[str, list[str]] = defaultdict(list)
         self._output_shapes: dict[str, list[str]] = defaultdict(list)
+        self._reference_identities_by_scope: dict[
+            tuple[str, str, str], list[SourceSymbolIdentity]
+        ] = defaultdict(list)
+        self._reference_identities_by_file: dict[
+            tuple[str, str], list[SourceSymbolIdentity]
+        ] = defaultdict(list)
+        self._reference_identities_by_callable: dict[
+            tuple[str, str], list[SourceSymbolIdentity]
+        ] = defaultdict(list)
+        self._reference_identities_by_symbol: dict[
+            str, list[SourceSymbolIdentity]
+        ] = defaultdict(list)
         writes_per_target: dict[str, int] = defaultdict(int)
         for binding in self._all_bindings:
             logged = exact_symbol(str(binding.get("logged_signal") or ""))
@@ -348,6 +409,23 @@ class _DAGBuilder:
             if target:
                 self._index_binding(self._by_target, self._target_shapes, target, binding)
                 writes_per_target[target] += 1
+            site_file, site_callable = self._binding_site_scope(binding)
+            for raw_symbol, raw_identity in (
+                binding.get("reference_identities") or {}
+            ).items():
+                try:
+                    identity = SourceSymbolIdentity.model_validate(raw_identity)
+                except (TypeError, ValueError):
+                    continue
+                symbol = exact_symbol(str(raw_symbol))
+                self._reference_identities_by_scope[
+                    (site_file, site_callable, symbol)
+                ].append(identity)
+                self._reference_identities_by_file[(site_file, symbol)].append(identity)
+                self._reference_identities_by_callable[
+                    (site_callable, symbol)
+                ].append(identity)
+                self._reference_identities_by_symbol[symbol].append(identity)
 
         # Source-defined numeric constants (enum entry / ``#define`` /
         # ``constexpr``), resolved natively from the bindings: a single
@@ -391,6 +469,7 @@ class _DAGBuilder:
         self.vertices: dict[str, DAGVertex] = {}
         self.edges: dict[tuple[str, str, str, str], DAGEdge] = {}
         self.unresolved_symbols: set[str] = set()
+        self._unresolved_references: dict[tuple[Any, ...], UnresolvedSourceReference] = {}
 
         # Memoization tables.
         self._evidence_by_signal: dict[tuple[str, str], str] = {}
@@ -544,15 +623,6 @@ class _DAGBuilder:
             exact_file = [item for item in candidates if str(item.get("file") or "") == file]
             if exact_file:
                 candidates = exact_file
-            else:
-                module = self._file_family(file)[0]
-                module_items = [
-                    item
-                    for item in candidates
-                    if self._file_family(str(item.get("file") or ""))[0] == module
-                ]
-                if module_items:
-                    candidates = module_items
         if scope_function:
             scoped = [
                 item
@@ -680,7 +750,12 @@ class _DAGBuilder:
             for raw in dedupe_keep_order(source_expression_names(normalized_expr)):
                 if raw:
                     frontier.append(("symbol", raw, scope))
-            for helper_name in self._find_helper_calls(expression, scope[0]):
+            for helper_name in self._find_helper_calls(
+                expression,
+                scope[0],
+                scope_function=scope[1],
+                line=scope[2],
+            ):
                 if helper_name not in materialized_helpers:
                     frontier.append(("helper", helper_name, scope))
 
@@ -773,9 +848,14 @@ class _DAGBuilder:
                     continue
                 materialized_helpers.add(helper_name)
                 self._materialize_helper_subgraph(
-                    helper_name, wire_edges=False, scope_file=scope[0]
+                    helper_name,
+                    wire_edges=False,
+                    scope_file=scope[0],
+                    scope_function=scope[1],
                 )
-                helper_key = self._pick_helper_key(helper_name, scope[0])
+                helper_key = self._pick_helper_key(
+                    helper_name, scope[0], scope_function=scope[1]
+                )
                 helper = self.helper_index.get(helper_key) if helper_key else None
                 if not helper:
                     continue
@@ -811,6 +891,7 @@ class _DAGBuilder:
             vertices=[self.vertices[key] for key in self.vertices],
             edges=[self.edges[key] for key in self.edges],
             unresolved_symbols=sorted(self.unresolved_symbols),
+            unresolved_references=list(self._unresolved_references.values()),
         )
 
     # ------------------------------------------------------------
@@ -863,10 +944,9 @@ class _DAGBuilder:
         Only IN-SET callees are considered: an unloaded callee has no body
         bindings to walk, so the synthesized hop would be inert — and
         probing the provider with generic statement names (``update``)
-        drags junk definitions. When several loaded classes define the
-        name, a callee whose class context matches the receiver's struct
-        type wins; else the deterministic first match (the Milestone 2
-        receiver-typing note on :meth:`_pick_helper_key` applies here too).
+        drags unrelated definitions. When several loaded classes define the
+        name, only a unique callee whose owner matches the receiver's derived
+        type is accepted; unresolved ambiguity creates no binding.
         """
         for call in self._call_statements:
             name = str(call.get("name") or "")
@@ -875,7 +955,7 @@ class _DAGBuilder:
                 continue
             if is_safe_math_function_name(name):
                 continue
-            matches = [key for key in self.helper_index if key[0] == name]
+            matches = list(self._helper_keys_by_name.get(name, ()))
             if not matches:
                 continue
             receiver = str(call.get("receiver") or "")
@@ -888,23 +968,17 @@ class _DAGBuilder:
             # Bind only an UNAMBIGUOUS callee — a generic statement name
             # (``update``) matched by sorted-first would spray one class's
             # formals with every caller's actuals and fuse unrelated
-            # modules. Resolution: exact receiver struct type, then
-            # receiver↔class name affinity (member ``_tecs`` ↔ class
-            # ``TECS``, underscores/case ignored), then a unique name.
+            # modules. Resolution uses exact receiver type when available,
+            # otherwise the callable name must identify one loaded helper.
             helper_key = None
             if receiver_type:
-                exact = [k for k in matches if str(k[1]) == receiver_type]
-                if exact:
-                    helper_key = sorted(exact)[0]
-            if helper_key is None and receiver:
-                affinity = receiver.strip("_").replace("_", "").lower()
-                akin = [
+                exact = [
                     k
                     for k in matches
-                    if str(k[1] or "").replace("_", "").lower() == affinity
+                    if str(self.helper_index[k].get("owner") or "") == receiver_type
                 ]
-                if akin:
-                    helper_key = sorted(akin)[0]
+                if exact:
+                    helper_key = exact[0] if len(exact) == 1 else None
             if helper_key is None and len(matches) == 1:
                 helper_key = matches[0]
             if helper_key is None:
@@ -1010,6 +1084,86 @@ class _DAGBuilder:
         )
         return (file, function)
 
+    @staticmethod
+    def _binding_target_identity(
+        binding: dict[str, Any],
+    ) -> Optional[SourceSymbolIdentity]:
+        raw = binding.get("target_identity")
+        if not raw:
+            return None
+        try:
+            return SourceSymbolIdentity.model_validate(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _reference_identity(
+        self,
+        symbol_raw: str,
+        file: Optional[str],
+        scope_function: str,
+    ) -> SourceSymbolIdentity:
+        canonical = exact_symbol(symbol_raw)
+        if file and scope_function:
+            candidates = self._reference_identities_by_scope.get(
+                (str(file), scope_function, canonical), []
+            )
+        elif file:
+            candidates = self._reference_identities_by_file.get(
+                (str(file), canonical), []
+            )
+        elif scope_function:
+            candidates = self._reference_identities_by_callable.get(
+                (scope_function, canonical), []
+            )
+        else:
+            candidates = self._reference_identities_by_symbol.get(canonical, [])
+        keys = {candidate.key() for candidate in candidates}
+        if len(keys) == 1:
+            return candidates[0]
+        callable_record = self._source_structure.callables_by_id.get(scope_function) or {}
+        return self._source_structure.symbol_identity(
+            symbol_raw,
+            file=str(file or ""),
+            callable_id=scope_function,
+            function_name=str(callable_record.get("name") or ""),
+            function_parameters=[
+                str(value) for value in callable_record.get("parameters") or []
+            ],
+        )
+
+    def _record_unresolved(
+        self,
+        symbol: str,
+        *,
+        kind: str = "symbol",
+        file: Optional[str] = None,
+        line: Optional[int] = None,
+        scope_function: str = "",
+        source_expression: str = "",
+        receiver: str = "",
+        argument_count: Optional[int] = None,
+    ) -> None:
+        identity = (
+            self._reference_identity(symbol, file, scope_function)
+            if kind == "symbol"
+            else None
+        )
+        owner = self._source_structure.callable_owner(scope_function)
+        reference = UnresolvedSourceReference(
+            symbol=symbol,
+            kind=kind,
+            file=str(file or ""),
+            line=line,
+            callable_id=scope_function,
+            class_owner=owner,
+            receiver=receiver,
+            argument_count=argument_count,
+            source_expression=source_expression,
+            identity=identity,
+        )
+        self._unresolved_references.setdefault(reference.visit_key(), reference)
+        self.unresolved_symbols.add(symbol)
+
     def _binding_site_scope(self, binding: dict[str, Any]) -> tuple[str, str]:
         """Where the binding's EXPRESSION text lives — the scope its
         referenced symbols are resolved in."""
@@ -1092,61 +1246,92 @@ class _DAGBuilder:
         scope_file, scope_function = scope[:2]
         scope_line = scope[2] if len(scope) > 2 else None
         if scope_file and target_writers:
-            root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
-            # PX4 marks members with a LEADING underscore in modules and a
-            # TRAILING one in libraries (``airspeed_ref_``) — both are
-            # class members, visible across the class file family.
-            if root.startswith("_") or root.endswith("_"):
-                family = self._file_family(scope_file)
-                same_family = [
-                    b
-                    for b in target_writers
-                    if self._file_family(self._binding_target_scope(b)[0]) == family
-                ]
-                if not same_family:
-                    # Inheritance widening stays within the MODULE (same
-                    # directory): RTL's members live in navigator/'s
-                    # MissionBlock, not in another module that happens to
-                    # write a same-named member.
-                    module = family[0]
-                    same_family = [
-                        b
-                        for b in target_writers
-                        if self._file_family(self._binding_target_scope(b)[0])[0]
-                        == module
-                    ]
-                target_writers = same_family
-            else:
-                scoped = []
-                for binding in target_writers:
-                    b_file, b_function = self._binding_target_scope(binding)
-                    if b_file != scope_file:
-                        continue
-                    if scope_function and b_function and b_function != scope_function:
-                        continue
-                    scoped.append(binding)
-                if scope_line is None:
-                    target_writers = scoped
+            reference = self._reference_identity(
+                symbol_raw, scope_file, scope_function
+            )
+            structurally_scoped: list[dict[str, Any]] = []
+            for binding in target_writers:
+                producer = self._binding_target_identity(binding)
+                if producer is not None and self._source_structure.compatible(
+                    reference, producer
+                ):
+                    structurally_scoped.append(binding)
+            # A structurally classified local/member must never widen. When
+            # declaration coverage is incomplete, same-callable fallback is
+            # conservative and explicitly prevents cross-method fusion.
+            if reference.kind in {"local", "member"}:
+                if structurally_scoped:
+                    target_writers = structurally_scoped
                 else:
-                    prior = [
+                    target_writers = [
                         binding
-                        for binding in scoped
-                        if not self._binding_target_line(binding)
-                        or self._binding_target_line(binding) <= scope_line
+                        for binding in target_writers
+                        if self._binding_target_scope(binding)
+                        == (scope_file, scope_function)
                     ]
-                    prior.sort(
-                        key=lambda binding: self._binding_target_line(binding) or 0,
-                        reverse=True,
-                    )
-                    reaching: list[dict[str, Any]] = []
-                    for binding in prior:
-                        reaching.append(binding)
-                        if (
-                            bool(binding.get("reachability_exact", True))
-                            and not binding.get("control_predicates")
-                        ):
-                            break
-                    target_writers = reaching
+            elif structurally_scoped:
+                producer_identities = {
+                    identity.key()
+                    for binding in structurally_scoped
+                    if (identity := self._binding_target_identity(binding))
+                }
+                target_writers = (
+                    structurally_scoped
+                    if len(producer_identities) == 1
+                    else []
+                )
+            else:
+                # Unknown/global references are admitted only when source
+                # lookup leaves one exact writer identity. Ambiguity remains
+                # unresolved instead of being settled by file proximity.
+                identities = {
+                    identity.key()
+                    for binding in target_writers
+                    if (identity := self._binding_target_identity(binding))
+                }
+                if not identities:
+                    same_scope = [
+                        binding
+                        for binding in target_writers
+                        if self._binding_target_scope(binding)
+                        == (scope_file, scope_function)
+                    ]
+                    if not same_scope and not scope_function:
+                        same_scope = [
+                            binding
+                            for binding in target_writers
+                            if self._binding_target_scope(binding)[0] == scope_file
+                        ]
+                    target_writers = same_scope
+                elif len(identities) != 1:
+                    target_writers = []
+            if reference.kind == "member":
+                # Textual order between methods has no runtime reaching-
+                # definition meaning; all owner-compatible member writers
+                # remain alternatives for later control/feasibility pruning.
+                return target_writers
+            if scope_line is not None and target_writers:
+                prior = [
+                    binding
+                    for binding in target_writers
+                    if self._binding_target_scope(binding)[0] != scope_file
+                    or not self._binding_target_line(binding)
+                    or self._binding_target_line(binding) <= scope_line
+                ]
+                prior.sort(
+                    key=lambda binding: self._binding_target_line(binding) or 0,
+                    reverse=True,
+                )
+                reaching: list[dict[str, Any]] = []
+                for binding in prior:
+                    reaching.append(binding)
+                    if (
+                        self._binding_target_scope(binding)[0] == scope_file
+                        and bool(binding.get("reachability_exact", True))
+                        and not binding.get("control_predicates")
+                    ):
+                        break
+                target_writers = reaching
         return target_writers
 
     def _writers_of(self, symbol_norm: str) -> list[dict[str, Any]]:
@@ -1223,6 +1408,8 @@ class _DAGBuilder:
                 "file": site_file,
                 "callable": site_callable,
             }
+            if binding.get("target_identity"):
+                metadata["target_identity"] = dict(binding["target_identity"])
             if binding.get("synthetic_call_binding"):
                 metadata["synthetic_call_binding"] = True
             logged_signal = exact_symbol(str(binding.get("logged_signal") or ""))
@@ -1282,8 +1469,12 @@ class _DAGBuilder:
                 self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
         # Helper-call inputs.
-        for helper_call in self._find_helper_calls(expression, file):
-            helper_key = self._pick_helper_key(helper_call, file)
+        for helper_call in self._find_helper_calls(
+            expression, file, scope_function=scope_function, line=line
+        ):
+            helper_key = self._pick_helper_key(
+                helper_call, file, scope_function=scope_function
+            )
             if helper_key is None:
                 continue
             helper_return_id = self._helper_subgraph_return_id.get(helper_key)
@@ -1309,7 +1500,11 @@ class _DAGBuilder:
             # dedupe with any source_assignments-derived vertex that
             # already covers the same call site.
             self._emit_helper_pointer_output_writes(
-                helper_call, expression, file=file, line=line
+                helper_call,
+                expression,
+                file=file,
+                line=line,
+                scope_function=scope_function,
             )
 
     def _emit_helper_pointer_output_writes(
@@ -1319,6 +1514,7 @@ class _DAGBuilder:
         *,
         file: Optional[str],
         line: Optional[int],
+        scope_function: str = "",
     ) -> None:
         """Graph-native equivalent of the profiler's pointer-output routing.
 
@@ -1329,7 +1525,9 @@ class _DAGBuilder:
         by :meth:`_emit_operation_vertex` so a source_assignments-derived
         binding for the same call site does not double-emit.
         """
-        helper_key = self._pick_helper_key(helper_call, file)
+        helper_key = self._pick_helper_key(
+            helper_call, file, scope_function=scope_function
+        )
         if helper_key is None:
             return
         helper = self.helper_index.get(helper_key)
@@ -1390,7 +1588,9 @@ class _DAGBuilder:
         function is invoked once per name; a limitation on today's parser,
         good enough for the RTL/airspeed cases.
         """
-        helper_key = self._pick_helper_key(helper_call, file)
+        helper_key = self._pick_helper_key(
+            helper_call, file, scope_function=scope_function
+        )
         if helper_key is None:
             return
         formals = self._helper_parameter_vertices.get(helper_key)
@@ -1438,37 +1638,23 @@ class _DAGBuilder:
         if not producers or not file:
             return list(producers)
 
-        root = symbol_raw.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
-        member_fallback = root.startswith("_") or root.endswith("_")
-
         def metadata(vertex_id: str) -> dict[str, Any]:
             return self.vertices[vertex_id].metadata or {}
 
-        if member_fallback:
-            family = self._file_family(file)
-            visible = [
-                producer_id
-                for producer_id in producers
-                if self._file_family(
-                    str((metadata(producer_id).get("target_scope") or {}).get("file")
-                        or self.vertices[producer_id].file
-                        or "")
-                ) == family
-            ]
-            if not visible:
-                visible = [
-                    producer_id
-                    for producer_id in producers
-                    if self._file_family(
-                        str((metadata(producer_id).get("target_scope") or {}).get("file")
-                            or self.vertices[producer_id].file
-                            or "")
-                    )[0] == family[0]
-                ]
-            return visible
-
+        reference = self._reference_identity(symbol_raw, file, scope_function)
         visible: list[str] = []
+        has_structured_producer = False
         for producer_id in producers:
+            raw_identity = metadata(producer_id).get("target_identity")
+            if raw_identity:
+                has_structured_producer = True
+                try:
+                    producer_identity = SourceSymbolIdentity.model_validate(raw_identity)
+                except (TypeError, ValueError):
+                    continue
+                if self._source_structure.compatible(reference, producer_identity):
+                    visible.append(producer_id)
+                continue
             target_scope = metadata(producer_id).get("target_scope") or {}
             target_file = str(target_scope.get("file") or self.vertices[producer_id].file or "")
             target_callable = str(
@@ -1479,6 +1665,16 @@ class _DAGBuilder:
             if scope_function and target_callable and target_callable != scope_function:
                 continue
             visible.append(producer_id)
+
+        if has_structured_producer and reference.kind in {"local", "member"}:
+            visible = [
+                producer_id
+                for producer_id in visible
+                if metadata(producer_id).get("target_identity")
+            ]
+        if reference.kind == "member":
+            # Source order across methods does not describe runtime order.
+            return visible
 
         if line is None:
             return visible
@@ -1534,11 +1730,8 @@ class _DAGBuilder:
         4. C stdlib constant (``CXX_STDLIB_CONSTANTS``) — same shape.
         5. Direct logged-signal set membership (fallback for canonical
            references that don't need a binding).
-        6. Parameter accessor match — heuristic; will retire when we
-           consume profiler ``ReferencedParameterRef`` records directly.
-        7. Enum-shaped name (``looks_like_enum_constant``) — heuristic;
-           retires when source constant coverage is complete.
-        8. Otherwise: opaque symbol.
+        6. Parameter accessor resolved through profiler-derived aliases.
+        7. Otherwise: typed unresolved source symbol.
 
         No flat ``symbol_bindings`` table is consulted anywhere — every
         source→logged mapping is derived from graph structure.
@@ -1693,14 +1886,14 @@ class _DAGBuilder:
                 )
             ]
 
-        # 6. Parameter accessor heuristic.
+        # 6. Parameter accessor resolved from profiler-derived aliases or an
+        # exact declaration/inventory name.
         parameter_alias = self._match_parameter(symbol_raw)
         if parameter_alias is not None:
             return [self._emit_evidence("parameter", parameter_alias, file=None, line=None)]
 
         # 7a. Bare PX4-parameter-shaped name resolved through the ULog
-        # parameter inventory. Handles source RHSes like ``FW_AIRSPD_TRIM``
-        # that aren't dotted (so ``looks_like_enum_constant`` skips them).
+        # parameter inventory. Handles source RHSes like ``FW_AIRSPD_TRIM``.
         parameter_value = self._parameter_values.get(symbol_raw.upper())
         if parameter_value is not None and is_px4_parameter_name(symbol_raw.upper()):
             return [self._emit_evidence(
@@ -1711,16 +1904,18 @@ class _DAGBuilder:
                 metadata={"value": parameter_value, "source": "parameter"},
             )]
 
-        # 7b. Enum-shaped name (no value known).
-        if looks_like_enum_constant(symbol_raw):
-            return [self._emit_evidence("constant", symbol_raw, file=None, line=None)]
-
         # 8. Unclassified. Callers probing an alternative spelling
         # (rebinding) suppress the fallback so the original symbol keeps
         # its own resolution sequence.
         if not emit_opaque:
             return []
-        self.unresolved_symbols.add(symbol_raw)
+        self._record_unresolved(
+            symbol_raw,
+            file=file,
+            line=line,
+            scope_function=scope_function,
+            source_expression=source_expression,
+        )
         return [self._emit_evidence("opaque_symbol", symbol_raw, file=file, line=line)]
 
     def _lower_predicate(
@@ -2165,46 +2360,68 @@ class _DAGBuilder:
     # ------------------------------------------------------------
 
     def _find_helper_calls(
-        self, expression: str, scope_file: Optional[str] = None
+        self,
+        expression: str,
+        scope_file: Optional[str] = None,
+        *,
+        scope_function: str = "",
+        line: Optional[int] = None,
     ) -> list[str]:
-        """Return helper names invoked in ``expression`` that we can expand.
-
-        A name is expandable when it appears in ``helper_index`` under some
-        class context, or when the on-demand provider can fetch it — the
-        latter check invokes :meth:`_pick_helper_key` which memoizes probes
-        so an unknown name is asked at most once per build.
-
-        Two guards:
-
-        * Math-function names (the ``expression_math`` vocabulary) never
-          expand — they're evaluator-native, and a template-math overload
-          (``Dual<S,N> sqrt(...)``) is not the mechanism's helper.
-        * A **dotted short** head (``.get(``, ``->dot(``) is a method on
-          another object — a param/uORB accessor or vector op — and a
-          bare-name match against the whole loaded helper set would let a
-          getter literally named ``get`` from an unrelated class claim
-          it. Long dotted heads (``_mission.get_landing_alt()``) stay
-          eligible, as do short *bare* heads; full receiver-class vs
-          ``class_context`` disambiguation is the Milestone 2 work noted
-          on :meth:`_pick_helper_key`.
-        """
+        """Return source-resolved helper calls and record unresolved calls."""
         matches: list[str] = []
         seen: set[str] = set()
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression):
             candidate = match.group(1)
             if candidate in seen:
                 continue
-            if is_safe_math_function_name(candidate):
-                continue
-            preceding = expression[max(0, match.start() - 2):match.start()]
-            if len(candidate) < 4 and (
-                preceding.endswith(".") or preceding.endswith("->")
-            ):
+            if candidate in _NON_CALL_SYNTAX or is_safe_math_function_name(candidate):
                 continue
             seen.add(candidate)
-            if self._pick_helper_key(candidate, scope_file) is not None:
+            prefix = expression[: match.start()]
+            receiver_match = re.search(
+                r"([A-Za-z_][A-Za-z0-9_.]*(?:\[[^\]]+\])?)\s*(?:\.|->)\s*$",
+                prefix,
+            )
+            receiver = receiver_match.group(1) if receiver_match else ""
+            close = self._matching_parenthesis(expression, match.end() - 1)
+            argument_count = None
+            if close is not None:
+                raw_args = expression[match.end() : close]
+                argument_count = len(
+                    [arg for arg in split_top_level_args(raw_args) if arg.strip()]
+                )
+            if self._pick_helper_key(
+                candidate,
+                scope_file,
+                scope_function=scope_function,
+                receiver=receiver,
+                argument_count=argument_count,
+            ) is not None:
                 matches.append(candidate)
+            else:
+                self._record_unresolved(
+                    f"{receiver}.{candidate}" if receiver else candidate,
+                    kind="callable",
+                    file=scope_file,
+                    line=line,
+                    scope_function=scope_function,
+                    source_expression=expression,
+                    receiver=receiver,
+                    argument_count=argument_count,
+                )
         return matches
+
+    @staticmethod
+    def _matching_parenthesis(text: str, opening: int) -> Optional[int]:
+        depth = 0
+        for index in range(opening, len(text)):
+            if text[index] == "(":
+                depth += 1
+            elif text[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    return index
+        return None
 
     def _materialize_helper_subgraph(
         self,
@@ -2212,6 +2429,7 @@ class _DAGBuilder:
         *,
         wire_edges: bool = True,
         scope_file: Optional[str] = None,
+        scope_function: str = "",
     ) -> Optional[str]:
         """Emit the helper's body as nested vertices, return its output vertex id.
 
@@ -2221,7 +2439,9 @@ class _DAGBuilder:
         When ``wire_edges`` is False, only vertices are emitted (pass 1).
         Edges are wired by :meth:`_wire_helper_subgraph_edges` in pass 2.
         """
-        helper_key = self._pick_helper_key(helper_name, scope_file)
+        helper_key = self._pick_helper_key(
+            helper_name, scope_file, scope_function=scope_function
+        )
         if helper_key is None:
             return None
         cached = self._helper_subgraph_return_id.get(helper_key)
@@ -2421,58 +2641,105 @@ class _DAGBuilder:
                     self._add_edge(producer_id, terminal_id, kind="data", role=f"branch:{symbol}")
 
     def _pick_helper_key(
-        self, helper_name: str, scope_file: Optional[str] = None
+        self,
+        helper_name: str,
+        scope_file: Optional[str] = None,
+        *,
+        scope_function: str = "",
+        receiver: str = "",
+        argument_count: Optional[int] = None,
     ) -> Optional[tuple[str, str]]:
-        """Choose one ``(name, class_context)`` for a call like ``foo(...)``.
+        """Resolve a callable from receiver type, owner lineage, and arity.
 
-        When several classes define the name, the CALLER's scope decides
-        — same file family, then same module directory. A unique match
-        wins regardless of module (cross-module library helpers).
-        Multiple candidates that are ALL foreign to the caller's module
-        are ambiguous: return None and let the call stay opaque —
-        sorted-first here materialized MavlinkMissionManager's subgraph
-        for navigator calls to same-named Mission methods.
-
-        On miss, consult the on-demand helper provider (if any) — the
-        cross-file callee isn't in the pre-flattened helper set but the
-        provider can locate and lower it. Result gets merged into
-        ``helper_index`` so subsequent lookups skip the provider call.
+        File proximity and sorted-first selection are deliberately absent.
+        Ambiguous overloads remain unresolved until source structure proves a
+        unique callable identity.
         """
-        matches = [key for key in self.helper_index if key[0] == helper_name]
+
+        def matching_keys() -> list[tuple[str, str]]:
+            found = list(self._helper_keys_by_name.get(helper_name, ()))
+            if argument_count is not None:
+                found = [
+                    key
+                    for key in found
+                    if self._helper_parameter_count(self.helper_index[key])
+                    == argument_count
+                ]
+            return found
+
+        matches = matching_keys()
         if not matches:
             if (
                 self.helper_body_provider is None
-                or helper_name in self._helper_provider_probed
+                or (helper_name, scope_function, receiver, argument_count)
+                in self._helper_provider_probed
             ):
                 return None
-            self._helper_provider_probed.add(helper_name)
-            fetched = self.helper_body_provider(helper_name)
+            probe_key = (helper_name, scope_function, receiver, argument_count)
+            self._helper_provider_probed.add(probe_key)
+            reference = UnresolvedSourceReference(
+                symbol=helper_name,
+                kind="callable",
+                file=str(scope_file or ""),
+                callable_id=scope_function,
+                class_owner=self._source_structure.callable_owner(scope_function),
+                receiver=receiver,
+                argument_count=argument_count,
+            )
+            try:
+                fetched = self.helper_body_provider(helper_name, reference)
+            except TypeError:
+                fetched = self.helper_body_provider(helper_name)
             for helper in _coerce_helpers(fetched):
                 key_iter = _index_helpers([helper])
                 for key, value in key_iter.items():
-                    self.helper_index.setdefault(key, value)
-            matches = [key for key in self.helper_index if key[0] == helper_name]
+                    if key not in self.helper_index:
+                        self.helper_index[key] = value
+                        self._helper_keys_by_name[key[0]].append(key)
+            matches = matching_keys()
         if not matches:
             return None
-        if len(matches) == 1:
-            return matches[0]
-        if scope_file:
-            family = self._file_family(scope_file)
-            preferred = [
-                k
-                for k in matches
-                if self._file_family(str(self.helper_index[k].get("file") or ""))
-                == family
-            ] or [
-                k
-                for k in matches
-                if self._file_family(str(self.helper_index[k].get("file") or ""))[0]
-                == family[0]
-            ]
-            if preferred:
-                return sorted(preferred)[0]
+        caller_owner = self._source_structure.callable_owner(scope_function)
+        receiver_type = ""
+        receiver_root = receiver.replace("->", ".").split(".", 1)[0].lstrip("&*")
+        if caller_owner and receiver_root:
+            declaring = self._source_structure.declaring_member_owner(
+                caller_owner, receiver_root
+            )
+            member = self._source_structure.members.get((declaring, receiver_root)) if declaring else None
+            receiver_type = str((member or {}).get("type") or "")
+            receiver_type = receiver_type.rstrip("*& ").split("<", 1)[0].strip()
+        if receiver and not receiver_type:
             return None
-        return sorted(matches)[0]
+        expected_owners = (
+            set(self._source_structure.lineage(receiver_type))
+            if receiver_type
+            else set(self._source_structure.lineage(caller_owner))
+        )
+        if expected_owners:
+            owned = [
+                key
+                for key in matches
+                if str(self.helper_index[key].get("owner") or "") in expected_owners
+            ]
+            if len(owned) == 1:
+                return owned[0]
+        if len(matches) == 1 and not receiver:
+            return matches[0]
+        return None
+
+    @staticmethod
+    def _helper_parameter_count(helper: dict[str, Any]) -> int:
+        parameters = helper.get("parameters")
+        if parameters:
+            return len(parameters)
+        evidence = str(helper.get("evidence") or "")
+        match = re.search(r"\((.*)\)", evidence)
+        if not match or not match.group(1).strip() or match.group(1).strip() == "void":
+            return 0
+        return len(
+            [value for value in split_top_level_args(match.group(1)) if value.strip()]
+        )
 
     # ------------------------------------------------------------
     # Edges and IDs
@@ -2586,12 +2853,7 @@ class _DAGBuilder:
 
 
 def _index_helpers(helpers: Sequence[Any]) -> dict[tuple[str, str], dict[str, Any]]:
-    """Index ``helper_expressions`` by ``(short_name, class_context)``.
-
-    ``class_context`` combines the enclosing class (if any) with the
-    function name, i.e. ``"RTL::calculate_return_alt_from_cone_half_angle"``
-    or ``"::free_function_name"`` when there's no class.
-    """
+    """Index helpers by short name and stable callable identity."""
     index: dict[tuple[str, str], dict[str, Any]] = {}
     for helper in helpers:
         as_dict = helper if isinstance(helper, dict) else _helper_to_dict(helper)
@@ -2599,8 +2861,18 @@ def _index_helpers(helpers: Sequence[Any]) -> dict[tuple[str, str], dict[str, An
         if not name:
             continue
         short = name.split("::")[-1]
-        class_context = _class_context_from_name_or_evidence(name, str(as_dict.get("evidence") or ""))
-        index[(short, class_context)] = as_dict
+        callable_id = str(as_dict.get("callable_id") or "") or ":".join(
+            [
+                str(as_dict.get("file") or ""),
+                str(as_dict.get("line") or 0),
+                name,
+                ",".join(str(value) for value in as_dict.get("parameters") or []),
+            ]
+        )
+        owner, separator, _method = name.rpartition("::")
+        as_dict.setdefault("owner", owner if separator else "")
+        as_dict.setdefault("callable_id", callable_id)
+        index[(short, callable_id)] = as_dict
     return index
 
 

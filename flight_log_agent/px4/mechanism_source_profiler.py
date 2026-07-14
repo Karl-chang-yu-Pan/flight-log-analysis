@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
@@ -208,6 +209,48 @@ class ParameterPredicateRef(BaseModel):
     compared_value: Optional[str] = None
 
 
+class SourceClassRef(BaseModel):
+    """One source-declared class and its direct inheritance relation."""
+
+    name: str
+    file: str
+    line: int
+    end_line: int
+    bases: List[str] = Field(default_factory=list)
+
+
+class SourceMemberRef(BaseModel):
+    """A direct data-member declaration owned by a class."""
+
+    name: str
+    owner: str
+    type: Optional[str] = None
+    file: str
+    line: int
+
+
+class SourceCallableRef(BaseModel):
+    """A source-defined callable with stable ownership and signature data."""
+
+    name: str
+    owner: Optional[str] = None
+    file: str
+    line: int
+    end_line: int
+    callable_id: str
+    parameters: List[str] = Field(default_factory=list)
+    parameter_types: List[str] = Field(default_factory=list)
+    return_type: Optional[str] = None
+
+
+class SourceIncludeRef(BaseModel):
+    """A source include resolved to a file in the configured source tree."""
+
+    file: str
+    included_file: str
+    line: int
+
+
 class MechanismSourceProfile(BaseModel):
     query: str
     source_root: str
@@ -223,6 +266,10 @@ class MechanismSourceProfile(BaseModel):
     helper_expressions: List[HelperExpressionRef] = Field(default_factory=list)
     branch_conditions: List[BranchConditionRef] = Field(default_factory=list)
     parameter_predicates: List[ParameterPredicateRef] = Field(default_factory=list)
+    classes: List[SourceClassRef] = Field(default_factory=list)
+    members: List[SourceMemberRef] = Field(default_factory=list)
+    callables: List[SourceCallableRef] = Field(default_factory=list)
+    includes: List[SourceIncludeRef] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
 
 
@@ -375,7 +422,7 @@ class MechanismSourceProfiler:
     )
     _CLASS_DECL_PATTERN = re.compile(
         r"\b(?:class|struct)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
-        r"(?:\s+final)?(?:\s*:[^{]+)?\s*\{"
+        r"(?:\s+final)?(?:\s*:\s*(?P<bases>[^{]+))?\s*\{"
     )
 
     # Parameter reference patterns.
@@ -500,6 +547,11 @@ class MechanismSourceProfiler:
         # methods across multiple source_discovery iterations. Keyed by
         # the rel path string so the path-resolution variants converge.
         self._text_cache: dict[str, Optional[str]] = {}
+        self._search_cache: dict[str, List[SourceMatch]] = {}
+        # Several fact extractors consume the same call-site inventory. Keep
+        # this parse memo local to one profiler/run; it is not a persisted DAG
+        # or source-facts cache and cannot survive a source snapshot change.
+        self._function_call_cache: dict[tuple[str, ...], List[FunctionCallRef]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -508,8 +560,9 @@ class MechanismSourceProfiler:
     def search_related_source_files(
         self,
         queries: Union[str, Sequence[str]],
-        max_files: int = 12,
+        max_files: Optional[int] = 12,
         max_matches_per_file: int = 8,
+        expand_query_tokens: bool = True,
     ) -> List[SourceFileHit]:
         """
         Search the PX4 source tree for files related to one or more query terms.
@@ -518,13 +571,20 @@ class MechanismSourceProfiler:
             queries: Single query string or list of query strings. Use concrete
                 terms when possible, e.g. "FW_TKO_PITCH_MIN", "takeoff pitch",
                 "position_setpoint_triplet".
-            max_files: Maximum number of ranked source files to return.
+            max_files: Maximum number of ranked source files to return. ``None``
+                returns every match so deterministic expansion can validate
+                candidates without a correctness-affecting retrieval cap.
             max_matches_per_file: Number of evidence lines to keep per file.
+            expand_query_tokens: Also search strong identifier tokens parsed
+                from prose queries. Deterministic definition lookup disables
+                this so an exact ``::callable(`` query is not broadened.
 
         Returns:
             Ranked source file hits with evidence lines.
         """
-        query_list = self._normalize_queries(queries)
+        query_list = self._normalize_queries(
+            queries, expand_tokens=expand_query_tokens
+        )
         by_file: Dict[str, SourceFileHit] = {}
         score_by_file_query: Dict[Tuple[str, str], float] = {}
 
@@ -555,7 +615,7 @@ class MechanismSourceProfiler:
             hit.score += self._file_path_boost(hit.file)
 
         ranked = sorted(by_file.values(), key=lambda x: (-x.score, x.file))
-        return ranked[:max_files]
+        return ranked if max_files is None else ranked[:max_files]
 
     def extract_uorb_io_from_source(
         self,
@@ -964,9 +1024,16 @@ class MechanismSourceProfiler:
     def extract_source_assignments_from_source(
         self,
         files: Sequence[Union[str, Path]],
+        *,
+        expand_companions: bool = True,
+        include_pointer_outputs: bool = True,
+        include_control_flow: bool = True,
     ) -> List[SourceAssignmentRef]:
         refs: List[SourceAssignmentRef] = []
-        for path in self._expand_companion_files(files):
+        paths = self._expand_companion_files(files) if expand_companions else [
+            self._resolve_file(file_path) for file_path in files
+        ]
+        for path in paths:
             text = self._read_text(path)
             if text is None:
                 continue
@@ -975,7 +1042,12 @@ class MechanismSourceProfiler:
             var_to_struct = self._extract_struct_variables(text)
             definitions = self._extract_function_definitions(text, rel_file)
             aliases_per_function = self._extract_reference_aliases_per_function(definitions)
-            control_predicates, unresolved_reach = self._control_predicates_by_line(text)
+            if include_control_flow:
+                control_predicates, unresolved_reach = self._control_predicates_by_line(text)
+            else:
+                # Candidate screening needs exact targets and callable scope,
+                # but reachability is relevant only after a file is admitted.
+                control_predicates, unresolved_reach = {}, set()
 
             code_lines = list(self._iter_code_lines(text))
             for index, (line_no, line) in enumerate(code_lines):
@@ -1123,7 +1195,8 @@ class MechanismSourceProfiler:
                     )
 
             refs.extend(self._extract_constant_definitions(text, rel_file))
-        refs.extend(self._extract_pointer_output_call_site_assignments(files))
+        if include_pointer_outputs:
+            refs.extend(self._extract_pointer_output_call_site_assignments(files))
         return self._dedupe_source_assignment_refs(refs)
 
     def _extract_pointer_output_call_site_assignments(
@@ -1658,6 +1731,12 @@ class MechanismSourceProfiler:
         self,
         files: Sequence[Union[str, Path]],
     ) -> List[FunctionCallRef]:
+        expanded_files = self._expand_companion_files(files)
+        cache_key = tuple(self._rel(path) for path in expanded_files)
+        cached = self._function_call_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
         refs: List[FunctionCallRef] = []
         ignored = {
             "if",
@@ -1673,7 +1752,6 @@ class MechanismSourceProfiler:
             "dynamic_cast",
         }
 
-        expanded_files = self._expand_companion_files(files)
         member_owners = self._collect_class_member_owners(expanded_files)
         for path in expanded_files:
             text = self._read_text(path)
@@ -1741,7 +1819,9 @@ class MechanismSourceProfiler:
                         )
                     )
 
-        return self._dedupe_function_call_refs(refs)
+        deduped = self._dedupe_function_call_refs(refs)
+        self._function_call_cache[cache_key] = list(deduped)
+        return deduped
 
     def extract_helper_expressions_from_source(
         self,
@@ -2039,7 +2119,12 @@ class MechanismSourceProfiler:
     # Search helpers
     # ------------------------------------------------------------------
 
-    def _normalize_queries(self, queries: Union[str, Sequence[str]]) -> List[str]:
+    def _normalize_queries(
+        self,
+        queries: Union[str, Sequence[str]],
+        *,
+        expand_tokens: bool = True,
+    ) -> List[str]:
         if isinstance(queries, str):
             raw = [queries]
         else:
@@ -2053,20 +2138,66 @@ class MechanismSourceProfiler:
             if self._should_keep_query(query):
                 normalized.append(query)
 
-            # Also search individual strong-looking tokens for recall.
-            for token in re.findall(r"[A-Z][A-Z0-9_]{2,}|[A-Za-z_][A-Za-z0-9_]{5,}", query):
-                if self._should_keep_query(token) and token not in normalized:
-                    normalized.append(token)
+            if expand_tokens:
+                # Also search individual strong-looking tokens for recall.
+                for token in re.findall(r"[A-Z][A-Z0-9_]{2,}|[A-Za-z_][A-Za-z0-9_]{5,}", query):
+                    if self._should_keep_query(token) and token not in normalized:
+                        normalized.append(token)
 
         return normalized
 
     def _ripgrep_or_python_search(self, query: str) -> List[SourceMatch]:
+        cached = self._search_cache.get(query)
+        if cached is not None:
+            return list(cached)
         try:
-            return self._ripgrep_search(query)
+            matches = self._ripgrep_search(query)
         except Exception:
-            return self._python_search(query)
+            matches = self._python_search(query)
+        self._search_cache[query] = list(matches)
+        return matches
 
     def _ripgrep_search(self, query: str) -> List[SourceMatch]:
+        local_root = getattr(self.source, "root", None)
+        if local_root is not None:
+            command = [
+                self.rg_path,
+                "--line-number",
+                "--no-heading",
+                "--color=never",
+                "--fixed-strings",
+                "--ignore-case",
+            ]
+            for source_glob in self.SOURCE_GLOBS:
+                command.extend(["--glob", source_glob])
+            for excluded in self.excludes:
+                command.extend(["--glob", f"!{excluded.rstrip('/')}/*"])
+                command.extend(["--glob", f"!{excluded.rstrip('/')}*/**"])
+            command.extend(["--", query, "."])
+            completed = subprocess.run(
+                command,
+                cwd=Path(local_root),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode not in {0, 1}:
+                raise RuntimeError(completed.stderr.strip() or "ripgrep failed")
+            matches: List[SourceMatch] = []
+            for raw_line in completed.stdout.splitlines():
+                file_name, separator, remainder = raw_line.partition(":")
+                line_text, line_separator, text = remainder.partition(":")
+                if not separator or not line_separator or not line_text.isdigit():
+                    continue
+                matches.append(
+                    SourceMatch(
+                        file=file_name.removeprefix("./"),
+                        line=int(line_text),
+                        text=text.strip(),
+                        query=query,
+                    )
+                )
+            return [match for match in matches if not self._is_excluded(match.file)]
         return [
             SourceMatch(file=match.file, line=match.line, text=match.text.strip(), query=query)
             for match in self.source.search(
@@ -2273,6 +2404,7 @@ class MechanismSourceProfiler:
                     "end_line": stripped.count("\n", 0, close_brace) + 1,
                     "open_index": open_brace,
                     "end_index": close_brace,
+                    "bases": self._parse_base_classes(match.group("bases") or ""),
                 }
             )
         for definition in definitions:
@@ -2290,6 +2422,206 @@ class MechanismSourceProfiler:
                 )
                 definition["name"] = f"{parent['name']}::{definition['name']}"
         return definitions
+
+    @staticmethod
+    def _parse_base_classes(raw_bases: str) -> List[str]:
+        bases: List[str] = []
+        for raw in split_top_level_args(raw_bases):
+            cleaned = re.sub(r"\b(?:public|protected|private|virtual)\b", "", raw)
+            cleaned = " ".join(cleaned.split()).strip()
+            if not cleaned:
+                continue
+            match = re.search(r"([A-Za-z_][A-Za-z0-9_:]*(?:\s*<.*>)?)\s*$", cleaned)
+            if match:
+                bases.append("".join(match.group(1).split()))
+        return bases
+
+    @staticmethod
+    def _member_declarations_from_body(
+        body: str,
+        *,
+        owner: str,
+        file: str,
+        first_line: int,
+    ) -> List[SourceMemberRef]:
+        """Extract direct data members from a class body.
+
+        Nested class/function bodies have already been blanked by
+        :meth:`_direct_class_body`. The remaining semicolon statements are
+        declarations at class scope. Function declarations and type aliases
+        are rejected structurally instead of using member-name conventions.
+        """
+        refs: List[SourceMemberRef] = []
+        body = "\n".join(line.split("//", 1)[0] for line in body.splitlines())
+        offset = 0
+        for statement in body.split(";")[:-1]:
+            statement_line = first_line + body.count("\n", 0, offset)
+            offset += len(statement) + 1
+            cleaned = re.sub(r"\b(?:public|protected|private)\s*:\s*", "", statement)
+            cleaned = " ".join(cleaned.split()).strip()
+            if not cleaned or cleaned.startswith(
+                (
+                    "using ",
+                    "typedef ",
+                    "friend ",
+                    "static_assert",
+                    "enum ",
+                    "class ",
+                    "struct ",
+                    "#",
+                )
+            ):
+                continue
+            # A top-level parenthesis before any initializer denotes a method
+            # declaration, macro invocation, or static assertion, not data.
+            paren = cleaned.find("(")
+            initializer = min(
+                [index for index in (cleaned.find("="), cleaned.find("{")) if index >= 0]
+                or [len(cleaned)]
+            )
+            if 0 <= paren < initializer:
+                continue
+            declaration = cleaned[:initializer].strip()
+            first = re.match(
+                r"(?P<type>.+?)(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+                r"\s*(?:\[[^\]]*\])?\s*$",
+                declaration,
+            )
+            if not first:
+                continue
+            type_name = first.group("type").strip().rstrip("*& ")
+            name = first.group("name")
+            if not type_name or type_name.endswith(("=", ",")):
+                continue
+            refs.append(
+                SourceMemberRef(
+                    name=name,
+                    owner=owner,
+                    type=type_name,
+                    file=file,
+                    line=statement_line,
+                )
+            )
+        return refs
+
+    @staticmethod
+    def _function_parameter_types(raw_params: str) -> List[str]:
+        types: List[str] = []
+        for raw in split_top_level_args(raw_params):
+            param = raw.split("=", 1)[0].strip()
+            if not param or param == "void":
+                continue
+            param = re.sub(r"\[[^\]]*\]", "", param).strip()
+            match = re.search(r"[A-Za-z_][A-Za-z0-9_]*\s*$", param)
+            if match:
+                param = param[: match.start()].strip()
+            types.append(" ".join(param.split()))
+        return types
+
+    def extract_source_structure_from_source(
+        self,
+        files: Sequence[Union[str, Path]],
+        *,
+        expand_companions: bool = True,
+    ) -> Dict[str, List[BaseModel]]:
+        """Extract source relationships used by deterministic expansion.
+
+        This is a source index, not a mechanism guess: class ownership,
+        inheritance, declarations, callable signatures, and include edges are
+        all emitted from syntax with stable source sites.
+        """
+        paths = self._expand_companion_files(files) if expand_companions else [
+            self._resolve_file(file_path) for file_path in files
+        ]
+        classes: List[SourceClassRef] = []
+        members: List[SourceMemberRef] = []
+        callables: List[SourceCallableRef] = []
+        includes: List[SourceIncludeRef] = []
+        for path in paths:
+            text = self._read_text(path)
+            if text is None:
+                continue
+            rel_file = self._rel(path)
+            stripped = self._strip_block_comments_preserve_lines(text)
+            definitions = self._extract_class_definitions(stripped)
+            for definition in definitions:
+                owner = str(definition.get("name") or "")
+                line = int(definition.get("line") or 0)
+                end_line = int(definition.get("end_line") or line)
+                classes.append(
+                    SourceClassRef(
+                        name=owner,
+                        file=rel_file,
+                        line=line,
+                        end_line=end_line,
+                        bases=[str(base) for base in definition.get("bases") or []],
+                    )
+                )
+                start = int(definition.get("open_index") or 0) + 1
+                end = int(definition.get("end_index") or start)
+                direct_body = self._direct_class_body(stripped[start:end])
+                members.extend(
+                    self._member_declarations_from_body(
+                        direct_body,
+                        owner=owner,
+                        file=rel_file,
+                        first_line=line,
+                    )
+                )
+            for definition in self._extract_function_definitions(stripped, rel_file):
+                name = str(definition.get("name") or "")
+                owner = self._function_owner(name)
+                evidence = str(definition.get("evidence") or "")
+                signature_match = re.search(r"\((?P<params>.*)\)\s*(?:const\s*)?\{$", evidence)
+                callables.append(
+                    SourceCallableRef(
+                        name=name,
+                        owner=owner,
+                        file=rel_file,
+                        line=int(definition.get("line") or 0),
+                        end_line=int(definition.get("end_line") or 0),
+                        callable_id=str(self._callable_id(definition) or ""),
+                        parameters=[str(value) for value in definition.get("params") or []],
+                        parameter_types=self._function_parameter_types(
+                            signature_match.group("params") if signature_match else ""
+                        ),
+                        return_type=(
+                            str(definition.get("return_type"))
+                            if definition.get("return_type")
+                            else None
+                        ),
+                    )
+                )
+            for line_no, line_text in enumerate(stripped.splitlines(), start=1):
+                match = re.match(r'\s*#\s*include\s*[<"](?P<path>[^>"]+)[>"]', line_text)
+                if not match:
+                    continue
+                include = match.group("path")
+                candidates = [path.parent / include, Path(include)]
+                resolved = next(
+                    (
+                        candidate.as_posix()
+                        for candidate in candidates
+                        if not candidate.is_absolute()
+                        and ".." not in candidate.parts
+                        and self.source.file_exists(candidate.as_posix())
+                    ),
+                    None,
+                )
+                if resolved:
+                    includes.append(
+                        SourceIncludeRef(
+                            file=rel_file,
+                            included_file=resolved,
+                            line=line_no,
+                        )
+                    )
+        return {
+            "classes": classes,
+            "members": members,
+            "callables": callables,
+            "includes": includes,
+        }
 
     @staticmethod
     def _class_owner_for_line(
@@ -2336,10 +2668,13 @@ class MechanismSourceProfiler:
             end = int(definition.get("end_index") or start)
             direct_body = self._direct_class_body(stripped[start:end])
             owner = str(definition.get("name") or "")
-            for _, line in self._iter_code_lines(direct_body):
-                for pattern in self._STRUCT_VAR_PATTERNS:
-                    for match in pattern.finditer(line):
-                        mapping.setdefault(match.group("var"), set()).add(owner)
+            for member in self._member_declarations_from_body(
+                direct_body,
+                owner=owner,
+                file="",
+                first_line=int(definition.get("line") or 0),
+            ):
+                mapping.setdefault(member.name, set()).add(owner)
         return mapping
 
     def _collect_class_member_owners(
@@ -3661,7 +3996,8 @@ class MechanismSourceProfiler:
 
     @staticmethod
     def _clean_field_path(field_text: str) -> str:
-        return re.sub(r"\s*(?:\.|->)\s*", ".", field_text.strip())
+        cleaned = re.sub(r"\s*(?:\.|->)\s*", ".", field_text.strip())
+        return cleaned[5:] if cleaned.startswith("this.") else cleaned
 
     @classmethod
     def _extract_reference_aliases_per_function(

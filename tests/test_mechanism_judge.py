@@ -15,6 +15,13 @@ from flight_log_agent.analysis.mechanism_judge import (
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 
 TWO_FILE_TREE = {
+    "src/modules/example/rtl.h": """
+class Rtl
+{
+    float _final_out;
+    float _dest_val;
+};
+""",
     "src/modules/example/rtl.cpp": """
 void Rtl::pick_altitude()
 {
@@ -127,10 +134,8 @@ def test_discover_with_judge_runs_seeder_discovery_judge(tmp_path):
     assert judged.bonus_round_used is False
 
 
-def test_judge_grants_one_bonus_round_for_essential_gaps(tmp_path):
-    """max_rounds=1 leaves _dest_val unresolved; the judge names it as an
-    essential gap and discovery reruns ONCE with the gap as a seed, which
-    pulls dest.cpp and completes the slice."""
+def test_judge_gaps_do_not_steer_completed_source_expansion(tmp_path):
+    """Textual judge gaps cannot admit files after deterministic fixed point."""
     profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
 
     async def stub_runner(agent, payload):
@@ -157,7 +162,7 @@ def test_judge_grants_one_bonus_round_for_essential_gaps(tmp_path):
         )
     )
 
-    assert judged.bonus_round_used is True
+    assert judged.bonus_round_used is False
     assert "_dest_val" not in judged.selected.dag.unresolved_symbols
     op_targets = {
         v.variable for v in judged.selected.dag.vertices if v.kind == "operation"
@@ -250,9 +255,7 @@ def test_empty_candidates_are_excluded_from_judge_choices(tmp_path):
     assert judged.selected is judged.results["_final_out"]
 
 
-def test_prose_gap_entries_are_dropped_from_bonus_seeds(tmp_path):
-    """Gap entries are verbatim search queries — a sentence greps nothing
-    and must not poison the bonus round; symbol-shaped entries survive."""
+def test_prose_gap_entries_are_not_used_as_source_queries(tmp_path):
     profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
 
     async def stub_runner(agent, payload):
@@ -278,7 +281,7 @@ def test_prose_gap_entries_are_dropped_from_bonus_seeds(tmp_path):
         )
     )
 
-    assert judged.bonus_round_used is True
+    assert judged.bonus_round_used is False
     op_targets = {
         v.variable for v in judged.selected.dag.vertices if v.kind == "operation"
     }
@@ -377,9 +380,7 @@ def test_seeder_receives_authoritative_normalized_intent(tmp_path):
     assert "_final_out" in surveyed
 
 
-def test_bonus_round_triggers_single_rejudge(tmp_path):
-    """After the bonus round the improved graph is judged once more; the
-    re-judge's own steering is not acted on (hard cap of one round)."""
+def test_essential_gap_does_not_trigger_rejudge(tmp_path):
     profiler = _mini_tree(tmp_path, TWO_FILE_TREE)
     judge_calls: list[dict] = []
 
@@ -408,12 +409,12 @@ def test_bonus_round_triggers_single_rejudge(tmp_path):
         )
     )
 
-    assert len(judge_calls) == 2
-    assert judged.bonus_round_used is True
+    assert len(judge_calls) == 1
+    assert judged.bonus_round_used is False
     op_targets = {v.variable for v in judged.selected.dag.vertices
                   if v.kind == "operation"}
     assert "_dest_val" in op_targets
-    assert judged.verdict.essential_gaps == ["_never_acted_on"]
+    assert judged.verdict.essential_gaps == ["_dest_val"]
 
 
 AIRSPEED_SHAPED_TREE = {

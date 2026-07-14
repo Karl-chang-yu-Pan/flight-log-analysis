@@ -5,9 +5,9 @@ Exactly two LLM touchpoints, neither inside the fixpoint loop:
 * **Seeder** — user question → grep-able search seeds + candidate
   terminal symbols. Runs once, before discovery.
 * **Judge** — compact rendering of the discovered DAG(s) → sufficiency
-  verdict, terminal selection, and triage of unresolved symbols into
-  essential (worth ONE more targeted discovery round) vs ignorable.
-  Runs once at fixpoint convergence; grants at most one bonus round.
+  verdict, terminal selection, and unresolved diagnostics. Runs after
+  fixpoint convergence; only a validated replacement terminal can trigger
+  one additional render and judgment.
 
 The judge consumes :func:`render_discovery_compact` — profile *facts*,
 not raw source snippets. Everything else in this module is deterministic
@@ -277,7 +277,8 @@ Output:
   terms.
 - candidate_terminals: the C++ symbols (class members or locals) that
   HOLD the quantity the question asks about, each with the source file
-  expected to write it. Order by likelihood; at most three.
+  expected to write it. Order by likelihood; keep the list concise because
+  each accepted terminal increases the downstream LLM payload and API cost.
 
 source_survey is the authority on what exists. Its anchors are the
 identifiers the question names AND the pinned tree confirms (declared
@@ -356,9 +357,10 @@ Decide from these facts only:
   at its decision site, name a better bare variable (with file) from
   the rendering's operations.
 
-When sufficient is false you MUST fill at least one of essential_gaps,
-expand_calls, or next_terminals — or leave all empty only if no further
-discovery could possibly help. One follow-up round is granted at most.
+When sufficient is false, use essential_gaps and expand_calls as diagnostics
+over the completed fixed-point graph. Fill next_terminals only when a shown
+source write proves that the selected terminal is wrong; one validated
+replacement terminal may be followed up.
 
 Branch entries contain a stable id, predicate, flight-data feasibility,
 and the exact active_windows. always_false means the predicate never held
@@ -380,8 +382,8 @@ fired cannot be the answer.
 
 essential_gaps and expand_calls entries are BARE symbol or function
 names copied from unresolved_symbols / unexpanded_calls / operation
-expressions — never sentences; they are used verbatim as source-search
-queries. empty_candidates lists terminals whose slice found nothing:
+expressions — never sentences; they are report diagnostics, not file-
+admission instructions. empty_candidates lists terminals whose slice found nothing:
 never select those; if no shown candidate holds the questioned quantity,
 propose a replacement in next_terminals taken from the operations of a
 non-empty rendering.
@@ -458,20 +460,20 @@ async def discover_with_judge(
     ``annotate`` (optional) maps a DiscoveryResult to a feasibility-
     annotated DAG; when given, the judge sees annotated renders (branch
     verdicts + active windows) so it can dismiss paths dead in THIS
-    flight instead of demanding their static grounding. After a bonus
-    round the improved DAG is re-annotated and judged ONCE more — the
-    verdict is never left stale relative to the graph it describes.
-    Worst case: seeder + judge + bonus re-judge = 3 LLM calls.
+    flight instead of demanding their static grounding. A replacement-
+    terminal DAG is re-annotated and judged once more so the verdict is never
+    stale. Terminal and retry limits deliberately bound LLM payload/API cost;
+    they are not deterministic-expansion limits.
 
-    The judge may grant at most ONE bonus discovery round: when the
-    verdict is insufficient and names ``essential_gaps``, discovery for
-    the selected terminal reruns once with those gaps added as seeds
-    (their definition search then pulls the missing files). The LLM is
-    never consulted inside the loop.
+    Deterministic source expansion reaches its own fixed point before the
+    judge runs. Judge-provided textual gaps do not steer file admission; only
+    a source-validated replacement terminal can trigger another complete
+    slice.
 
     ``discovery_kwargs`` pass through to
     :func:`~flight_log_agent.analysis.mechanism_discovery.discover_mechanism_dag`
-    (``source_root``, ``inventory``, ``logged_signals``, budgets, …).
+    (``source_root``, ``inventory``, ``logged_signals``, and compatibility
+    arguments for the retired deterministic-expansion limits).
     """
     runner = run_agent or _default_run_agent
 
@@ -579,10 +581,14 @@ async def discover_with_judge(
     results: dict[str, DiscoveryResult] = {}
 
     def _slice_candidates(candidates: Sequence[TerminalCandidate]) -> int:
-        """Slice candidates in order until ``max_terminals`` VALID slices
-        exist. A rejected terminal costs an attempt, never a slot — the
-        flat head-of-list cut discarded viable later candidates whenever
-        the first proposals did not exist in the tree."""
+        """Slice candidates under explicit LLM/API-cost safeguards.
+
+        ``max_terminals`` and ``max_terminal_attempts`` are not correctness
+        claims and can hide a later valid terminal. They are retained while
+        each additional rendered DAG materially increases paid model input.
+        Revisit them if terminal rejection or selection evidence shows that
+        this cost guard is affecting answers.
+        """
         valid = sum(1 for result in results.values() if _is_valid(result))
         attempts = 0
         for candidate in candidates:
@@ -687,61 +693,34 @@ async def discover_with_judge(
 
     selected = results.get(verdict.selected_terminal)
     bonus_round_used = False
-    steer = verdict.essential_gaps or verdict.expand_calls or verdict.next_terminals
-    if not verdict.sufficient and steer:
-        # The judge steers exactly one follow-up: re-terminal when it
-        # named a better decision-site variable, else re-slice the
-        # selected terminal with gaps/calls as extra seeds. The rerun
-        # gets a larger budget — the flat one suits single-module
-        # slices but starves multi-module chains.
-        if verdict.next_terminals:
-            target = verdict.next_terminals[0]
-            bonus_terminal = target.terminal
-            bonus_file = target.terminal_file
-        else:
-            bonus_terminal = verdict.selected_terminal
-            bonus_file = next(
-                (
-                    c.terminal_file
-                    for c in seeds.candidate_terminals
-                    if c.terminal == verdict.selected_terminal
-                ),
-                None,
-            )
+    if not verdict.sufficient and verdict.next_terminals:
+        # One replacement terminal is another API-cost guard: the new slice
+        # itself is deterministic and complete, but every re-judge sends a
+        # full graph payload. It is not a source-expansion depth limit.
+        target = verdict.next_terminals[0]
+        bonus_terminal = target.terminal
+        bonus_file = target.terminal_file
         # A judge-proposed terminal is subject to the same source truth:
         # when the survey knows the symbol, its real write file wins over
         # a named one the tree does not have.
         bonus_known_files = survey.files_for(bonus_terminal)
         if bonus_known_files and bonus_file not in bonus_known_files:
             bonus_file = bonus_known_files[0]
-        # Gap entries are used verbatim as search queries — a prose
-        # sentence greps nothing. Keep only symbol-shaped entries.
-        symbol_gaps = [
-            gap
-            for gap in [*verdict.essential_gaps, *verdict.expand_calls]
-            if gap and " " not in gap.strip() and len(gap) < 60
-        ]
         if bonus_terminal:
-            bonus_kwargs = dict(discovery_kwargs)
-            bonus_kwargs["max_rounds"] = bonus_kwargs.get("max_rounds", 3) + 2
-            bonus_kwargs["max_files_total"] = (
-                bonus_kwargs.get("max_files_total", 24) + 12
-            )
             selected = discover_mechanism_dag(
                 profiler,
                 cache_root,
-                [*seeds.seeds, *symbol_gaps],
+                seeds.seeds,
                 bonus_terminal,
                 source_hash,
                 terminal_file=bonus_file,
-                **bonus_kwargs,
+                **discovery_kwargs,
             )
             results[bonus_terminal] = selected
             bonus_round_used = True
-            # Re-judge ONCE over the improved graph — otherwise the
-            # verdict (and the report built from it) describes the
-            # pre-bonus DAG. The re-judge's own steering fields are not
-            # acted on; one follow-up round is the hard cap.
+            # Re-judge once so the verdict describes the replacement graph.
+            # Further replacements are not acted on because each additional
+            # full render incurs model input/API cost.
             verdict = await runner(
                 judge_agent,
                 {

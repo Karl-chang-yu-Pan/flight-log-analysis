@@ -9,6 +9,7 @@ from flight_log_agent.analysis.mechanism_dag import (
     split_by_terminal,
     write_dag_to_cache,
 )
+from flight_log_agent.analysis.source_expansion import SourceStructureIndex
 from flight_log_agent.ulog.inventory import observed_signals_from_inventory
 
 
@@ -92,6 +93,19 @@ def _fake_helper(
         "symbol_bindings": {},
         "parameters": [],
     }
+
+
+def _owned_bindings(
+    bindings: list[dict],
+    *,
+    bases: dict[str, set[str]] | None = None,
+    members: dict[tuple[str, str], dict] | None = None,
+) -> tuple[list[dict], SourceStructureIndex]:
+    structure = SourceStructureIndex(
+        direct_bases=bases or {},
+        members=members or {},
+    )
+    return structure.enrich_bindings(bindings), structure
 
 
 def test_backward_slice_emits_vertices_for_reaching_bindings():
@@ -886,10 +900,9 @@ def test_helper_call_arguments_wire_into_formal_parameter_vertices():
     assert any(e.role == "arg:base" for e in incoming)
 
 
-def test_struct_root_expansion_walks_through_bare_struct_argument():
-    """Backward walk landing on a bare ``_mission_item`` (no direct writer,
-    only field writes) should expand into ``_mission_item.*`` writes so
-    the chain closes at the field level."""
+def test_struct_root_does_not_guess_which_fields_a_helper_reads():
+    """An aggregate argument stays distinct from element writes until the
+    called helper body proves which fields it consumes."""
     bindings = [
         # Terminal: mission_item_altitude_amsl = get_absolute_altitude_for_item(_mission_item)
         _fake_binding(
@@ -898,6 +911,7 @@ def test_struct_root_expansion_walks_through_bare_struct_argument():
             expression="get_absolute_altitude_for_item(_mission_item)",
             file="mission_block.cpp",
             line=190,
+            function="MissionBlock::set_item",
         ),
         # Two field writes on _mission_item — the walk would normally
         # never see these because nothing writes _mission_item bare.
@@ -907,6 +921,7 @@ def test_struct_root_expansion_walks_through_bare_struct_argument():
             expression="_rtl_alt",
             file="rtl.cpp",
             line=361,
+            function="MissionBlock::update_item",
         ),
         _fake_binding(
             binding_id="field_lat",
@@ -914,6 +929,7 @@ def test_struct_root_expansion_walks_through_bare_struct_argument():
             expression="_destination.lat",
             file="rtl.cpp",
             line=360,
+            function="MissionBlock::update_item",
         ),
         # An upstream write for _rtl_alt so the walk continues past the
         # field expansion.
@@ -923,16 +939,31 @@ def test_struct_root_expansion_walks_through_bare_struct_argument():
             expression="max(gpos.alt, _destination.alt + _param_rtl_return_alt.get())",
             file="rtl.cpp",
             line=248,
+            function="MissionBlock::update_item",
         ),
     ]
-    dag = build_mechanism_dag(bindings, "mission_item_altitude_amsl")
+    bindings, structure = _owned_bindings(
+        bindings,
+        bases={"MissionBlock": set()},
+        members={
+            ("MissionBlock", "_mission_item"): {"type": "mission_item_s"},
+            ("MissionBlock", "_rtl_alt"): {"type": "float"},
+            ("MissionBlock", "_destination"): {"type": "Position"},
+        },
+    )
+    dag = build_mechanism_dag(
+        bindings,
+        "mission_item_altitude_amsl",
+        source_structure=structure,
+    )
 
     variables = {v.variable for v in dag.vertices if v.kind == "operation"}
-    # All three field-level writes + the upstream _rtl_alt should be reachable.
+    # No blanket aggregate-to-element fan-out: the helper is unresolved, so
+    # its actual field dependencies remain unresolved too.
     assert "mission_item_altitude_amsl" in variables
-    assert "_mission_item.altitude" in variables
-    assert "_mission_item.lat" in variables
-    assert "_rtl_alt" in variables
+    assert "_mission_item.altitude" not in variables
+    assert "_mission_item.lat" not in variables
+    assert "_mission_item" in dag.unresolved_symbols
 
 
 def test_dag_without_source_root_omits_snippets():
@@ -1783,10 +1814,8 @@ def test_local_symbols_never_fuse_across_files():
     assert not any("sensor_b" in str(v.signal_name or "") for v in dag.vertices)
 
 
-def test_member_symbols_widen_when_family_has_no_writer():
-    """A member consumed in one class but written only elsewhere
-    (inheritance, cross-file flows) must still resolve — members widen
-    on family miss; only locals are strict."""
+def test_member_symbols_do_not_widen_to_sibling_class():
+    """Same-spelled sibling members never connect through file proximity."""
     bindings = [
         _fake_binding(binding_id="t", target="_out_a", expression="_shared_member + 1.0",
                       file="a.cpp", line=1, function="Alpha::run"),
@@ -1794,13 +1823,24 @@ def test_member_symbols_widen_when_family_has_no_writer():
                       file="b.cpp", line=2, function="Beta::update",
                       logged_signal=""),
     ]
-    dag = build_mechanism_dag(bindings, "_out_a", terminal_file="a.cpp")
+    bindings, structure = _owned_bindings(
+        bindings,
+        bases={"Alpha": {"Base"}, "Beta": {"Base"}, "Base": set()},
+        members={("Base", "_shared_member"): {"type": "float"}},
+    )
+    dag = build_mechanism_dag(
+        bindings,
+        "_out_a",
+        terminal_file="a.cpp",
+        source_structure=structure,
+    )
 
     ops = {v.variable for v in dag.vertices if v.kind == "operation"}
-    assert "_shared_member" in ops
+    assert "_shared_member" not in ops
+    assert "_shared_member" in dag.unresolved_symbols
 
 
-def test_member_symbols_prefer_family_writers():
+def test_member_symbols_use_declared_owner_not_file_family():
     bindings = [
         _fake_binding(binding_id="t", target="_out_a", expression="_gain + 1.0",
                       file="src/modules/a/a.cpp", line=1, function="Alpha::run"),
@@ -1811,8 +1851,20 @@ def test_member_symbols_prefer_family_writers():
                       file="src/modules/b/b.cpp", line=3, function="Beta::init",
                       logged_signal=""),
     ]
-    dag = build_mechanism_dag(bindings, "_out_a",
-                              terminal_file="src/modules/a/a.cpp")
+    bindings, structure = _owned_bindings(
+        bindings,
+        bases={"Alpha": set(), "Beta": set()},
+        members={
+            ("Alpha", "_gain"): {"type": "float"},
+            ("Beta", "_gain"): {"type": "float"},
+        },
+    )
+    dag = build_mechanism_dag(
+        bindings,
+        "_out_a",
+        terminal_file="src/modules/a/a.cpp",
+        source_structure=structure,
+    )
 
     gain_files = {v.file for v in dag.vertices
                   if v.kind == "operation" and v.variable == "_gain"}
@@ -1833,8 +1885,17 @@ def test_trailing_underscore_members_resolve_across_class_files():
                       file="src/lib/npfg/npfg.cpp", line=3, function="Npfg::guide",
                       logged_signal=""),
     ]
-    dag = build_mechanism_dag(bindings, "ref_out",
-                              terminal_file="src/lib/npfg/npfg.hpp")
+    bindings, structure = _owned_bindings(
+        bindings,
+        bases={"Npfg": set()},
+        members={("Npfg", "airspeed_ref_"): {"type": "float"}},
+    )
+    dag = build_mechanism_dag(
+        bindings,
+        "ref_out",
+        terminal_file="src/lib/npfg/npfg.hpp",
+        source_structure=structure,
+    )
 
     ops = {v.variable for v in dag.vertices if v.kind == "operation"}
     assert "airspeed_ref_" in ops
@@ -1853,9 +1914,15 @@ def test_internal_state_branch_grounds_through_graph_and_gets_windows():
                       file="a.cpp", line=2, function="A::poll",
                       logged_signal=""),
     ]
+    bindings, structure = _owned_bindings(
+        bindings,
+        bases={"A": set()},
+        members={("A", "_flare_states"): {"type": "FlareStates"}},
+    )
     dag = build_mechanism_dag(
         bindings, "_out",
         logged_signals={"vehicle_land_detected.flaring_flag"},
+        source_structure=structure,
     )
     annotated = evaluate_feasibility(
         dag,
@@ -1886,8 +1953,17 @@ def test_grounding_substitutes_constant_values():
                       file="a.cpp", line=3, function="",
                       logged_signal="", declaration_kind="enum"),
     ]
-    dag = build_mechanism_dag(bindings, "_out",
-                              logged_signals={"vehicle_status.nav_mode"})
+    bindings, structure = _owned_bindings(
+        bindings,
+        bases={"A": set()},
+        members={("A", "_mode_state"): {"type": "int"}},
+    )
+    dag = build_mechanism_dag(
+        bindings,
+        "_out",
+        logged_signals={"vehicle_status.nav_mode"},
+        source_structure=structure,
+    )
     annotated = evaluate_feasibility(
         dag,
         signal_samples={"vehicle_status.nav_mode": [
@@ -1954,8 +2030,19 @@ def test_helper_pick_prefers_caller_module_and_skips_foreign_ambiguity():
                       file="src/modules/navigator/rtl.cpp", line=1,
                       function="RTL::run"),
     ]
-    dag = build_mechanism_dag(bindings, "_out",
-                              helper_expressions=[foreign, ours])
+    structure = SourceStructureIndex(
+        direct_bases={
+            "RTL": {"Mission"},
+            "Mission": set(),
+            "MavlinkMissionManager": set(),
+        }
+    )
+    dag = build_mechanism_dag(
+        structure.enrich_bindings(bindings),
+        "_out",
+        helper_expressions=[foreign, ours],
+        source_structure=structure,
+    )
 
     bodies = {v.file for v in dag.vertices
               if v.provenance and v.provenance.startswith("helper_return")}
@@ -1986,10 +2073,16 @@ def test_schema_enum_resolves_scoped_constant_and_evaluates():
                       file="a.cpp", line=2, function="A::poll",
                       logged_signal=""),
     ]
+    bindings, structure = _owned_bindings(
+        bindings,
+        bases={"A": set()},
+        members={("A", "_type_state"): {"type": "int"}},
+    )
     dag = build_mechanism_dag(
         bindings, "_out",
         logged_signals={"position_setpoint.type"},
         enum_registry={"position_setpoint": {"SETPOINT_TYPE_LAND": 3}},
+        source_structure=structure,
     )
     leaf = next(v for v in dag.vertices if v.kind == "evidence"
                 and v.sub_kind == "constant"

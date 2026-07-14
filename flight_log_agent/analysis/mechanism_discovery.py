@@ -10,9 +10,9 @@ The binding mapping was validated end-to-end against real PX4 v1.14.3
 source (airspeed / NPFG / weathervane / terrain mechanisms) before being
 promoted here from the test shim.
 
-Later stages grow this module into the discovery fixpoint (seeds → search
-→ rank → load → build DAG → resolve gaps → repeat) and the judge-LLM
-checkpoints. No LLM code belongs in this file.
+The discovery fixed point retrieves candidates, validates exact source
+entities, loads their facts, rebuilds the DAG, and repeats from the typed
+frontier. No LLM code belongs in this file.
 """
 
 from __future__ import annotations
@@ -23,6 +23,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
 from flight_log_agent.analysis.source_expression import source_expression_names
+from flight_log_agent.analysis.source_expansion import (
+    SourceExpansionResolver,
+    SourceStructureIndex,
+    UnresolvedSourceReference,
+)
 from flight_log_agent.analysis.mechanism_dag import (
     MechanismDAG,
     _DAGBuilder,
@@ -104,6 +109,7 @@ class DAGInputs:
     parameter_names: set[str] = field(default_factory=set)
     call_statements: list[dict[str, Any]] = field(default_factory=list)
     boundary_bindings: list[dict[str, Any]] = field(default_factory=list)
+    structure: SourceStructureIndex = field(default_factory=SourceStructureIndex)
 
 
 def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
@@ -316,6 +322,9 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                 if member:
                     inputs.parameter_aliases.setdefault(str(member), str(name))
 
+    inputs.structure = SourceStructureIndex.from_facts(entries)
+    inputs.bindings = inputs.structure.enrich_bindings(inputs.bindings)
+    inputs.call_statements = inputs.structure.enrich_calls(inputs.call_statements)
     return inputs
 
 
@@ -722,6 +731,7 @@ def validate_terminal(
     bindings: Iterable[dict[str, Any]],
     logged_signals: Iterable[str],
     terminal_file: Optional[str] = None,
+    source_structure: Optional[SourceStructureIndex] = None,
 ) -> TerminalValidation:
     """Validate a candidate terminal against actual write targets and
     the observed catalogue — never by prompt trust or name shape.
@@ -735,9 +745,10 @@ def validate_terminal(
     within its file family — write targets spread wider than that
     without a declared terminal file are ambiguous, not sliceable. A
     ``Class::member`` qualifier is used as scope evidence: it selects
-    the write file whose family matches the class name.
+    the writer whose extracted class ownership matches.
     """
     qualifier, canonical = split_terminal_qualifier(terminal)
+    structure = source_structure or SourceStructureIndex()
     norm = exact_symbol(canonical)
     if not norm:
         return TerminalValidation(
@@ -786,17 +797,19 @@ def validate_terminal(
         return ranked[0] if ranked else None
 
     if qualifier and not terminal_file:
-        # The class qualifier is scope evidence: pick the write files
-        # whose family stem matches the class name (same underscore/case
-        # convention as receiver↔class affinity). No match falls through
-        # to the unqualified rules — the qualifier could name a base
-        # class whose file is not loaded yet.
-        affinity = qualifier.rsplit("::", 1)[-1].replace("_", "").lower()
-        class_files = [
-            f
-            for f in write_files
-            if _DAGBuilder._file_family(f)[1].replace("_", "").lower() == affinity
-        ]
+        lineage = set(structure.lineage(qualifier))
+        class_files = []
+        for binding in matches:
+            identity = binding.get("target_identity") or {}
+            owners = {
+                str(identity.get("class_owner") or ""),
+                str(identity.get("declaring_class") or ""),
+                str(binding.get("function_owner") or ""),
+            }
+            if owners & lineage:
+                file = _DAGBuilder._binding_first_file(binding)
+                if file:
+                    class_files.append(file)
         if class_files:
             return TerminalValidation(
                 terminal=canonical,
@@ -821,16 +834,6 @@ def validate_terminal(
             for f in write_files
             if _DAGBuilder._file_family(f) == declared_family
         ]
-        if not family_files:
-            # Member widening stays within the module (same directory),
-            # matching the walk's visibility convention.
-            root = canonical.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
-            if root.startswith("_") or root.endswith("_"):
-                family_files = [
-                    f
-                    for f in write_files
-                    if _DAGBuilder._file_family(f)[0] == declared_family[0]
-                ]
         if family_files:
             return TerminalValidation(
                 terminal=canonical,
@@ -850,14 +853,14 @@ def validate_terminal(
             ),
         )
 
-    root = canonical.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
-    if root.startswith("_") or root.endswith("_"):
-        scopes = {_DAGBuilder._file_family(f)[0] for f in write_files}
-        scope_kind = "modules"
-    else:
-        scopes = {_DAGBuilder._file_family(f) for f in write_files}
-        scope_kind = "file families"
-    if len(scopes) <= 1:
+    identities = {
+        tuple(sorted((binding.get("target_identity") or {}).items()))
+        for binding in matches
+        if binding.get("target_identity")
+    }
+    if (identities and len(identities) == 1) or (
+        not identities and len(write_files) == 1
+    ):
         return TerminalValidation(
             terminal=canonical,
             status="valid",
@@ -879,7 +882,7 @@ def validate_terminal(
         logged=logged,
         write_files=write_files,
         reason=(
-            f"write targets span {len(scopes)} {scope_kind} with no terminal"
+            f"write targets span {len(identities) or len(write_files)} scoped identities with no terminal"
             f" file declared: {', '.join(write_files[:4])}"
         ),
     )
@@ -895,9 +898,9 @@ def _definition_queries(symbol: str) -> list[str]:
 
     Unresolved entries can be dotted accessor chains
     (``_scale_check_groundspeed.isAllFinite``); the writable entity is the
-    root, so query on an assignment-shaped root pattern. Empty for roots
-    too short to search meaningfully (a two-letter root matches half the
-    tree and only burns the round's file budget).
+    root, so query on an assignment-shaped root pattern. Short roots omit
+    the broad assignment query because it carries no useful structural
+    selectivity; typed callable resolution handles accessor tails.
     """
     root = symbol.split(".", 1)[0].split("->", 1)[0].strip().strip("&*")
     queries: list[str] = []
@@ -920,73 +923,79 @@ def _gap_definition_files(
     max_matched_files: int = 10,
     max_total: int = 16,
 ) -> list[str]:
-    """Candidate definition files for unresolved symbols, noise-guarded.
+    """Return files containing exact assignment definitions for ``symbols``.
 
-    One ranked search per gap so a single gap can never monopolize the
-    round's file budget (``max_files_per_gap``). A query matching more
-    than ``max_matched_files`` distinct files is *ungreppable* — a generic
-    name like ``scale`` matches half the tree — and is dropped entirely:
-    loading its top hits would pull unrelated modules whose bindings then
-    collide with slice-local names (measured on RTL: rotation.h/Dual.hpp
-    contributed ~⅓ of the DAG before this guard). Specificity is decided
-    by measured hit count, not name shape.
+    The numeric arguments remain for API compatibility but no longer limit
+    correctness. Search examines every hit and admits a file only after the
+    profiler extracts an exact write target from that same file.
     """
+    _ = (max_files_per_gap, max_matched_files, max_total)
     files: list[str] = []
     for symbol in sorted({str(s) for s in symbols if s}):
-        if len(files) >= max_total:
-            break
+        canonical = exact_symbol(symbol)
         for query in _definition_queries(symbol):
             hits = profiler.search_related_source_files(
-                [query], max_files=max_matched_files + 1
+                [query], max_files=None, expand_query_tokens=False
             )
-            if len(hits) > max_matched_files:
-                continue
-            # The ranker penalizes test/vendored paths below zero but
-            # still returns them when nothing else matches — a negative
-            # score means "known junk", never load it.
-            positive = [hit for hit in hits if hit.score > 0]
-            files.extend(hit.file for hit in positive[:max_files_per_gap])
-    return dedupe_keep_order(files)[:max_total]
+            for hit in hits:
+                assignments = profiler.extract_source_assignments_from_source(
+                    [hit.file]
+                )
+                if any(
+                    assignment.file == hit.file
+                    and symbol_produces_reference(
+                        exact_symbol(assignment.target), canonical
+                    )
+                    for assignment in assignments
+                ):
+                    files.append(hit.file)
+    return dedupe_keep_order(files)
 
 
 def make_helper_body_provider(
     profiler: MechanismSourceProfiler,
     fetched_files: list[str],
     *,
-    max_files_per_helper: int = 2,
-) -> Callable[[str], Any]:
-    """On-demand cross-file helper loader for :func:`build_mechanism_dag`.
+    structure: Optional[SourceStructureIndex] = None,
+    resolver: Optional[SourceExpansionResolver] = None,
+) -> Callable[..., Any]:
+    """Load exact callable definitions without admitting ranked hit files.
 
-    Searches for the callee's definition (PX4 methods define as
-    ``Class::name(``; the bare ``name(`` form catches free functions),
-    extracts helper records from the top hits, and appends those files to
-    ``fetched_files`` so the discovery loop can load their full facts in
-    the next round. The DAG builder memoizes probes, so an unknown name
-    costs at most one search per build.
-
-    Noise control differs from :func:`_gap_definition_files` on purpose:
-    hits with a non-positive ranking score (test/vendored paths) are never
-    extracted from, but there is NO hit-count ambiguity guard here — a
-    real mechanism helper (``get_distance_to_next_waypoint``) is *called*
-    from dozens of files, and extraction already filters to definitions
-    of the requested name, so caller-heavy hits are harmless while the
-    guard measurably severed the RTL→geo.cpp haversine subgraph.
+    Search returns every candidate. Only files from which the profiler
+    extracts a matching helper definition are retained; receiver ownership
+    and arity further narrow the result when the DAG supplies call context.
     """
+    source_structure = structure or SourceStructureIndex()
+    source_resolver = resolver or SourceExpansionResolver(profiler, "provider")
 
-    def provider(helper_name: str) -> Any:
-        hits = profiler.search_related_source_files(
-            [f"::{helper_name}(", f"{helper_name}("],
-            max_files=max_files_per_helper,
+    def provider(
+        helper_name: str,
+        reference: Optional[UnresolvedSourceReference] = None,
+    ) -> Any:
+        call_reference = reference or UnresolvedSourceReference(
+            symbol=helper_name,
+            kind="callable",
         )
-        files = [hit.file for hit in hits if hit.score > 0]
-        if not files:
-            return []
-        for file_path in files:
-            if file_path not in fetched_files:
-                fetched_files.append(file_path)
-        return profiler.extract_helper_expressions_from_source(
-            files, helper_names=[helper_name]
-        )
+        resolved: list[Any] = []
+        for candidate in source_resolver.resolve(
+            call_reference, source_structure
+        ):
+            exact = [
+                helper
+                for helper in candidate.facts.helper_expressions
+                if helper.file == candidate.file
+                and helper.name.rsplit("::", 1)[-1] == helper_name
+                and (
+                    not candidate.matched_identity
+                    or helper.callable_id == candidate.matched_identity
+                )
+            ]
+            if not exact:
+                continue
+            if candidate.file not in fetched_files:
+                fetched_files.append(candidate.file)
+            resolved.extend(exact)
+        return resolved
 
     return provider
 
@@ -1030,31 +1039,26 @@ def discover_mechanism_dag(
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
     preranked_files: Optional[Sequence[str]] = None,
 ) -> DiscoveryResult:
-    """Deterministic discovery fixpoint: the DAG's own gaps drive the search.
+    """Build a DAG by exact, provenance-checked fixed-point expansion.
 
-    Round 0 seeds the file set from ``seeds`` (+ the terminal itself, so
-    an empty seed list can still bootstrap). Every round loads new files
-    through Layer 1, rebuilds the DAG from the union of facts, then turns
-    the DAG's ``unresolved_symbols`` into definition searches for the next
-    round's files. Cross-file helpers resolve *within* a round via the
-    on-demand provider; the provider's fetched files join the next round
-    so their assignments bind too.
-
-    Stops when: nothing is unresolved, a round makes no progress (same
-    gap set and no provider fetches), no new files remain, or budgets run
-    out. No LLM anywhere — seed selection and sufficiency judgment are
-    the caller's problem (the judge stage).
+    Search results are candidates only. A file joins the source index after
+    it proves an exact terminal, symbol, callable, class, or companion
+    relationship. The graph itself admits only entities reached by the DAG's
+    backward walk. Expansion has no file, round, or gap budget; it terminates
+    when every structured frontier item has been resolved, rejected, or
+    visited without discovering a new source entity.
 
     Every terminal — seeder-proposed, judge-proposed, or replayed from
     the Layer 4 cache — passes :func:`validate_terminal` against the
-    round's loaded facts before anything is built from it. An absent
-    terminal keeps loading pending files but never builds; an ambiguous
-    or out-of-scope one stops the fixpoint with the structured reason in
-    ``terminal_validation`` — building would fuse unrelated modules.
+    loaded exact-writer facts before anything is built from it. An absent,
+    ambiguous, or out-of-scope terminal stops with the structured reason in
+    ``terminal_validation``; building would invent or fuse source identity.
 
-    ``preranked_files`` supplies round 0's file set directly (the source
-    survey already ranked the same seeds), skipping a repeat search.
+    ``max_rounds``, ``max_files_per_round``, and ``max_files_total`` remain in
+    the API for compatibility but are intentionally ignored. They previously
+    made source-search order affect correctness.
     """
+    _ = (cache_root, source_root, max_rounds, max_files_per_round, max_files_total)
     terminal_as_given = str(terminal or "").strip()
     terminal = canonicalize_terminal(terminal)
     if logged_signals is not None:
@@ -1072,43 +1076,71 @@ def discover_mechanism_dag(
         except Exception:
             enum_registry = {}
 
-    if preranked_files:
-        pending: list[str] = [str(f) for f in preranked_files if f]
-    else:
-        seed_queries = dedupe_keep_order([*(str(s) for s in seeds if s), terminal])
-        hits = profiler.search_related_source_files(
-            seed_queries, max_files=max_files_per_round
-        )
-        pending = [hit.file for hit in hits]
-    if terminal_file:
-        # The declared write file is provenance, not a search guess —
-        # load it first so validation decides with it in evidence.
-        pending = dedupe_keep_order([terminal_file, *pending])
-
+    resolver = SourceExpansionResolver(profiler, source_hash)
     loaded: list[str] = []
     facts_by_file: dict[str, SourceFileFacts] = {}
     rounds: list[DiscoveryRound] = []
     dag: Optional[MechanismDAG] = None
     inputs = DAGInputs()
     validation: Optional[TerminalValidation] = None
-    previous_unresolved: Optional[set[str]] = None
+    visited: set[tuple[Any, ...]] = set()
 
-    for index in range(max_rounds):
-        budget_left = max(0, max_files_total - len(loaded))
-        new_files = [f for f in pending if f not in facts_by_file]
-        new_files = new_files[: min(max_files_per_round, budget_left)]
-        if not new_files and index > 0:
-            break
+    def writes_terminal(facts: SourceFileFacts) -> bool:
+        canonical = exact_symbol(terminal)
+        return any(
+            symbol_produces_reference(exact_symbol(item.target), canonical)
+            for item in facts.source_assignments
+        )
 
-        for facts in load_facts(
-            profiler,
-            cache_root,
-            new_files,
-            source_hash,
-            source_root=source_root,
+    explicit_files = [str(terminal_file)] if terminal_file else []
+    explicit_companions = [
+        companion
+        for file_path in explicit_files
+        for companion in resolver.companion_files(file_path)
+    ]
+    terminal_queries = _definition_queries(terminal) or [terminal]
+    candidate_files = dedupe_keep_order(
+        [
+            *explicit_files,
+            *explicit_companions,
+            *(str(file_path) for file_path in (preranked_files or ()) if file_path),
+        ]
+    )
+    # Seeder queries remain useful for the source survey, but they are not
+    # graph provenance and therefore cannot admit round-zero files.
+    _ = seeds
+    pending: list[str] = []
+    explicit_set = set(explicit_files) | set(explicit_companions)
+    for file_path in candidate_files:
+        facts = resolver.facts_for(file_path)
+        if file_path in explicit_set or writes_terminal(facts):
+            pending.append(file_path)
+            pending.extend(resolver.companion_files(file_path))
+    if not terminal_file:
+        # A ranked survey is not an exhaustive declaration index. Unscoped
+        # terminals must inspect every exact writer so ambiguity cannot depend
+        # on ranking order. A declared terminal file already supplies scope.
+        for hit in profiler.search_related_source_files(
+            terminal_queries,
+            max_files=None,
+            expand_query_tokens=False,
         ):
-            facts_by_file[facts.file] = facts
-        loaded.extend(new_files)
+            facts = resolver.facts_for(hit.file)
+            if writes_terminal(facts):
+                pending.append(hit.file)
+                pending.extend(resolver.companion_files(hit.file))
+    pending = dedupe_keep_order(pending)
+
+    index = 0
+    first_pass = True
+    while first_pass or pending:
+        first_pass = False
+        new_files = [file_path for file_path in pending if file_path not in facts_by_file]
+        pending = []
+        for file_path in new_files:
+            facts = resolver.facts_for(file_path)
+            facts_by_file[file_path] = facts
+            loaded.append(file_path)
 
         inputs = dag_inputs_from_facts(facts_by_file.values())
 
@@ -1124,7 +1156,11 @@ def discover_mechanism_dag(
         )
         if not locked:
             validation = validate_terminal(
-                terminal_as_given, inputs.bindings, logged_signals or (), terminal_file
+                terminal_as_given,
+                inputs.bindings,
+                logged_signals or (),
+                terminal_file,
+                source_structure=inputs.structure,
             )
         if validation.status != "valid":
             dag = None
@@ -1137,20 +1173,15 @@ def discover_mechanism_dag(
                     edges=0,
                 )
             )
-            # Ambiguity only grows with more files; an out-of-scope
-            # verdict is final once the declared file itself is loaded.
-            # Plain absence keeps draining pending files — the writer
-            # may live in a file the seed search found but the round
-            # budget deferred.
-            if validation.status == "ambiguous" or (
-                validation.status == "absent_in_scope"
-                and terminal_file in facts_by_file
-            ):
-                break
-            continue
+            break
 
         fetched_files: list[str] = []
-        provider = make_helper_body_provider(profiler, fetched_files)
+        provider = make_helper_body_provider(
+            profiler,
+            fetched_files,
+            structure=inputs.structure,
+            resolver=resolver,
+        )
         dag = build_mechanism_dag(
             inputs.bindings,
             terminal,
@@ -1167,6 +1198,7 @@ def discover_mechanism_dag(
             call_statements=inputs.call_statements,
             boundary_bindings=inputs.boundary_bindings,
             enum_registry=enum_registry,
+            source_structure=inputs.structure,
         )
 
         unresolved = set(dag.unresolved_symbols)
@@ -1180,19 +1212,55 @@ def discover_mechanism_dag(
             )
         )
 
-        if not unresolved:
-            break
-        if unresolved == previous_unresolved and not fetched_files:
-            break
-        previous_unresolved = unresolved
+        references = list(dag.unresolved_references)
+        known_classes = set(inputs.structure.direct_bases)
+        for owner, bases in inputs.structure.direct_bases.items():
+            owner_record = next(
+                (
+                    item
+                    for facts in facts_by_file.values()
+                    for item in facts.classes
+                    if item.name == owner
+                ),
+                None,
+            )
+            for base in bases:
+                if base not in known_classes:
+                    references.append(
+                        UnresolvedSourceReference(
+                            symbol=base,
+                            kind="class",
+                            file=owner_record.file if owner_record else "",
+                            line=owner_record.line if owner_record else None,
+                            class_owner=owner,
+                        )
+                    )
 
-        gap_files = _gap_definition_files(
-            profiler,
-            unresolved,
-            max_files_per_gap=2,
-            max_total=max_files_per_round * 2,
-        )
-        pending = dedupe_keep_order(gap_files + fetched_files)
+        next_files: list[str] = []
+        for reference in references:
+            receiver_type = ""
+            if reference.kind == "callable" and reference.receiver:
+                receiver_type = inputs.structure.member_receiver_type(
+                    reference.class_owner, reference.receiver
+                )
+            key = (*reference.visit_key(), receiver_type)
+            if key in visited:
+                continue
+            visited.add(key)
+            for candidate in resolver.resolve(reference, inputs.structure):
+                next_files.append(candidate.file)
+                next_files.extend(resolver.companion_files(candidate.file))
+        for file_path in fetched_files:
+            next_files.append(file_path)
+            next_files.extend(resolver.companion_files(file_path))
+        pending = [
+            file_path
+            for file_path in dedupe_keep_order(next_files)
+            if file_path not in facts_by_file
+        ]
+        if not pending:
+            break
+        index += 1
 
     return DiscoveryResult(
         dag=dag,

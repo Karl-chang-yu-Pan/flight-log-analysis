@@ -136,6 +136,51 @@ def test_profiler_models_are_pydantic_serializable():
     assert dumped["parameter_predicates"][0]["operator"] == ">"
 
 
+def test_source_structure_extracts_ownership_inheritance_and_includes(tmp_path):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "base.h").write_text(
+        "class Base { protected: float inherited_value; };\n",
+        encoding="utf-8",
+    )
+    (module_dir / "controller.h").write_text(
+        """
+#include "base.h"
+class Controller : public Base
+{
+    float local_value;
+    void run();
+};
+""",
+        encoding="utf-8",
+    )
+    (module_dir / "controller.cpp").write_text(
+        "void Controller::run() { local_value = inherited_value; }\n",
+        encoding="utf-8",
+    )
+
+    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    structure = profiler.extract_source_structure_from_source(
+        ["src/modules/example/controller.h", "src/modules/example/controller.cpp"],
+        expand_companions=False,
+    )
+
+    controller = next(item for item in structure["classes"] if item.name == "Controller")
+    assert controller.bases == ["Base"]
+    assert {(item.owner, item.name) for item in structure["members"]} >= {
+        ("Controller", "local_value")
+    }
+    callable_ref = next(
+        item for item in structure["callables"] if item.name == "Controller::run"
+    )
+    assert callable_ref.owner == "Controller"
+    assert any(
+        item.included_file == "src/modules/example/base.h"
+        for item in structure["includes"]
+    )
+
+
 def test_profile_mechanism_returns_plain_dict_with_current_extractions(tmp_path):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"

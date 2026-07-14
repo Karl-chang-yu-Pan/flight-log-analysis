@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from functools import cache
 import math
 import re
 from typing import Any, Iterable
@@ -114,11 +115,17 @@ def top_level_operator_index(expression: str, operator: str, *, start: int = 0) 
 
 
 def source_expression_names(expression: str) -> list[str]:
+    return list(_source_expression_names_cached(str(expression or "")))
+
+
+@cache
+def _source_expression_names_cached(expression: str) -> tuple[str, ...]:
+    """Parse one immutable source expression once within this process."""
     normalized = normalize_source_expression(expression)
     try:
         tree = ast.parse(normalized, mode="eval")
     except SyntaxError:
-        return []
+        return ()
 
     parents: dict[ast.AST, ast.AST] = {
         child: parent
@@ -166,7 +173,7 @@ def source_expression_names(expression: str) -> list[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
-    return list(
+    return tuple(
         dict.fromkeys(
             name for _, _, name in sorted(names) if name not in function_names
         )

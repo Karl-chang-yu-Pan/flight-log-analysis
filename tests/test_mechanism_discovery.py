@@ -8,6 +8,12 @@ from flight_log_agent.analysis.mechanism_discovery import (
     dag_inputs_from_facts,
     load_facts,
 )
+from flight_log_agent.analysis.source_expansion import (
+    SourceExpansionResolver,
+    SourceStructureIndex,
+    SourceSymbolIdentity,
+    UnresolvedSourceReference,
+)
 from flight_log_agent.px4.mechanism_source_profiler import (
     MechanismSourceProfiler,
     ParameterRef,
@@ -159,12 +165,22 @@ void Rtl::pick()
 """,
         encoding="utf-8",
     )
+    (module_dir / "rtl.h").write_text(
+        """
+class Rtl
+{
+    float _rtl_alt;
+    float _destination_alt;
+};
+""",
+        encoding="utf-8",
+    )
 
     profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
     facts = load_facts(
         profiler,
         tmp_path / "cache",
-        ["src/modules/example/rtl.cpp"],
+        ["src/modules/example/rtl.cpp", "src/modules/example/rtl.h"],
         "hash",
     )
     inputs = dag_inputs_from_facts(facts)
@@ -177,6 +193,7 @@ void Rtl::pick()
         parameter_names=inputs.parameter_names,
         parameter_aliases=inputs.parameter_aliases,
         logged_signals={"gpos_alt"},
+        source_structure=inputs.structure,
     )
 
     op_targets = {v.variable for v in dag.vertices if v.kind == "operation"}
@@ -328,6 +345,13 @@ void Rtl::pick_altitude()
     _final_out = _dest_val + 1.0f;
 }
 """,
+        "src/modules/example/rtl.h": """
+class Rtl
+{
+    float _final_out;
+    float _dest_val;
+};
+""",
         "src/modules/example/dest.cpp": """
 void Rtl::update()
 {
@@ -346,7 +370,10 @@ void Rtl::update()
     )
 
     assert len(result.rounds) == 2
-    assert result.rounds[0].new_files == ["src/modules/example/rtl.cpp"]
+    assert set(result.rounds[0].new_files) == {
+        "src/modules/example/rtl.cpp",
+        "src/modules/example/rtl.h",
+    }
     assert "_dest_val" in result.rounds[0].unresolved_symbols
     assert "src/modules/example/dest.cpp" in result.rounds[1].new_files
 
@@ -358,7 +385,7 @@ void Rtl::update()
     assert result.dag.unresolved_symbols == []
 
 
-def test_fixpoint_stops_at_round_budget(tmp_path):
+def test_fixpoint_ignores_legacy_round_budget(tmp_path):
     from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
 
     profiler = _mini_tree(tmp_path, {
@@ -367,6 +394,13 @@ void Rtl::pick_altitude()
 {
     _final_out = _dest_val + 1.0f;
 }
+""",
+        "src/modules/example/rtl.h": """
+class Rtl
+{
+    float _final_out;
+    float _dest_val;
+};
 """,
         "src/modules/example/dest.cpp": """
 void Rtl::update()
@@ -383,10 +417,11 @@ void Rtl::update()
         terminal="_final_out",
         source_hash="hash",
         max_rounds=1,
+        logged_signals={"gspeed"},
     )
 
-    assert len(result.rounds) == 1
-    assert "_dest_val" in result.dag.unresolved_symbols
+    assert len(result.rounds) == 2
+    assert result.dag.unresolved_symbols == []
 
 
 def test_fixpoint_provider_expands_cross_file_helper(tmp_path):
@@ -448,10 +483,8 @@ void Rtl::pick_altitude()
     assert "_lone_terminal" in op_targets
 
 
-def test_gap_search_drops_ungreppable_queries(tmp_path):
-    """A gap whose definition query matches more files than the threshold
-    is generic noise ('scale =' matches half the tree) — it must load
-    nothing, while a specific gap still resolves to its defining file."""
+def test_gap_search_keeps_every_exact_definition(tmp_path):
+    """Hit count cannot reject exact definitions; provenance resolves them."""
     from flight_log_agent.analysis.mechanism_discovery import _gap_definition_files
 
     files = {
@@ -463,10 +496,11 @@ def test_gap_search_drops_ungreppable_queries(tmp_path):
 
     out = _gap_definition_files(profiler, ["scale", "_dest_val"])
 
-    assert out == ["src/modules/example/dest.cpp"]
+    assert "src/modules/example/dest.cpp" in out
+    assert len([path for path in out if "junk" in path]) == 12
 
 
-def test_gap_search_caps_files_per_gap(tmp_path):
+def test_gap_search_ignores_legacy_file_cap(tmp_path):
     from flight_log_agent.analysis.mechanism_discovery import _gap_definition_files
 
     files = {
@@ -477,22 +511,22 @@ def test_gap_search_caps_files_per_gap(tmp_path):
 
     out = _gap_definition_files(profiler, ["_multi_writer"], max_files_per_gap=2)
 
-    assert len(out) == 2
+    assert len(out) == 4
 
 
-def test_gap_search_never_loads_negatively_scored_files(tmp_path):
-    """A gap whose only definition lives in a test/vendored path (negative
-    path boost) must load nothing rather than the junk file."""
+def test_gap_search_does_not_reject_exact_definition_by_path_score(tmp_path):
     from flight_log_agent.analysis.mechanism_discovery import _gap_definition_files
 
     profiler = _mini_tree(tmp_path, {
         "test/catch2/catch.hpp": "void f() { _only_in_test = 1; }\n",
     })
 
-    assert _gap_definition_files(profiler, ["_only_in_test"]) == []
+    assert _gap_definition_files(profiler, ["_only_in_test"]) == [
+        "test/catch2/catch.hpp"
+    ]
 
 
-def test_provider_never_extracts_from_negatively_scored_files(tmp_path):
+def test_provider_admits_exact_callable_independent_of_path_score(tmp_path):
     from flight_log_agent.analysis.mechanism_discovery import make_helper_body_provider
 
     profiler = _mini_tree(tmp_path, {
@@ -500,9 +534,15 @@ def test_provider_never_extracts_from_negatively_scored_files(tmp_path):
     })
     fetched: list[str] = []
     provider = make_helper_body_provider(profiler, fetched)
+    reference = UnresolvedSourceReference(
+        symbol="junk_helper",
+        kind="callable",
+        class_owner="Rtl",
+        argument_count=1,
+    )
 
-    assert provider("junk_helper") == []
-    assert fetched == []
+    assert len(provider("junk_helper", reference)) == 1
+    assert fetched == ["test/catch2/catch.hpp"]
 
 
 def test_provider_resolves_definition_despite_many_callers(tmp_path):
@@ -521,10 +561,33 @@ def test_provider_resolves_definition_despite_many_callers(tmp_path):
     profiler = _mini_tree(tmp_path, files)
     fetched: list[str] = []
     provider = make_helper_body_provider(profiler, fetched)
+    reference = UnresolvedSourceReference(
+        symbol="calc_gain",
+        kind="callable",
+        class_owner="Rtl",
+        argument_count=1,
+    )
 
-    found = provider("calc_gain")
+    found = provider("calc_gain", reference)
     assert found and found[0].name.endswith("calc_gain")
     assert "src/lib/gain/gain.cpp" in fetched
+
+
+def test_provider_keeps_multiple_exact_callable_definitions_unresolved(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import make_helper_body_provider
+
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "platforms/first/clock.cpp": "float platform_clock() { return 1.0f; }",
+            "platforms/second/clock.cpp": "float platform_clock() { return 2.0f; }",
+        },
+    )
+    fetched: list[str] = []
+    provider = make_helper_body_provider(profiler, fetched)
+
+    assert provider("platform_clock") == []
+    assert fetched == []
 
 
 def test_qualified_terminal_is_stripped_to_bare_member(tmp_path):
@@ -611,11 +674,16 @@ void Tecs::update(float speed_sp)
         "adaptation branch not reached through the argument hop"
 
 
-def _vt_binding(target: str, file: str, logged: str = "") -> dict:
+def _vt_binding(
+    target: str,
+    file: str,
+    logged: str = "",
+    function: str = "C::f",
+) -> dict:
     return {
         "target_symbol": target,
         "source_symbol": "input_val + 1.0f",
-        "function": "C::f",
+        "function": function,
         "assignment_path": [{"file": file, "line": 1, "expression": "input_val + 1.0f"}],
         "logged_signal": logged,
         "control_predicates": [],
@@ -646,9 +714,8 @@ def test_validate_terminal_statuses():
 
 
 def test_validate_terminal_scoping_rules():
-    """Scope rules mirror the walk's visibility conventions: locals are
-    ambiguous across file families, members across module directories;
-    a declared terminal file selects, including through its header twin."""
+    """Without ownership metadata, same names in different files remain
+    ambiguous; an explicit file or its companion can scope the terminal."""
     from flight_log_agent.analysis.mechanism_discovery import validate_terminal
 
     cross = [
@@ -680,7 +747,7 @@ def test_validate_terminal_scoping_rules():
         _vt_binding("_alt", "src/modules/aaa/alpha.cpp"),
         _vt_binding("_alt", "src/modules/aaa/base.cpp"),
     ]
-    assert validate_terminal("_alt", member_same_module, []).status == "valid"
+    assert validate_terminal("_alt", member_same_module, []).status == "ambiguous"
 
     member_cross_module = [
         _vt_binding("_alt", "src/modules/aaa/alpha.cpp"),
@@ -688,13 +755,11 @@ def test_validate_terminal_scoping_rules():
     ]
     assert validate_terminal("_alt", member_cross_module, []).status == "ambiguous"
 
-    # A member reaches its module's other families through the declared
-    # file's directory (inheritance widening), where a local cannot.
+    # Directory proximity is not ownership evidence.
     inherited = validate_terminal(
         "_alt", member_cross_module, [], terminal_file="src/modules/aaa/other.cpp"
     )
-    assert inherited.status == "valid"
-    assert inherited.resolved_file == "src/modules/aaa/alpha.cpp"
+    assert inherited.status == "absent_in_scope"
 
 
 def test_discovery_rejects_ambiguous_terminal_without_declared_file(tmp_path):
@@ -765,12 +830,71 @@ void Alpha::run()
     assert "no write target" in result.terminal_validation.reason
 
 
-def test_discovery_rejects_late_cross_module_ambiguity(tmp_path):
-    """An unscoped terminal that looks unique in round 0 but gains a
-    foreign-module writer from a later gap-search round is genuinely
-    ambiguous — the slice built before the evidence arrived is discarded,
-    not kept. (A verdict scoped by a declared/resolved file stays locked;
-    only the unscoped case re-checks.)"""
+def test_expansion_does_not_search_for_callable_local_producers(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/ctrl.cpp": """
+void Ctrl::run()
+{
+    output = local_value;
+}
+""",
+        },
+    )
+
+    def fail_search(*args, **kwargs):
+        raise AssertionError("a callable-local reference cannot resolve tree-wide")
+
+    profiler.search_related_source_files = fail_search  # type: ignore[assignment]
+    identity = SourceSymbolIdentity(
+        kind="local",
+        symbol="local_value",
+        root="local_value",
+        file="src/modules/example/ctrl.cpp",
+        callable_id="src/modules/example/ctrl.cpp:2:Ctrl::run:",
+        class_owner="Ctrl",
+    )
+    reference = UnresolvedSourceReference(
+        symbol="local_value",
+        file=identity.file,
+        callable_id=identity.callable_id,
+        class_owner="Ctrl",
+        identity=identity,
+    )
+
+    resolver = SourceExpansionResolver(profiler, "hash")
+    assert resolver.resolve(reference, SourceStructureIndex()) == []
+
+
+def test_expansion_does_not_bind_method_without_receiver_type(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/unrelated/other.cpp": """
+float Other::get()
+{
+    return 1.0f;
+}
+""",
+        },
+    )
+    reference = UnresolvedSourceReference(
+        symbol="get",
+        kind="callable",
+        file="src/modules/example/ctrl.cpp",
+        callable_id="src/modules/example/ctrl.cpp:2:Ctrl::run:",
+        class_owner="Ctrl",
+        receiver="_param_value",
+        argument_count=0,
+    )
+
+    resolver = SourceExpansionResolver(profiler, "hash")
+    assert resolver.resolve(reference, SourceStructureIndex()) == []
+
+
+def test_discovery_checks_all_exact_terminal_writers_before_slicing(tmp_path):
+    """Unbounded terminal retrieval exposes ambiguity before graph build."""
     from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
 
     profiler = _mini_tree(tmp_path, {
@@ -794,36 +918,70 @@ void Beta::run()
         seeds=["run_alpha_marker"], terminal="shared_out", source_hash="hash",
         max_files_per_round=1,
     )
-    assert result.rounds[0].new_files == ["src/modules/aaa/alpha.cpp"]
+    assert set(result.rounds[0].new_files) == {
+        "src/modules/aaa/alpha.cpp",
+        "src/modules/bbb/beta.cpp",
+    }
     assert result.dag is None
     assert result.terminal_validation.status == "ambiguous"
 
 
 def test_qualifier_scopes_terminal_to_class_family():
-    """A ``Class::member`` qualifier is scope evidence, not spelling
-    noise: it selects the write file whose family matches the class
-    name; an unresolvable qualifier falls through to the unqualified
-    rules."""
+    """A qualifier resolves through declared class ownership, not filenames."""
     from flight_log_agent.analysis.mechanism_discovery import validate_terminal
 
-    cross = [
-        _vt_binding("shared_out", "src/modules/aaa/alpha.cpp"),
-        _vt_binding("shared_out", "src/modules/bbb/beta.cpp"),
-    ]
+    structure = SourceStructureIndex(
+        direct_bases={"Alpha": set(), "Beta": set()},
+        members={
+            ("Alpha", "shared_out"): {"type": "float"},
+            ("Beta", "shared_out"): {"type": "float"},
+        },
+    )
+    cross = structure.enrich_bindings([
+        _vt_binding(
+            "shared_out", "src/modules/aaa/alpha.cpp", function="Alpha::run"
+        ),
+        _vt_binding(
+            "shared_out", "src/modules/bbb/beta.cpp", function="Beta::run"
+        ),
+    ])
 
-    qualified = validate_terminal("Alpha::shared_out", cross, [])
+    qualified = validate_terminal(
+        "Alpha::shared_out", cross, [], source_structure=structure
+    )
     assert qualified.status == "valid"
     assert qualified.resolved_file == "src/modules/aaa/alpha.cpp"
     assert qualified.terminal == "shared_out"
 
-    snake = validate_terminal("MissionBlock::dist", [
-        _vt_binding("dist", "src/modules/nav/mission_block.cpp"),
-        _vt_binding("dist", "src/modules/other/thing.cpp"),
-    ], [])
+    snake_structure = SourceStructureIndex(
+        direct_bases={"MissionBlock": set(), "Thing": set()},
+        members={
+            ("MissionBlock", "dist"): {"type": "float"},
+            ("Thing", "dist"): {"type": "float"},
+        },
+    )
+    snake_bindings = snake_structure.enrich_bindings([
+        _vt_binding(
+            "dist",
+            "src/modules/nav/mission_block.cpp",
+            function="MissionBlock::run",
+        ),
+        _vt_binding(
+            "dist", "src/modules/other/thing.cpp", function="Thing::run"
+        ),
+    ])
+    snake = validate_terminal(
+        "MissionBlock::dist",
+        snake_bindings,
+        [],
+        source_structure=snake_structure,
+    )
     assert snake.status == "valid"
     assert snake.resolved_file == "src/modules/nav/mission_block.cpp"
 
-    unknown = validate_terminal("Gamma::shared_out", cross, [])
+    unknown = validate_terminal(
+        "Gamma::shared_out", cross, [], source_structure=structure
+    )
     assert unknown.status == "ambiguous"
 
 
@@ -1033,8 +1191,7 @@ void Ctrl::update()
 
 
 def test_discovery_accepts_preranked_files(tmp_path):
-    """Round 0 takes the survey's ranked files instead of repeating the
-    search."""
+    """A declared terminal file can reuse its survey-ranked candidate set."""
     from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
 
     profiler = _mini_tree(tmp_path, {
@@ -1055,6 +1212,7 @@ void Ctrl::run()
         profiler, tmp_path / "cache", seeds=[], terminal="speed_sp",
         source_hash="hash", logged_signals={"gspeed"},
         preranked_files=["src/modules/example/ctrl.cpp"],
+        terminal_file="src/modules/example/ctrl.cpp",
     )
 
     assert result.terminal_validation.status == "valid"

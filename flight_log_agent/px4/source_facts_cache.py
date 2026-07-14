@@ -46,6 +46,10 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     ParameterPredicateRef,
     ParameterRef,
     SourceAssignmentRef,
+    SourceCallableRef,
+    SourceClassRef,
+    SourceIncludeRef,
+    SourceMemberRef,
     TopicRef,
 )
 
@@ -72,6 +76,10 @@ class SourceFileFacts(BaseModel):
     helper_expressions: List[HelperExpressionRef] = Field(default_factory=list)
     branch_conditions: List[BranchConditionRef] = Field(default_factory=list)
     parameter_predicates: List[ParameterPredicateRef] = Field(default_factory=list)
+    classes: List[SourceClassRef] = Field(default_factory=list)
+    members: List[SourceMemberRef] = Field(default_factory=list)
+    callables: List[SourceCallableRef] = Field(default_factory=list)
+    includes: List[SourceIncludeRef] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -335,21 +343,47 @@ def extract_facts_for_file(
     """
     files = [file_path]
 
+    def from_exact_file(items):
+        return [item for item in items if str(getattr(item, "file", "")) == file_path]
+
     uorb = profiler.extract_uorb_io_from_source(files)
     params = profiler.extract_params_from_source(files)
+    structure = profiler.extract_source_structure_from_source(
+        files, expand_companions=False
+    )
 
     return SourceFileFacts(
         file=file_path,
         source_hash=source_hash,
-        published_topics=list(uorb.get("published_topics", []) or []),
-        subscribed_topics=list(uorb.get("subscribed_topics", []) or []),
-        unknown_direction_topics=list(uorb.get("unknown_direction_topics", []) or []),
-        referenced_parameters=list(params or []),
-        assigned_fields=list(profiler.extract_assigned_fields_from_source(files)),
-        read_fields=list(profiler.extract_read_fields_from_source(files)),
-        source_assignments=list(profiler.extract_source_assignments_from_source(files)),
-        function_calls=list(profiler.extract_function_calls_from_source(files)),
-        helper_expressions=list(profiler.extract_helper_expressions_from_source(files)),
-        branch_conditions=list(profiler.extract_branch_conditions_from_source(files)),
-        parameter_predicates=list(profiler.extract_parameter_predicates_from_source(files)),
+        published_topics=from_exact_file(uorb.get("published_topics", []) or []),
+        subscribed_topics=from_exact_file(uorb.get("subscribed_topics", []) or []),
+        unknown_direction_topics=from_exact_file(
+            uorb.get("unknown_direction_topics", []) or []
+        ),
+        referenced_parameters=from_exact_file(params or []),
+        assigned_fields=from_exact_file(
+            profiler.extract_assigned_fields_from_source(files)
+        ),
+        read_fields=from_exact_file(
+            profiler.extract_read_fields_from_source(files)
+        ),
+        source_assignments=from_exact_file(
+            profiler.extract_source_assignments_from_source(files)
+        ),
+        function_calls=from_exact_file(
+            profiler.extract_function_calls_from_source(files)
+        ),
+        helper_expressions=from_exact_file(
+            profiler.extract_helper_expressions_from_source(files)
+        ),
+        branch_conditions=from_exact_file(
+            profiler.extract_branch_conditions_from_source(files)
+        ),
+        parameter_predicates=from_exact_file(
+            profiler.extract_parameter_predicates_from_source(files)
+        ),
+        classes=list(structure.get("classes") or []),
+        members=list(structure.get("members") or []),
+        callables=list(structure.get("callables") or []),
+        includes=list(structure.get("includes") or []),
     )
