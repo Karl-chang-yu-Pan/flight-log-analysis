@@ -409,6 +409,131 @@ float Control::run(float input)
     assert call.args == ["scale", "input"]
 
 
+def test_storage_aliases_preserve_pointer_and_reference_targets(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+void Control::run(float input, float alternate, float yaw)
+{
+    position_setpoint_triplet_s *triplet = get_triplet();
+    triplet->current.alt = input;
+    {
+        position_setpoint_s &current = triplet->next;
+        current.alt = alternate;
+        float &altitude = current.alt;
+        altitude = input;
+    }
+    triplet->current.yaw = yaw;
+}
+""",
+    )
+
+    writes = {
+        (item.expression, item.target.replace("->", "."))
+        for item in facts.source_assignments
+    }
+    assert ("input", "get_triplet().current.alt") in writes
+    assert ("alternate", "get_triplet().next.alt") in writes
+    assert ("input", "get_triplet().next.alt") in writes
+    assert ("yaw", "get_triplet().current.yaw") in writes
+
+
+def test_storage_aliases_do_not_leak_between_switch_cases(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+void Control::run(int mode, float input, float alternate)
+{
+    state_s first{};
+    state_s second{};
+    state_s *selected = &first;
+    switch (mode) {
+    case 0:
+        selected = &second;
+        selected->value = input;
+        break;
+    case 1:
+        selected->value = alternate;
+        break;
+    }
+}
+""",
+    )
+
+    writes = {
+        (item.expression, item.target.replace("->", "."))
+        for item in facts.source_assignments
+    }
+    assert ("input", "second.value") in writes
+    assert ("alternate", "first.value") in writes
+
+
+def test_switch_fallthrough_alias_target_is_explicitly_non_exact(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+void Control::run(int mode, float input)
+{
+    state_s first{};
+    state_s second{};
+    state_s *selected = &first;
+    switch (mode) {
+    case 0:
+        selected = &second;
+    case 1:
+        selected->value = input;
+        break;
+    }
+}
+""",
+    )
+
+    write = next(
+        item
+        for item in facts.source_assignments
+        if item.expression == "input" and item.target.replace("->", ".").endswith(".value")
+    )
+    assert write.reachability_exact is False
+
+
+def test_helper_metadata_uses_resolved_pointer_output_storage(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+void fill(output_s *sp, float value)
+{
+    output_s *local = sp;
+    local->alt = value;
+}
+""",
+    )
+
+    helper = next(item for item in facts.helper_expressions if item.name == "fill")
+    assert helper.assignments["sp.alt"] == "value"
+    assert helper.pointer_output_writes == [
+        {"param": "sp", "field": "alt", "expression": "value"}
+    ]
+
+
+def test_tree_sitter_literal_for_loop_uses_step_ir(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+int pick_iter()
+{
+    for (int i = 2; i < 3; i++) {
+        return i;
+    }
+    return 0;
+}
+""",
+    )
+
+    helper = next(item for item in facts.helper_expressions if item.name == "pick_iter")
+    assert helper.unresolved_reason is None
+    assert helper.lowered_return_expression == "(2)"
+
+
 def test_parse_errors_are_reported_without_legacy_fallback(tmp_path):
     facts = _facts(
         tmp_path,

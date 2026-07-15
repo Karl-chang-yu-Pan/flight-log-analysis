@@ -395,7 +395,6 @@ class SourceExpansionResolver:
         self.source_hash = source_hash
         self._facts: dict[str, SourceFileFacts] = {}
         self._candidate_facts: dict[tuple[str, GapKind], SourceFileFacts] = {}
-        self._candidate_structures: dict[str, dict[str, list[BaseModel]]] = {}
 
     def facts_for(self, file_path: str) -> SourceFileFacts:
         if file_path not in self._facts:
@@ -462,8 +461,6 @@ class SourceExpansionResolver:
                 )
                 if not self._contains_exact_definition(reference, candidate_facts):
                     continue
-                if reference.kind in {"symbol", "constant"}:
-                    candidate_facts = self._with_candidate_structure(candidate_facts)
                 match = self._exact_match(reference, candidate_facts, structure)
                 if match:
                     facts = self.facts_for(file_path)
@@ -495,53 +492,12 @@ class SourceExpansionResolver:
         cached = self._candidate_facts.get(key)
         if cached is not None:
             return cached
-        structure: dict[str, list[BaseModel]] = {}
-        if kind in {"callable", "class"}:
-            structure = self._structure_for_candidate(file_path)
-        assignments = []
-        if kind in {"symbol", "constant"}:
-            assignments = [
-                item
-                for item in self.profiler.extract_source_assignments_from_source(
-                    [file_path],
-                    expand_companions=False,
-                    include_pointer_outputs=False,
-                    include_control_flow=False,
-                )
-                if item.file == file_path
-            ]
-        facts = SourceFileFacts(
-            file=file_path,
-            source_hash=self.source_hash,
-            source_assignments=assignments,
-            classes=list(structure.get("classes") or []),
-            members=list(structure.get("members") or []),
-            callables=list(structure.get("callables") or []),
-            includes=list(structure.get("includes") or []),
-        )
+        # Candidate admission must inspect the same parser facts that will
+        # enter the DAG. A legacy pre-scan in Tree-sitter mode can otherwise
+        # reject an exact definition before the selected backend is loaded.
+        facts = self.facts_for(file_path)
         self._candidate_facts[key] = facts
         return facts
-
-    def _structure_for_candidate(self, file_path: str) -> dict[str, list[BaseModel]]:
-        cached = self._candidate_structures.get(file_path)
-        if cached is None:
-            cached = self.profiler.extract_source_structure_from_source(
-                [file_path], expand_companions=False
-            )
-            self._candidate_structures[file_path] = cached
-        return cached
-
-    def _with_candidate_structure(self, facts: SourceFileFacts) -> SourceFileFacts:
-        structure = self._structure_for_candidate(facts.file)
-        return SourceFileFacts(
-            file=facts.file,
-            source_hash=facts.source_hash,
-            source_assignments=list(facts.source_assignments),
-            classes=list(structure.get("classes") or []),
-            members=list(structure.get("members") or []),
-            callables=list(structure.get("callables") or []),
-            includes=list(structure.get("includes") or []),
-        )
 
     @staticmethod
     def _contains_exact_definition(

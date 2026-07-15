@@ -129,7 +129,7 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
     seen_bindings: set[tuple[str, str, str, int]] = set()
     seen_helpers: set[tuple[str, str, int]] = set()
     seen_predicates: set[tuple[str, str, int]] = set()
-    seen_calls: set[tuple[str, str, str, int]] = set()
+    seen_calls: set[tuple[Any, ...]] = set()
 
     entries = [_as_dict(facts_entry) for facts_entry in facts]
 
@@ -358,10 +358,13 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             if not call_dict.get("args"):
                 continue
             key = (
+                str(call_dict.get("source_site_id") or ""),
+                str(call_dict.get("callable_id") or ""),
                 str(call_dict.get("name") or ""),
                 str(call_dict.get("receiver") or ""),
                 str(call_dict.get("file") or ""),
                 int(call_dict.get("line") or 0),
+                tuple(str(arg) for arg in call_dict.get("args") or []),
             )
             if key in seen_calls:
                 continue

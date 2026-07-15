@@ -181,6 +181,9 @@ class _ExtractionState:
     seen_assignments: set[tuple[int, int]] = field(default_factory=set)
     seen_calls: set[tuple[int, int]] = field(default_factory=set)
     lambda_bindings: dict[str, _Callable] = field(default_factory=dict)
+    storage_aliases: dict[str, str] = field(default_factory=dict)
+    alias_capable_symbols: set[str] = field(default_factory=set)
+    reference_alias_symbols: set[str] = field(default_factory=set)
 
 
 def _walk(node: Node) -> Iterator[Node]:
@@ -1066,13 +1069,24 @@ class TreeSitterSourceExtractor:
         unit = state.unit
         exact = exact and not node.has_error
         if node.type == "compound_statement":
-            self._walk_sequence(
-                state,
-                node.named_children,
-                controls=controls,
-                exact=exact,
-                exit_context=exit_context,
-            )
+            saved_aliases = state.storage_aliases
+            saved_capable = state.alias_capable_symbols
+            saved_references = state.reference_alias_symbols
+            state.storage_aliases = dict(saved_aliases)
+            state.alias_capable_symbols = set(saved_capable)
+            state.reference_alias_symbols = set(saved_references)
+            try:
+                self._walk_sequence(
+                    state,
+                    node.named_children,
+                    controls=controls,
+                    exact=exact,
+                    exit_context=exit_context,
+                )
+            finally:
+                state.storage_aliases = saved_aliases
+                state.alias_capable_symbols = saved_capable
+                state.reference_alias_symbols = saved_references
             return
         if node.type == "if_statement":
             condition_node = node.child_by_field_name("condition")
@@ -1088,7 +1102,7 @@ class TreeSitterSourceExtractor:
             self._record_branch(state, "if", term, node)
             consequence = node.child_by_field_name("consequence")
             if consequence is not None:
-                self._walk_statement(
+                self._walk_scoped_statement(
                     state,
                     consequence,
                     controls=[*controls, term],
@@ -1102,7 +1116,7 @@ class TreeSitterSourceExtractor:
                     if alternative.type == "else_clause" and alternative.named_children
                     else alternative
                 )
-                self._walk_statement(
+                self._walk_scoped_statement(
                     state,
                     alternative_body,
                     controls=[
@@ -1134,24 +1148,35 @@ class TreeSitterSourceExtractor:
             self._record_branch(state, node.type.removesuffix("_statement"), term, node)
             initializer = node.child_by_field_name("initializer")
             update = node.child_by_field_name("update")
-            self._collect_operations(
-                state, initializer, controls=controls, exact=False
-            )
+            saved_aliases = state.storage_aliases
+            saved_capable = state.alias_capable_symbols
+            saved_references = state.reference_alias_symbols
+            state.storage_aliases = dict(saved_aliases)
+            state.alias_capable_symbols = set(saved_capable)
+            state.reference_alias_symbols = set(saved_references)
+            self._collect_operations(state, initializer, controls=controls, exact=False)
+            if initializer is not None and initializer.type == "declaration":
+                self._register_storage_aliases(state, initializer)
             body = node.child_by_field_name("body")
-            if body is not None:
-                body_controls = controls if node.type == "do_statement" else [*controls, term]
-                self._walk_statement(
-                    state,
-                    body,
-                    controls=body_controls,
-                    exact=False,
-                    # A transfer inside this loop belongs to the loop rather
-                    # than to a switch that happens to contain the loop.
-                    exit_context=None,
+            try:
+                if body is not None:
+                    body_controls = controls if node.type == "do_statement" else [*controls, term]
+                    self._walk_statement(
+                        state,
+                        body,
+                        controls=body_controls,
+                        exact=False,
+                        # A transfer inside this loop belongs to the loop rather
+                        # than to a switch that happens to contain the loop.
+                        exit_context=None,
+                    )
+                self._collect_operations(
+                    state, update, controls=[*controls, term], exact=False
                 )
-            self._collect_operations(
-                state, update, controls=[*controls, term], exact=False
-            )
+            finally:
+                state.storage_aliases = saved_aliases
+                state.alias_capable_symbols = saved_capable
+                state.reference_alias_symbols = saved_references
             return
         if node.type == "return_statement":
             self._collect_operations(state, node, controls=controls, exact=exact)
@@ -1162,8 +1187,14 @@ class TreeSitterSourceExtractor:
                 )
                 state.return_paths.append(
                     {
-                        "condition": self.profiler._normalize_source_expression(condition),
-                        "expression": self.profiler._normalize_source_expression(expression),
+                        "condition": self._apply_storage_aliases(
+                            self.profiler._normalize_source_expression(condition),
+                            state.storage_aliases,
+                        ),
+                        "expression": self._apply_storage_aliases(
+                            self.profiler._normalize_source_expression(expression),
+                            state.storage_aliases,
+                        ),
                         "file": unit.file,
                         "line": unit.line(node),
                         "source_site_id": unit.site_id(node),
@@ -1175,6 +1206,38 @@ class TreeSitterSourceExtractor:
             self._collect_operations(state, node, controls=controls, exact=False)
             return
         self._collect_operations(state, node, controls=controls, exact=exact)
+        if node.type == "declaration":
+            self._register_storage_aliases(state, node)
+        elif node.type == "expression_statement" and node.named_children:
+            self._update_storage_alias(state, node.named_children[0])
+
+    def _walk_scoped_statement(
+        self,
+        state: _ExtractionState,
+        node: Node,
+        *,
+        controls: list[_ControlTerm],
+        exact: bool,
+        exit_context: Optional[str],
+    ) -> None:
+        saved_aliases = state.storage_aliases
+        saved_capable = state.alias_capable_symbols
+        saved_references = state.reference_alias_symbols
+        state.storage_aliases = dict(saved_aliases)
+        state.alias_capable_symbols = set(saved_capable)
+        state.reference_alias_symbols = set(saved_references)
+        try:
+            self._walk_statement(
+                state,
+                node,
+                controls=controls,
+                exact=exact,
+                exit_context=exit_context,
+            )
+        finally:
+            state.storage_aliases = saved_aliases
+            state.alias_capable_symbols = saved_capable
+            state.reference_alias_symbols = saved_references
 
     def _walk_switch(
         self,
@@ -1195,6 +1258,10 @@ class TreeSitterSourceExtractor:
             f"!({discriminant} == {label})" for label in labels
         ) or "true"
         fallthrough = "false"
+        switch_aliases = state.storage_aliases
+        switch_capable = state.alias_capable_symbols
+        switch_references = state.reference_alias_symbols
+        fallthrough_alias_ambiguous = False
         for label, site, statements in sections:
             entry = no_match if label is None else f"{discriminant} == {label}"
             active = _or(entry, fallthrough)
@@ -1205,18 +1272,39 @@ class TreeSitterSourceExtractor:
             )
             kind = "default" if label is None else "case"
             self._record_branch(state, kind, term, site)
+            # A single alias environment cannot represent the different
+            # storage bindings produced by mutually exclusive case entries.
+            # Start every section from the pre-switch environment; this is
+            # conservative for fallthrough aliases and prevents one case's
+            # assignment from being applied to an unrelated case.
+            state.storage_aliases = dict(switch_aliases)
+            state.alias_capable_symbols = set(switch_capable)
+            state.reference_alias_symbols = set(switch_references)
             self._walk_sequence(
                 state,
                 statements,
                 controls=[*controls, term],
-                exact=exact,
+                exact=exact and not fallthrough_alias_ambiguous,
                 exit_context="switch",
             )
             exit_expression, exit_exact = self._switch_exit_expression(
                 unit, statements
             )
+            if (
+                exit_expression != "true"
+                and state.storage_aliases != switch_aliases
+            ):
+                # The next section has a direct-entry environment and a
+                # different fallthrough environment. One scalar alias map
+                # cannot represent both, so later writes remain present but
+                # explicitly non-exact until path-sensitive alias states are
+                # modeled.
+                fallthrough_alias_ambiguous = True
             fallthrough = _and(active, _not(exit_expression))
             exact = exact and exit_exact
+        state.storage_aliases = switch_aliases
+        state.alias_capable_symbols = switch_capable
+        state.reference_alias_symbols = switch_references
 
     def _switch_sections(
         self, unit: _ParsedUnit, body: Optional[Node]
@@ -1253,7 +1341,10 @@ class TreeSitterSourceExtractor:
         state.branches.append(
             BranchConditionRef(
                 kind=kind,
-                condition=self.profiler._normalize_source_expression(term.expression),
+                condition=self._apply_storage_aliases(
+                    self.profiler._normalize_source_expression(term.expression),
+                    state.storage_aliases,
+                ),
                 file=state.unit.file,
                 line=term.line,
                 evidence=state.unit.evidence(node),
@@ -1441,7 +1532,7 @@ class TreeSitterSourceExtractor:
         right = node.child_by_field_name("right")
         if left is None or right is None:
             return None
-        target = self._canonical_symbol(unit.text(left))
+        target = self._storage_target(state, unit.text(left))
         if not target:
             return None
         operator = unit.source[left.end_byte : right.start_byte].decode(
@@ -1449,7 +1540,10 @@ class TreeSitterSourceExtractor:
         ).strip()
         if operator not in {"=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^="}:
             return None
-        rhs = self.profiler._normalize_source_expression(unit.text(right))
+        rhs = self._apply_storage_aliases(
+            self.profiler._normalize_source_expression(unit.text(right)),
+            state.storage_aliases,
+        )
         expression = (
             rhs
             if operator == "="
@@ -1483,8 +1577,11 @@ class TreeSitterSourceExtractor:
             return None
         if any(child.type == "lambda_expression" for child in _walk(value)):
             return None
-        expression = self.profiler._normalize_source_expression(
-            _strip_initializer_delimiters(unit.text(value))
+        expression = self._apply_storage_aliases(
+            self.profiler._normalize_source_expression(
+                _strip_initializer_delimiters(unit.text(value))
+            ),
+            state.storage_aliases,
         )
         declaration = node.parent
         declaration_text = unit.text(declaration) if declaration is not None else unit.text(node)
@@ -1515,7 +1612,10 @@ class TreeSitterSourceExtractor:
         root, field_name = split_source_field(target)
         struct = state.struct_variables.get(root)
         topic = self.profiler._topic_from_struct(struct) if struct else None
-        predicates = [item.expression for item in controls]
+        predicates = [
+            self._apply_storage_aliases(item.expression, state.storage_aliases)
+            for item in controls
+        ]
         combined = " ".join([target, expression, *predicates])
         return SourceAssignmentRef(
             target=target,
@@ -1559,9 +1659,12 @@ class TreeSitterSourceExtractor:
         if function_node.type == "field_expression":
             receiver_node = function_node.child_by_field_name("argument")
             field_node = function_node.child_by_field_name("field")
-            receiver = self._canonical_symbol(unit.text(receiver_node))
+            receiver = self._storage_target(state, unit.text(receiver_node))
             name = unit.text(field_node).strip()
-        args = [unit.text(arg).strip() for arg in (arguments_node.named_children if arguments_node else [])]
+        args = [
+            self._apply_storage_aliases(unit.text(arg).strip(), state.storage_aliases)
+            for arg in (arguments_node.named_children if arguments_node else [])
+        ]
         lambda_callable = state.lambda_bindings.get(name) if receiver is None else None
         if lambda_callable is not None:
             args = [*lambda_callable.capture_arguments, *args]
@@ -1579,7 +1682,10 @@ class TreeSitterSourceExtractor:
             member = state.context.declaring_member(state.callable.owner, root)
             if member is not None:
                 argument_owners[root] = member.owner
-        predicates = [item.expression for item in controls]
+        predicates = [
+            self._apply_storage_aliases(item.expression, state.storage_aliases)
+            for item in controls
+        ]
         return FunctionCallRef(
             name=name,
             receiver=receiver,
@@ -2205,6 +2311,121 @@ class TreeSitterSourceExtractor:
             )
         return assigned, read
 
+    def _register_storage_aliases(
+        self, state: _ExtractionState, declaration: Node
+    ) -> None:
+        """Record pointer/reference locals as aliases of source storage.
+
+        The environment is lexical: callers copy it when entering a block,
+        branch, or loop. Only syntax-proven pointer/reference declarators are
+        eligible, and every initializer is resolved through aliases already in
+        scope before the new name is installed.
+        """
+        unit = state.unit
+        for declarator in (
+            node
+            for node in declaration.named_children
+            if node.type == "init_declarator"
+        ):
+            declared = declarator.child_by_field_name("declarator")
+            value = declarator.child_by_field_name("value")
+            if declared is None:
+                continue
+            is_alias_capable = any(
+                node.type in {"pointer_declarator", "reference_declarator"}
+                for node in _walk(declared)
+            )
+            if not is_alias_capable:
+                continue
+            name_node = _last_identifier(declared)
+            name = unit.text(name_node).strip()
+            if not name:
+                continue
+            state.alias_capable_symbols.add(name)
+            if any(
+                node.type == "reference_declarator" for node in _walk(declared)
+            ):
+                state.reference_alias_symbols.add(name)
+            replacement = self._storage_alias_value(state, value)
+            if replacement:
+                state.storage_aliases[name] = replacement
+            else:
+                state.storage_aliases.pop(name, None)
+
+    def _update_storage_alias(self, state: _ExtractionState, node: Node) -> None:
+        """Update or invalidate a previously declared pointer/reference alias."""
+        if node.type == "assignment_expression":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is None or right is None:
+                return
+            target = self._canonical_symbol(state.unit.text(left))
+            if "." in target or target not in state.alias_capable_symbols:
+                return
+            if target in state.reference_alias_symbols:
+                # C++ references cannot be rebound. ``ref = value`` writes
+                # through the alias and leaves its storage identity intact.
+                return
+            replacement = self._storage_alias_value(state, right)
+            if replacement:
+                state.storage_aliases[target] = replacement
+            else:
+                state.storage_aliases.pop(target, None)
+        elif node.type == "update_expression":
+            argument = node.child_by_field_name("argument")
+            target = self._canonical_symbol(state.unit.text(argument))
+            if target in state.alias_capable_symbols:
+                state.storage_aliases.pop(target, None)
+
+    def _storage_alias_value(
+        self, state: _ExtractionState, value: Optional[Node]
+    ) -> Optional[str]:
+        if value is None:
+            return None
+        while value.type == "parenthesized_expression" and value.named_children:
+            value = value.named_children[0]
+        if value.type == "new_expression":
+            return None
+        if value.type == "pointer_expression":
+            text = state.unit.text(value).lstrip()
+            if not text.startswith("&") or not value.named_children:
+                return None
+            value = value.named_children[0]
+        if value.type not in {
+            "identifier",
+            "field_expression",
+            "subscript_expression",
+            "call_expression",
+            "qualified_identifier",
+        }:
+            return None
+        expression = self._canonical_symbol(state.unit.text(value))
+        expression = self._apply_storage_aliases(
+            expression, state.storage_aliases
+        )
+        return expression or None
+
+    def _storage_target(self, state: _ExtractionState, text: str) -> str:
+        target = self._canonical_symbol(text)
+        if target in state.reference_alias_symbols:
+            return state.storage_aliases.get(target, target)
+        if "." not in target:
+            return target
+        return self._apply_storage_aliases(target, state.storage_aliases)
+
+    @staticmethod
+    def _apply_storage_aliases(expression: str, aliases: dict[str, str]) -> str:
+        value = str(expression or "")
+        for name, replacement in sorted(
+            aliases.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            value = re.sub(
+                rf"(?<![A-Za-z0-9_.]){re.escape(name)}(?![A-Za-z0-9_])",
+                replacement,
+                value,
+            )
+        return value
+
     @staticmethod
     def _canonical_symbol(text: str) -> str:
         value = MechanismSourceProfiler._clean_field_path(text)
@@ -2236,7 +2457,14 @@ class TreeSitterSourceExtractor:
             if len(returns) == 1
             else None
         )
-        assignments = self._helper_assignment_map(statements)
+        # Keep helper metadata aligned with the ordinary assignment facts.
+        # The latter already carry lexical storage-alias resolution and exact
+        # source scopes; rebuilding this map from the raw helper IR would
+        # reintroduce pre-alias targets such as ``local_ptr.alt``.
+        assignments = {
+            assignment.target: assignment.expression
+            for assignment in state.assignments
+        }
         pointer_params = {
             name
             for name, type_text in zip(
@@ -2375,7 +2603,7 @@ class TreeSitterSourceExtractor:
             init_statements = self._as_statement_list(
                 self._helper_statement(unit, initializer) if initializer is not None else None
             )
-            update_statement = self._helper_simple_expression(unit, update) if update is not None else None
+            update_statement = self._helper_loop_increment(unit, update)
             return {
                 "kind": "for",
                 "init": init_statements[0] if init_statements else None,
@@ -2423,6 +2651,46 @@ class TreeSitterSourceExtractor:
             return self._helper_simple_expression(unit, node)
         return None
 
+    def _helper_loop_increment(
+        self, unit: _ParsedUnit, node: Optional[Node]
+    ) -> Optional[dict[str, Any]]:
+        """Adapt a C++ for-update to the shared helper-lowering step IR.
+
+        Ordinary assignment IR stores the resulting value expression. The
+        loop lowerer instead expects the signed step expression, so reusing
+        ``_helper_simple_expression`` turns ``i++`` into a non-constant
+        ``i + 1`` step and prevents otherwise literal loops from unrolling.
+        """
+        if node is None:
+            return None
+        if node.type == "update_expression":
+            argument = node.child_by_field_name("argument")
+            target = self._canonical_symbol(unit.text(argument))
+            text = unit.text(node)
+            return {
+                "target": target,
+                "operator": "+=" if "++" in text else "-=",
+                "expression": "1",
+            }
+        if node.type == "assignment_expression":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is None or right is None:
+                return None
+            operator = unit.source[left.end_byte : right.start_byte].decode(
+                "utf-8", errors="replace"
+            ).strip()
+            if operator not in {"+=", "-="}:
+                return None
+            return {
+                "target": self._canonical_symbol(unit.text(left)),
+                "operator": operator,
+                "expression": self.profiler._normalize_source_expression(
+                    unit.text(right)
+                ),
+            }
+        return None
+
     def _helper_simple_expression(
         self, unit: _ParsedUnit, node: Optional[Node]
     ) -> Optional[dict[str, Any]]:
@@ -2467,24 +2735,6 @@ class TreeSitterSourceExtractor:
         if value is None:
             return []
         return value if isinstance(value, list) else [value]
-
-    def _helper_assignment_map(
-        self, statements: Sequence[dict[str, Any]]
-    ) -> dict[str, str]:
-        assignments: dict[str, str] = {}
-        for statement in statements:
-            if statement.get("kind") in {"declare", "assign"}:
-                target = str(statement.get("target") or "")
-                expression = str(statement.get("expression") or "")
-                if target and expression:
-                    assignments[target] = expression
-            for key in ("then", "else", "body", "default"):
-                nested = statement.get(key)
-                if isinstance(nested, list):
-                    assignments.update(self._helper_assignment_map(nested))
-            for case in statement.get("cases") or []:
-                assignments.update(self._helper_assignment_map(case.get("body") or []))
-        return assignments
 
     @staticmethod
     def _helper_unsupported_reason(body: Node) -> Optional[str]:

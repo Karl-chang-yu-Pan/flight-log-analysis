@@ -20,6 +20,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceAssignmentRef,
 )
 from flight_log_agent.px4.source_facts_cache import SourceFileFacts
+from flight_log_agent.symbols import exact_symbol
 
 
 def _assignment(**overrides) -> SourceAssignmentRef:
@@ -323,13 +324,17 @@ void Reader::calculate()
     assert "status.nav_state" in dag.unresolved_symbols
 
 
-def _mini_tree(tmp_path, files: dict[str, str]):
+def _mini_tree(tmp_path, files: dict[str, str], *, backend: str = "legacy"):
     root = tmp_path / "PX4-Autopilot"
     for rel, text in files.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
-    return MechanismSourceProfiler(root, rg_path="missing-rg")
+    return MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend=backend,
+    )
 
 
 def test_fixpoint_resolves_symbol_across_files_in_second_round(tmp_path):
@@ -630,6 +635,14 @@ def test_call_statement_argument_flow_crosses_object_boundary(tmp_path):
     )
 
     profiler = _mini_tree(tmp_path, {
+        "src/modules/fw/fw.h": """
+class Tecs;
+class Fw {
+    Tecs _tecs;
+    void control();
+    float adapt_speed(float base_speed);
+};
+""",
         "src/modules/fw/fw.cpp": """
 void Fw::control()
 {
@@ -645,6 +658,12 @@ float Fw::adapt_speed(float base_speed)
     return base_speed;
 }
 """,
+        "src/lib/tecs/tecs.h": """
+class Tecs {
+    float _speed_state;
+    void update(float speed_sp);
+};
+""",
         "src/lib/tecs/tecs.cpp": """
 void Tecs::update(float speed_sp)
 {
@@ -654,7 +673,13 @@ void Tecs::update(float speed_sp)
     })
     facts = load_facts(
         profiler, tmp_path / "cache",
-        ["src/modules/fw/fw.cpp", "src/lib/tecs/tecs.cpp"], "hash",
+        [
+            "src/modules/fw/fw.cpp",
+            "src/modules/fw/fw.h",
+            "src/lib/tecs/tecs.cpp",
+            "src/lib/tecs/tecs.h",
+        ],
+        "hash",
     )
     inputs = dag_inputs_from_facts(facts)
 
@@ -663,6 +688,7 @@ void Tecs::update(float speed_sp)
         "_speed_state",
         helper_expressions=inputs.helper_expressions,
         call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
     )
 
     op_targets = {v.variable for v in dag.vertices if v.kind == "operation"}
@@ -670,8 +696,126 @@ void Tecs::update(float speed_sp)
     assert "speed_sp" in op_targets, "synthesized formal<-actual hop missing"
     assert "target_speed" in op_targets, "caller local not reached"
     branches = [v.predicate_raw or "" for v in dag.vertices if v.kind == "branch"]
-    assert any("_param_gnd_min" in b for b in branches), \
+    assert any("_param_gnd_min" in branch for branch in branches), (
         "adaptation branch not reached through the argument hop"
+    )
+
+
+def test_tree_sitter_pointer_output_crosses_inherited_helper_boundary(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/mode/mode.h": """
+struct mission_item_s;
+struct position_setpoint_triplet_s;
+class Base;
+class Mode : public Base {
+public:
+    void run();
+    position_setpoint_triplet_s *get_triplet();
+private:
+    mission_item_s _item;
+};
+""",
+            "src/modules/mode/mode.cpp": """
+void Mode::run()
+{
+    position_setpoint_triplet_s *triplet = get_triplet();
+    fill(_item, &triplet->current);
+}
+""",
+            "src/modules/mode/base.h": """
+struct mission_item_s;
+struct position_setpoint_s;
+class Base {
+protected:
+    void fill(const mission_item_s &item, position_setpoint_s *sp);
+};
+""",
+            "src/modules/mode/base.cpp": """
+void Base::fill(const mission_item_s &item, position_setpoint_s *sp)
+{
+    if (item.valid) {
+        sp->alt = item.altitude;
+    } else {
+        sp->alt = 0.0f;
+    }
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        [
+            "src/modules/mode/mode.h",
+            "src/modules/mode/mode.cpp",
+            "src/modules/mode/base.h",
+            "src/modules/mode/base.cpp",
+        ],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "get_triplet().current.alt",
+        terminal_file="src/modules/mode/mode.cpp",
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+    )
+
+    operations = [vertex for vertex in dag.vertices if vertex.kind == "operation"]
+    effect = next(
+        vertex
+        for vertex in operations
+        if exact_symbol(vertex.variable or "")
+        == exact_symbol("get_triplet().current.alt")
+        and vertex.expression == "sp.alt"
+    )
+    helper_writers = [
+        vertex
+        for vertex in operations
+        if exact_symbol(vertex.variable or "") == exact_symbol("sp.alt")
+    ]
+    assert len(helper_writers) == 2
+    assert {vertex.id for vertex in helper_writers} <= {
+        edge.source_id for edge in dag.edges if edge.target_id == effect.id
+    }
+    assert any(
+        vertex.kind == "branch" and "item.valid" in (vertex.predicate_raw or "")
+        for vertex in dag.vertices
+    )
+
+
+def test_tree_sitter_expansion_admission_uses_selected_backend(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/candidate.cpp": """
+void Controller::run()
+{
+    output = input;
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+
+    def fail_legacy_scan(*args, **kwargs):
+        raise AssertionError("Tree-sitter admission must not invoke the legacy scanner")
+
+    profiler.extract_source_assignments_from_source = fail_legacy_scan  # type: ignore[assignment]
+    resolver = SourceExpansionResolver(profiler, "hash")
+    candidates = resolver.resolve(
+        UnresolvedSourceReference(symbol="output"),
+        SourceStructureIndex(),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].facts.parser_backend == "tree_sitter"
 
 
 def _vt_binding(

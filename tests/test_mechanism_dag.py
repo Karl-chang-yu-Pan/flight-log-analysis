@@ -1042,6 +1042,7 @@ def test_helper_pointer_output_writes_emit_ops_at_call_site():
         return_expression="",
     )
     helper["parameters"] = ["sp"]
+    helper["assignments"] = {"sp.alt": "_rtl_alt"}
     helper["pointer_output_writes"] = [
         {"param": "sp", "field": "alt", "expression": "_rtl_alt"},
     ]
@@ -1063,8 +1064,59 @@ def test_helper_pointer_output_writes_emit_ops_at_call_site():
     variables = {v.variable for v in ops}
     assert "_pos_sp.alt" in variables
     pointer_op = next(v for v in ops if v.variable == "_pos_sp.alt")
-    assert pointer_op.expression == "_rtl_alt"
+    assert pointer_op.expression == "sp.alt"
     assert (pointer_op.provenance or "").startswith("pointer_output:")
+    helper_write = next(v for v in ops if v.variable == "sp.alt")
+    assert any(
+        edge.source_id == helper_write.id and edge.target_id == pointer_op.id
+        for edge in dag.edges
+    )
+
+
+def test_short_call_statement_name_is_not_filtered_by_spelling():
+    helper = _fake_helper(
+        name="gen",
+        file="helper.cpp",
+        line=10,
+        evidence="void gen(float value)",
+        assignments={},
+        return_expression="",
+    )
+    helper["parameters"] = ["value"]
+    helper["callable_id"] = "helper.cpp:10:gen:value"
+    bindings = [
+        _fake_binding(
+            binding_id="state",
+            target="state",
+            expression="value",
+            file="helper.cpp",
+            line=12,
+            function="gen",
+        )
+    ]
+    bindings[0]["callable_id"] = helper["callable_id"]
+    calls = [
+        {
+            "name": "gen",
+            "args": ["input"],
+            "file": "caller.cpp",
+            "line": 20,
+            "function": "run",
+            "callable_id": "caller.cpp:20:run:",
+        }
+    ]
+
+    dag = build_mechanism_dag(
+        bindings,
+        "state",
+        helper_expressions=[helper],
+        call_statements=calls,
+    )
+
+    assert any(
+        vertex.kind == "operation" and vertex.variable == "value"
+        for vertex in dag.vertices
+    )
 
 
 def test_helper_body_provider_lazily_supplies_missing_helper():

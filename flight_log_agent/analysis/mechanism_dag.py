@@ -983,56 +983,48 @@ class _DAGBuilder:
         """
         for call in self._call_statements:
             name = str(call.get("name") or "")
-            args = [str(a) for a in (call.get("args") or []) if str(a).strip()]
-            if not name or len(name) < 4 or not args:
+            args = [str(a).strip() for a in (call.get("args") or [])]
+            if not name or not args or any(not arg for arg in args):
                 continue
             if is_safe_math_function_name(name):
                 continue
-            matches = list(self._helper_keys_by_name.get(name, ()))
-            if not matches:
-                continue
             receiver = str(call.get("receiver") or "")
-            receiver_type = (
+            receiver_type = str(call.get("receiver_type") or "") or (
                 self._struct_variables.get(receiver)
                 or self._struct_variables.get(receiver.lstrip("_"))
                 if receiver
-                else None
+                else ""
             )
-            # Bind only an UNAMBIGUOUS callee — a generic statement name
-            # (``update``) matched by sorted-first would spray one class's
-            # formals with every caller's actuals and fuse unrelated
-            # modules. Resolution uses exact receiver type when available,
-            # otherwise the callable name must identify one loaded helper.
-            helper_key = None
-            if receiver_type:
-                exact = [
-                    k
-                    for k in matches
-                    if str(self.helper_index[k].get("owner") or "") == receiver_type
-                ]
-                if exact:
-                    helper_key = exact[0] if len(exact) == 1 else None
-            if helper_key is None and len(matches) == 1:
-                helper_key = matches[0]
+            file = str(call.get("file") or "")
+            caller_callable = str(
+                call.get("callable_id") or call.get("function") or ""
+            )
+            helper_key = self._pick_helper_key(
+                name,
+                file,
+                scope_function=caller_callable,
+                receiver=receiver,
+                receiver_type_hint=receiver_type,
+                argument_count=len(args),
+            )
             if helper_key is None:
                 continue
             helper = self.helper_index.get(helper_key) or {}
             formals = [str(f) for f in (helper.get("parameters") or [])]
             if not formals:
                 continue
-            file = str(call.get("file") or "")
             line_raw = call.get("line")
             line = int(line_raw) if isinstance(line_raw, (int, float)) else 0
             predicates = list(call.get("control_predicates") or [])
             predicate_lines = list(call.get("control_predicate_lines") or [])
+            predicate_site_ids = list(
+                call.get("control_predicate_site_ids") or []
+            )
             for formal, actual in zip(formals, args):
                 formal_norm = exact_symbol(formal)
                 if not formal_norm:
                     continue
-                self._index_binding(
-                    self._by_target,
-                    self._target_shapes,
-                    formal_norm,
+                self._register_synthetic_binding(
                     {
                         "target_symbol": formal,
                         "source_symbol": actual,
@@ -1042,6 +1034,7 @@ class _DAGBuilder:
                         "logged_signal": "",
                         "control_predicates": predicates,
                         "control_predicate_lines": predicate_lines,
+                        "control_predicate_site_ids": predicate_site_ids,
                         "reachability_exact": bool(
                             call.get("reachability_exact", True)
                         ),
@@ -1053,10 +1046,139 @@ class _DAGBuilder:
                         "scope_function": self._helper_callable_id(helper_key, helper),
                         "scope_line": int(helper.get("line") or 0),
                         "function": str(call.get("function") or ""),
-                        "callable_id": str(call.get("callable_id") or ""),
+                        "callable_id": caller_callable,
                         "synthetic_call_binding": True,
                     }
                 )
+            self._register_pointer_output_call(
+                call,
+                helper_key,
+                helper,
+                args,
+                caller_callable=caller_callable,
+                call_file=file,
+                call_line=line,
+            )
+
+    def _register_synthetic_binding(self, binding: dict[str, Any]) -> None:
+        target = exact_symbol(
+            str(binding.get("target_symbol") or binding.get("target") or "")
+        )
+        if not target:
+            return
+        self._all_bindings.append(binding)
+        self._index_binding(
+            self._by_target, self._target_shapes, target, binding
+        )
+
+    def _register_pointer_output_call(
+        self,
+        call: dict[str, Any],
+        helper_key: tuple[str, str],
+        helper: dict[str, Any],
+        args: Sequence[str],
+        *,
+        caller_callable: str,
+        call_file: str,
+        call_line: int,
+    ) -> None:
+        pointer_writes = list(helper.get("pointer_output_writes") or [])
+        pointer_params = _pointer_param_positions(helper)
+        if not pointer_writes or not pointer_params:
+            return
+        helper_file = str(helper.get("file") or "")
+        helper_callable = self._helper_callable_id(helper_key, helper)
+        helper_line = int(helper.get("line") or 0)
+        substituted = derive_pointer_output_bindings(
+            pointer_writes, pointer_params, args
+        )
+        seen_effects: set[tuple[str, str]] = set()
+        for entry in substituted:
+            formal_target = f"{entry['param']}.{entry['field']}"
+            effect_key = (exact_symbol(entry["target"]), exact_symbol(formal_target))
+            if effect_key in seen_effects:
+                continue
+            seen_effects.add(effect_key)
+            helper_writers = [
+                binding
+                for binding in self._targets_matching(exact_symbol(formal_target))
+                if self._binding_target_scope(binding)
+                == (helper_file, helper_callable)
+            ]
+            if not helper_writers:
+                # Provider-fetched helper records can arrive without their
+                # file's ordinary source bindings. Preserve the effect while
+                # marking its internal reachability unresolved rather than
+                # dropping the output or claiming an unconditional write.
+                self._register_synthetic_binding(
+                    {
+                        "target_symbol": formal_target,
+                        "source_symbol": entry["expression"],
+                        "assignment_path": [
+                            {
+                                "file": helper_file,
+                                "line": helper_line,
+                                "expression": entry["expression"],
+                            }
+                        ],
+                        "logged_signal": "",
+                        "control_predicates": [],
+                        "reachability_exact": False,
+                        "struct_variables": dict(
+                            helper.get("struct_variables") or {}
+                        ),
+                        "function": str(helper.get("name") or ""),
+                        "callable_id": helper_callable,
+                        "synthetic_pointer_helper_write": True,
+                    }
+                )
+            predicates = list(call.get("control_predicates") or [])
+            predicate_lines = list(call.get("control_predicate_lines") or [])
+            predicate_sites = list(
+                call.get("control_predicate_site_ids") or []
+            )
+            target_identity = self._source_structure.symbol_identity(
+                entry["target"],
+                file=call_file,
+                callable_id=caller_callable,
+                function_name=str(call.get("function") or ""),
+            )
+            self._register_synthetic_binding(
+                {
+                    "target_symbol": entry["target"],
+                    # The actual output is produced by the helper's formal
+                    # field write. Keeping that intermediate operation makes
+                    # callee-local data and controls explicit in the DAG.
+                    "source_symbol": formal_target,
+                    "assignment_path": [
+                        {
+                            "file": call_file,
+                            "line": call_line,
+                            "expression": formal_target,
+                        }
+                    ],
+                    "logged_signal": "",
+                    "control_predicates": predicates,
+                    "control_predicate_lines": predicate_lines,
+                    "control_predicate_site_ids": predicate_sites,
+                    "reachability_exact": bool(
+                        call.get("reachability_exact", True)
+                    ),
+                    "struct_variables": {},
+                    "scope_file": call_file,
+                    "scope_function": caller_callable,
+                    "scope_line": call_line,
+                    "expression_scope_file": helper_file,
+                    "expression_scope_function": helper_callable,
+                    "expression_scope_unordered": True,
+                    "control_scope_file": call_file,
+                    "control_scope_function": caller_callable,
+                    "function": str(call.get("function") or ""),
+                    "callable_id": caller_callable,
+                    "target_identity": target_identity.model_dump(),
+                    "synthetic_pointer_output_binding": True,
+                }
+            )
 
     @staticmethod
     def _binding_first_file(binding: dict[str, Any]) -> str:
@@ -1201,9 +1323,26 @@ class _DAGBuilder:
         """Where the binding's EXPRESSION text lives — the scope its
         referenced symbols are resolved in."""
         return (
-            self._binding_first_file(binding),
+            str(
+                binding.get("expression_scope_file")
+                or self._binding_first_file(binding)
+                or ""
+            ),
             self._bare_function(
-                binding.get("callable_id") or binding.get("function") or ""
+                binding.get("expression_scope_function")
+                or binding.get("callable_id")
+                or binding.get("function")
+                or ""
+            ),
+        )
+
+    def _binding_control_scope(self, binding: dict[str, Any]) -> tuple[str, str]:
+        """Where the binding's governing predicates are evaluated."""
+        site_file, site_function = self._binding_site_scope(binding)
+        return (
+            str(binding.get("control_scope_file") or site_file),
+            self._bare_function(
+                binding.get("control_scope_function") or site_function
             ),
         )
 
@@ -1211,6 +1350,11 @@ class _DAGBuilder:
         self, binding: dict[str, Any]
     ) -> tuple[str, str, Optional[int]]:
         file, callable_id = self._binding_site_scope(binding)
+        if binding.get("expression_scope_unordered"):
+            return file, callable_id, None
+        raw_expression_line = binding.get("expression_scope_line")
+        if isinstance(raw_expression_line, (int, float)):
+            return file, callable_id, int(raw_expression_line)
         path = binding.get("assignment_path") or []
         first = path[0] if path else {}
         raw_line = (first or {}).get("line")
@@ -1428,6 +1572,7 @@ class _DAGBuilder:
             }
             target_file, target_callable = self._binding_target_scope(binding)
             site_file, site_callable = self._binding_site_scope(binding)
+            control_file, control_callable = self._binding_control_scope(binding)
             function = target_callable
             if function:
                 # The target's declaring callable — wiring visibility for
@@ -1440,6 +1585,10 @@ class _DAGBuilder:
             metadata["site_scope"] = {
                 "file": site_file,
                 "callable": site_callable,
+            }
+            metadata["control_scope"] = {
+                "file": control_file,
+                "callable": control_callable,
             }
             if binding.get("target_identity"):
                 metadata["target_identity"] = dict(binding["target_identity"])
@@ -1474,6 +1623,9 @@ class _DAGBuilder:
         # not where the gated assignment does.
         predicate_sites = binding.get("control_predicate_lines") or []
         predicate_site_ids = binding.get("control_predicate_site_ids") or []
+        predicate_files = binding.get("control_predicate_files") or []
+        predicate_callables = binding.get("control_predicate_callables") or []
+        control_file, control_callable = self._binding_control_scope(binding)
         for position, predicate in enumerate(binding.get("control_predicates") or []):
             site = (
                 int(predicate_sites[position])
@@ -1482,9 +1634,17 @@ class _DAGBuilder:
             )
             branch_id = self._emit_branch(
                 str(predicate),
-                file=file,
+                file=(
+                    str(predicate_files[position])
+                    if position < len(predicate_files)
+                    else control_file or file
+                ),
                 line=site,
-                scope_function=self._binding_site_scope(binding)[1],
+                scope_function=(
+                    str(predicate_callables[position])
+                    if position < len(predicate_callables)
+                    else control_callable
+                ),
                 source_site_id=(
                     str(predicate_site_ids[position])
                     if position < len(predicate_site_ids)
@@ -1495,13 +1655,18 @@ class _DAGBuilder:
 
         # Wire each source-expression symbol as an incoming data edge,
         # resolved in the binding's own callable scope.
-        scope_function = self._binding_site_scope(binding)[1]
+        expression_file, scope_function = self._binding_site_scope(binding)
+        expression_line = self._binding_walk_scope(binding)[2]
         for symbol in self._wire_symbols(expression):
             normalized = exact_symbol(symbol)
             if not normalized or normalized == target_norm:
                 continue
             producer_ids = self._resolve_symbol_producers(
-                normalized, symbol, expression, file, line,
+                normalized,
+                symbol,
+                expression,
+                expression_file or file,
+                expression_line,
                 scope_function=scope_function,
             )
             for producer_id in producer_ids:
@@ -1509,10 +1674,15 @@ class _DAGBuilder:
 
         # Helper-call inputs.
         for helper_call in self._find_helper_calls(
-            expression, file, scope_function=scope_function, line=line
+            expression,
+            expression_file or file,
+            scope_function=scope_function,
+            line=expression_line,
         ):
             helper_key = self._pick_helper_key(
-                helper_call, file, scope_function=scope_function
+                helper_call,
+                expression_file or file,
+                scope_function=scope_function,
             )
             if helper_key is None:
                 continue
@@ -1530,8 +1700,8 @@ class _DAGBuilder:
             self._wire_helper_call_arguments(
                 helper_call,
                 expression,
-                file,
-                line,
+                expression_file or file,
+                expression_line,
                 scope_function=scope_function,
             )
             # Emit pointer-output writes from the helper as ops with the
@@ -1541,8 +1711,8 @@ class _DAGBuilder:
             self._emit_helper_pointer_output_writes(
                 helper_call,
                 expression,
-                file=file,
-                line=line,
+                file=expression_file or file,
+                line=expression_line,
                 scope_function=scope_function,
             )
 
@@ -1559,10 +1729,12 @@ class _DAGBuilder:
 
         For each ``pointer_output_writes`` entry on the resolved helper, emit
         an operation vertex whose target is ``{caller_actual_arg}.{field}``
-        with the write's RHS as the expression. Wires RHS symbols as data
-        edges. Ops share the (target, expression, file, line) identity used
-        by :meth:`_emit_operation_vertex` so a source_assignments-derived
-        binding for the same call site does not double-emit.
+        with the helper's formal output field as its expression. The helper's
+        ordinary assignment operations retain the internal RHS and control
+        predicates, and feed this call-site effect through a data edge. Ops
+        share the (target, expression, file, line) identity used by
+        :meth:`_emit_operation_vertex` so a source_assignments-derived binding
+        for the same call site does not double-emit.
         """
         helper_key = self._pick_helper_key(
             helper_call, file, scope_function=scope_function
@@ -1580,9 +1752,12 @@ class _DAGBuilder:
             return
         args = _extract_call_arguments(helper_call, caller_expression)
         substituted = derive_pointer_output_bindings(pointer_writes, pointer_params, args)
+        helper_file = str(helper.get("file") or "")
+        helper_callable = self._helper_callable_id(helper_key, helper)
+        helper_line = int(helper.get("line") or 0) or None
         for entry in substituted:
             target = entry["target"]
-            expression = entry["expression"]
+            expression = f"{entry['param']}.{entry['field']}"
             target_norm = exact_symbol(target)
             op_id = self._make_id("op", (target_norm, expression, file or "", line or 0))
             if op_id not in self.vertices:
@@ -1598,15 +1773,18 @@ class _DAGBuilder:
                     provenance=f"pointer_output:{helper_key[0]}@{helper_key[1]}",
                 )
                 self._index_producer(target_norm, op_id)
-            for symbol in self._wire_symbols(expression):
-                normalized = exact_symbol(symbol)
-                if not normalized or normalized == target_norm:
-                    continue
-                producer_ids = self._resolve_symbol_producers(
-                    normalized, symbol, expression, file, line
+            producer_ids = self._resolve_symbol_producers(
+                exact_symbol(expression),
+                expression,
+                expression,
+                helper_file,
+                helper_line,
+                scope_function=helper_callable,
+            )
+            for producer_id in producer_ids:
+                self._add_edge(
+                    producer_id, op_id, kind="data", role=expression
                 )
-                for producer_id in producer_ids:
-                    self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
     def _wire_helper_call_arguments(
         self,
@@ -2696,6 +2874,7 @@ class _DAGBuilder:
         *,
         scope_function: str = "",
         receiver: str = "",
+        receiver_type_hint: str = "",
         argument_count: Optional[int] = None,
     ) -> Optional[tuple[str, str]]:
         """Resolve a callable from receiver type, owner lineage, and arity.
@@ -2749,9 +2928,9 @@ class _DAGBuilder:
         if not matches:
             return None
         caller_owner = self._source_structure.callable_owner(scope_function)
-        receiver_type = ""
+        receiver_type = str(receiver_type_hint or "").rstrip("*& ").split("<", 1)[0].strip()
         receiver_root = receiver.replace("->", ".").split(".", 1)[0].lstrip("&*")
-        if caller_owner and receiver_root:
+        if not receiver_type and caller_owner and receiver_root:
             declaring = self._source_structure.declaring_member_owner(
                 caller_owner, receiver_root
             )
@@ -3872,8 +4051,8 @@ def derive_pointer_output_bindings(
 ) -> list[dict[str, str]]:
     """Substitute call-site arguments into a helper's pointer-output writes.
 
-    Returns entries ``{"param": <formal>, "target": <arg.field>,
-    "expression": <RHS>}`` suitable for emission as either DAG operation
+    Returns entries ``{"param": <formal>, "field": <field>,
+    "target": <arg.field>, "expression": <RHS>}`` suitable for emission as either DAG operation
     vertices or profiler ``SourceAssignmentRef`` records. Single semantic
     owner for the substitution — both the profiler's flatten pass and
     the DAG builder's graph-native emission call this function, so a
@@ -3902,6 +4081,7 @@ def derive_pointer_output_bindings(
             continue
         results.append({
             "param": param,
+            "field": field,
             "target": f"{arg}.{field}",
             "expression": expression,
         })
