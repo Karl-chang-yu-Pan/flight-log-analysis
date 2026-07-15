@@ -15,6 +15,7 @@ from flight_log_agent.analysis.source_expansion import (
     UnresolvedSourceReference,
 )
 from flight_log_agent.px4.mechanism_source_profiler import (
+    FunctionCallRef,
     MechanismSourceProfiler,
     ParameterRef,
     SourceAssignmentRef,
@@ -118,6 +119,31 @@ def test_dag_inputs_from_facts_aggregates_and_dedupes():
     assert "_destination_alt" in targets
     assert inputs.parameter_aliases == {"_param_rtl_return_alt": "RTL_RETURN_ALT"}
     assert inputs.parameter_names == {"RTL_RETURN_ALT", "RTL_TYPE"}
+
+
+def test_dag_inputs_preserve_zero_argument_calls():
+    facts = SourceFileFacts(
+        file="control.cpp",
+        source_hash="h",
+        function_calls=[
+            FunctionCallRef(
+                name="update",
+                args=[],
+                file="control.cpp",
+                line=12,
+                evidence="controller.update();",
+                receiver="controller",
+                function="run",
+                callable_id="control.cpp:1:run:",
+                source_site_id="control.cpp:12:update",
+            )
+        ],
+    )
+
+    inputs = dag_inputs_from_facts([facts])
+
+    assert len(inputs.call_statements) == 1
+    assert inputs.call_statements[0]["args"] == []
 
 
 def test_load_facts_extracts_fresh_without_populating_layer1(tmp_path):

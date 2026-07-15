@@ -65,6 +65,38 @@ EvidenceSubKind = Literal["logged_signal", "parameter", "constant", "opaque_symb
 OperationSubKind = Literal["assign", "reduction", "helper_call", "external_call", "unresolved"]
 EdgeKind = Literal["data", "control", "selection"]
 
+_CALL_SCOPE_MARKER = "::@call:"
+
+
+@dataclass(frozen=True)
+class _ExpressionCall:
+    """One syntactic call occurrence inside a source expression."""
+
+    name: str
+    receiver: str
+    args: tuple[str, ...]
+    offset: int
+    source_site_id: str
+
+
+def _base_callable_scope(callable_id: str) -> str:
+    """Return the source callable behind a call-site-instantiated scope."""
+    return str(callable_id or "").split(_CALL_SCOPE_MARKER, 1)[0]
+
+
+def _callable_instance_scope(
+    callee_callable: str,
+    *,
+    caller_callable: str,
+    source_site_id: str,
+) -> str:
+    """Create a stable lexical scope for one invocation of ``callee``."""
+    token = stable_id(
+        "call",
+        (str(caller_callable or ""), str(source_site_id or ""), callee_callable),
+    )
+    return f"{callee_callable}{_CALL_SCOPE_MARKER}{token}"
+
 # Fixed language/evaluator grammar, not domain semantics. These tokens can be
 # followed by parentheses in lowered source but never identify source helpers.
 _NON_CALL_SYNTAX = {
@@ -334,9 +366,23 @@ class _DAGBuilder:
             else None
         )
         self._call_statements = list(call_statements or [])
+        self._calls_by_site: dict[
+            tuple[str, str, int, str, tuple[str, ...]], list[dict[str, Any]]
+        ] = defaultdict(list)
+        for call in self._call_statements:
+            key = (
+                str(call.get("file") or ""),
+                _base_callable_scope(
+                    str(call.get("callable_id") or call.get("function") or "")
+                ),
+                int(call.get("line") or 0),
+                str(call.get("name") or "").rsplit("::", 1)[-1],
+                tuple(str(arg).strip() for arg in (call.get("args") or [])),
+            )
+            self._calls_by_site[key].append(call)
         self._boundary_bindings = list(boundary_bindings or [])
         # Guards dotted-root rebinding recursion against alias cycles.
-        self._rebinding_stack: set[str] = set()
+        self._rebinding_stack: set[tuple[str, str, str]] = set()
         # Schema-derived message enums, scoped per message
         # (``{message: {CONSTANT: value}}``) — resolved at wiring time
         # like every other constant, never as a flat global table.
@@ -392,7 +438,9 @@ class _DAGBuilder:
         # symbol — both on the EXACT identity, with index-erased shape maps
         # so an index-free reference still finds its indexed writers (and
         # vice versa) without ever fusing distinct indices.
-        self._all_bindings: list[dict[str, Any]] = list(source_bindings)
+        self._source_bindings: list[dict[str, Any]] = list(source_bindings)
+        self._all_bindings: list[dict[str, Any]] = list(self._source_bindings)
+        self._registered_call_instances: set[str] = set()
         self._by_output: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._target_shapes: dict[str, list[str]] = defaultdict(list)
@@ -486,14 +534,15 @@ class _DAGBuilder:
         self._evidence_by_signal: dict[tuple[str, str], str] = {}
         # Branch vertices key on predicate plus the parser's source-node ID.
         # File/line remain the fallback for legacy facts.
-        self._branch_by_site: dict[tuple[str, str, int, str], str] = {}
-        self._helper_subgraph_return_id: dict[tuple[str, str], str] = {}
-        # helper_key -> ordered list of (formal_name, param_vertex_id).
+        self._branch_by_site: dict[tuple[str, str, int, str, str], str] = {}
+        self._helper_subgraph_return_id: dict[tuple[str, str, str], str] = {}
+        self._helper_instance_site: dict[tuple[str, str, str], str] = {}
+        # (helper key, call site) -> ordered formal parameter vertices.
         # Callers wire their i-th argument's producer to the i-th formal
         # vertex; helper body operations that reference the formal look
         # it up in this map (scoped to the helper).
         self._helper_parameter_vertices: dict[
-            tuple[str, str], list[tuple[str, str]]
+            tuple[str, str, str], list[tuple[str, str]]
         ] = {}
         # Assignment-target index: EXACT target symbol → list of vertex ids
         # that produce it, plus the index-erased shape map for
@@ -738,8 +787,6 @@ class _DAGBuilder:
         constructed directly, and struct-root field expansion is folded
         into the same walk.
         """
-        self._register_call_statement_bindings()
-
         # Every frontier symbol carries the scope of the site that
         # referenced it — writers are then resolved under C++-faithful
         # visibility instead of a global by-name index, so a local named
@@ -756,7 +803,7 @@ class _DAGBuilder:
             ),
             None,
         )
-        frontier: deque[tuple[str, str, Scope]] = deque(
+        frontier: deque[tuple[str, Any, Scope]] = deque(
             [("symbol", self.terminal_raw, terminal_scope)]
         )
         walked: set[tuple[str, Scope]] = set()
@@ -771,14 +818,14 @@ class _DAGBuilder:
             for raw in dedupe_keep_order(source_expression_names(normalized_expr)):
                 if raw:
                     frontier.append(("symbol", raw, scope))
-            for helper_name in self._find_helper_calls(
+            for invocation in self._find_helper_calls(
                 expression,
                 scope[0],
                 scope_function=scope[1],
                 line=scope[2],
             ):
-                if helper_name not in materialized_helpers:
-                    frontier.append(("helper", helper_name, scope))
+                if invocation.source_site_id not in materialized_helpers:
+                    frontier.append(("helper", invocation, scope))
 
         while frontier:
             kind, payload, scope = frontier.popleft()
@@ -804,6 +851,10 @@ class _DAGBuilder:
                     continue
                 if norm == self.terminal:
                     writers = self._writers_of(norm)
+                    call_writers = self._writers_from_relevant_calls(
+                        norm, raw, scope, terminal=True
+                    )
+                    writers = self._dedupe_bindings([*writers, *call_writers])
                     if writers and self.terminal_identity is not None:
                         writers = [
                             binding
@@ -825,8 +876,16 @@ class _DAGBuilder:
                         ]
                         if scoped:
                             writers = scoped
+                    writers = self._terminal_call_context_writers(writers)
                 else:
                     writers = self._scoped_writers(norm, raw, scope)
+                    call_writers = self._writers_from_relevant_calls(
+                        norm,
+                        raw,
+                        scope,
+                        terminal=False,
+                    )
+                    writers = self._dedupe_bindings([*writers, *call_writers])
                 if writers:
                     for binding in writers:
                         if id(binding) not in self._emitted_ids:
@@ -843,10 +902,35 @@ class _DAGBuilder:
                         # A branch's inputs are part of the mechanism:
                         # walking predicate symbols emits the internal-state
                         # writers that feasibility grounding later follows.
-                        for predicate in binding.get("control_predicates") or []:
+                        for position, predicate in enumerate(
+                            binding.get("control_predicates") or []
+                        ):
                             enqueue_expression(
-                                str(predicate), self._binding_walk_scope(binding)
+                                str(predicate),
+                                self._binding_predicate_scope(binding, position),
                             )
+                elif "." in norm:
+                    # A member read can be rooted in a source assignment to
+                    # the aggregate itself (most importantly a call formal
+                    # bound to its caller actual). Emit those root writers so
+                    # wiring can perform the exact ``root.field`` rebinding.
+                    root_raw = raw.replace("->", ".").split(".", 1)[0]
+                    root_writers = self._scoped_writers(
+                        exact_symbol(root_raw), root_raw, scope
+                    )
+                    for binding in root_writers:
+                        if id(binding) not in self._emitted_ids:
+                            self._emitted_ids.add(id(binding))
+                            self._emitted_bindings.append(binding)
+                            self._emit_operation_vertex(binding, is_terminal=False)
+                        enqueue_expression(
+                            str(
+                                binding.get("source_symbol")
+                                or binding.get("expression")
+                                or ""
+                            ),
+                            self._binding_walk_scope(binding),
+                        )
                 elif (
                     "." not in norm
                     and norm != self.terminal
@@ -876,18 +960,22 @@ class _DAGBuilder:
                                 )
                             )
             else:  # helper
-                helper_name = payload
-                if helper_name in materialized_helpers:
+                invocation = payload
+                if invocation.source_site_id in materialized_helpers:
                     continue
-                materialized_helpers.add(helper_name)
+                materialized_helpers.add(invocation.source_site_id)
                 self._materialize_helper_subgraph(
-                    helper_name,
+                    invocation,
                     wire_edges=False,
                     scope_file=scope[0],
                     scope_function=scope[1],
                 )
                 helper_key = self._pick_helper_key(
-                    helper_name, scope[0], scope_function=scope[1]
+                    invocation.name,
+                    scope[0],
+                    scope_function=scope[1],
+                    receiver=invocation.receiver,
+                    argument_count=len(invocation.args),
                 )
                 helper = self.helper_index.get(helper_key) if helper_key else None
                 if not helper:
@@ -904,7 +992,11 @@ class _DAGBuilder:
                     body_expressions.append(str(pointer_write.get("expression") or ""))
                 body_scope: Scope = (
                     str(helper.get("file") or ""),
-                    self._helper_callable_id(helper_key, helper),
+                    _callable_instance_scope(
+                        self._helper_callable_id(helper_key, helper),
+                        caller_callable=scope[1],
+                        source_site_id=invocation.source_site_id,
+                    ),
                     None,
                 )
                 for expression in body_expressions:
@@ -963,101 +1055,699 @@ class _DAGBuilder:
             source_expression_names(_normalize_cpp_expression(str(expression)))
         )
 
-    def _register_call_statement_bindings(self) -> None:
-        """Model side-effect argument flow across bare call statements.
-
-        ``obj.method(a, b);`` passes each actual into the callee's formal,
-        which the callee body reads as ordinary state — but the statement
-        is not an assignment, so no binding exists and the backward walk
-        cannot cross the argument hop (a caller local feeding a member
-        object's published field stays invisible). Synthesize one binding
-        ``formal <- actual`` per resolvable call; the callee body's own
-        assignments are ordinary source bindings already.
-
-        Only IN-SET callees are considered: an unloaded callee has no body
-        bindings to walk, so the synthesized hop would be inert — and
-        probing the provider with generic statement names (``update``)
-        drags unrelated definitions. When several loaded classes define the
-        name, only a unique callee whose owner matches the receiver's derived
-        type is accepted; unresolved ambiguity creates no binding.
-        """
-        for call in self._call_statements:
-            name = str(call.get("name") or "")
-            args = [str(a).strip() for a in (call.get("args") or [])]
-            if not name or not args or any(not arg for arg in args):
+    @staticmethod
+    def _dedupe_bindings(
+        bindings: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Preserve source order while de-duplicating binding objects."""
+        seen: set[int] = set()
+        result: list[dict[str, Any]] = []
+        for binding in bindings:
+            marker = id(binding)
+            if marker in seen:
                 continue
-            if is_safe_math_function_name(name):
+            seen.add(marker)
+            result.append(binding)
+        return result
+
+    def _binding_formal_parameters(
+        self, binding: dict[str, Any]
+    ) -> list[str]:
+        """Derive a binding's formals from loaded source structure."""
+        direct = [
+            str(value)
+            for value in (binding.get("function_parameters") or [])
+            if str(value)
+        ]
+        if direct:
+            return direct
+        callable_id = _base_callable_scope(
+            self._binding_target_scope(binding)[1]
+        )
+        callable_record = self._source_structure.callables_by_id.get(callable_id)
+        if callable_record:
+            parameters = [
+                str(value)
+                for value in (callable_record.get("parameters") or [])
+                if str(value)
+            ]
+            if parameters:
+                return parameters
+        for helper_key, helper in self.helper_index.items():
+            if self._helper_callable_id(helper_key, helper) != callable_id:
+                continue
+            return [
+                str(value)
+                for value in (helper.get("parameters") or [])
+                if str(value)
+            ]
+        return []
+
+    def _binding_reads_formal(self, binding: dict[str, Any]) -> bool:
+        """Whether a writer's value or reachability reads a formal."""
+        formals = {
+            exact_symbol(value)
+            for value in self._binding_formal_parameters(binding)
+            if exact_symbol(value)
+        }
+        if not formals:
+            return False
+        expressions = [
+            str(binding.get("source_symbol") or binding.get("expression") or ""),
+            *(
+                str(value)
+                for value in (binding.get("control_predicates") or [])
+            ),
+        ]
+        for expression in expressions:
+            for symbol in self._wire_symbols(expression):
+                root = symbol.replace("->", ".").split(".", 1)[0]
+                if exact_symbol(root) in formals:
+                    return True
+        return False
+
+    def _terminal_call_context_writers(
+        self, writers: Sequence[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Instantiate only terminal writers that need caller formals.
+
+        A member writer that depends only on class state represents the same
+        storage at every call and stays at its source definition. A writer
+        whose value or control predicate reads a formal needs the caller's
+        actual argument, so each source-proven invocation gets a private
+        callable scope. No provider search is performed here: the terminal's
+        writer and callable definition are already loaded facts.
+        """
+        contextualized: list[dict[str, Any]] = []
+        for writer in writers:
+            writer_file, writer_callable = self._binding_target_scope(writer)
+            base_callable = _base_callable_scope(writer_callable)
+            if (
+                _CALL_SCOPE_MARKER in writer_callable
+                or not base_callable
+                or not self._binding_reads_formal(writer)
+            ):
+                contextualized.append(writer)
+                continue
+
+            matching_helpers = {
+                helper_key
+                for helper_key, helper in self.helper_index.items()
+                if self._helper_callable_id(helper_key, helper) == base_callable
+            }
+            if not matching_helpers:
+                contextualized.append(writer)
+                continue
+
+            clones: list[dict[str, Any]] = []
+            target = exact_symbol(
+                str(writer.get("target_symbol") or writer.get("target") or "")
+            )
+            expression = str(
+                writer.get("source_symbol") or writer.get("expression") or ""
+            )
+            writer_line = self._binding_target_line(writer)
+            for source_call in self._call_statements:
+                args = [
+                    str(value).strip()
+                    for value in (source_call.get("args") or [])
+                ]
+                call_file = str(source_call.get("file") or "")
+                caller_callable = str(
+                    source_call.get("callable_id")
+                    or source_call.get("function")
+                    or ""
+                )
+                helper_key = self._pick_helper_key(
+                    str(source_call.get("name") or ""),
+                    call_file,
+                    scope_function=caller_callable,
+                    receiver=str(source_call.get("receiver") or ""),
+                    receiver_type_hint=str(
+                        source_call.get("receiver_type") or ""
+                    ),
+                    argument_count=len(args),
+                    allow_provider=False,
+                )
+                if helper_key not in matching_helpers:
+                    continue
+                helper = self.helper_index.get(helper_key) or {}
+                call_scope = self._register_call_instance(
+                    source_call,
+                    helper_key,
+                    helper,
+                    args,
+                    caller_callable=caller_callable,
+                )
+                clones.extend(
+                    candidate
+                    for candidate in self._targets_matching(target)
+                    if self._binding_target_scope(candidate)
+                    == (writer_file, call_scope)
+                    and str(
+                        candidate.get("source_symbol")
+                        or candidate.get("expression")
+                        or ""
+                    )
+                    == expression
+                    and self._binding_target_line(candidate) == writer_line
+                )
+            contextualized.extend(clones or [writer])
+        return self._dedupe_bindings(contextualized)
+
+    @staticmethod
+    def _call_argument_storage(argument: str) -> str:
+        text = str(argument or "").strip()
+        while text.startswith("(") and text.endswith(")"):
+            text = text[1:-1].strip()
+        text = text.lstrip("&*").strip()
+        if not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*|\[[^\]]+\]|\(\))*",
+            text,
+        ):
+            return ""
+        return exact_symbol(text)
+
+    @staticmethod
+    def _storage_contains_reference(storage: str, reference: str) -> bool:
+        """Whether an actual object can contain the referenced output.
+
+        Pointer/reference calls receive aggregate storage (``out``) while
+        source-proven effects commonly target a member (``out.alt``). This is
+        directional: a field actual does not prove its enclosing aggregate.
+        """
+        storage_parts = exact_symbol(storage).split(".")
+        reference_parts = exact_symbol(reference).split(".")
+        if not storage_parts or len(storage_parts) > len(reference_parts):
+            return False
+        reference_prefix = ".".join(reference_parts[: len(storage_parts)])
+        return symbol_produces_reference(
+            ".".join(storage_parts), reference_prefix
+        )
+
+    def _helper_writes_receiver_member(
+        self,
+        helper_key: tuple[str, str],
+        helper: dict[str, Any],
+    ) -> bool:
+        """Whether loaded source proves a member write by ``helper``."""
+        helper_scope = (
+            str(helper.get("file") or ""),
+            self._helper_callable_id(helper_key, helper),
+        )
+        return any(
+            self._binding_target_scope(binding) == helper_scope
+            and (identity := self._binding_target_identity(binding)) is not None
+            and identity.kind == "member"
+            for binding in self._source_bindings
+        )
+
+    def _symbol_is_receiver_call_result(
+        self,
+        symbol_norm: str,
+        scope: tuple[str, str, Optional[int]],
+    ) -> bool:
+        """Whether ``symbol`` is the parser's identity for a method call.
+
+        Expression-name extraction represents ``obj.read().field`` as
+        ``obj.read``. That is a call result, not storage owned by ``obj``;
+        helper expansion handles its return value separately.
+        """
+        scope_file, scope_callable = scope[:2]
+        source_callable = _base_callable_scope(scope_callable)
+        for call in self._call_statements:
+            call_file = str(call.get("file") or "")
+            caller = _base_callable_scope(
+                str(call.get("callable_id") or call.get("function") or "")
+            )
+            if scope_file and call_file != scope_file:
+                continue
+            if source_callable and caller != source_callable:
                 continue
             receiver = str(call.get("receiver") or "")
-            receiver_type = str(call.get("receiver_type") or "") or (
-                self._struct_variables.get(receiver)
-                or self._struct_variables.get(receiver.lstrip("_"))
-                if receiver
-                else ""
+            if not receiver:
+                continue
+            name = str(call.get("name") or "").rsplit("::", 1)[-1]
+            if exact_symbol(f"{receiver}.{name}") == symbol_norm:
+                return True
+        return False
+
+    def _writers_from_relevant_calls(
+        self,
+        symbol_norm: str,
+        symbol_raw: str,
+        scope: tuple[str, str, Optional[int]],
+        *,
+        terminal: bool,
+    ) -> list[dict[str, Any]]:
+        """Resolve calls whose source-proven effects can produce ``symbol``.
+
+        Passing a value to a call does not make the call its producer. Loaded
+        callees must prove either a write through a pointer/reference formal
+        or a receiver-member write. Missing callees become typed discovery
+        gaps instead of being fetched inline based only on textual overlap.
+        """
+        scope_file, scope_callable = scope[:2]
+        source_callable = _base_callable_scope(scope_callable)
+        if self._symbol_is_receiver_call_result(symbol_norm, scope):
+            return []
+        admitted = False
+        for source_call in self._call_statements:
+            call_file = str(source_call.get("file") or "")
+            caller = _base_callable_scope(
+                str(
+                    source_call.get("callable_id")
+                    or source_call.get("function")
+                    or ""
+                )
             )
-            file = str(call.get("file") or "")
-            caller_callable = str(
-                call.get("callable_id") or call.get("function") or ""
+            if scope_file and call_file != scope_file:
+                continue
+            if source_callable and caller != source_callable:
+                continue
+            name = str(source_call.get("name") or "")
+            if not name or is_safe_math_function_name(name):
+                continue
+            receiver = exact_symbol(str(source_call.get("receiver") or ""))
+            if receiver and self._match_parameter(
+                f"{receiver}.{name.rsplit('::', 1)[-1]}"
+            ) is not None:
+                continue
+            args = [str(arg).strip() for arg in (source_call.get("args") or [])]
+            storages = [
+                self._call_argument_storage(str(arg))
+                for arg in args
+            ]
+            possible_argument_match = any(
+                storage
+                and self._storage_contains_reference(storage, symbol_norm)
+                for storage in storages
             )
+            possible_receiver_match = bool(
+                receiver
+                and self._storage_contains_reference(receiver, symbol_norm)
+            )
+            if not possible_argument_match and not possible_receiver_match:
+                continue
             helper_key = self._pick_helper_key(
                 name,
-                file,
-                scope_function=caller_callable,
-                receiver=receiver,
-                receiver_type_hint=receiver_type,
+                call_file,
+                scope_function=scope_callable or caller,
+                receiver=str(source_call.get("receiver") or ""),
+                receiver_type_hint=str(
+                    source_call.get("receiver_type") or ""
+                ),
                 argument_count=len(args),
+                allow_provider=False,
             )
             if helper_key is None:
+                self._record_unresolved(
+                    name,
+                    kind="callable",
+                    file=call_file,
+                    line=int(source_call.get("line") or 0) or None,
+                    scope_function=scope_callable or caller,
+                    source_expression=str(source_call.get("evidence") or ""),
+                    receiver=str(source_call.get("receiver") or ""),
+                    argument_count=len(args),
+                )
                 continue
             helper = self.helper_index.get(helper_key) or {}
-            formals = [str(f) for f in (helper.get("parameters") or [])]
-            if not formals:
-                continue
-            line_raw = call.get("line")
-            line = int(line_raw) if isinstance(line_raw, (int, float)) else 0
-            predicates = list(call.get("control_predicates") or [])
-            predicate_lines = list(call.get("control_predicate_lines") or [])
-            predicate_site_ids = list(
-                call.get("control_predicate_site_ids") or []
+            output_positions = set(_pointer_param_positions(helper).values())
+            output_argument_match = any(
+                index in output_positions
+                and storage
+                and self._storage_contains_reference(storage, symbol_norm)
+                for index, storage in enumerate(storages)
             )
-            for formal, actual in zip(formals, args):
-                formal_norm = exact_symbol(formal)
-                if not formal_norm:
-                    continue
-                self._register_synthetic_binding(
-                    {
-                        "target_symbol": formal,
-                        "source_symbol": actual,
-                        "assignment_path": [
-                            {"file": file, "line": line, "expression": actual}
-                        ],
-                        "logged_signal": "",
-                        "control_predicates": predicates,
-                        "control_predicate_lines": predicate_lines,
-                        "control_predicate_site_ids": predicate_site_ids,
-                        "reachability_exact": bool(
-                            call.get("reachability_exact", True)
-                        ),
-                        "struct_variables": {},
-                        # The formal lives in the CALLEE; the actual's
-                        # symbols resolve at the call site (see
-                        # _binding_target_scope / _binding_site_scope).
-                        "scope_file": str(helper.get("file") or ""),
-                        "scope_function": self._helper_callable_id(helper_key, helper),
-                        "scope_line": int(helper.get("line") or 0),
-                        "function": str(call.get("function") or ""),
-                        "callable_id": caller_callable,
-                        "synthetic_call_binding": True,
-                    }
+            receiver_output_match = bool(
+                possible_receiver_match
+                and self._helper_writes_receiver_member(helper_key, helper)
+            )
+            if not output_argument_match and not receiver_output_match:
+                continue
+            runtime_call = dict(source_call)
+            runtime_call["callable_id"] = scope_callable or caller
+            if _CALL_SCOPE_MARKER in scope_callable:
+                runtime_call["source_site_id"] = stable_id(
+                    "invocation",
+                    (scope_callable, self._call_site_id(source_call)),
                 )
-            self._register_pointer_output_call(
-                call,
+            self._register_call_instance(
+                runtime_call,
                 helper_key,
                 helper,
                 args,
-                caller_callable=caller_callable,
-                call_file=file,
-                call_line=line,
+                caller_callable=scope_callable or caller,
+            )
+            admitted = True
+        if not admitted:
+            return []
+        if terminal:
+            return self._writers_of(symbol_norm)
+        return self._scoped_writers(symbol_norm, symbol_raw, scope)
+
+    @staticmethod
+    def _call_site_id(call: dict[str, Any]) -> str:
+        explicit = str(call.get("source_site_id") or "")
+        if explicit:
+            return explicit
+        return stable_id(
+            "callsite",
+            (
+                str(call.get("file") or ""),
+                _base_callable_scope(
+                    str(call.get("callable_id") or call.get("function") or "")
+                ),
+                int(call.get("line") or 0),
+                str(call.get("name") or ""),
+                str(call.get("receiver") or ""),
+                tuple(str(arg).strip() for arg in (call.get("args") or [])),
+            ),
+        )
+
+    @staticmethod
+    def _identity_in_call_scope(
+        raw: Any, source_callable: str, call_scope: str
+    ) -> Any:
+        if not raw:
+            return raw
+        try:
+            identity = SourceSymbolIdentity.model_validate(raw)
+        except (TypeError, ValueError):
+            return raw
+        if identity.kind == "local" and identity.callable_id == source_callable:
+            identity = identity.model_copy(update={"callable_id": call_scope})
+        return identity.model_dump()
+
+    def _register_call_instance(
+        self,
+        call: dict[str, Any],
+        helper_key: tuple[str, str],
+        helper: dict[str, Any],
+        args: Sequence[str],
+        *,
+        caller_callable: str,
+    ) -> str:
+        helper_file = str(helper.get("file") or "")
+        helper_callable = self._helper_callable_id(helper_key, helper)
+        source_site_id = self._call_site_id(call)
+        call_scope = _callable_instance_scope(
+            helper_callable,
+            caller_callable=caller_callable,
+            source_site_id=source_site_id,
+        )
+        if call_scope in self._registered_call_instances:
+            return call_scope
+        self._registered_call_instances.add(call_scope)
+
+        caller_file = str(call.get("file") or "")
+        caller_line = int(call.get("line") or 0)
+        caller_predicates = [
+            str(value) for value in (call.get("control_predicates") or [])
+        ]
+        caller_predicate_lines = list(call.get("control_predicate_lines") or [])
+        caller_predicate_sites = list(
+            call.get("control_predicate_site_ids") or []
+        )
+        instance_bindings: list[dict[str, Any]] = []
+
+        # Clone source-definition bindings into this invocation scope. The
+        # source locations remain the callee's; only lexical/runtime identity
+        # changes. Caller reachability is conjoined with callee reachability.
+        for original in self._source_bindings:
+            if self._binding_target_scope(original) != (
+                helper_file,
+                helper_callable,
+            ):
+                continue
+            clone = dict(original)
+            callee_predicates = [
+                str(value)
+                for value in (original.get("control_predicates") or [])
+            ]
+            callee_lines = list(original.get("control_predicate_lines") or [])
+            callee_sites = list(
+                original.get("control_predicate_site_ids") or []
+            )
+            clone.update(
+                {
+                    "scope_file": helper_file,
+                    "scope_function": call_scope,
+                    "expression_scope_file": helper_file,
+                    "expression_scope_function": call_scope,
+                    "control_scope_file": helper_file,
+                    "control_scope_function": call_scope,
+                    "control_predicates": [
+                        *caller_predicates,
+                        *callee_predicates,
+                    ],
+                    "control_predicate_lines": [
+                        *caller_predicate_lines,
+                        *callee_lines,
+                    ],
+                    "control_predicate_site_ids": [
+                        *caller_predicate_sites,
+                        *callee_sites,
+                    ],
+                    "control_predicate_files": [
+                        *(caller_file for _ in caller_predicates),
+                        *(helper_file for _ in callee_predicates),
+                    ],
+                    "control_predicate_callables": [
+                        *(caller_callable for _ in caller_predicates),
+                        *(call_scope for _ in callee_predicates),
+                    ],
+                    "reachability_exact": bool(
+                        call.get("reachability_exact", True)
+                    )
+                    and bool(original.get("reachability_exact", True)),
+                    "call_site_id": source_site_id,
+                    "call_instance_scope": call_scope,
+                    "callable_id": call_scope,
+                }
+            )
+            clone["target_identity"] = self._identity_in_call_scope(
+                original.get("target_identity"), helper_callable, call_scope
+            )
+            clone["reference_identities"] = {
+                symbol: self._identity_in_call_scope(
+                    identity, helper_callable, call_scope
+                )
+                for symbol, identity in (
+                    original.get("reference_identities") or {}
+                ).items()
+            }
+            self._register_synthetic_binding(clone)
+            instance_bindings.append(clone)
+
+        formals = [str(value) for value in (helper.get("parameters") or [])]
+        output_formals = {
+            str(write.get("param") or "")
+            for write in (helper.get("pointer_output_writes") or [])
+        }
+        for formal, actual in zip(formals, args):
+            if not exact_symbol(formal):
+                continue
+            if formal in output_formals and not self._helper_reads_formal(
+                helper_callable, helper, formal
+            ):
+                continue
+            formal_identity = self._source_structure.symbol_identity(
+                formal,
+                file=helper_file,
+                callable_id=helper_callable,
+                function_name=str(helper.get("name") or ""),
+                function_parameters=formals,
+            )
+            self._register_synthetic_binding(
+                {
+                    "target_symbol": formal,
+                    "source_symbol": actual,
+                    "assignment_path": [
+                        {
+                            "file": caller_file,
+                            "line": caller_line,
+                            "expression": actual,
+                        }
+                    ],
+                    "logged_signal": "",
+                    "control_predicates": caller_predicates,
+                    "control_predicate_lines": caller_predicate_lines,
+                    "control_predicate_site_ids": caller_predicate_sites,
+                    "reachability_exact": bool(
+                        call.get("reachability_exact", True)
+                    ),
+                    "struct_variables": {},
+                    "scope_file": helper_file,
+                    "scope_function": call_scope,
+                    "scope_line": int(helper.get("line") or 0),
+                    "expression_scope_file": caller_file,
+                    "expression_scope_function": caller_callable,
+                    "control_scope_file": caller_file,
+                    "control_scope_function": caller_callable,
+                    "function": str(call.get("function") or ""),
+                    "callable_id": caller_callable,
+                    "target_identity": formal_identity.model_copy(
+                        update={"callable_id": call_scope}
+                    ).model_dump(),
+                    "synthetic_call_binding": True,
+                    "call_site_id": source_site_id,
+                    "call_instance_scope": call_scope,
+                }
+            )
+
+        self._register_pointer_output_call(
+            call,
+            helper_key,
+            helper,
+            args,
+            caller_callable=caller_callable,
+            call_file=caller_file,
+            call_line=caller_line,
+            call_scope=call_scope,
+        )
+        self._register_member_output_calls(
+            call,
+            helper,
+            instance_bindings,
+            caller_callable=caller_callable,
+            call_file=caller_file,
+            call_line=caller_line,
+            call_scope=call_scope,
+        )
+        return call_scope
+
+    def _helper_reads_formal(
+        self, helper_callable: str, helper: dict[str, Any], formal: str
+    ) -> bool:
+        """Whether source facts prove a value read through ``formal``."""
+        for binding in self._source_bindings:
+            if self._binding_target_scope(binding)[1] != helper_callable:
+                continue
+            texts = [
+                str(
+                    binding.get("source_symbol")
+                    or binding.get("expression")
+                    or ""
+                ),
+                *(str(value) for value in binding.get("control_predicates") or []),
+            ]
+            for text in texts:
+                for symbol in self._wire_symbols(text):
+                    root = symbol.replace("->", ".").split(".", 1)[0]
+                    if exact_symbol(root) == exact_symbol(formal):
+                        return True
+        helper_texts = [
+            str(helper.get("return_expression") or ""),
+            str(helper.get("lowered_return_expression") or ""),
+            *(str(value) for value in (helper.get("assignments") or {}).values()),
+        ]
+        return any(
+            any(
+                exact_symbol(symbol.replace("->", ".").split(".", 1)[0])
+                == exact_symbol(formal)
+                for symbol in self._wire_symbols(text)
+            )
+            for text in helper_texts
+        )
+
+    def _register_member_output_calls(
+        self,
+        call: dict[str, Any],
+        helper: dict[str, Any],
+        instance_bindings: Sequence[dict[str, Any]],
+        *,
+        caller_callable: str,
+        call_file: str,
+        call_line: int,
+        call_scope: str,
+    ) -> None:
+        """Expose source-proven receiver-member writes at the call site."""
+        receiver = str(call.get("receiver") or "").replace("->", ".").strip()
+        if not receiver:
+            # An unqualified same-object call writes the same member storage
+            # already represented by the callee's source binding. Projecting
+            # it back onto itself duplicates the entire callee once per caller
+            # and adds no storage identity information.
+            return
+        helper_callable = _base_callable_scope(call_scope)
+        helper_file = str(helper.get("file") or "")
+        formals = [str(value) for value in (helper.get("parameters") or [])]
+        seen: set[tuple[str, str]] = set()
+        for binding in instance_bindings:
+            target = str(
+                binding.get("target_symbol") or binding.get("target") or ""
+            )
+            if not target:
+                continue
+            identity = self._binding_target_identity(binding)
+            if identity is None:
+                identity = self._source_structure.symbol_identity(
+                    target,
+                    file=helper_file,
+                    callable_id=helper_callable,
+                    function_name=str(helper.get("name") or ""),
+                    function_parameters=formals,
+                )
+            if identity.kind != "member":
+                continue
+            member_path = target.replace("->", ".")
+            if member_path.startswith("this."):
+                member_path = member_path[5:]
+            caller_target = (
+                f"{receiver}.{member_path}" if receiver else member_path
+            )
+            key = (exact_symbol(caller_target), exact_symbol(target))
+            if key in seen:
+                continue
+            seen.add(key)
+            target_identity = self._source_structure.symbol_identity(
+                caller_target,
+                file=call_file,
+                callable_id=_base_callable_scope(caller_callable),
+                function_name=str(call.get("function") or ""),
+            )
+            self._register_synthetic_binding(
+                {
+                    "target_symbol": caller_target,
+                    "source_symbol": target,
+                    "assignment_path": [
+                        {
+                            "file": call_file,
+                            "line": call_line,
+                            "expression": target,
+                        }
+                    ],
+                    "logged_signal": "",
+                    "control_predicates": list(
+                        call.get("control_predicates") or []
+                    ),
+                    "control_predicate_lines": list(
+                        call.get("control_predicate_lines") or []
+                    ),
+                    "control_predicate_site_ids": list(
+                        call.get("control_predicate_site_ids") or []
+                    ),
+                    "reachability_exact": bool(
+                        call.get("reachability_exact", True)
+                    ),
+                    "struct_variables": {},
+                    "scope_file": call_file,
+                    "scope_function": caller_callable,
+                    "scope_line": call_line,
+                    "expression_scope_file": helper_file,
+                    "expression_scope_function": call_scope,
+                    "expression_scope_unordered": True,
+                    "control_scope_file": call_file,
+                    "control_scope_function": caller_callable,
+                    "function": str(call.get("function") or ""),
+                    "callable_id": caller_callable,
+                    "target_identity": target_identity.model_dump(),
+                    "synthetic_member_output_binding": True,
+                    "call_site_id": self._call_site_id(call),
+                    "call_instance_scope": call_scope,
+                }
             )
 
     def _register_synthetic_binding(self, binding: dict[str, Any]) -> None:
@@ -1081,20 +1771,24 @@ class _DAGBuilder:
         caller_callable: str,
         call_file: str,
         call_line: int,
+        call_scope: str,
     ) -> None:
         pointer_writes = list(helper.get("pointer_output_writes") or [])
         pointer_params = _pointer_param_positions(helper)
         if not pointer_writes or not pointer_params:
             return
         helper_file = str(helper.get("file") or "")
-        helper_callable = self._helper_callable_id(helper_key, helper)
         helper_line = int(helper.get("line") or 0)
         substituted = derive_pointer_output_bindings(
             pointer_writes, pointer_params, args
         )
         seen_effects: set[tuple[str, str]] = set()
         for entry in substituted:
-            formal_target = f"{entry['param']}.{entry['field']}"
+            formal_target = (
+                f"{entry['param']}.{entry['field']}"
+                if entry["field"]
+                else entry["param"]
+            )
             effect_key = (exact_symbol(entry["target"]), exact_symbol(formal_target))
             if effect_key in seen_effects:
                 continue
@@ -1103,7 +1797,7 @@ class _DAGBuilder:
                 binding
                 for binding in self._targets_matching(exact_symbol(formal_target))
                 if self._binding_target_scope(binding)
-                == (helper_file, helper_callable)
+                == (helper_file, call_scope)
             ]
             if not helper_writers:
                 # Provider-fetched helper records can arrive without their
@@ -1128,7 +1822,12 @@ class _DAGBuilder:
                             helper.get("struct_variables") or {}
                         ),
                         "function": str(helper.get("name") or ""),
-                        "callable_id": helper_callable,
+                        "scope_file": helper_file,
+                        "scope_function": call_scope,
+                        "expression_scope_file": helper_file,
+                        "expression_scope_function": call_scope,
+                        "callable_id": call_scope,
+                        "call_site_id": self._call_site_id(call),
                         "synthetic_pointer_helper_write": True,
                     }
                 )
@@ -1169,7 +1868,7 @@ class _DAGBuilder:
                     "scope_function": caller_callable,
                     "scope_line": call_line,
                     "expression_scope_file": helper_file,
-                    "expression_scope_function": helper_callable,
+                    "expression_scope_function": call_scope,
                     "expression_scope_unordered": True,
                     "control_scope_file": call_file,
                     "control_scope_function": caller_callable,
@@ -1177,6 +1876,8 @@ class _DAGBuilder:
                     "callable_id": caller_callable,
                     "target_identity": target_identity.model_dump(),
                     "synthetic_pointer_output_binding": True,
+                    "call_site_id": self._call_site_id(call),
+                    "call_instance_scope": call_scope,
                 }
             )
 
@@ -1214,6 +1915,20 @@ class _DAGBuilder:
                 ",".join(str(p) for p in (helper.get("parameters") or [])),
             ]
         )
+
+    def _helper_instance_key(
+        self,
+        helper_key: tuple[str, str],
+        invocation: _ExpressionCall,
+        caller_callable: str,
+    ) -> tuple[str, str, str]:
+        helper = self.helper_index[helper_key]
+        call_scope = _callable_instance_scope(
+            self._helper_callable_id(helper_key, helper),
+            caller_callable=caller_callable,
+            source_site_id=invocation.source_site_id,
+        )
+        return helper_key[0], helper_key[1], call_scope
 
     @staticmethod
     def _file_family(path: str) -> tuple[str, str]:
@@ -1258,9 +1973,10 @@ class _DAGBuilder:
         scope_function: str,
     ) -> SourceSymbolIdentity:
         canonical = exact_symbol(symbol_raw)
+        source_callable = _base_callable_scope(scope_function)
         if file and scope_function:
             candidates = self._reference_identities_by_scope.get(
-                (str(file), scope_function, canonical), []
+                (str(file), source_callable, canonical), []
             )
         elif file:
             candidates = self._reference_identities_by_file.get(
@@ -1268,23 +1984,30 @@ class _DAGBuilder:
             )
         elif scope_function:
             candidates = self._reference_identities_by_callable.get(
-                (scope_function, canonical), []
+                (source_callable, canonical), []
             )
         else:
             candidates = self._reference_identities_by_symbol.get(canonical, [])
         keys = {candidate.key() for candidate in candidates}
         if len(keys) == 1:
-            return candidates[0]
-        callable_record = self._source_structure.callables_by_id.get(scope_function) or {}
-        return self._source_structure.symbol_identity(
-            symbol_raw,
-            file=str(file or ""),
-            callable_id=scope_function,
-            function_name=str(callable_record.get("name") or ""),
-            function_parameters=[
-                str(value) for value in callable_record.get("parameters") or []
-            ],
-        )
+            identity = candidates[0]
+        else:
+            callable_record = (
+                self._source_structure.callables_by_id.get(source_callable) or {}
+            )
+            identity = self._source_structure.symbol_identity(
+                symbol_raw,
+                file=str(file or ""),
+                callable_id=source_callable,
+                function_name=str(callable_record.get("name") or ""),
+                function_parameters=[
+                    str(value)
+                    for value in callable_record.get("parameters") or []
+                ],
+            )
+        if identity.kind == "local" and scope_function != source_callable:
+            return identity.model_copy(update={"callable_id": scope_function})
+        return identity
 
     def _record_unresolved(
         self,
@@ -1303,7 +2026,9 @@ class _DAGBuilder:
             if kind == "symbol"
             else None
         )
-        owner = self._source_structure.callable_owner(scope_function)
+        owner = self._source_structure.callable_owner(
+            _base_callable_scope(scope_function)
+        )
         reference = UnresolvedSourceReference(
             symbol=symbol,
             kind=kind,
@@ -1343,6 +2068,28 @@ class _DAGBuilder:
             str(binding.get("control_scope_file") or site_file),
             self._bare_function(
                 binding.get("control_scope_function") or site_function
+            ),
+        )
+
+    def _binding_predicate_scope(
+        self, binding: dict[str, Any], position: int
+    ) -> tuple[str, str, Optional[int]]:
+        files = list(binding.get("control_predicate_files") or [])
+        callables = list(binding.get("control_predicate_callables") or [])
+        lines = list(binding.get("control_predicate_lines") or [])
+        default_file, default_callable = self._binding_control_scope(binding)
+        return (
+            str(files[position]) if position < len(files) else default_file,
+            self._bare_function(
+                callables[position]
+                if position < len(callables)
+                else default_callable
+            ),
+            (
+                int(lines[position])
+                if position < len(lines)
+                and isinstance(lines[position], (int, float))
+                else None
             ),
         )
 
@@ -1422,6 +2169,16 @@ class _DAGBuilder:
     ) -> list[dict[str, Any]]:
         scope_file, scope_function = scope[:2]
         scope_line = scope[2] if len(scope) > 2 else None
+        if _CALL_SCOPE_MARKER in scope_function:
+            # Runtime call instances share source identity but not storage for
+            # locals/formals. Resolve inside the exact invocation before the
+            # structural source-identity checks below.
+            target_writers = [
+                binding
+                for binding in target_writers
+                if self._binding_target_scope(binding)
+                == (scope_file, scope_function)
+            ]
         if scope_file and target_writers:
             reference = self._reference_identity(
                 symbol_raw, scope_file, scope_function
@@ -1548,7 +2305,18 @@ class _DAGBuilder:
         file = str(first_hop.get("file") or "") or None
         line_raw = first_hop.get("line")
         line = int(line_raw) if isinstance(line_raw, (int, float)) else None
-        op_id = self._make_id("op", (target_norm, expression, file or "", line or 0))
+        target_scope = self._binding_target_scope(binding)
+        op_id = self._make_id(
+            "op",
+            (
+                target_norm,
+                expression,
+                file or "",
+                line or 0,
+                target_scope[0],
+                target_scope[1],
+            ),
+        )
         return op_id, target_raw, file, line, target_norm, expression
 
     def _emit_operation_vertex(self, binding: dict[str, Any], *, is_terminal: bool) -> str:
@@ -1594,6 +2362,12 @@ class _DAGBuilder:
                 metadata["target_identity"] = dict(binding["target_identity"])
             if binding.get("synthetic_call_binding"):
                 metadata["synthetic_call_binding"] = True
+            if binding.get("call_site_id"):
+                metadata["call_site_id"] = str(binding["call_site_id"])
+            if binding.get("call_instance_scope"):
+                metadata["call_instance_scope"] = str(
+                    binding["call_instance_scope"]
+                )
             logged_signal = exact_symbol(str(binding.get("logged_signal") or ""))
             if logged_signal:
                 observed_placement = self._observed_signal_placement(logged_signal)
@@ -1659,7 +2433,11 @@ class _DAGBuilder:
         expression_line = self._binding_walk_scope(binding)[2]
         for symbol in self._wire_symbols(expression):
             normalized = exact_symbol(symbol)
-            if not normalized or normalized == target_norm:
+            if not normalized or (
+                normalized == target_norm
+                and not binding.get("synthetic_pointer_output_binding")
+                and not binding.get("synthetic_member_output_binding")
+            ):
                 continue
             producer_ids = self._resolve_symbol_producers(
                 normalized,
@@ -1669,37 +2447,52 @@ class _DAGBuilder:
                 expression_line,
                 scope_function=scope_function,
             )
+            if binding.get("synthetic_pointer_output_binding"):
+                producer_ids = [
+                    producer_id
+                    for producer_id in producer_ids
+                    if not bool(
+                        (self.vertices[producer_id].metadata or {}).get(
+                            "synthetic_call_binding"
+                        )
+                    )
+                ]
             for producer_id in producer_ids:
                 self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
         # Helper-call inputs.
-        for helper_call in self._find_helper_calls(
+        for invocation in self._find_helper_calls(
             expression,
             expression_file or file,
             scope_function=scope_function,
             line=expression_line,
         ):
             helper_key = self._pick_helper_key(
-                helper_call,
+                invocation.name,
                 expression_file or file,
                 scope_function=scope_function,
+                receiver=invocation.receiver,
+                argument_count=len(invocation.args),
             )
             if helper_key is None:
                 continue
-            helper_return_id = self._helper_subgraph_return_id.get(helper_key)
+            instance_key = self._helper_instance_key(
+                helper_key, invocation, scope_function
+            )
+            helper_return_id = self._helper_subgraph_return_id.get(instance_key)
             if helper_return_id:
                 self._add_edge(
                     helper_return_id,
                     op_id,
                     kind="data",
-                    role=f"call:{helper_call}",
-                    via=helper_call,
+                    role=f"call:{invocation.name}",
+                    via=invocation.source_site_id,
                 )
             # Wire the caller's actual arguments to the helper's formal
             # parameter vertices — one edge per positional match.
             self._wire_helper_call_arguments(
-                helper_call,
-                expression,
+                invocation,
+                instance_key,
                 expression_file or file,
                 expression_line,
                 scope_function=scope_function,
@@ -1709,8 +2502,8 @@ class _DAGBuilder:
             # dedupe with any source_assignments-derived vertex that
             # already covers the same call site.
             self._emit_helper_pointer_output_writes(
-                helper_call,
-                expression,
+                invocation,
+                instance_key,
                 file=expression_file or file,
                 line=expression_line,
                 scope_function=scope_function,
@@ -1718,8 +2511,8 @@ class _DAGBuilder:
 
     def _emit_helper_pointer_output_writes(
         self,
-        helper_call: str,
-        caller_expression: str,
+        invocation: _ExpressionCall,
+        instance_key: tuple[str, str, str],
         *,
         file: Optional[str],
         line: Optional[int],
@@ -1737,7 +2530,11 @@ class _DAGBuilder:
         for the same call site does not double-emit.
         """
         helper_key = self._pick_helper_key(
-            helper_call, file, scope_function=scope_function
+            invocation.name,
+            file,
+            scope_function=scope_function,
+            receiver=invocation.receiver,
+            argument_count=len(invocation.args),
         )
         if helper_key is None:
             return
@@ -1750,16 +2547,26 @@ class _DAGBuilder:
         pointer_params = _pointer_param_positions(helper)
         if not pointer_params:
             return
-        args = _extract_call_arguments(helper_call, caller_expression)
-        substituted = derive_pointer_output_bindings(pointer_writes, pointer_params, args)
+        substituted = derive_pointer_output_bindings(
+            pointer_writes, pointer_params, invocation.args
+        )
         helper_file = str(helper.get("file") or "")
-        helper_callable = self._helper_callable_id(helper_key, helper)
+        helper_callable = instance_key[2]
         helper_line = int(helper.get("line") or 0) or None
         for entry in substituted:
             target = entry["target"]
             expression = f"{entry['param']}.{entry['field']}"
             target_norm = exact_symbol(target)
-            op_id = self._make_id("op", (target_norm, expression, file or "", line or 0))
+            op_id = self._make_id(
+                "op",
+                (
+                    target_norm,
+                    expression,
+                    file or "",
+                    line or 0,
+                    instance_key[2],
+                ),
+            )
             if op_id not in self.vertices:
                 self.vertices[op_id] = DAGVertex(
                     id=op_id,
@@ -1771,6 +2578,10 @@ class _DAGBuilder:
                     variable=target,
                     expression=expression,
                     provenance=f"pointer_output:{helper_key[0]}@{helper_key[1]}",
+                    metadata={
+                        "call_site_id": invocation.source_site_id,
+                        "call_instance_scope": instance_key[2],
+                    },
                 )
                 self._index_producer(target_norm, op_id)
             producer_ids = self._resolve_symbol_producers(
@@ -1788,33 +2599,29 @@ class _DAGBuilder:
 
     def _wire_helper_call_arguments(
         self,
-        helper_call: str,
-        caller_expression: str,
+        invocation: _ExpressionCall,
+        instance_key: tuple[str, str, str],
         file: Optional[str],
         line: Optional[int],
         *,
         scope_function: str = "",
     ) -> None:
-        """Parse the ``helper_call(...)`` in ``caller_expression`` and wire
-        each positional argument to the helper's matching formal parameter
-        vertex.
-
-        Uses the first occurrence of ``helper_call(...)`` in the expression.
-        Multiple invocations in one expression get handled if they appear
-        as separate entries in the ``_find_helper_calls`` result — the
-        function is invoked once per name; a limitation on today's parser,
-        good enough for the RTL/airspeed cases.
-        """
+        """Wire one call occurrence's actuals to its private formals."""
         helper_key = self._pick_helper_key(
-            helper_call, file, scope_function=scope_function
+            invocation.name,
+            file,
+            scope_function=scope_function,
+            receiver=invocation.receiver,
+            argument_count=len(invocation.args),
         )
         if helper_key is None:
             return
-        formals = self._helper_parameter_vertices.get(helper_key)
+        formals = self._helper_parameter_vertices.get(instance_key)
         if not formals:
             return
-        args = _extract_call_arguments(helper_call, caller_expression)
-        for (formal_name, formal_vertex_id), arg_text in zip(formals, args):
+        for (formal_name, formal_vertex_id), arg_text in zip(
+            formals, invocation.args
+        ):
             for symbol in self._wire_symbols(arg_text):
                 normalized = exact_symbol(symbol)
                 if not normalized:
@@ -1833,7 +2640,7 @@ class _DAGBuilder:
                         formal_vertex_id,
                         kind="data",
                         role=f"arg:{formal_name}",
-                        via=helper_call,
+                        via=invocation.source_site_id,
                     )
 
     def _visible_reaching_producers(
@@ -1859,6 +2666,20 @@ class _DAGBuilder:
             return self.vertices[vertex_id].metadata or {}
 
         reference = self._reference_identity(symbol_raw, file, scope_function)
+        if _CALL_SCOPE_MARKER in scope_function:
+            instance_producers = [
+                producer_id
+                for producer_id in producers
+                if str(
+                    (metadata(producer_id).get("target_scope") or {}).get(
+                        "callable"
+                    )
+                    or ""
+                )
+                == scope_function
+            ]
+            if instance_producers:
+                producers = instance_producers
         visible: list[str] = []
         has_structured_producer = False
         for producer_id in producers:
@@ -1969,7 +2790,8 @@ class _DAGBuilder:
         # reaches the actual's logged placement
         # (``triplet.current.field``) instead of degrading to the nested
         # message name.
-        if "." in symbol_raw and symbol_norm not in self._rebinding_stack:
+        rebinding_key = (symbol_norm, str(file or ""), scope_function)
+        if "." in symbol_raw and rebinding_key not in self._rebinding_stack:
             root_raw, _, tail = symbol_raw.replace("->", ".").partition(".")
             root_norm = exact_symbol(root_raw)
             rebinders = [
@@ -1988,11 +2810,18 @@ class _DAGBuilder:
                 # actual) is an identity, not a rebinding.
                 and exact_symbol(str(b.get("source_symbol") or "")) != root_norm
             ]
-            targets = {str(b.get("source_symbol")).strip() for b in rebinders}
+            targets = {
+                (
+                    str(binding.get("source_symbol")).strip(),
+                    self._binding_walk_scope(binding),
+                )
+                for binding in rebinders
+            }
             if len(targets) == 1:
-                rewritten = f"{next(iter(targets))}.{tail}"
+                target, target_scope = next(iter(targets))
+                rewritten = f"{target}.{tail}"
                 if exact_symbol(rewritten) != symbol_norm:
-                    self._rebinding_stack.add(symbol_norm)
+                    self._rebinding_stack.add(rebinding_key)
                     try:
                         # A failed rewrite must not hijack resolution:
                         # when the rewritten form classifies to nothing,
@@ -2003,15 +2832,31 @@ class _DAGBuilder:
                             exact_symbol(rewritten),
                             rewritten,
                             source_expression,
-                            file,
-                            line,
-                            scope_function=scope_function,
+                            target_scope[0],
+                            target_scope[2],
+                            scope_function=target_scope[1],
                             emit_opaque=False,
                         )
                     finally:
-                        self._rebinding_stack.discard(symbol_norm)
+                        self._rebinding_stack.discard(rebinding_key)
                     if rebound:
                         return rebound
+                    if any(
+                        binding.get("synthetic_call_binding")
+                        for binding in rebinders
+                    ):
+                        # A formal-to-actual binding is syntax-proven, so an
+                        # unresolved rewritten leaf belongs to the caller's
+                        # storage identity, not to the callee formal name.
+                        return self._resolve_symbol_producers(
+                            exact_symbol(rewritten),
+                            rewritten,
+                            source_expression,
+                            target_scope[0],
+                            target_scope[2],
+                            scope_function=target_scope[1],
+                            emit_opaque=True,
+                        )
 
         # 2a. Graph-native derivation: if ``source_expression`` contains a
         # ``symbol_raw().field`` chain, resolve it via the helper's
@@ -2533,6 +3378,7 @@ class _DAGBuilder:
             str(file or ""),
             int(line or 0),
             str(source_site_id or ""),
+            str(scope_function or ""),
         )
         existing = self._branch_by_site.get(site_key)
         if existing is not None:
@@ -2589,39 +3435,88 @@ class _DAGBuilder:
         *,
         scope_function: str = "",
         line: Optional[int] = None,
-    ) -> list[str]:
-        """Return source-resolved helper calls and record unresolved calls."""
-        matches: list[str] = []
-        seen: set[str] = set()
+    ) -> list[_ExpressionCall]:
+        """Return each source-resolved call occurrence in ``expression``.
+
+        Resolution is frontier-driven: this is the only path that may ask
+        the provider for a missing expression callee. Every occurrence keeps
+        a distinct site identity, including repeated calls with the same name
+        on one source line.
+        """
+        matches: list[_ExpressionCall] = []
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression):
             candidate = match.group(1)
-            if candidate in seen:
-                continue
             if candidate in _NON_CALL_SYNTAX or is_safe_math_function_name(candidate):
                 continue
-            seen.add(candidate)
             prefix = expression[: match.start()]
             receiver_match = re.search(
                 r"([A-Za-z_][A-Za-z0-9_.]*(?:\[[^\]]+\])?)\s*(?:\.|->)\s*$",
                 prefix,
             )
             receiver = receiver_match.group(1) if receiver_match else ""
+            if receiver and self._match_parameter(
+                f"{receiver}.{candidate}"
+            ) is not None:
+                continue
             close = self._matching_parenthesis(expression, match.end() - 1)
-            argument_count = None
-            if close is not None:
-                raw_args = expression[match.end() : close]
-                argument_count = len(
-                    [arg for arg in split_top_level_args(raw_args) if arg.strip()]
+            if close is None:
+                continue
+            raw_args = expression[match.end() : close]
+            args = tuple(
+                arg.strip()
+                for arg in split_top_level_args(raw_args)
+                if arg.strip()
+            )
+            lookup_key = (
+                str(scope_file or ""),
+                _base_callable_scope(scope_function),
+                int(line or 0),
+                candidate,
+                args,
+            )
+            source_record = next(
+                (
+                    call
+                    for call in self._calls_by_site.get(lookup_key, ())
+                    if str(call.get("receiver") or "") == receiver
+                ),
+                None,
+            )
+            source_site_id = (
+                self._call_site_id(source_record)
+                if source_record is not None
+                else stable_id(
+                    "callsite",
+                    (
+                        str(scope_file or ""),
+                        _base_callable_scope(scope_function),
+                        int(line or 0),
+                        match.start(),
+                        candidate,
+                        receiver,
+                        args,
+                    ),
                 )
-            if self._pick_helper_key(
+            )
+            # A source site nested under two different parent invocations is
+            # two runtime instances even though its AST node is shared.
+            runtime_site_id = (
+                stable_id("invocation", (scope_function, source_site_id))
+                if _CALL_SCOPE_MARKER in scope_function
+                else source_site_id
+            )
+            helper_key = self._pick_helper_key(
                 candidate,
                 scope_file,
                 scope_function=scope_function,
                 receiver=receiver,
-                argument_count=argument_count,
-            ) is not None:
-                matches.append(candidate)
-            else:
+                receiver_type_hint=str(
+                    (source_record or {}).get("receiver_type") or ""
+                ),
+                argument_count=len(args),
+                allow_provider=True,
+            )
+            if helper_key is None:
                 self._record_unresolved(
                     f"{receiver}.{candidate}" if receiver else candidate,
                     kind="callable",
@@ -2630,8 +3525,38 @@ class _DAGBuilder:
                     scope_function=scope_function,
                     source_expression=expression,
                     receiver=receiver,
-                    argument_count=argument_count,
+                    argument_count=len(args),
                 )
+                continue
+            helper = self.helper_index.get(helper_key) or {}
+            runtime_call = dict(source_record or {})
+            runtime_call.update(
+                {
+                    "name": candidate,
+                    "receiver": receiver,
+                    "args": list(args),
+                    "file": str(scope_file or ""),
+                    "line": int(line or 0),
+                    "callable_id": scope_function,
+                    "source_site_id": runtime_site_id,
+                }
+            )
+            self._register_call_instance(
+                runtime_call,
+                helper_key,
+                helper,
+                args,
+                caller_callable=scope_function,
+            )
+            matches.append(
+                _ExpressionCall(
+                    name=candidate,
+                    receiver=receiver,
+                    args=args,
+                    offset=match.start(),
+                    source_site_id=runtime_site_id,
+                )
+            )
         return matches
 
     @staticmethod
@@ -2648,7 +3573,7 @@ class _DAGBuilder:
 
     def _materialize_helper_subgraph(
         self,
-        helper_name: str,
+        invocation: _ExpressionCall,
         *,
         wire_edges: bool = True,
         scope_file: Optional[str] = None,
@@ -2656,25 +3581,33 @@ class _DAGBuilder:
     ) -> Optional[str]:
         """Emit the helper's body as nested vertices, return its output vertex id.
 
-        Memoized by ``(helper_name, class_context)``. Preserves every
+        Memoized by source callable plus call site. Preserves every
         intermediate assignment as its own vertex — no collapsing.
 
         When ``wire_edges`` is False, only vertices are emitted (pass 1).
         Edges are wired by :meth:`_wire_helper_subgraph_edges` in pass 2.
         """
         helper_key = self._pick_helper_key(
-            helper_name, scope_file, scope_function=scope_function
+            invocation.name,
+            scope_file,
+            scope_function=scope_function,
+            receiver=invocation.receiver,
+            argument_count=len(invocation.args),
         )
         if helper_key is None:
             return None
-        cached = self._helper_subgraph_return_id.get(helper_key)
+        instance_key = self._helper_instance_key(
+            helper_key, invocation, scope_function
+        )
+        self._helper_instance_site[instance_key] = invocation.source_site_id
+        cached = self._helper_subgraph_return_id.get(instance_key)
         if cached is not None:
             return cached or None
 
         helper = self.helper_index[helper_key]
         file = helper.get("file")
         line = helper.get("line")
-        scope_function = self._helper_callable_id(helper_key, helper)
+        scope_function = instance_key[2]
 
         # Emit a helper_parameter vertex for each formal so callers can
         # wire their actual arguments into shared entry points and helper
@@ -2684,7 +3617,16 @@ class _DAGBuilder:
             formal_str = str(formal)
             if not formal_str:
                 continue
-            param_id = self._make_id("ev", ("helper_param", helper_key[0], helper_key[1], formal_str))
+            param_id = self._make_id(
+                "ev",
+                (
+                    "helper_param",
+                    helper_key[0],
+                    helper_key[1],
+                    invocation.source_site_id,
+                    formal_str,
+                ),
+            )
             if param_id not in self.vertices:
                 self.vertices[param_id] = DAGVertex(
                     id=param_id,
@@ -2693,14 +3635,27 @@ class _DAGBuilder:
                     file=file,
                     line=line,
                     signal_name=formal_str,
-                    metadata={"helper": f"{helper_key[0]}@{helper_key[1]}"},
+                    metadata={
+                        "helper": f"{helper_key[0]}@{helper_key[1]}",
+                        "call_site_id": invocation.source_site_id,
+                        "call_instance_scope": scope_function,
+                    },
                 )
             formals.append((formal_str, param_id))
-        self._helper_parameter_vertices[helper_key] = formals
+        self._helper_parameter_vertices[instance_key] = formals
 
         for var, expression in (helper.get("assignments") or {}).items():
             var_norm = exact_symbol(var)
-            op_id = self._make_id("op", (helper_key[0], helper_key[1], var_norm, expression))
+            op_id = self._make_id(
+                "op",
+                (
+                    helper_key[0],
+                    helper_key[1],
+                    invocation.source_site_id,
+                    var_norm,
+                    expression,
+                ),
+            )
             if op_id not in self.vertices:
                 self.vertices[op_id] = DAGVertex(
                     id=op_id,
@@ -2717,6 +3672,8 @@ class _DAGBuilder:
                         "target_scope": {"file": str(file or ""), "callable": scope_function},
                         "site_scope": {"file": str(file or ""), "callable": scope_function},
                         "reachability": {"all_of": [], "exact": False},
+                        "call_site_id": invocation.source_site_id,
+                        "call_instance_scope": scope_function,
                     },
                 )
                 self._index_producer(var_norm, op_id)
@@ -2726,12 +3683,18 @@ class _DAGBuilder:
             or helper.get("return_expression")
         )
         if not return_expression:
-            self._helper_subgraph_return_id[helper_key] = ""
+            self._helper_subgraph_return_id[instance_key] = ""
             return None
 
         terminal_id = self._make_id(
             "op",
-            (helper_key[0], helper_key[1], "__return__", return_expression),
+            (
+                helper_key[0],
+                helper_key[1],
+                invocation.source_site_id,
+                "__return__",
+                return_expression,
+            ),
         )
         if terminal_id not in self.vertices:
             self.vertices[terminal_id] = DAGVertex(
@@ -2741,7 +3704,7 @@ class _DAGBuilder:
                 file=file,
                 line=line,
                 snippet=self._snippet(file, line),
-                variable=f"{helper_key[1]}::__return__",
+                variable=f"{scope_function}::__return__",
                 expression=return_expression,
                 lowered_expression=return_expression,
                 provenance=f"helper_return:{helper_key[0]}@{helper_key[1]}",
@@ -2750,21 +3713,27 @@ class _DAGBuilder:
                     "target_scope": {"file": str(file or ""), "callable": scope_function},
                     "site_scope": {"file": str(file or ""), "callable": scope_function},
                     "reachability": {"all_of": [], "exact": False},
+                    "call_site_id": invocation.source_site_id,
+                    "call_instance_scope": scope_function,
                 },
             )
-        self._helper_subgraph_return_id[helper_key] = terminal_id
+        self._helper_subgraph_return_id[instance_key] = terminal_id
 
         if wire_edges:
-            self._wire_helper_subgraph_edges(helper_key)
+            self._wire_helper_subgraph_edges(instance_key)
         return terminal_id
 
-    def _wire_helper_subgraph_edges(self, helper_key: tuple[str, str]) -> None:
+    def _wire_helper_subgraph_edges(
+        self, instance_key: tuple[str, str, str]
+    ) -> None:
+        helper_key = instance_key[:2]
         helper = self.helper_index.get(helper_key)
         if not helper:
             return
         file = helper.get("file")
         line = helper.get("line")
-        scope_function = self._helper_callable_id(helper_key, helper)
+        scope_function = instance_key[2]
+        call_site_id = self._helper_instance_site.get(instance_key, "")
 
         # Helper-scoped local resolver: formal parameter names bind to
         # their formal-parameter vertex before falling back to the global
@@ -2772,12 +3741,21 @@ class _DAGBuilder:
         # helpers happen to share a formal name (``float x``).
         local_scope = {
             exact_symbol(formal): vertex_id
-            for formal, vertex_id in self._helper_parameter_vertices.get(helper_key, ())
+            for formal, vertex_id in self._helper_parameter_vertices.get(instance_key, ())
         }
 
         for var, expression in (helper.get("assignments") or {}).items():
             var_norm = exact_symbol(var)
-            op_id = self._make_id("op", (helper_key[0], helper_key[1], var_norm, expression))
+            op_id = self._make_id(
+                "op",
+                (
+                    helper_key[0],
+                    helper_key[1],
+                    call_site_id,
+                    var_norm,
+                    expression,
+                ),
+            )
             for symbol in self._wire_symbols(str(expression)):
                 normalized = exact_symbol(symbol)
                 if not normalized or normalized == var_norm:
@@ -2806,7 +3784,13 @@ class _DAGBuilder:
         if return_expression:
             terminal_id = self._make_id(
                 "op",
-                (helper_key[0], helper_key[1], "__return__", return_expression),
+                (
+                    helper_key[0],
+                    helper_key[1],
+                    call_site_id,
+                    "__return__",
+                    return_expression,
+                ),
             )
             for symbol in self._wire_symbols(str(return_expression)):
                 normalized = exact_symbol(symbol)
@@ -2876,6 +3860,7 @@ class _DAGBuilder:
         receiver: str = "",
         receiver_type_hint: str = "",
         argument_count: Optional[int] = None,
+        allow_provider: bool = False,
     ) -> Optional[tuple[str, str]]:
         """Resolve a callable from receiver type, owner lineage, and arity.
 
@@ -2898,6 +3883,8 @@ class _DAGBuilder:
         matches = matching_keys()
         if not matches:
             if (
+                not allow_provider
+                or
                 self.helper_body_provider is None
                 or (helper_name, scope_function, receiver, argument_count)
                 in self._helper_provider_probed
@@ -2909,8 +3896,10 @@ class _DAGBuilder:
                 symbol=helper_name,
                 kind="callable",
                 file=str(scope_file or ""),
-                callable_id=scope_function,
-                class_owner=self._source_structure.callable_owner(scope_function),
+                callable_id=_base_callable_scope(scope_function),
+                class_owner=self._source_structure.callable_owner(
+                    _base_callable_scope(scope_function)
+                ),
                 receiver=receiver,
                 argument_count=argument_count,
             )
@@ -2927,7 +3916,9 @@ class _DAGBuilder:
             matches = matching_keys()
         if not matches:
             return None
-        caller_owner = self._source_structure.callable_owner(scope_function)
+        caller_owner = self._source_structure.callable_owner(
+            _base_callable_scope(scope_function)
+        )
         receiver_type = str(receiver_type_hint or "").rstrip("*& ").split("<", 1)[0].strip()
         receiver_root = receiver.replace("->", ".").split(".", 1)[0].lstrip("&*")
         if not receiver_type and caller_owner and receiver_root:
@@ -4026,13 +5017,13 @@ def read_dag_from_cache(path: Path) -> Optional[MechanismDAG]:
 
 
 def _pointer_param_positions(helper: dict[str, Any]) -> dict[str, int]:
-    """Return {formal_name → positional index} for pointer parameters.
+    """Return positions of source-proven pointer/reference outputs.
 
     The profiler stamps ``pointer_output_writes`` with the FORMAL name; the
     DAG builder needs the positional index to look up the caller's actual
     argument. Positions are inferred from ``parameters`` order; type info
-    ``*`` vs ``&`` is dropped since the profiler already gated on it when
-    it decided the write was routable.
+    ``*`` vs ``&`` is intentionally not needed here: the profiler only emits
+    an entry after syntax proves alias-capable storage and a write through it.
     """
     positions: dict[str, int] = {}
     formals = helper.get("parameters") or []
@@ -4074,7 +5065,7 @@ def derive_pointer_output_bindings(
         field = str(write.get("field") or "")
         expression = str(write.get("expression") or "")
         index = pointer_params.get(param)
-        if index is None or index >= len(call_args) or not field or not expression:
+        if index is None or index >= len(call_args) or not expression:
             continue
         arg = str(call_args[index]).strip().lstrip("&").strip()
         if not arg:
@@ -4082,7 +5073,7 @@ def derive_pointer_output_bindings(
         results.append({
             "param": param,
             "field": field,
-            "target": f"{arg}.{field}",
+            "target": f"{arg}.{field}" if field else arg,
             "expression": expression,
         })
     return results

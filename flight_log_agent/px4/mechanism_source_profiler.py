@@ -181,10 +181,12 @@ class HelperExpressionRef(BaseModel):
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
     call_resolutions: List[Dict[str, Any]] = Field(default_factory=list)
     helper_calls: List[str] = Field(default_factory=list)
-    # Pointer-output writes carried on the helper record so the DAG builder
+    # Alias-output writes carried on the helper record so the DAG builder
     # can emit graph-native operations at each call site (target derived
     # from the caller's actual arg). Each entry is
     # ``{"param": <formal>, "field": <dotted field>, "expression": <RHS>}``.
+    # The historical field name is retained for schema compatibility; entries
+    # may be proven through pointer or reference parameters.
     pointer_output_writes: List[Dict[str, str]] = Field(default_factory=list)
     # Raw C++ return type extracted from the function signature so the DAG
     # can derive source→logged bindings without the flat ``symbol_bindings``
@@ -1284,7 +1286,7 @@ class MechanismSourceProfiler:
 
     @staticmethod
     def _function_pointer_params(definition: Dict[str, Any]) -> Dict[str, int]:
-        """Map pointer parameter name → positional index for a function."""
+        """Map pointer/reference parameter name to positional index."""
         names = definition.get("params") or []
         evidence = str(definition.get("evidence") or "")
         match = re.search(r"\(([^()]*)\)", evidence)
@@ -1296,10 +1298,10 @@ class MechanismSourceProfiler:
             stripped = raw.strip()
             if not stripped or stripped == "void":
                 continue
-            if "*" not in stripped:
+            if "*" not in stripped and "&" not in stripped:
                 continue
             for name in names:
-                if re.search(rf"\*\s*{re.escape(name)}\b", stripped):
+                if re.search(rf"[*&]\s*{re.escape(name)}\b", stripped):
                     out[name] = index
                     break
         return out

@@ -515,6 +515,25 @@ void fill(output_s *sp, float value)
     ]
 
 
+def test_helper_metadata_derives_reference_output_writes(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+void fill(float value, output_s &out, float &direct)
+{
+    out.alt = value;
+    direct = value * 2.0f;
+}
+""",
+    )
+
+    helper = next(item for item in facts.helper_expressions if item.name == "fill")
+    assert helper.pointer_output_writes == [
+        {"param": "out", "field": "alt", "expression": "value"},
+        {"param": "direct", "field": "", "expression": "value * 2.0"},
+    ]
+
+
 def test_tree_sitter_literal_for_loop_uses_step_ir(tmp_path):
     facts = _facts(
         tmp_path,

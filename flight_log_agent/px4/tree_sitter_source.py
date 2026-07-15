@@ -284,16 +284,26 @@ class TreeSitterSourceExtractor:
         self.profiler = profiler
         self.parser = Parser(_CPP_LANGUAGE)
         self._units: dict[str, Optional[_ParsedUnit]] = {}
+        self._fully_structured_units: set[str] = set()
+        self._paths_by_file: dict[str, list[Path]] = {}
+
+    def _source_family_paths(self, file_path: str) -> list[Path]:
+        cached = self._paths_by_file.get(file_path)
+        if cached is not None:
+            return list(cached)
+        primary_path = self.profiler._resolve_file(file_path)
+        paths = self.profiler._expand_companion_files([primary_path])
+        if all(self.profiler._rel(path) != file_path for path in paths):
+            paths.insert(0, primary_path)
+        self._paths_by_file[file_path] = list(paths)
+        return paths
 
     def extract(self, file_path: str, source_hash: str):
         # Imported lazily to keep the legacy profiler usable when the optional
         # parser dependency has not been installed yet.
         from flight_log_agent.px4.source_facts_cache import SourceFileFacts
 
-        primary_path = self.profiler._resolve_file(file_path)
-        paths = self.profiler._expand_companion_files([primary_path])
-        if all(self.profiler._rel(path) != file_path for path in paths):
-            paths.insert(0, primary_path)
+        paths = self._source_family_paths(file_path)
         units = [unit for path in paths if (unit := self._parse(path)) is not None]
         primary = next((unit for unit in units if unit.file == file_path), None)
         if primary is None:
@@ -361,21 +371,178 @@ class TreeSitterSourceExtractor:
             includes=primary.includes,
         )
 
-    def _parse(self, path: Path) -> Optional[_ParsedUnit]:
+    def extract_admission(
+        self,
+        file_path: str,
+        source_hash: str,
+        *,
+        kind: str,
+        symbol: str,
+    ):
+        """Extract only facts needed to admit one expansion candidate.
+
+        This uses the same parsed AST and source-fact constructors as full
+        extraction. Callable/class admission needs structure only. Symbol and
+        constant admission extracts assignments only from callables whose AST
+        text contains the requested identifier, plus source-level constants.
+        No candidate count or source-search budget is applied.
+        """
+        from flight_log_agent.px4.source_facts_cache import SourceFileFacts
+
+        paths = self._source_family_paths(file_path)
+        units = [
+            unit
+            for path in paths
+            if (unit := self._parse(path, full_structure=False)) is not None
+        ]
+        primary = next((unit for unit in units if unit.file == file_path), None)
+        if primary is None:
+            return SourceFileFacts(
+                file=file_path,
+                source_hash=source_hash,
+                parser_backend="tree_sitter:admission",
+                parse_diagnostics={"error": "source file could not be read"},
+            )
+
+        self._resolve_class_bases(units)
+        assignments: list[SourceAssignmentRef] = []
+        if kind in {"symbol", "constant"}:
+            requested = str(symbol or "").replace("->", ".")
+            root_match = re.search(r"[A-Za-z_][A-Za-z0-9_]*", requested)
+            requested_root = root_match.group(0) if root_match else ""
+            for callable_item in primary.callables:
+                body_text = primary.text(callable_item.body)
+                if requested_root and not re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(requested_root)}(?![A-Za-z0-9_])",
+                    body_text,
+                ):
+                    continue
+                assignments.extend(
+                    self._admission_assignments(primary, callable_item)
+                )
+            assignments.extend(self._extract_global_constants(primary))
+
+        return SourceFileFacts(
+            file=file_path,
+            source_hash=source_hash,
+            parser_backend="tree_sitter:admission",
+            # Detailed diagnostics walk the entire AST and are part of full
+            # extraction. Admission only needs to fail closed on a parser
+            # error; exact candidates are fully extracted immediately after.
+            parse_diagnostics={
+                "has_error": bool(primary.tree.root_node.has_error)
+            },
+            source_assignments=self._dedupe(assignments),
+            classes=primary.classes,
+            members=primary.members,
+            callables=[
+                SourceCallableRef(
+                    name=item.name,
+                    owner=item.owner,
+                    file=item.file,
+                    line=item.line,
+                    end_line=item.end_line,
+                    callable_id=item.callable_id,
+                    parameters=item.parameters,
+                    parameter_types=item.parameter_types,
+                    return_type=item.return_type,
+                )
+                for item in primary.callables
+            ],
+            includes=primary.includes,
+        )
+
+    def _admission_assignments(
+        self, unit: _ParsedUnit, callable_item: _Callable
+    ) -> list[SourceAssignmentRef]:
+        """Collect raw AST write targets without full callable extraction."""
+        assignments: list[SourceAssignmentRef] = []
+        seen: set[tuple[int, int]] = set()
+        for node in _walk_operations(callable_item.body):
+            target_node: Optional[Node] = None
+            value_node: Optional[Node] = None
+            operator = "="
+            if node.type == "assignment_expression":
+                target_node = node.child_by_field_name("left")
+                value_node = node.child_by_field_name("right")
+                if target_node is not None and value_node is not None:
+                    operator = unit.source[
+                        target_node.end_byte : value_node.start_byte
+                    ].decode("utf-8", errors="replace").strip()
+            elif node.type == "init_declarator":
+                declarator = node.child_by_field_name("declarator")
+                target_node = _last_identifier(declarator)
+                value_node = node.child_by_field_name("value")
+            if target_node is None or value_node is None:
+                continue
+            site = (node.start_byte, node.end_byte)
+            if site in seen:
+                continue
+            seen.add(site)
+            target = self._canonical_symbol(unit.text(target_node))
+            if not target:
+                continue
+            expression = self.profiler._normalize_source_expression(
+                _strip_initializer_delimiters(unit.text(value_node))
+            )
+            assignments.append(
+                SourceAssignmentRef(
+                    target=target,
+                    expression=expression,
+                    assignment_operator=operator,
+                    file=unit.file,
+                    line=unit.line(node),
+                    evidence=unit.evidence(node),
+                    function=callable_item.name,
+                    callable_id=callable_item.callable_id,
+                    function_parameters=list(callable_item.parameters),
+                    source_site_id=unit.site_id(node),
+                )
+            )
+        return assignments
+
+    def _parse(
+        self, path: Path, *, full_structure: bool = True
+    ) -> Optional[_ParsedUnit]:
         file = self.profiler._rel(path)
         if file in self._units:
-            return self._units[file]
-        text = self.profiler._read_text(path)
-        if text is None:
-            self._units[file] = None
-            return None
-        source = text.encode("utf-8")
-        unit = _ParsedUnit(file=file, source=source, tree=self.parser.parse(source))
-        self._extract_structure(unit, path)
-        self._units[file] = unit
+            unit = self._units[file]
+            if unit is None:
+                return None
+        else:
+            text = self.profiler._read_text(path)
+            if text is None:
+                self._units[file] = None
+                return None
+            source = text.encode("utf-8")
+            unit = _ParsedUnit(
+                file=file, source=source, tree=self.parser.parse(source)
+            )
+            self._units[file] = unit
+            self._extract_structure(
+                unit, path, include_lambdas=full_structure
+            )
+            if full_structure:
+                self._fully_structured_units.add(file)
+            return unit
+        if full_structure and file not in self._fully_structured_units:
+            unit.classes.clear()
+            unit.members.clear()
+            unit.callables.clear()
+            unit.includes.clear()
+            unit.class_ranges.clear()
+            unit.namespace_ranges.clear()
+            self._extract_structure(unit, path, include_lambdas=True)
+            self._fully_structured_units.add(file)
         return unit
 
-    def _extract_structure(self, unit: _ParsedUnit, path: Path) -> None:
+    def _extract_structure(
+        self,
+        unit: _ParsedUnit,
+        path: Path,
+        *,
+        include_lambdas: bool,
+    ) -> None:
         self._extract_classes(unit, unit.tree.root_node, None, ())
         existing_members = {(item.owner, item.name) for item in unit.members}
         for name, member, owner, template in self._parameter_declarations(unit):
@@ -391,7 +558,9 @@ class TreeSitterSourceExtractor:
                 )
             )
             existing_members.add((owner, member))
-        self._extract_callables(unit)
+        self._extract_callables(unit, include_lambdas=include_lambdas)
+        if not include_lambdas:
+            return
         for node in _walk(unit.tree.root_node):
             if node.type != "preproc_include":
                 continue
@@ -545,7 +714,9 @@ class TreeSitterSourceExtractor:
             )
         return refs
 
-    def _extract_callables(self, unit: _ParsedUnit) -> None:
+    def _extract_callables(
+        self, unit: _ParsedUnit, *, include_lambdas: bool = True
+    ) -> None:
         # Materialize before traversing each declarator. py-tree-sitter's
         # child cursors are not safe to traverse re-entrantly from a suspended
         # recursive generator on some grammar/backend combinations.
@@ -635,7 +806,8 @@ class TreeSitterSourceExtractor:
                     evidence=evidence,
                 )
             )
-        self._extract_lambdas(unit, definitions)
+        if include_lambdas:
+            self._extract_lambdas(unit, definitions)
 
     def _extract_lambdas(
         self, unit: _ParsedUnit, parent_definitions: Sequence[Node]
@@ -2465,21 +2637,24 @@ class TreeSitterSourceExtractor:
             assignment.target: assignment.expression
             for assignment in state.assignments
         }
-        pointer_params = {
+        output_alias_params = {
             name
             for name, type_text in zip(
                 state.callable.parameters, state.callable.parameter_types
             )
-            if "*" in type_text
+            if "*" in type_text or "&" in type_text
         }
         pointer_writes: list[dict[str, str]] = []
         for assignment in state.assignments:
             root, field_name = split_source_field(assignment.target)
-            if root in pointer_params and field_name:
+            # The declaration proves aliasing; an actual assignment through
+            # that alias proves output behavior. This covers pointers and
+            # non-const references without guessing from helper names.
+            if root in output_alias_params:
                 pointer_writes.append(
                     {
                         "param": root,
-                        "field": field_name,
+                        "field": field_name or "",
                         "expression": assignment.expression,
                     }
                 )

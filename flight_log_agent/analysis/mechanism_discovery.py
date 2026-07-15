@@ -355,8 +355,6 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
 
         for call in entry.get("function_calls") or []:
             call_dict = _as_dict(call)
-            if not call_dict.get("args"):
-                continue
             key = (
                 str(call_dict.get("source_site_id") or ""),
                 str(call_dict.get("callable_id") or ""),

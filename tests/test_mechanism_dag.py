@@ -253,7 +253,7 @@ def test_unresolved_symbol_becomes_opaque_evidence():
     assert "some_unresolved_thing" in dag.unresolved_symbols
 
 
-def test_helper_body_preserves_intermediates_and_reuses_subgraph():
+def test_helper_body_preserves_intermediates_per_call_site():
     helper = _fake_helper(
         name="RTL::calc_cone_alt",
         file="src/modules/navigator/rtl.cpp",
@@ -310,13 +310,26 @@ def test_helper_body_preserves_intermediates_and_reuses_subgraph():
         for v in dag.vertices
         if v.provenance and v.provenance.startswith("helper_return")
     ]
-    assert len(helper_terminals) == 1, "helper subgraph should be reused across callers"
+    assert len(helper_terminals) == 2
+    assert len(
+        {
+            terminal.metadata.get("call_site_id")
+            for terminal in helper_terminals
+        }
+    ) == 2
 
     caller_op_ids = {
         v.id for v in dag.vertices if v.variable in {"_rtl_alt", "_alt_snapshot"}
     }
-    via_edges = [e for e in dag.edges if e.via == "calc_cone_alt" and e.target_id in caller_op_ids]
+    via_edges = [
+        edge
+        for edge in dag.edges
+        if edge.kind == "data"
+        and edge.target_id in caller_op_ids
+        and edge.source_id in {terminal.id for terminal in helper_terminals}
+    ]
     assert len(via_edges) == 2
+    assert len({edge.source_id for edge in via_edges}) == 2
 
 
 def test_dag_terminal_is_recorded():
@@ -1117,6 +1130,538 @@ def test_short_call_statement_name_is_not_filtered_by_spelling():
         vertex.kind == "operation" and vertex.variable == "value"
         for vertex in dag.vertices
     )
+
+
+def test_exact_local_terminal_is_selected_before_call_context_cloning():
+    helper_callable = "helper.cpp:10:gen:value"
+    caller_callable = "caller.cpp:1:run:"
+    helper = _fake_helper(
+        name="gen",
+        file="helper.cpp",
+        line=10,
+        evidence="void gen(float value)",
+        assignments={"state": "value"},
+        return_expression="",
+    )
+    helper.update(
+        {
+            "callable_id": helper_callable,
+            "parameters": ["value"],
+        }
+    )
+    writer = _fake_binding(
+        binding_id="state",
+        target="state",
+        expression="value",
+        file="helper.cpp",
+        line=12,
+        logged_signal="",
+        function="gen",
+    )
+    writer["callable_id"] = helper_callable
+    writer["function_parameters"] = ["value"]
+    structure = SourceStructureIndex(
+        callables_by_id={
+            helper_callable: {
+                "callable_id": helper_callable,
+                "name": "gen",
+                "parameters": ["value"],
+            },
+            caller_callable: {
+                "callable_id": caller_callable,
+                "name": "run",
+                "parameters": [],
+            },
+        }
+    )
+    enriched_writer = structure.enrich_bindings([writer])[0]
+    call = structure.enrich_calls(
+        [
+            {
+                "name": "gen",
+                "args": ["input"],
+                "file": "caller.cpp",
+                "line": 20,
+                "function": "run",
+                "callable_id": caller_callable,
+            }
+        ]
+    )[0]
+    terminal_identity = structure.symbol_identity(
+        "state",
+        file="helper.cpp",
+        callable_id=helper_callable,
+        function_name="gen",
+        function_parameters=["value"],
+    )
+
+    dag = build_mechanism_dag(
+        [enriched_writer],
+        "state",
+        terminal_file="helper.cpp",
+        terminal_identity=terminal_identity,
+        helper_expressions=[helper],
+        call_statements=[call],
+        source_structure=structure,
+    )
+
+    state = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.variable == "state"
+    )
+    assert state.metadata.get("is_terminal") is True
+    assert state.metadata.get("call_instance_scope")
+    assert any(
+        vertex.kind == "operation"
+        and vertex.variable == "value"
+        and vertex.expression == "input"
+        for vertex in dag.vertices
+    )
+
+
+def test_statement_call_instances_do_not_share_formal_actuals():
+    helper_callable = "helper.cpp:10:fill:value,sp"
+    helper = _fake_helper(
+        name="fill",
+        file="helper.cpp",
+        line=10,
+        evidence="void fill(float value, output_s *sp)",
+        assignments={"sp.alt": "value"},
+        return_expression="",
+    )
+    helper.update(
+        {
+            "callable_id": helper_callable,
+            "parameters": ["value", "sp"],
+            "pointer_output_writes": [
+                {"param": "sp", "field": "alt", "expression": "value"}
+            ],
+        }
+    )
+    writer = _fake_binding(
+        binding_id="writer",
+        target="sp.alt",
+        expression="value",
+        file="helper.cpp",
+        line=12,
+        logged_signal="",
+        function="fill",
+    )
+    writer["callable_id"] = helper_callable
+    writer["function_parameters"] = ["value", "sp"]
+    calls = [
+        {
+            "name": "fill",
+            "args": ["first", "&out_a"],
+            "file": "caller.cpp",
+            "line": 20,
+            "function": "run",
+            "callable_id": "caller.cpp:1:run:",
+        },
+        {
+            "name": "fill",
+            "args": ["second", "&out_b"],
+            "file": "caller.cpp",
+            "line": 30,
+            "function": "run",
+            "callable_id": "caller.cpp:1:run:",
+        },
+    ]
+
+    expected = {"out_a.alt": "first", "out_b.alt": "second"}
+    for terminal, actual in expected.items():
+        dag = build_mechanism_dag(
+            [writer],
+            terminal,
+            terminal_file="caller.cpp",
+            helper_expressions=[helper],
+            call_statements=calls,
+        )
+        formal_ops = [
+            vertex
+            for vertex in dag.vertices
+            if vertex.kind == "operation" and vertex.variable == "value"
+        ]
+        assert [(vertex.expression, vertex.line) for vertex in formal_ops] == [
+            (actual, 20 if actual == "first" else 30)
+        ]
+
+
+def test_statement_call_rebinds_structured_formal_to_caller_storage():
+    helper_callable = "helper.cpp:10:fill:item,sp"
+    helper = _fake_helper(
+        name="fill",
+        file="helper.cpp",
+        line=10,
+        evidence="void fill(const item_s &item, output_s *sp)",
+        assignments={"sp.alt": "item.altitude"},
+        return_expression="",
+    )
+    helper.update(
+        {
+            "callable_id": helper_callable,
+            "parameters": ["item", "sp"],
+            "pointer_output_writes": [
+                {
+                    "param": "sp",
+                    "field": "alt",
+                    "expression": "item.altitude",
+                }
+            ],
+        }
+    )
+    writer = _fake_binding(
+        binding_id="writer",
+        target="sp.alt",
+        expression="item.altitude",
+        file="helper.cpp",
+        line=12,
+        logged_signal="",
+        function="fill",
+    )
+    writer["callable_id"] = helper_callable
+    writer["function_parameters"] = ["item", "sp"]
+    call = {
+        "name": "fill",
+        "args": ["source_item", "&out"],
+        "file": "caller.cpp",
+        "line": 20,
+        "function": "run",
+        "callable_id": "caller.cpp:1:run:",
+    }
+
+    dag = build_mechanism_dag(
+        [writer],
+        "out.alt",
+        terminal_file="caller.cpp",
+        helper_expressions=[helper],
+        call_statements=[call],
+    )
+
+    assert "item.altitude" not in dag.unresolved_symbols
+    assert "source_item.altitude" in dag.unresolved_symbols
+
+
+def test_direct_reference_output_does_not_create_actual_formal_cycle():
+    helper_callable = "helper.cpp:10:fill:value,out"
+    helper = _fake_helper(
+        name="fill",
+        file="helper.cpp",
+        line=10,
+        evidence="void fill(float value, float &out)",
+        assignments={"out": "value * 2"},
+        return_expression="",
+    )
+    helper.update(
+        {
+            "callable_id": helper_callable,
+            "parameters": ["value", "out"],
+            "pointer_output_writes": [
+                {
+                    "param": "out",
+                    "field": "",
+                    "expression": "value * 2",
+                }
+            ],
+        }
+    )
+    writer = _fake_binding(
+        binding_id="writer",
+        target="out",
+        expression="value * 2",
+        file="helper.cpp",
+        line=12,
+        logged_signal="",
+        function="fill",
+    )
+    writer["callable_id"] = helper_callable
+    writer["function_parameters"] = ["value", "out"]
+    call = {
+        "name": "fill",
+        "args": ["input", "result"],
+        "file": "caller.cpp",
+        "line": 20,
+        "function": "run",
+        "callable_id": "caller.cpp:1:run:",
+    }
+
+    dag = build_mechanism_dag(
+        [writer],
+        "result",
+        terminal_file="caller.cpp",
+        helper_expressions=[helper],
+        call_statements=[call],
+    )
+
+    operations = [vertex for vertex in dag.vertices if vertex.kind == "operation"]
+    assert any(
+        vertex.variable == "result" and vertex.expression == "out"
+        for vertex in operations
+    )
+    assert any(
+        vertex.variable == "out" and vertex.expression == "value * 2"
+        for vertex in operations
+    )
+    assert not any(
+        vertex.variable == "out" and vertex.expression == "result"
+        for vertex in operations
+    )
+
+
+def test_expression_call_instances_have_private_formals_and_returns():
+    helper = _fake_helper(
+        name="scale",
+        file="helper.cpp",
+        line=10,
+        evidence="float scale(float value)",
+        assignments={},
+        return_expression="value * 2",
+    )
+    helper.update(
+        {
+            "callable_id": "helper.cpp:10:scale:value",
+            "parameters": ["value"],
+        }
+    )
+    bindings = [
+        _fake_binding(
+            binding_id="first",
+            target="output",
+            expression="scale(first)",
+            file="caller.cpp",
+            line=20,
+            logged_signal="",
+            control_predicates=["mode == 0"],
+            function="run",
+        ),
+        _fake_binding(
+            binding_id="second",
+            target="output",
+            expression="scale(second)",
+            file="caller.cpp",
+            line=30,
+            logged_signal="",
+            control_predicates=["mode != 0"],
+            function="run",
+        ),
+    ]
+    for binding in bindings:
+        binding["callable_id"] = "caller.cpp:1:run:"
+
+    dag = build_mechanism_dag(
+        bindings,
+        "output",
+        terminal_file="caller.cpp",
+        helper_expressions=[helper],
+    )
+
+    returns = [
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation" and "__return__" in str(vertex.variable)
+    ]
+    formals = [
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "evidence" and vertex.sub_kind == "helper_parameter"
+    ]
+    assert len(returns) == 2
+    assert len(formals) == 2
+    assert len({vertex.metadata["call_site_id"] for vertex in returns}) == 2
+    incoming = {
+        formal.id: {
+            edge.source_id for edge in dag.edges if edge.target_id == formal.id
+        }
+        for formal in formals
+    }
+    evidence = {
+        vertex.signal_name: vertex.id
+        for vertex in dag.vertices
+        if vertex.kind == "evidence" and vertex.sub_kind == "opaque_symbol"
+    }
+    assert sorted(
+        source in predecessors
+        for source in (evidence["first"], evidence["second"])
+        for predecessors in incoming.values()
+    ) == [False, False, True, True]
+
+
+def test_unrelated_call_does_not_probe_helper_provider():
+    probes: list[str] = []
+
+    def provider(name, reference=None):
+        probes.append(name)
+        return []
+
+    binding = _fake_binding(
+        binding_id="answer",
+        target="answer",
+        expression="input_value",
+        file="main.cpp",
+        line=10,
+        logged_signal="",
+        function="run",
+    )
+    binding["callable_id"] = "main.cpp:1:run:"
+    dag = build_mechanism_dag(
+        [binding],
+        "answer",
+        terminal_file="main.cpp",
+        call_statements=[
+            {
+                "name": "unrelated",
+                "args": ["value"],
+                "file": "other.cpp",
+                "line": 20,
+                "function": "tick",
+                "callable_id": "other.cpp:1:tick:",
+            }
+        ],
+        helper_body_provider=provider,
+    )
+
+    assert probes == []
+    assert [
+        (vertex.variable, vertex.expression)
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+    ] == [("answer", "input_value")]
+
+
+def test_loaded_read_only_call_does_not_become_a_writer():
+    helper = _fake_helper(
+        name="observe",
+        file="main.cpp",
+        line=20,
+        evidence="float observe(float value)",
+        assignments={},
+        return_expression="value",
+    )
+    helper.update(
+        {
+            "callable_id": "main.cpp:20:observe:value",
+            "parameters": ["value"],
+        }
+    )
+    binding = _fake_binding(
+        binding_id="answer",
+        target="answer",
+        expression="input_value",
+        file="main.cpp",
+        line=10,
+        logged_signal="",
+        function="run",
+    )
+    binding["callable_id"] = "main.cpp:1:run:"
+
+    dag = build_mechanism_dag(
+        [binding],
+        "answer",
+        terminal_file="main.cpp",
+        helper_expressions=[helper],
+        call_statements=[
+            {
+                "name": "observe",
+                "args": ["answer"],
+                "file": "main.cpp",
+                "line": 30,
+                "function": "run",
+                "callable_id": "main.cpp:1:run:",
+            }
+        ],
+    )
+
+    operations = [
+        (vertex.variable, vertex.expression)
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+    ]
+    assert operations == [("answer", "input_value")]
+    assert "observe" not in dag.unresolved_symbols
+
+
+def test_unloaded_possible_call_effect_is_a_typed_gap_not_inline_fetch():
+    probes: list[str] = []
+
+    def provider(name, reference=None):
+        probes.append(name)
+        return []
+
+    dag = build_mechanism_dag(
+        [],
+        "out.alt",
+        terminal_file="main.cpp",
+        call_statements=[
+            {
+                "name": "fill",
+                "args": ["source", "&out"],
+                "file": "main.cpp",
+                "line": 30,
+                "function": "run",
+                "callable_id": "main.cpp:1:run:",
+                "evidence": "fill(source, &out);",
+            }
+        ],
+        helper_body_provider=provider,
+    )
+
+    assert probes == []
+    assert "fill" in dag.unresolved_symbols
+    reference = next(
+        item for item in dag.unresolved_references if item.symbol == "fill"
+    )
+    assert reference.kind == "callable"
+    assert reference.callable_id == "main.cpp:1:run:"
+    assert reference.argument_count == 2
+
+
+def test_receiver_call_result_does_not_admit_other_receiver_methods():
+    probes: list[str] = []
+
+    def provider(name, reference=None):
+        probes.append(name)
+        return []
+
+    binding = _fake_binding(
+        binding_id="answer",
+        target="answer",
+        expression="client.get_value().field",
+        file="main.cpp",
+        line=10,
+        logged_signal="",
+        function="run",
+    )
+    binding["callable_id"] = "main.cpp:1:run:"
+    dag = build_mechanism_dag(
+        [binding],
+        "answer",
+        terminal_file="main.cpp",
+        call_statements=[
+            {
+                "name": "get_value",
+                "receiver": "client",
+                "args": [],
+                "file": "main.cpp",
+                "line": 10,
+                "function": "run",
+                "callable_id": "main.cpp:1:run:",
+            },
+            {
+                "name": "unrelated_mutation",
+                "receiver": "client",
+                "args": [],
+                "file": "main.cpp",
+                "line": 20,
+                "function": "run",
+                "callable_id": "main.cpp:1:run:",
+            },
+        ],
+        helper_body_provider=provider,
+    )
+
+    assert probes == ["get_value"]
+    assert "unrelated_mutation" not in dag.unresolved_symbols
 
 
 def test_helper_body_provider_lazily_supplies_missing_helper():

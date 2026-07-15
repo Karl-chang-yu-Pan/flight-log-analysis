@@ -394,7 +394,7 @@ class SourceExpansionResolver:
         self.profiler = profiler
         self.source_hash = source_hash
         self._facts: dict[str, SourceFileFacts] = {}
-        self._candidate_facts: dict[tuple[str, GapKind], SourceFileFacts] = {}
+        self._candidate_facts: dict[tuple[Any, ...], SourceFileFacts] = {}
 
     def facts_for(self, file_path: str) -> SourceFileFacts:
         if file_path not in self._facts:
@@ -457,7 +457,7 @@ class SourceExpansionResolver:
             candidates: list[ExpansionCandidate] = []
             for file_path in dedupe_keep_order(hit.file for hit in hits):
                 candidate_facts = self._candidate_facts_for(
-                    file_path, reference.kind
+                    file_path, reference
                 )
                 if not self._contains_exact_definition(reference, candidate_facts):
                     continue
@@ -486,16 +486,64 @@ class SourceExpansionResolver:
     def _candidate_facts_for(
         self,
         file_path: str,
-        kind: GapKind,
+        reference: UnresolvedSourceReference,
     ) -> SourceFileFacts:
-        key = (file_path, kind)
+        key = (file_path, *reference.visit_key())
         cached = self._candidate_facts.get(key)
         if cached is not None:
             return cached
-        # Candidate admission must inspect the same parser facts that will
-        # enter the DAG. A legacy pre-scan in Tree-sitter mode can otherwise
-        # reject an exact definition before the selected backend is loaded.
-        facts = self.facts_for(file_path)
+        backend = str(
+            getattr(self.profiler, "source_parser_backend", "legacy")
+        )
+        if backend in {"tree_sitter", "compare"}:
+            from flight_log_agent.px4.tree_sitter_source import (
+                TreeSitterSourceExtractor,
+            )
+
+            extractor = getattr(
+                self.profiler, "_tree_sitter_source_extractor", None
+            )
+            if extractor is None:
+                extractor = TreeSitterSourceExtractor(self.profiler)
+                setattr(
+                    self.profiler,
+                    "_tree_sitter_source_extractor",
+                    extractor,
+                )
+            facts = extractor.extract_admission(
+                file_path,
+                self.source_hash,
+                kind=reference.kind,
+                symbol=reference.symbol,
+            )
+        else:
+            structure: dict[str, list[Any]] = {}
+            if reference.kind in {"callable", "class", "symbol"}:
+                structure = self.profiler.extract_source_structure_from_source(
+                    [file_path], expand_companions=False
+                )
+            assignments = []
+            if reference.kind in {"symbol", "constant"}:
+                assignments = [
+                    item
+                    for item in self.profiler.extract_source_assignments_from_source(
+                        [file_path],
+                        expand_companions=False,
+                        include_pointer_outputs=False,
+                        include_control_flow=False,
+                    )
+                    if item.file == file_path
+                ]
+            facts = SourceFileFacts(
+                file=file_path,
+                source_hash=self.source_hash,
+                parser_backend="legacy:admission",
+                source_assignments=assignments,
+                classes=list(structure.get("classes") or []),
+                members=list(structure.get("members") or []),
+                callables=list(structure.get("callables") or []),
+                includes=list(structure.get("includes") or []),
+            )
         self._candidate_facts[key] = facts
         return facts
 
