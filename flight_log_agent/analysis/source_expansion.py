@@ -106,6 +106,8 @@ class SourceStructureIndex:
     """In-memory structural index derived from the currently loaded facts."""
 
     direct_bases: dict[str, set[str]] = field(default_factory=dict)
+    declared_classes: set[str] = field(default_factory=set)
+    class_files: dict[str, set[str]] = field(default_factory=dict)
     members: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     callables_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
     callables_by_name: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -121,6 +123,10 @@ class SourceStructureIndex:
                 item = _as_dict(class_ref)
                 name = str(item.get("name") or "")
                 if name:
+                    index.declared_classes.add(name)
+                    file = str(item.get("file") or "")
+                    if file:
+                        index.class_files.setdefault(name, set()).add(file)
                     raw_bases.setdefault(name, set()).update(
                         str(base) for base in item.get("bases") or [] if base
                     )
@@ -152,6 +158,7 @@ class SourceStructureIndex:
                     index.includes.setdefault(source, set()).add(included)
         declared = set(raw_bases)
         for owner, bases in raw_bases.items():
+            index.direct_bases.setdefault(owner, set())
             owner_parts = owner.split("::")[:-1]
             for raw_base in bases:
                 base = re.sub(r"^virtual\s+", "", raw_base.strip().lstrip(":"))
@@ -163,19 +170,51 @@ class SourceStructureIndex:
                 ]
                 resolved = next(
                     (candidate for candidate in candidates if candidate in declared),
-                    base,
+                    base_name,
                 )
                 if resolved:
                     index.direct_bases.setdefault(owner, set()).add(resolved)
         return index
 
-    def lineage(self, class_name: str) -> list[str]:
+    def resolve_class_name(self, class_name: str, lexical_owner: str = "") -> str:
+        """Resolve a source-declared type in its C++ lexical class scope."""
+        name = _source_type_name(class_name)
+        if not name:
+            return ""
+        declared = set(self.declared_classes)
+        declared.update(self.direct_bases)
+        declared.update(owner for owner, _member in self.members)
+        declared.update(
+            str(item.get("owner") or "")
+            for item in self.callables_by_id.values()
+            if item.get("owner")
+        )
+        if name in declared:
+            return name
+
+        owner = _source_type_name(lexical_owner)
+        owner_parts = owner.split("::") if owner else []
+        for depth in range(len(owner_parts), -1, -1):
+            candidate = "::".join([*owner_parts[:depth], name])
+            if candidate in declared:
+                return candidate
+
+        suffix = f"::{name}"
+        matches = sorted(
+            candidate
+            for candidate in declared
+            if candidate == name or candidate.endswith(suffix)
+        )
+        return matches[0] if len(matches) == 1 else name
+
+    def lineage(self, class_name: str, lexical_owner: str = "") -> list[str]:
         """Return ``class_name`` followed by all derivable base classes."""
         ordered: list[str] = []
-        frontier = [class_name] if class_name else []
+        resolved = self.resolve_class_name(class_name, lexical_owner)
+        frontier = [resolved] if resolved else []
         seen: set[str] = set()
         while frontier:
-            current = frontier.pop(0)
+            current = self.resolve_class_name(frontier.pop(0))
             if not current or current in seen:
                 continue
             seen.add(current)
@@ -211,7 +250,10 @@ class SourceStructureIndex:
         declaring = self.declaring_member_owner(class_name, root)
         member = self.members.get((declaring, root)) if declaring else None
         receiver_type = str((member or {}).get("type") or "")
-        return receiver_type.rstrip("*& ").split("<", 1)[0].strip()
+        return self.resolve_class_name(
+            receiver_type,
+            lexical_owner=declaring or class_name,
+        )
 
     def symbol_identity(
         self,
@@ -365,14 +407,106 @@ class SourceStructureIndex:
             owner = self.callable_owner(callable_id, function)
             receiver = str(call.get("receiver") or "").replace("->", ".")
             root = receiver.split(".", 1)[0].lstrip("&*")
-            declaring_owner = self.declaring_member_owner(owner, root) if owner and root else None
-            member = self.members.get((declaring_owner, root)) if declaring_owner else None
-            receiver_type = str((member or {}).get("type") or "")
-            receiver_type = receiver_type.rstrip("*& ").split("<", 1)[0].strip()
+            receiver_type = self.member_receiver_type(owner, root) if owner and root else ""
             call["caller_owner"] = owner
             call["receiver_type"] = receiver_type
             enriched.append(call)
         return enriched
+
+
+def callable_dispatch_context(
+    reference: UnresolvedSourceReference,
+    structure: SourceStructureIndex,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Return ``(dispatch kind, short name, source-derived owners)``.
+
+    Owners come from explicit qualification, the receiver's declared type,
+    or the lexical caller class. They are source identity, not a filename or
+    method-name heuristic. A genuinely non-member call has no owner.
+    """
+    symbol = str(reference.symbol or "").replace("->", ".").strip()
+    bare = symbol.rsplit(".", 1)[-1].rsplit("::", 1)[-1].strip("()")
+    explicitly_qualified = "::" in symbol and not reference.receiver
+    if reference.receiver:
+        receiver_type = structure.member_receiver_type(
+            reference.class_owner, reference.receiver
+        )
+        owners = tuple(structure.lineage(receiver_type)) if receiver_type else ()
+        return "receiver", bare, owners
+    if explicitly_qualified:
+        owner = symbol.rpartition("::")[0].strip(":")
+        owners = tuple(structure.lineage(owner)) or ((owner,) if owner else ())
+        return "qualified", bare, owners
+    if reference.class_owner:
+        return (
+            "unqualified_member",
+            bare,
+            tuple(structure.lineage(reference.class_owner)),
+        )
+    return "free", bare, ()
+
+
+def source_reference_resolution_key(
+    reference: UnresolvedSourceReference,
+    structure: SourceStructureIndex,
+) -> tuple[Any, ...]:
+    """Identity of one source lookup, independent of runtime call sites."""
+    if reference.kind == "callable":
+        dispatch, bare, owners = callable_dispatch_context(reference, structure)
+        contextual_file = reference.file if dispatch == "free" else ""
+        return (
+            reference.kind,
+            dispatch,
+            bare,
+            owners,
+            reference.argument_count,
+            contextual_file,
+        )
+    if reference.identity is not None:
+        return (reference.kind, reference.identity.storage_key())
+    return reference.visit_key()
+
+
+def reference_receiver_is_source_boundary(
+    reference: UnresolvedSourceReference,
+    boundary_bindings: Sequence[dict[str, Any]],
+    structure: SourceStructureIndex,
+) -> bool:
+    """Whether a callable receiver is one exact source-proven I/O endpoint."""
+    if reference.kind != "callable" or not reference.receiver:
+        return False
+    receiver = exact_symbol(reference.receiver)
+    if receiver.startswith("this."):
+        receiver = receiver[5:]
+    caller = str(reference.callable_id or "").split("::@call:", 1)[0]
+    lineage = set(structure.lineage(reference.class_owner))
+    candidates: list[dict[str, Any]] = []
+    for item in boundary_bindings:
+        source_symbol = exact_symbol(str(item.get("source_symbol") or ""))
+        if source_symbol != receiver or not item.get("topic"):
+            continue
+        endpoint_kind = str(item.get("endpoint_kind") or "")
+        item_owner = str(item.get("source_owner") or "")
+        item_callable = str(item.get("callable_id") or "")
+        item_file = str(item.get("file") or "")
+        if not endpoint_kind:
+            endpoint_kind = (
+                "member" if item_owner else "local" if item_callable else "global"
+            )
+        if endpoint_kind in {"member", "base"}:
+            if item_owner and item_owner in lineage:
+                candidates.append(item)
+        elif endpoint_kind == "local":
+            if caller and item_callable == caller:
+                candidates.append(item)
+        elif endpoint_kind == "global":
+            if reference.file and item_file == reference.file:
+                candidates.append(item)
+    placements = {
+        (str(item.get("topic") or ""), item.get("instance"))
+        for item in candidates
+    }
+    return len(placements) == 1
 
 
 @dataclass
@@ -384,7 +518,7 @@ class ExpansionCandidate:
 
 
 class SourceExpansionResolver:
-    """Retrieve broadly, then admit only exact source definitions."""
+    """Resolve owners first, then admit only exact source definitions."""
 
     def __init__(
         self,
@@ -434,18 +568,24 @@ class SourceExpansionResolver:
                 # A method name has no source identity without the receiver's
                 # declared type. Bare-name retrieval cannot make it safer.
                 return []
-        queries = self._queries(reference)
-        if not queries:
-            return []
-        if reference.kind == "callable" and len(queries) > 1:
-            query_groups = [[queries[0]], queries[1:]]
-        elif reference.kind == "symbol" and len(queries) > 1:
-            # Assignment-shaped queries have structural meaning. The final
-            # bare-name query preserves completeness for unusual formatting,
-            # but only after no exact-shaped query yields a definition.
-            query_groups = [queries[:-1], queries[-1:]]
+        if reference.kind == "callable":
+            direct_files = self._callable_owner_files(reference, structure)
+            candidates = self._admit_files(reference, structure, direct_files)
+            if candidates:
+                return self._unique_entity(reference, candidates)
+            query_groups = self._callable_query_groups(reference, structure)
         else:
-            query_groups = [queries]
+            queries = self._queries(reference)
+            if not queries:
+                return []
+            query_groups: list[list[str]]
+            if reference.kind == "symbol" and len(queries) > 1:
+                # Assignment-shaped queries have structural meaning. The final
+                # bare-name query preserves completeness for unusual formatting,
+                # but only after no exact-shaped query yields a definition.
+                query_groups = [queries[:-1], queries[-1:]]
+            else:
+                query_groups = [queries]
         for query_group in query_groups:
             if not query_group:
                 continue
@@ -454,41 +594,121 @@ class SourceExpansionResolver:
                 max_files=None,
                 expand_query_tokens=False,
             )
-            candidates: list[ExpansionCandidate] = []
-            for file_path in dedupe_keep_order(hit.file for hit in hits):
-                candidate_facts = self._candidate_facts_for(
-                    file_path, reference
+            hit_files = dedupe_keep_order(hit.file for hit in hits)
+            if reference.kind == "callable" and query_group and all(
+                query.startswith(("class ", "struct ", "namespace "))
+                for query in query_group
+            ):
+                hit_files = dedupe_keep_order(
+                    file_path
+                    for hit_file in hit_files
+                    for file_path in [hit_file, *self.companion_files(hit_file)]
                 )
-                if not self._contains_exact_definition(reference, candidate_facts):
-                    continue
-                match = self._exact_match(reference, candidate_facts, structure)
-                if match:
-                    facts = self.facts_for(file_path)
-                    candidates.append(
-                        ExpansionCandidate(
-                            file=file_path,
-                            facts=facts,
-                            matched_kind=reference.kind,
-                            matched_identity=match,
-                        )
-                    )
+            candidates = self._admit_files(reference, structure, hit_files)
             if candidates:
-                if reference.kind in {"callable", "class"}:
-                    # A callable or class definition is one source entity.
-                    # Multiple exact definitions usually represent overloads,
-                    # platform alternatives, or duplicate ownership; without
-                    # build/type evidence, admitting all of them invents a
-                    # union mechanism.
-                    return candidates if len(candidates) == 1 else []
-                return candidates
+                return self._unique_entity(reference, candidates)
         return []
+
+    def resolution_key(
+        self,
+        reference: UnresolvedSourceReference,
+        structure: SourceStructureIndex,
+    ) -> tuple[Any, ...]:
+        return source_reference_resolution_key(reference, structure)
+
+    def _callable_owner_files(
+        self,
+        reference: UnresolvedSourceReference,
+        structure: SourceStructureIndex,
+    ) -> list[str]:
+        _dispatch, _bare, owners = callable_dispatch_context(reference, structure)
+        return dedupe_keep_order(
+            file_path
+            for owner in owners
+            for declared_file in sorted(structure.class_files.get(owner, ()))
+            for file_path in [declared_file, *self.companion_files(declared_file)]
+        )
+
+    @staticmethod
+    def _callable_query_groups(
+        reference: UnresolvedSourceReference,
+        structure: SourceStructureIndex,
+    ) -> list[list[str]]:
+        dispatch, bare, owners = callable_dispatch_context(reference, structure)
+        groups: list[list[str]] = []
+        if owners:
+            groups.append([f"{owner}::{bare}(" for owner in owners])
+            class_queries = dedupe_keep_order(
+                query
+                for owner in owners
+                for query in (
+                    f"class {owner.rsplit('::', 1)[-1]}",
+                    f"struct {owner.rsplit('::', 1)[-1]}",
+                )
+            )
+            if class_queries:
+                groups.append(class_queries)
+            if dispatch == "qualified":
+                namespace_queries = dedupe_keep_order(
+                    query
+                    for owner in owners
+                    for query in (
+                        f"namespace {owner}",
+                        f"namespace {owner.rsplit('::', 1)[-1]}",
+                    )
+                )
+                if namespace_queries:
+                    groups.append(namespace_queries)
+        if dispatch in {"free", "unqualified_member"}:
+            groups.append([f"{bare}("])
+        return groups
+
+    def _admit_files(
+        self,
+        reference: UnresolvedSourceReference,
+        structure: SourceStructureIndex,
+        files: Iterable[str],
+    ) -> list[ExpansionCandidate]:
+        candidates: list[ExpansionCandidate] = []
+        for file_path in dedupe_keep_order(str(value) for value in files if value):
+            candidate_facts = self._candidate_facts_for(file_path, reference)
+            if not self._contains_exact_definition(reference, candidate_facts):
+                continue
+            match = self._exact_match(reference, candidate_facts, structure)
+            if not match:
+                continue
+            candidates.append(
+                ExpansionCandidate(
+                    file=file_path,
+                    facts=self.facts_for(file_path),
+                    matched_kind=reference.kind,
+                    matched_identity=match,
+                )
+            )
+        return candidates
+
+    @staticmethod
+    def _unique_entity(
+        reference: UnresolvedSourceReference,
+        candidates: list[ExpansionCandidate],
+    ) -> list[ExpansionCandidate]:
+        if reference.kind in {"callable", "class"}:
+            # Multiple exact definitions can be overloads, build variants, or
+            # ambiguous base members. Source facts must disambiguate them.
+            identities = {item.matched_identity for item in candidates}
+            return candidates[:1] if len(identities) == 1 else []
+        return candidates
 
     def _candidate_facts_for(
         self,
         file_path: str,
         reference: UnresolvedSourceReference,
     ) -> SourceFileFacts:
-        key = (file_path, *reference.visit_key())
+        key = (
+            file_path,
+            reference.kind,
+            exact_symbol(reference.symbol),
+        )
         cached = self._candidate_facts.get(key)
         if cached is not None:
             return cached
@@ -587,7 +807,7 @@ class SourceExpansionResolver:
         bare = symbol.replace("->", ".").rsplit(".", 1)[-1].strip("()")
         root = symbol.replace("->", ".").split(".", 1)[0].lstrip("&*")
         if reference.kind == "callable":
-            return [f"::{bare}(", f"{bare}("]
+            return [f"{bare}("]
         if reference.kind == "class":
             return [f"class {bare}", f"struct {bare}"]
         if reference.kind == "constant":
@@ -621,22 +841,23 @@ class SourceExpansionResolver:
                     for item in matches
                     if len(item.parameters) == reference.argument_count
                 ]
-            if reference.class_owner:
-                expected_owner = reference.class_owner
-                if reference.receiver:
-                    receiver_type = structure.member_receiver_type(
-                        reference.class_owner, reference.receiver
+            dispatch, _short, owners = callable_dispatch_context(reference, structure)
+            owner_set = set(owners)
+            if dispatch == "receiver":
+                matches = [item for item in matches if item.owner in owner_set]
+            elif dispatch == "qualified":
+                matches = [
+                    item
+                    for item in matches
+                    if item.owner in owner_set
+                    or (
+                        not item.owner
+                        and item.name.rpartition("::")[0] in owner_set
                     )
-                    if not receiver_type:
-                        return ""
-                    expected_owner = receiver_type
-                lineage = set(structure.lineage(expected_owner))
-                if reference.receiver:
-                    matches = [item for item in matches if item.owner in lineage]
-                else:
-                    owned = [item for item in matches if item.owner in lineage]
-                    if owned:
-                        matches = owned
+                ]
+            elif dispatch == "unqualified_member":
+                owned = [item for item in matches if item.owner in owner_set]
+                matches = owned or [item for item in matches if not item.owner]
             else:
                 matches = [item for item in matches if not item.owner]
             return matches[0].callable_id if len(matches) == 1 else ""
@@ -683,8 +904,18 @@ class SourceExpansionResolver:
         includes = {key: set(value) for key, value in structure.includes.items()}
         for key, value in local_structure.includes.items():
             includes.setdefault(key, set()).update(value)
+        class_files = {
+            key: set(value) for key, value in structure.class_files.items()
+        }
+        for key, value in local_structure.class_files.items():
+            class_files.setdefault(key, set()).update(value)
         combined = SourceStructureIndex(
             direct_bases=direct_bases,
+            declared_classes={
+                *structure.declared_classes,
+                *local_structure.declared_classes,
+            },
+            class_files=class_files,
             members={**structure.members, **local_structure.members},
             callables_by_id={**structure.callables_by_id, **local_structure.callables_by_id},
             callables_by_name=callables_by_name,
@@ -709,3 +940,12 @@ def _as_dict(value: Any) -> dict[str, Any]:
     if hasattr(value, "model_dump"):
         return value.model_dump(exclude_none=True)
     return dict(vars(value))
+
+
+def _source_type_name(value: str) -> str:
+    """Return the class-like part of a declared C++ type expression."""
+    text = str(value or "").strip()
+    text = re.sub(r"\b(?:const|volatile|class|struct|typename)\b", " ", text)
+    text = text.replace("*", " ").replace("&", " ")
+    text = " ".join(text.split()).strip().lstrip(":")
+    return text.split("<", 1)[0].strip()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from flight_log_agent.analysis.mechanism_discovery import dag_inputs_from_facts
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.px4.source_facts_cache import extract_facts_for_file
+from flight_log_agent.px4.tree_sitter_source import TreeSitterSourceExtractor
 
 
 def _facts(tmp_path, source: str, *, backend: str = "tree_sitter"):
@@ -20,6 +21,39 @@ def _facts(tmp_path, source: str, *, backend: str = "tree_sitter"):
         "src/modules/example/example.cpp",
         "source-hash",
     )
+
+
+def test_admission_parses_one_file_without_retaining_rejected_ast(tmp_path):
+    root = tmp_path / "PX4-Autopilot"
+    source_file = root / "src" / "modules" / "example" / "candidate.cpp"
+    header_file = source_file.with_suffix(".hpp")
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text(
+        "void Candidate::run() { consume(output); }",
+        encoding="utf-8",
+    )
+    header_file.write_text(
+        "class Candidate { void write() { output = input; } };",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+    extractor = TreeSitterSourceExtractor(profiler)
+
+    facts = extractor.extract_admission(
+        "src/modules/example/candidate.cpp",
+        "source-hash",
+        kind="symbol",
+        symbol="output",
+    )
+
+    assert facts.source_assignments == []
+    assert [item.name for item in facts.callables] == ["Candidate::run"]
+    assert extractor._units == {}
+    assert profiler._text_cache == {}
 
 
 def test_tree_sitter_extracts_assignment_heap_base_and_c_api_boundaries(tmp_path):

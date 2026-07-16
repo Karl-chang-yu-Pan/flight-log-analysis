@@ -1063,6 +1063,187 @@ float Other::get()
     assert resolver.resolve(reference, SourceStructureIndex()) == []
 
 
+def test_typed_receiver_expansion_searches_qualified_owner_only(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/services/widget_impl.cpp": """
+float Widget::update(float value)
+{
+    return value + 1.0f;
+}
+""",
+            "src/unrelated/other.cpp": """
+float Other::update(float value)
+{
+    return value - 1.0f;
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+    structure = SourceStructureIndex(
+        direct_bases={"Caller": set(), "Widget": set(), "Other": set()},
+        declared_classes={"Caller", "Widget", "Other"},
+        members={
+            ("Caller", "_service"): {
+                "name": "_service",
+                "owner": "Caller",
+                "type": "Widget",
+            }
+        },
+    )
+    reference = UnresolvedSourceReference(
+        symbol="update",
+        kind="callable",
+        file="src/controllers/caller.cpp",
+        callable_id="src/controllers/caller.cpp:1:Caller::run:",
+        class_owner="Caller",
+        receiver="_service",
+        argument_count=1,
+    )
+    queries: list[str] = []
+    original_search = profiler.search_related_source_files
+
+    def record_search(values, *args, **kwargs):
+        queries.extend([values] if isinstance(values, str) else values)
+        return original_search(values, *args, **kwargs)
+
+    profiler.search_related_source_files = record_search  # type: ignore[assignment]
+    candidates = SourceExpansionResolver(profiler, "hash").resolve(
+        reference, structure
+    )
+
+    assert [item.file for item in candidates] == ["src/services/widget_impl.cpp"]
+    assert "Widget::update(" in queries
+    assert "update(" not in queries
+
+
+def test_inherited_inline_callable_resolves_without_class_named_filename(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "platform/common/runtime_contract.hpp": """
+template<typename T>
+class BaseControl
+{
+public:
+    bool halted() const { return stop_requested; }
+    bool stop_requested{false};
+};
+""",
+            "src/controllers/derived.hpp": """
+class DerivedControl : public BaseControl<DerivedControl> {};
+""",
+        },
+        backend="tree_sitter",
+    )
+    structure = SourceStructureIndex(
+        direct_bases={
+            "DerivedControl": {"BaseControl<DerivedControl>"},
+            "BaseControl": set(),
+        },
+        declared_classes={"DerivedControl", "BaseControl"},
+        class_files={
+            "DerivedControl": {"src/controllers/derived.hpp"},
+        },
+    )
+    reference = UnresolvedSourceReference(
+        symbol="halted",
+        kind="callable",
+        file="src/controllers/derived.cpp",
+        callable_id="src/controllers/derived.cpp:1:DerivedControl::run:",
+        class_owner="DerivedControl",
+        argument_count=0,
+    )
+
+    candidates = SourceExpansionResolver(profiler, "hash").resolve(
+        reference, structure
+    )
+
+    assert [item.file for item in candidates] == [
+        "platform/common/runtime_contract.hpp"
+    ]
+    assert candidates[0].matched_identity.endswith("BaseControl::halted:")
+
+
+def test_explicitly_qualified_namespace_function_is_not_treated_as_class_member(
+    tmp_path,
+):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/lib/numeric_ops.cpp": """
+namespace numeric {
+float reshape(float value) { return value + 2.0f; }
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+    reference = UnresolvedSourceReference(
+        symbol="numeric::reshape",
+        kind="callable",
+        file="src/controllers/caller.cpp",
+        callable_id="src/controllers/caller.cpp:1:Caller::run:",
+        class_owner="Caller",
+        argument_count=1,
+    )
+
+    candidates = SourceExpansionResolver(profiler, "hash").resolve(
+        reference,
+        SourceStructureIndex(direct_bases={"Caller": set()}),
+    )
+
+    assert [item.file for item in candidates] == ["src/lib/numeric_ops.cpp"]
+
+
+def test_unqualified_call_rejects_foreign_member_but_keeps_free_function(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/unrelated/other.cpp": """
+float Other::transform(float value) { return value; }
+""",
+            "src/lib/free_transform.cpp": """
+float reshape(float value) { return value + 2.0f; }
+""",
+        },
+        backend="tree_sitter",
+    )
+    structure = SourceStructureIndex(
+        direct_bases={"Caller": set(), "Other": set()},
+        declared_classes={"Caller", "Other"},
+    )
+    resolver = SourceExpansionResolver(profiler, "hash")
+
+    foreign = resolver.resolve(
+        UnresolvedSourceReference(
+            symbol="transform",
+            kind="callable",
+            file="src/controllers/caller.cpp",
+            callable_id="src/controllers/caller.cpp:1:Caller::run:",
+            class_owner="Caller",
+            argument_count=1,
+        ),
+        structure,
+    )
+    free = resolver.resolve(
+        UnresolvedSourceReference(
+            symbol="reshape",
+            kind="callable",
+            file="src/controllers/caller.cpp",
+            callable_id="src/controllers/caller.cpp:1:Caller::run:",
+            class_owner="Caller",
+            argument_count=1,
+        ),
+        structure,
+    )
+
+    assert foreign == []
+    assert [item.file for item in free] == ["src/lib/free_transform.cpp"]
+
+
 def test_discovery_checks_all_exact_terminal_writers_before_slicing(tmp_path):
     """Unbounded terminal retrieval exposes ambiguity before graph build."""
     from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag

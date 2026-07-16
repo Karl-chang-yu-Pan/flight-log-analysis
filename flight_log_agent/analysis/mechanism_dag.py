@@ -42,6 +42,8 @@ from flight_log_agent.analysis.source_expansion import (
     SourceStructureIndex,
     SourceSymbolIdentity,
     UnresolvedSourceReference,
+    reference_receiver_is_source_boundary,
+    source_reference_resolution_key,
 )
 from flight_log_agent.expression_math import is_safe_math_function_name
 from flight_log_agent.px4.mechanism_source_profiler import (
@@ -395,7 +397,7 @@ class _DAGBuilder:
         self.helper_body_provider = helper_body_provider
         # Helpers already probed via the provider so a repeated call for an
         # unknown name doesn't re-fetch on every backward-walk pass.
-        self._helper_provider_probed: set[tuple[str, str, str, Optional[int]]] = set()
+        self._helper_provider_probed: set[tuple[Any, ...]] = set()
         self.source_root = source_root
         # Catalogues key on exact identity. Schema shape lookup allows an
         # aggregate declaration to validate an indexed element; observed
@@ -2971,6 +2973,18 @@ class _DAGBuilder:
         # its own resolution sequence.
         if not emit_opaque:
             return []
+        if self._symbol_is_receiver_call_result(
+            symbol_norm,
+            (str(file or ""), scope_function, line),
+        ) or re.search(rf"{re.escape(symbol_raw)}\s*\(", source_expression):
+            # The callable frontier owns expansion of a call result. Keeping
+            # its parser placeholder as a second symbol gap causes searches
+            # for names such as ``receiver.method`` and cannot find storage.
+            return [
+                self._emit_evidence(
+                    "opaque_symbol", symbol_raw, file=file, line=line
+                )
+            ]
         self._record_unresolved(
             symbol_raw,
             file=file,
@@ -3505,6 +3519,35 @@ class _DAGBuilder:
                 if _CALL_SCOPE_MARKER in scope_function
                 else source_site_id
             )
+            call_reference = UnresolvedSourceReference(
+                symbol=candidate,
+                kind="callable",
+                file=str(scope_file or ""),
+                line=line,
+                callable_id=_base_callable_scope(scope_function),
+                class_owner=self._source_structure.callable_owner(
+                    _base_callable_scope(scope_function)
+                ),
+                receiver=receiver,
+                argument_count=len(args),
+                source_expression=expression,
+            )
+            if reference_receiver_is_source_boundary(
+                call_reference,
+                self._boundary_bindings,
+                self._source_structure,
+            ):
+                self._record_unresolved(
+                    f"{receiver}.{candidate}" if receiver else candidate,
+                    kind="callable",
+                    file=scope_file,
+                    line=line,
+                    scope_function=scope_function,
+                    source_expression=expression,
+                    receiver=receiver,
+                    argument_count=len(args),
+                )
+                continue
             helper_key = self._pick_helper_key(
                 candidate,
                 scope_file,
@@ -3882,16 +3925,8 @@ class _DAGBuilder:
 
         matches = matching_keys()
         if not matches:
-            if (
-                not allow_provider
-                or
-                self.helper_body_provider is None
-                or (helper_name, scope_function, receiver, argument_count)
-                in self._helper_provider_probed
-            ):
+            if not allow_provider or self.helper_body_provider is None:
                 return None
-            probe_key = (helper_name, scope_function, receiver, argument_count)
-            self._helper_provider_probed.add(probe_key)
             reference = UnresolvedSourceReference(
                 symbol=helper_name,
                 kind="callable",
@@ -3903,6 +3938,12 @@ class _DAGBuilder:
                 receiver=receiver,
                 argument_count=argument_count,
             )
+            probe_key = source_reference_resolution_key(
+                reference, self._source_structure
+            )
+            if probe_key in self._helper_provider_probed:
+                return None
+            self._helper_provider_probed.add(probe_key)
             try:
                 fetched = self.helper_body_provider(helper_name, reference)
             except TypeError:
@@ -3922,12 +3963,15 @@ class _DAGBuilder:
         receiver_type = str(receiver_type_hint or "").rstrip("*& ").split("<", 1)[0].strip()
         receiver_root = receiver.replace("->", ".").split(".", 1)[0].lstrip("&*")
         if not receiver_type and caller_owner and receiver_root:
-            declaring = self._source_structure.declaring_member_owner(
-                caller_owner, receiver_root
+            receiver_type = self._source_structure.member_receiver_type(
+                caller_owner,
+                receiver_root,
             )
-            member = self._source_structure.members.get((declaring, receiver_root)) if declaring else None
-            receiver_type = str((member or {}).get("type") or "")
-            receiver_type = receiver_type.rstrip("*& ").split("<", 1)[0].strip()
+        elif receiver_type:
+            receiver_type = self._source_structure.resolve_class_name(
+                receiver_type,
+                lexical_owner=caller_owner,
+            )
         if receiver and not receiver_type:
             return None
         expected_owners = (

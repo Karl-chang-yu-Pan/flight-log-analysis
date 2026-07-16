@@ -381,21 +381,22 @@ class TreeSitterSourceExtractor:
     ):
         """Extract only facts needed to admit one expansion candidate.
 
-        This uses the same parsed AST and source-fact constructors as full
-        extraction. Callable/class admission needs structure only. Symbol and
-        constant admission extracts assignments only from callables whose AST
-        text contains the requested identifier, plus source-level constants.
-        No candidate count or source-search budget is applied.
+        Admission parses only the candidate physical file. Its AST is not put
+        in the persistent full-extraction cache, so rejecting a broad search
+        hit releases the tree and source bytes. Callable/class admission needs
+        structure only. Symbol and constant admission extracts assignments only
+        from callables whose AST text contains the requested identifier, plus
+        source-level constants. No candidate count or source-search budget is
+        applied.
         """
         from flight_log_agent.px4.source_facts_cache import SourceFileFacts
 
-        paths = self._source_family_paths(file_path)
-        units = [
-            unit
-            for path in paths
-            if (unit := self._parse(path, full_structure=False)) is not None
-        ]
-        primary = next((unit for unit in units if unit.file == file_path), None)
+        primary = self._units.get(file_path)
+        if primary is None:
+            primary = self._parse_ephemeral(
+                self.profiler._resolve_file(file_path),
+                full_structure=False,
+            )
         if primary is None:
             return SourceFileFacts(
                 file=file_path,
@@ -404,7 +405,7 @@ class TreeSitterSourceExtractor:
                 parse_diagnostics={"error": "source file could not be read"},
             )
 
-        self._resolve_class_bases(units)
+        self._resolve_class_bases([primary])
         assignments: list[SourceAssignmentRef] = []
         if kind in {"symbol", "constant"}:
             requested = str(symbol or "").replace("->", ".")
@@ -451,6 +452,33 @@ class TreeSitterSourceExtractor:
             ],
             includes=primary.includes,
         )
+
+    def _parse_ephemeral(
+        self,
+        path: Path,
+        *,
+        full_structure: bool,
+    ) -> Optional[_ParsedUnit]:
+        """Parse one candidate without retaining its text, tree, or nodes."""
+        file = self.profiler._rel(path)
+        try:
+            text = self.profiler.source.read_text(file, errors="ignore")
+            source = text.encode("utf-8")
+            if len(source) > self.profiler.read_limit_bytes:
+                return None
+        except Exception:
+            return None
+        unit = _ParsedUnit(
+            file=file,
+            source=source,
+            tree=self.parser.parse(source),
+        )
+        self._extract_structure(
+            unit,
+            path,
+            include_lambdas=full_structure,
+        )
+        return unit
 
     def _admission_assignments(
         self, unit: _ParsedUnit, callable_item: _Callable

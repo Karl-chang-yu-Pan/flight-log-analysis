@@ -28,6 +28,7 @@ from flight_log_agent.analysis.source_expansion import (
     SourceStructureIndex,
     SourceSymbolIdentity,
     UnresolvedSourceReference,
+    reference_receiver_is_source_boundary,
 )
 from flight_log_agent.analysis.mechanism_dag import (
     MechanismDAG,
@@ -279,6 +280,7 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                     "source_owner": str(
                         (call.get("argument_owners") or {}).get(root) or ""
                     ),
+                    "source_site_id": str(call.get("source_site_id") or ""),
                     "provenance": f"{receiver}.{name}",
                 }
             )
@@ -1439,12 +1441,13 @@ def discover_mechanism_dag(
 
         next_files: list[str] = []
         for reference in references:
-            receiver_type = ""
-            if reference.kind == "callable" and reference.receiver:
-                receiver_type = inputs.structure.member_receiver_type(
-                    reference.class_owner, reference.receiver
-                )
-            key = (*reference.visit_key(), receiver_type)
+            if reference_receiver_is_source_boundary(
+                reference,
+                inputs.boundary_bindings,
+                inputs.structure,
+            ):
+                continue
+            key = resolver.resolution_key(reference, inputs.structure)
             if key in visited:
                 continue
             visited.add(key)

@@ -1662,6 +1662,121 @@ def test_receiver_call_result_does_not_admit_other_receiver_methods():
 
     assert probes == ["get_value"]
     assert "unrelated_mutation" not in dag.unresolved_symbols
+    assert any(
+        item.kind == "callable" and item.symbol == "client.get_value"
+        for item in dag.unresolved_references
+    )
+    assert not any(
+        item.kind == "symbol" and item.symbol == "client.get_value"
+        for item in dag.unresolved_references
+    )
+
+
+def test_source_boundary_receiver_does_not_expand_framework_method():
+    probes: list[str] = []
+
+    def provider(name, reference=None):
+        probes.append(name)
+        return []
+
+    binding = _fake_binding(
+        binding_id="answer",
+        target="answer",
+        expression="_channel.update(&sample)",
+        file="main.cpp",
+        line=10,
+        logged_signal="",
+        function="Controller::run",
+    )
+    structure = SourceStructureIndex(
+        direct_bases={"Controller": set(), "Channel": set()},
+        declared_classes={"Controller", "Channel"},
+        members={
+            ("Controller", "_channel"): {
+                "name": "_channel",
+                "owner": "Controller",
+                "type": "Channel",
+            }
+        },
+    )
+    binding = structure.enrich_bindings([binding])[0]
+    dag = build_mechanism_dag(
+        [binding],
+        "answer",
+        terminal_file="main.cpp",
+        call_statements=structure.enrich_calls(
+            [
+                {
+                    "name": "update",
+                    "receiver": "_channel",
+                    "args": ["&sample"],
+                    "file": "main.cpp",
+                    "line": 10,
+                    "function": "Controller::run",
+                    "callable_id": "main.cpp:1:Controller::run:",
+                }
+            ]
+        ),
+        boundary_bindings=[
+            {
+                "source_symbol": "_channel",
+                "topic": "sample_stream",
+                "direction": "subscribe",
+                "source_owner": "Controller",
+                "endpoint_kind": "member",
+                "file": "main.hpp",
+            }
+        ],
+        source_structure=structure,
+        helper_body_provider=provider,
+    )
+
+    assert probes == []
+    assert any(
+        item.kind == "callable"
+        and item.symbol == "_channel.update"
+        and item.receiver == "_channel"
+        for item in dag.unresolved_references
+    )
+
+
+def test_unresolved_receiver_calls_share_one_provider_lookup_identity():
+    probes: list[str] = []
+
+    def provider(name, reference=None):
+        probes.append(name)
+        return []
+
+    binding = _fake_binding(
+        binding_id="answer",
+        target="answer",
+        expression="client.compute(left) + client.compute(right)",
+        file="main.cpp",
+        line=10,
+        logged_signal="",
+        function="Controller::run",
+    )
+    structure = SourceStructureIndex(
+        direct_bases={"Controller": set(), "Client": set()},
+        declared_classes={"Controller", "Client"},
+        members={
+            ("Controller", "client"): {
+                "name": "client",
+                "owner": "Controller",
+                "type": "Client",
+            }
+        },
+    )
+    binding = structure.enrich_bindings([binding])[0]
+    build_mechanism_dag(
+        [binding],
+        "answer",
+        terminal_file="main.cpp",
+        source_structure=structure,
+        helper_body_provider=provider,
+    )
+
+    assert probes == ["compute"]
 
 
 def test_helper_body_provider_lazily_supplies_missing_helper():
@@ -2747,6 +2862,56 @@ def test_helper_pick_prefers_caller_module_and_skips_foreign_ambiguity():
                                helper_expressions=[foreign, ours])
     assert not [v for v in dag2.vertices
                 if v.provenance and v.provenance.startswith("helper_return")]
+
+
+def test_helper_pick_qualifies_nested_receiver_type_from_lexical_owner():
+    helper = _fake_helper(
+        name="RTL::RTLPosition::set",
+        file="src/modules/navigator/rtl.h",
+        line=20,
+        evidence="void RTL::RTLPosition::set(float value)",
+        assignments={"alt": "value"},
+        return_expression="",
+    )
+    helper["parameters"] = ["value"]
+    binding = _fake_binding(
+        binding_id="terminal",
+        target="_out",
+        expression="_destination.set(input_value)",
+        file="src/modules/navigator/rtl.cpp",
+        line=10,
+        function="RTL::run",
+    )
+    structure = SourceStructureIndex(
+        direct_bases={"RTL": set(), "RTL::RTLPosition": set()},
+        declared_classes={"RTL", "RTL::RTLPosition"},
+        members={
+            ("RTL", "_destination"): {
+                "name": "_destination",
+                "owner": "RTL",
+                "type": "RTLPosition",
+            }
+        },
+    )
+
+    dag = build_mechanism_dag(
+        structure.enrich_bindings([binding]),
+        "_out",
+        helper_expressions=[helper],
+        source_structure=structure,
+    )
+
+    assert structure.member_receiver_type("RTL", "_destination") == "RTL::RTLPosition"
+    assert any(
+        vertex.kind == "operation"
+        and vertex.variable == "alt"
+        and vertex.file == "src/modules/navigator/rtl.h"
+        for vertex in dag.vertices
+    )
+    assert not any(
+        reference.kind == "callable" and reference.symbol == "set"
+        for reference in dag.unresolved_references
+    )
 
 
 def test_schema_enum_resolves_scoped_constant_and_evaluates():
