@@ -59,6 +59,7 @@ class _Callable:
     callable_id: str
     parameters: list[str]
     parameter_types: list[str]
+    parameter_defaults: list[Optional[str]]
     return_type: Optional[str]
     node: Node
     body: Node
@@ -201,6 +202,13 @@ def _walk_operations(node: Node) -> Iterator[Node]:
         yield from _walk_operations(child)
 
 
+def _argument_nodes(arguments: Optional[Node]) -> list[Node]:
+    """Return expression arguments, excluding named comment trivia."""
+    if arguments is None:
+        return []
+    return [child for child in arguments.named_children if child.type != "comment"]
+
+
 def _last_identifier(node: Optional[Node]) -> Optional[Node]:
     if node is None:
         return None
@@ -315,6 +323,7 @@ class TreeSitterSourceExtractor:
             )
 
         self._resolve_class_bases(units)
+        self._merge_callable_defaults(units)
         context = _SourceContext(units)
         self._index_parameter_members(context)
         states = [self._extract_callable(primary, context, item) for item in primary.callables]
@@ -364,6 +373,7 @@ class TreeSitterSourceExtractor:
                     callable_id=item.callable_id,
                     parameters=item.parameters,
                     parameter_types=item.parameter_types,
+                    parameter_defaults=item.parameter_defaults,
                     return_type=item.return_type,
                 )
                 for item in primary.callables
@@ -406,6 +416,7 @@ class TreeSitterSourceExtractor:
             )
 
         self._resolve_class_bases([primary])
+        self._merge_callable_defaults([primary])
         assignments: list[SourceAssignmentRef] = []
         if kind in {"symbol", "constant"}:
             requested = str(symbol or "").replace("->", ".")
@@ -446,6 +457,7 @@ class TreeSitterSourceExtractor:
                     callable_id=item.callable_id,
                     parameters=item.parameters,
                     parameter_types=item.parameter_types,
+                    parameter_defaults=item.parameter_defaults,
                     return_type=item.return_type,
                 )
                 for item in primary.callables
@@ -742,6 +754,29 @@ class TreeSitterSourceExtractor:
             )
         return refs
 
+    @staticmethod
+    def _callable_identity(
+        unit: _ParsedUnit,
+        site: Node,
+        function_declarator: Node,
+    ) -> tuple[str, Optional[str]]:
+        name_node = function_declarator.child_by_field_name("declarator")
+        raw_name = unit.text(name_node).strip()
+        lexical_owner = unit.class_owner(site)
+        namespace_owner = unit.namespace_owner(site)
+        qualified_owner, separator, short_name = raw_name.rpartition("::")
+        if separator:
+            owner = qualified_owner.strip(":")
+            if namespace_owner and not owner.startswith(f"{namespace_owner}::"):
+                owner = f"{namespace_owner}::{owner}"
+            return f"{owner}::{short_name}", owner
+        if lexical_owner:
+            return f"{lexical_owner}::{raw_name}", lexical_owner
+        return (
+            f"{namespace_owner}::{raw_name}" if namespace_owner else raw_name,
+            None,
+        )
+
     def _extract_callables(
         self, unit: _ParsedUnit, *, include_lambdas: bool = True
     ) -> None:
@@ -765,48 +800,11 @@ class TreeSitterSourceExtractor:
             )
             if body is None or function_declarator is None:
                 continue
-            name_node = function_declarator.child_by_field_name("declarator")
-            raw_name = unit.text(name_node).strip()
-            lexical_owner = unit.class_owner(node)
-            namespace_owner = unit.namespace_owner(node)
-            qualified_owner, separator, short_name = raw_name.rpartition("::")
-            if separator:
-                owner = qualified_owner.strip(":")
-                if namespace_owner and not owner.startswith(f"{namespace_owner}::"):
-                    owner = f"{namespace_owner}::{owner}"
-                name = f"{owner}::{short_name}"
-            elif lexical_owner:
-                owner = lexical_owner
-                name = f"{owner}::{raw_name}"
-            else:
-                owner = None
-                name = (
-                    f"{namespace_owner}::{raw_name}"
-                    if namespace_owner
-                    else raw_name
-                )
+            name, owner = self._callable_identity(unit, node, function_declarator)
             parameters_node = function_declarator.child_by_field_name("parameters")
-            parameters: list[str] = []
-            parameter_types: list[str] = []
-            if parameters_node is not None:
-                for param in parameters_node.named_children:
-                    if param.type not in {
-                        "parameter_declaration",
-                        "optional_parameter_declaration",
-                    }:
-                        continue
-                    declarator_node = param.child_by_field_name("declarator")
-                    identifier = _last_identifier(declarator_node)
-                    parameter_name = unit.text(identifier).strip()
-                    if parameter_name:
-                        parameters.append(parameter_name)
-                    type_node = param.child_by_field_name("type")
-                    type_text = unit.text(type_node).strip()
-                    if declarator_node is not None:
-                        declarator_text = unit.text(declarator_node)
-                        suffix = declarator_text[: max(0, declarator_text.rfind(parameter_name))]
-                        type_text = " ".join(f"{type_text} {suffix}".split())
-                    parameter_types.append(type_text)
+            parameters, parameter_types, parameter_defaults = self._parameter_list(
+                unit, parameters_node
+            )
             return_type_node = node.child_by_field_name("type")
             return_type = unit.text(return_type_node).strip() or None
             line = unit.line(node)
@@ -828,6 +826,7 @@ class TreeSitterSourceExtractor:
                     callable_id=callable_id,
                     parameters=parameters,
                     parameter_types=parameter_types,
+                    parameter_defaults=parameter_defaults,
                     return_type=return_type,
                     node=node,
                     body=body,
@@ -890,7 +889,7 @@ class TreeSitterSourceExtractor:
                 if declarator is not None
                 else None
             )
-            parameters, parameter_types = self._parameter_list(
+            parameters, parameter_types, parameter_defaults = self._parameter_list(
                 unit, parameters_node
             )
             body = node.child_by_field_name("body")
@@ -934,6 +933,7 @@ class TreeSitterSourceExtractor:
                     callable_id=callable_id,
                     parameters=all_parameters,
                     parameter_types=[*("capture" for _ in captures), *parameter_types],
+                    parameter_defaults=[*(None for _ in captures), *parameter_defaults],
                     return_type=return_type,
                     node=node,
                     body=body,
@@ -1082,11 +1082,12 @@ class TreeSitterSourceExtractor:
 
     def _parameter_list(
         self, unit: _ParsedUnit, parameters_node: Optional[Node]
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[Optional[str]]]:
         parameters: list[str] = []
         parameter_types: list[str] = []
+        parameter_defaults: list[Optional[str]] = []
         if parameters_node is None:
-            return parameters, parameter_types
+            return parameters, parameter_types, parameter_defaults
         for param in parameters_node.named_children:
             if param.type not in {
                 "parameter_declaration",
@@ -1107,7 +1108,64 @@ class TreeSitterSourceExtractor:
                 ]
                 type_text = " ".join(f"{type_text} {suffix}".split())
             parameter_types.append(type_text)
-        return parameters, parameter_types
+            default_node = param.child_by_field_name("default_value")
+            parameter_defaults.append(
+                self.profiler._normalize_source_expression(unit.text(default_node))
+                if default_node is not None
+                else None
+            )
+        return parameters, parameter_types, parameter_defaults
+
+    def _merge_callable_defaults(self, units: Sequence[_ParsedUnit]) -> None:
+        """Merge source-declared defaults into matching callable definitions.
+
+        C++ commonly places defaults on a class declaration in a header while
+        keeping them off the out-of-class definition. Matching uses the exact
+        source-derived owner/name and parameter-type sequence. Conflicting
+        declarations remain unset so omitted arguments fail closed.
+        """
+        declared: dict[
+            tuple[str, tuple[str, ...]], list[list[Optional[str]]]
+        ] = {}
+        for unit in units:
+            for node in _walk(unit.tree.root_node):
+                if node.type != "function_declarator":
+                    continue
+                parameters_node = node.child_by_field_name("parameters")
+                _parameters, parameter_types, defaults = self._parameter_list(
+                    unit, parameters_node
+                )
+                if not defaults or not any(value is not None for value in defaults):
+                    continue
+                name, _owner = self._callable_identity(unit, node, node)
+                if not name:
+                    continue
+                declared.setdefault((name, tuple(parameter_types)), []).append(
+                    defaults
+                )
+
+        for unit in units:
+            for callable_item in unit.callables:
+                key = (callable_item.name, tuple(callable_item.parameter_types))
+                candidates = declared.get(key, [])
+                if not candidates:
+                    continue
+                total = max(
+                    len(callable_item.parameter_types),
+                    len(callable_item.parameters),
+                    len(callable_item.parameter_defaults),
+                )
+                merged = list(callable_item.parameter_defaults)
+                if len(merged) < total:
+                    merged.extend([None] * (total - len(merged)))
+                for index in range(total):
+                    values = {
+                        str(defaults[index]).strip()
+                        for defaults in [merged, *candidates]
+                        if index < len(defaults) and defaults[index] is not None
+                    }
+                    merged[index] = next(iter(values)) if len(values) == 1 else None
+                callable_item.parameter_defaults = merged
 
     def _index_parameter_members(self, context: _SourceContext) -> None:
         for unit in context.units:
@@ -1863,7 +1921,7 @@ class TreeSitterSourceExtractor:
             name = unit.text(field_node).strip()
         args = [
             self._apply_storage_aliases(unit.text(arg).strip(), state.storage_aliases)
-            for arg in (arguments_node.named_children if arguments_node else [])
+            for arg in _argument_nodes(arguments_node)
         ]
         lambda_callable = state.lambda_bindings.get(name) if receiver is None else None
         if lambda_callable is not None:
@@ -2120,7 +2178,7 @@ class TreeSitterSourceExtractor:
             if not topics:
                 continue
             arguments = node.child_by_field_name("arguments")
-            args = list(arguments.named_children) if arguments is not None else []
+            args = _argument_nodes(arguments)
             callable = self._enclosing_callable(unit, node)
             boundary_symbol: Optional[str] = None
             if short_name.startswith(("orb_copy", "orb_publish", "orb_advertise")) and args:
@@ -2183,7 +2241,7 @@ class TreeSitterSourceExtractor:
                 if function_name.rsplit("::", 1)[-1] != "ORB_ID":
                     continue
                 arguments = node.child_by_field_name("arguments")
-                args = list(arguments.named_children) if arguments is not None else []
+                args = _argument_nodes(arguments)
                 if not args:
                     continue
                 topic = unit.text(args[0]).strip()
@@ -2325,7 +2383,7 @@ class TreeSitterSourceExtractor:
                 function_node = node.child_by_field_name("function")
                 function_text = unit.text(function_node).strip()
                 args_node = node.child_by_field_name("arguments")
-                args = list(args_node.named_children) if args_node is not None else []
+                args = _argument_nodes(args_node)
                 if function_text.rsplit("::", 1)[-1] == "param_find" and args:
                     literal = unit.text(args[0]).strip()
                     if len(literal) >= 2 and literal[0] == literal[-1] == '"':
@@ -2542,11 +2600,16 @@ class TreeSitterSourceExtractor:
             if not name:
                 continue
             state.alias_capable_symbols.add(name)
-            if any(
+            is_reference = any(
                 node.type == "reference_declarator" for node in _walk(declared)
-            ):
+            )
+            if is_reference:
                 state.reference_alias_symbols.add(name)
-            replacement = self._storage_alias_value(state, value)
+            replacement = self._storage_alias_value(
+                state,
+                value,
+                allow_dereference=is_reference,
+            )
             if replacement:
                 state.storage_aliases[name] = replacement
             else:
@@ -2578,19 +2641,30 @@ class TreeSitterSourceExtractor:
                 state.storage_aliases.pop(target, None)
 
     def _storage_alias_value(
-        self, state: _ExtractionState, value: Optional[Node]
+        self,
+        state: _ExtractionState,
+        value: Optional[Node],
+        *,
+        allow_dereference: bool = False,
     ) -> Optional[str]:
         if value is None:
             return None
-        while value.type == "parenthesized_expression" and value.named_children:
+        while True:
+            while value.type == "parenthesized_expression" and value.named_children:
+                value = value.named_children[0]
+            if value.type != "pointer_expression":
+                break
+            text = state.unit.text(value).lstrip()
+            address_of = text.startswith("&")
+            dereference = text.startswith("*")
+            if (
+                not value.named_children
+                or (not address_of and not (allow_dereference and dereference))
+            ):
+                return None
             value = value.named_children[0]
         if value.type == "new_expression":
             return None
-        if value.type == "pointer_expression":
-            text = state.unit.text(value).lstrip()
-            if not text.startswith("&") or not value.named_children:
-                return None
-            value = value.named_children[0]
         if value.type not in {
             "identifier",
             "field_expression",
@@ -2650,13 +2724,17 @@ class TreeSitterSourceExtractor:
             if node.type in {"return_statement", "co_return_statement"}
             and node.named_children
         ]
-        return_expression = (
-            self.profiler._normalize_source_expression(
-                state.unit.text(returns[0].named_children[0])
-            )
-            if len(returns) == 1
-            else None
-        )
+        return_expression: Optional[str] = None
+        if len(returns) == 1:
+            return_value = returns[0].named_children[0]
+            # Pointer-return accessors commonly expose member storage with
+            # ``return &member``. Preserve the storage identity so the DAG can
+            # follow the helper return to a source-proven boundary.
+            return_expression = self._storage_alias_value(state, return_value)
+            if return_expression is None:
+                return_expression = self.profiler._normalize_source_expression(
+                    state.unit.text(return_value)
+                )
         # Keep helper metadata aligned with the ordinary assignment facts.
         # The latter already carry lexical storage-alias resolution and exact
         # source scopes; rebuilding this map from the raw helper IR would
@@ -2708,6 +2786,7 @@ class TreeSitterSourceExtractor:
             evidence=state.callable.evidence,
             callable_id=state.callable.callable_id,
             parameters=state.callable.parameters,
+            parameter_defaults=state.callable.parameter_defaults,
             statements=statements if unresolved is None else [],
             assignments=assignments if unresolved is None else {},
             return_expression=return_expression if unresolved is None else None,

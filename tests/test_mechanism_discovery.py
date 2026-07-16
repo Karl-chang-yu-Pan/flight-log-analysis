@@ -816,6 +816,156 @@ void Base::fill(const mission_item_s &item, position_setpoint_s *sp)
     )
 
 
+def test_tree_sitter_default_argument_expands_and_binds_in_dag(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/caller.cpp": """
+float input;
+float output;
+void run()
+{
+    output = adjust(input);
+}
+""",
+            "src/lib/numeric.hpp": """
+float adjust(float value, bool enabled = false);
+""",
+            "src/lib/numeric.cpp": """
+float adjust(float value, bool enabled)
+{
+    return enabled ? value * 2.0f : value;
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+    caller_facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        ["src/modules/caller.cpp"],
+        "hash",
+    )
+    caller_inputs = dag_inputs_from_facts(caller_facts)
+    reference = UnresolvedSourceReference(
+        symbol="adjust",
+        kind="callable",
+        file="src/modules/caller.cpp",
+        callable_id=next(
+            item.callable_id
+            for item in caller_facts[0].callables
+            if item.name == "run"
+        ),
+        argument_count=1,
+    )
+
+    candidates = SourceExpansionResolver(profiler, "hash").resolve(
+        reference,
+        caller_inputs.structure,
+    )
+
+    assert [item.file for item in candidates] == ["src/lib/numeric.cpp"]
+    helper = next(
+        item
+        for item in candidates[0].facts.helper_expressions
+        if item.name == "adjust"
+    )
+    assert helper.parameter_defaults == [None, "false"]
+
+    inputs = dag_inputs_from_facts([*caller_facts, candidates[0].facts])
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/caller.cpp",
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+    )
+
+    assert "adjust" not in dag.unresolved_symbols
+    assert any(
+        vertex.kind == "operation"
+        and vertex.variable == "enabled"
+        and vertex.expression == "false"
+        for vertex in dag.vertices
+    )
+
+
+def test_dereferenced_reference_alias_reaches_source_proven_log_boundary(tmp_path):
+    source_file = "src/modules/mode/mode.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+struct vehicle_global_position_s { float alt; };
+
+class Navigator {
+public:
+    void update();
+    vehicle_global_position_s *get_global_position();
+private:
+    uORB::Subscription _global_position_sub{ORB_ID(vehicle_global_position)};
+    vehicle_global_position_s _global_position{};
+};
+
+void Navigator::update()
+{
+    _global_position_sub.copy(&_global_position);
+}
+
+vehicle_global_position_s *Navigator::get_global_position()
+{
+    return &_global_position;
+}
+
+class Mode {
+public:
+    void run();
+private:
+    Navigator *_navigator;
+    float output;
+};
+
+void Mode::run()
+{
+    const vehicle_global_position_s &global_position = *_navigator->get_global_position();
+    output = global_position.alt;
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        [source_file],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        inventory={
+            "topic_fields": {"vehicle_global_position": ["alt"]},
+            "available_topics": ["vehicle_global_position"],
+        },
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+
+    assert any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "vehicle_global_position.alt"
+        for vertex in dag.vertices
+    )
+    assert "global_position.alt" not in dag.unresolved_symbols
+
+
 def test_tree_sitter_expansion_admission_uses_selected_backend(tmp_path):
     profiler = _mini_tree(
         tmp_path,

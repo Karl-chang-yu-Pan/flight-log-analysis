@@ -450,6 +450,8 @@ def test_storage_aliases_preserve_pointer_and_reference_targets(tmp_path):
 void Control::run(float input, float alternate, float yaw)
 {
     position_setpoint_triplet_s *triplet = get_triplet();
+    const position_setpoint_triplet_s &snapshot = *get_triplet();
+    float observed_altitude = snapshot.current.alt;
     triplet->current.alt = input;
     {
         position_setpoint_s &current = triplet->next;
@@ -467,9 +469,66 @@ void Control::run(float input, float alternate, float yaw)
         for item in facts.source_assignments
     }
     assert ("input", "get_triplet().current.alt") in writes
+    assert ("get_triplet().current.alt", "observed_altitude") in writes
     assert ("alternate", "get_triplet().next.alt") in writes
     assert ("input", "get_triplet().next.alt") in writes
     assert ("yaw", "get_triplet().current.yaw") in writes
+
+
+def test_companion_declaration_defaults_and_call_comments_are_structural(tmp_path):
+    root = tmp_path / "PX4-Autopilot"
+    source_file = root / "src" / "modules" / "example" / "control.cpp"
+    header_file = source_file.with_suffix(".hpp")
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    header_file.write_text(
+        """
+class Control {
+public:
+    float adapt(float value, bool enabled = false);
+    void run(float input, bool enabled);
+};
+""",
+        encoding="utf-8",
+    )
+    source_file.write_text(
+        """
+float Control::adapt(float value, bool enabled)
+{
+    return enabled ? value * 2.0f : value;
+}
+
+void Control::run(float input, bool enabled)
+{
+    float output = adapt(input);
+    consume(input,
+            // explanation between arguments
+            output,
+            /* block comment is trivia too */ enabled);
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+    facts = extract_facts_for_file(
+        profiler,
+        "src/modules/example/control.cpp",
+        "source-hash",
+    )
+
+    helper = next(item for item in facts.helper_expressions if item.name.endswith("::adapt"))
+    callable_ref = next(item for item in facts.callables if item.name.endswith("::adapt"))
+    assert helper.parameter_defaults == [None, "false"]
+    assert callable_ref.parameter_defaults == [None, "false"]
+    assert next(item for item in facts.function_calls if item.name == "adapt").args == ["input"]
+    assert next(item for item in facts.function_calls if item.name == "consume").args == [
+        "input",
+        "output",
+        "enabled",
+    ]
 
 
 def test_storage_aliases_do_not_leak_between_switch_cases(tmp_path):

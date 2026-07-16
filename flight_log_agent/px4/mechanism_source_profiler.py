@@ -173,6 +173,11 @@ class HelperExpressionRef(BaseModel):
     evidence: str
     callable_id: Optional[str] = None
     parameters: List[str] = Field(default_factory=list)
+    # Source-derived default expressions aligned with formal positions.
+    # ``None`` means the corresponding formal has no default. The tree-sitter
+    # backend can merge companion-header defaults into the definition's helper
+    # record without changing the callable's source identity.
+    parameter_defaults: List[Optional[str]] = Field(default_factory=list)
     statements: List[Dict[str, Any]] = Field(default_factory=list)
     assignments: Dict[str, str] = Field(default_factory=dict)
     return_expression: Optional[str] = None
@@ -253,7 +258,82 @@ class SourceCallableRef(BaseModel):
     callable_id: str
     parameters: List[str] = Field(default_factory=list)
     parameter_types: List[str] = Field(default_factory=list)
+    parameter_defaults: List[Optional[str]] = Field(default_factory=list)
     return_type: Optional[str] = None
+
+
+def callable_parameter_count(record: Any) -> int:
+    """Return the structurally known formal count for a callable record."""
+    parameters = (
+        record.get("parameters")
+        if isinstance(record, dict)
+        else getattr(record, "parameters", None)
+    )
+    parameter_types = (
+        record.get("parameter_types")
+        if isinstance(record, dict)
+        else getattr(record, "parameter_types", None)
+    )
+    defaults = (
+        record.get("parameter_defaults")
+        if isinstance(record, dict)
+        else getattr(record, "parameter_defaults", None)
+    )
+    count = max(
+        len(parameters or []),
+        len(parameter_types or []),
+        len(defaults or []),
+    )
+    if count:
+        return count
+
+    raw_evidence = (
+        record.get("evidence")
+        if isinstance(record, dict)
+        else getattr(record, "evidence", "")
+    )
+    evidence = str(raw_evidence or "")
+    match = re.search(r"\((.*)\)", evidence)
+    if not match or not match.group(1).strip() or match.group(1).strip() == "void":
+        return 0
+    return len(
+        [value for value in split_top_level_args(match.group(1)) if value.strip()]
+    )
+
+
+def callable_arguments_with_defaults(
+    record: Any,
+    arguments: Sequence[str],
+) -> Optional[List[str]]:
+    """Return a complete positional argument list or fail closed.
+
+    Defaults are accepted only when source extraction supplied an expression
+    for every omitted formal. Older records without default metadata therefore
+    retain exact-arity behavior.
+    """
+    explicit = [str(value).strip() for value in arguments]
+    total = callable_parameter_count(record)
+    if len(explicit) > total:
+        return None
+
+    raw_defaults = (
+        record.get("parameter_defaults")
+        if isinstance(record, dict)
+        else getattr(record, "parameter_defaults", None)
+    )
+    defaults: List[Optional[str]] = list(raw_defaults or [])
+    if len(defaults) < total:
+        defaults.extend([None] * (total - len(defaults)))
+
+    omitted = defaults[len(explicit) : total]
+    if any(value is None or not str(value).strip() for value in omitted):
+        return None
+    return [*explicit, *(str(value).strip() for value in omitted)]
+
+
+def callable_accepts_argument_count(record: Any, argument_count: int) -> bool:
+    """Whether ``argument_count`` is valid under source-declared defaults."""
+    return callable_arguments_with_defaults(record, [""] * argument_count) is not None
 
 
 class SourceIncludeRef(BaseModel):

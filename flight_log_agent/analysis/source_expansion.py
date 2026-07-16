@@ -15,7 +15,11 @@ from typing import Any, Iterable, Literal, Optional, Sequence
 from pydantic import BaseModel
 
 from flight_log_agent.analysis.source_expression import source_expression_names
-from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
+from flight_log_agent.px4.mechanism_source_profiler import (
+    MechanismSourceProfiler,
+    callable_accepts_argument_count,
+    callable_parameter_count,
+)
 from flight_log_agent.px4.source_facts_cache import SourceFileFacts, extract_facts_for_file
 from flight_log_agent.symbols import exact_symbol, symbol_produces_reference
 from flight_log_agent.utils import dedupe_keep_order
@@ -672,6 +676,27 @@ class SourceExpansionResolver:
         candidates: list[ExpansionCandidate] = []
         for file_path in dedupe_keep_order(str(value) for value in files if value):
             candidate_facts = self._candidate_facts_for(file_path, reference)
+            if reference.kind == "callable":
+                if not self._callable_matches(
+                    reference,
+                    candidate_facts,
+                    structure,
+                    defaults_required=False,
+                ):
+                    continue
+                full_facts = self.facts_for(file_path)
+                match = self._exact_match(reference, full_facts, structure)
+                if not match:
+                    continue
+                candidates.append(
+                    ExpansionCandidate(
+                        file=file_path,
+                        facts=full_facts,
+                        matched_kind=reference.kind,
+                        matched_identity=match,
+                    )
+                )
+                continue
             if not self._contains_exact_definition(reference, candidate_facts):
                 continue
             match = self._exact_match(reference, candidate_facts, structure)
@@ -783,7 +808,9 @@ class SourceExpansionResolver:
                 )
                 and (
                     reference.argument_count is None
-                    or len(item.parameters) == reference.argument_count
+                    or callable_accepts_argument_count(
+                        item, reference.argument_count
+                    )
                 )
                 for item in facts.callables
             )
@@ -817,6 +844,61 @@ class SourceExpansionResolver:
         )
 
     @staticmethod
+    def _callable_matches(
+        reference: UnresolvedSourceReference,
+        facts: SourceFileFacts,
+        structure: SourceStructureIndex,
+        *,
+        defaults_required: bool,
+    ) -> list[Any]:
+        bare = reference.symbol.replace("->", ".").rsplit(".", 1)[-1].strip("()")
+        matches = [
+            item
+            for item in facts.callables
+            if item.name == reference.symbol
+            or item.name.rsplit("::", 1)[-1] == bare
+        ]
+        if reference.argument_count is not None:
+            if defaults_required:
+                matches = [
+                    item
+                    for item in matches
+                    if callable_accepts_argument_count(
+                        item, reference.argument_count
+                    )
+                ]
+            else:
+                # Admission sees only one physical file, so a declaration in
+                # a companion header may still supply defaults. It may reject
+                # impossible over-arity calls, but final acceptance waits for
+                # full companion-aware facts.
+                matches = [
+                    item
+                    for item in matches
+                    if reference.argument_count <= callable_parameter_count(item)
+                ]
+        dispatch, _short, owners = callable_dispatch_context(reference, structure)
+        owner_set = set(owners)
+        if dispatch == "receiver":
+            matches = [item for item in matches if item.owner in owner_set]
+        elif dispatch == "qualified":
+            matches = [
+                item
+                for item in matches
+                if item.owner in owner_set
+                or (
+                    not item.owner
+                    and item.name.rpartition("::")[0] in owner_set
+                )
+            ]
+        elif dispatch == "unqualified_member":
+            owned = [item for item in matches if item.owner in owner_set]
+            matches = owned or [item for item in matches if not item.owner]
+        else:
+            matches = [item for item in matches if not item.owner]
+        return matches
+
+    @staticmethod
     def _exact_match(
         reference: UnresolvedSourceReference,
         facts: SourceFileFacts,
@@ -829,37 +911,12 @@ class SourceExpansionResolver:
                 (item.name for item in facts.classes if item.name == bare), ""
             )
         if reference.kind == "callable":
-            matches = [
-                item
-                for item in facts.callables
-                if item.name == reference.symbol
-                or item.name.rsplit("::", 1)[-1] == bare
-            ]
-            if reference.argument_count is not None:
-                matches = [
-                    item
-                    for item in matches
-                    if len(item.parameters) == reference.argument_count
-                ]
-            dispatch, _short, owners = callable_dispatch_context(reference, structure)
-            owner_set = set(owners)
-            if dispatch == "receiver":
-                matches = [item for item in matches if item.owner in owner_set]
-            elif dispatch == "qualified":
-                matches = [
-                    item
-                    for item in matches
-                    if item.owner in owner_set
-                    or (
-                        not item.owner
-                        and item.name.rpartition("::")[0] in owner_set
-                    )
-                ]
-            elif dispatch == "unqualified_member":
-                owned = [item for item in matches if item.owner in owner_set]
-                matches = owned or [item for item in matches if not item.owner]
-            else:
-                matches = [item for item in matches if not item.owner]
+            matches = SourceExpansionResolver._callable_matches(
+                reference,
+                facts,
+                structure,
+                defaults_required=True,
+            )
             return matches[0].callable_id if len(matches) == 1 else ""
 
         bindings = []

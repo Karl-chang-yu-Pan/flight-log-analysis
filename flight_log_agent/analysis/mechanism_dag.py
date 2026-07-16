@@ -47,6 +47,9 @@ from flight_log_agent.analysis.source_expansion import (
 )
 from flight_log_agent.expression_math import is_safe_math_function_name
 from flight_log_agent.px4.mechanism_source_profiler import (
+    callable_accepts_argument_count,
+    callable_arguments_with_defaults,
+    callable_parameter_count,
     split_top_level_args,
     substitute_expression_symbols,
 )
@@ -1459,6 +1462,11 @@ class _DAGBuilder:
             caller_callable=caller_callable,
             source_site_id=source_site_id,
         )
+        explicit_count = len(args)
+        effective_args = callable_arguments_with_defaults(helper, args)
+        if effective_args is None:
+            return ""
+        args = effective_args
         if call_scope in self._registered_call_instances:
             return call_scope
         self._registered_call_instances.add(call_scope)
@@ -1548,7 +1556,7 @@ class _DAGBuilder:
             str(write.get("param") or "")
             for write in (helper.get("pointer_output_writes") or [])
         }
-        for formal, actual in zip(formals, args):
+        for index, (formal, actual) in enumerate(zip(formals, args)):
             if not exact_symbol(formal):
                 continue
             if formal in output_formals and not self._helper_reads_formal(
@@ -1562,14 +1570,20 @@ class _DAGBuilder:
                 function_name=str(helper.get("name") or ""),
                 function_parameters=formals,
             )
+            uses_default = index >= explicit_count
+            expression_file = helper_file if uses_default else caller_file
+            expression_callable = call_scope if uses_default else caller_callable
+            expression_line = (
+                int(helper.get("line") or 0) if uses_default else caller_line
+            )
             self._register_synthetic_binding(
                 {
                     "target_symbol": formal,
                     "source_symbol": actual,
                     "assignment_path": [
                         {
-                            "file": caller_file,
-                            "line": caller_line,
+                            "file": expression_file,
+                            "line": expression_line,
                             "expression": actual,
                         }
                     ],
@@ -1584,8 +1598,8 @@ class _DAGBuilder:
                     "scope_file": helper_file,
                     "scope_function": call_scope,
                     "scope_line": int(helper.get("line") or 0),
-                    "expression_scope_file": caller_file,
-                    "expression_scope_function": caller_callable,
+                    "expression_scope_file": expression_file,
+                    "expression_scope_function": expression_callable,
                     "control_scope_file": caller_file,
                     "control_scope_function": caller_callable,
                     "function": str(call.get("function") or ""),
@@ -2543,6 +2557,11 @@ class _DAGBuilder:
         helper = self.helper_index.get(helper_key)
         if not helper:
             return
+        effective_args = callable_arguments_with_defaults(
+            helper, invocation.args
+        )
+        if effective_args is None:
+            return
         pointer_writes = helper.get("pointer_output_writes") or []
         if not pointer_writes:
             return
@@ -2550,7 +2569,7 @@ class _DAGBuilder:
         if not pointer_params:
             return
         substituted = derive_pointer_output_bindings(
-            pointer_writes, pointer_params, invocation.args
+            pointer_writes, pointer_params, effective_args
         )
         helper_file = str(helper.get("file") or "")
         helper_callable = instance_key[2]
@@ -2618,12 +2637,27 @@ class _DAGBuilder:
         )
         if helper_key is None:
             return
+        helper = self.helper_index.get(helper_key)
+        if not helper:
+            return
+        effective_args = callable_arguments_with_defaults(
+            helper, invocation.args
+        )
+        if effective_args is None:
+            return
         formals = self._helper_parameter_vertices.get(instance_key)
         if not formals:
             return
-        for (formal_name, formal_vertex_id), arg_text in zip(
-            formals, invocation.args
+        explicit_count = len(invocation.args)
+        helper_file = str(helper.get("file") or "")
+        helper_line = int(helper.get("line") or 0) or None
+        for index, ((formal_name, formal_vertex_id), arg_text) in enumerate(
+            zip(formals, effective_args)
         ):
+            uses_default = index >= explicit_count
+            argument_file = helper_file if uses_default else file
+            argument_line = helper_line if uses_default else line
+            argument_scope = instance_key[2] if uses_default else scope_function
             for symbol in self._wire_symbols(arg_text):
                 normalized = exact_symbol(symbol)
                 if not normalized:
@@ -2632,9 +2666,9 @@ class _DAGBuilder:
                     normalized,
                     symbol,
                     arg_text,
-                    file,
-                    line,
-                    scope_function=scope_function,
+                    argument_file,
+                    argument_line,
+                    scope_function=argument_scope,
                 )
                 for producer_id in producer_ids:
                     self._add_edge(
@@ -3918,8 +3952,9 @@ class _DAGBuilder:
                 found = [
                     key
                     for key in found
-                    if self._helper_parameter_count(self.helper_index[key])
-                    == argument_count
+                    if callable_accepts_argument_count(
+                        self.helper_index[key], argument_count
+                    )
                 ]
             return found
 
@@ -3993,16 +4028,7 @@ class _DAGBuilder:
 
     @staticmethod
     def _helper_parameter_count(helper: dict[str, Any]) -> int:
-        parameters = helper.get("parameters")
-        if parameters:
-            return len(parameters)
-        evidence = str(helper.get("evidence") or "")
-        match = re.search(r"\((.*)\)", evidence)
-        if not match or not match.group(1).strip() or match.group(1).strip() == "void":
-            return 0
-        return len(
-            [value for value in split_top_level_args(match.group(1)) if value.strip()]
-        )
+        return callable_parameter_count(helper)
 
     # ------------------------------------------------------------
     # Edges and IDs
