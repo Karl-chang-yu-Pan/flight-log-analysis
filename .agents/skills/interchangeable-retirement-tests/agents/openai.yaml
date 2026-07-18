@@ -1,0 +1,4 @@
+interface:
+  display_name: "Interchangeable Retirement Tests"
+  short_description: "Contract tests for staged replacements"
+  default_prompt: "Use $interchangeable-retirement-tests to design shared compatibility tests for a staged implementation replacement."
