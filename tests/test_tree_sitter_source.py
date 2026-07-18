@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
 from flight_log_agent.analysis.mechanism_discovery import dag_inputs_from_facts
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.px4.source_facts_cache import extract_facts_for_file
@@ -156,6 +157,131 @@ void Derived::update() { inherited = 3; }
     )
     assert inherited["class_owner"] == "nav::Derived"
     assert inherited["declaring_class"] == "nav::Base"
+
+
+def test_declaration_identity_distinguishes_shadowed_local_from_member(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+class Control
+{
+    int value;
+    int inner_output;
+    int outer_output;
+
+    void run()
+    {
+        value = 1;
+        {
+            int value = 2;
+            inner_output = value;
+        }
+        outer_output = value;
+    }
+};
+""",
+    )
+
+    inputs = dag_inputs_from_facts([facts])
+    member_write = next(
+        binding
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "value"
+        and binding["target_identity"]["kind"] == "member"
+    )
+    local_write = next(
+        binding
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "value"
+        and binding["target_identity"]["kind"] == "local"
+    )
+    inner_read = next(
+        binding
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "inner_output"
+    )["reference_identities"]["value"]
+    outer_read = next(
+        binding
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "outer_output"
+    )["reference_identities"]["value"]
+
+    assert member_write["target_identity"]["declaration_proven"] is True
+    assert local_write["target_identity"]["declaration_proven"] is True
+    assert inner_read["declaration_id"] == local_write["target_identity"]["declaration_id"]
+    assert outer_read["declaration_id"] == member_write["target_identity"]["declaration_id"]
+
+
+def test_companion_member_declaration_survives_primary_fact_aggregation(tmp_path):
+    root = tmp_path / "PX4-Autopilot"
+    module = root / "src" / "modules" / "example"
+    module.mkdir(parents=True)
+    (module / "control.hpp").write_text(
+        "class Control { int value; public: void set(); int get(); };",
+        encoding="utf-8",
+    )
+    (module / "control.cpp").write_text(
+        '#include "control.hpp"\n'
+        "void Control::set() { value = 3; }\n"
+        "int Control::get() { return value; }\n",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+    facts = extract_facts_for_file(
+        profiler,
+        "src/modules/example/control.cpp",
+        "source-hash",
+    )
+
+    # The Layer-1 payload remains primary-file scoped, but identities retain
+    # the declaration proven from its parsed companion header.
+    assert facts.members == []
+    inputs = dag_inputs_from_facts([facts])
+    write = next(
+        binding for binding in inputs.bindings if binding["target_symbol"] == "value"
+    )
+    assert write["target_identity"]["kind"] == "member"
+    assert write["target_identity"]["declaring_class"] == "Control"
+    assert write["target_identity"]["declaration_proven"] is True
+
+
+def test_missing_declaration_stays_unknown_instead_of_becoming_local(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+void Control::run()
+{
+    value = input;
+    output = value;
+}
+""",
+    )
+    inputs = dag_inputs_from_facts([facts])
+    identities = {
+        binding["target_symbol"]: binding["target_identity"]
+        for binding in inputs.bindings
+    }
+
+    assert identities["value"]["kind"] == "unknown"
+    assert identities["output"]["kind"] == "unknown"
+    assert identities["value"]["declaration_proven"] is False
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/example/example.cpp",
+        terminal_identity=identities["output"],
+        source_structure=inputs.structure,
+    )
+    assert not any(
+        vertex.kind == "operation" and vertex.variable == "value"
+        for vertex in dag.vertices
+    )
+    assert dag.vertices == []
 
 
 def test_anonymous_namespace_ownership_is_source_unit_scoped(tmp_path):
@@ -529,6 +655,75 @@ void Control::run(float input, bool enabled)
         "output",
         "enabled",
     ]
+
+
+def test_member_initializers_and_value_receivers_are_source_facts(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+class VectorState {
+public:
+    float norm() const;
+};
+
+class Control {
+    bool valid{false};
+    VectorState velocity{};
+    float output{};
+
+    void run()
+    {
+        output = velocity.norm();
+    }
+};
+""",
+    )
+
+    initial = next(
+        item
+        for item in facts.source_assignments
+        if item.target == "valid" and item.declaration_kind == "member_initializer"
+    )
+    assert initial.owner == "Control"
+    assert initial.expression == "false"
+    write = next(
+        item
+        for item in facts.source_assignments
+        if item.target == "output" and item.function == "Control::run"
+    )
+    assert write.expression_ref is not None
+    assert write.expression_ref.exact is True
+    assert write.expression_ref.input_symbols == ["velocity"]
+
+
+def test_conditional_endpoint_alternatives_keep_one_storage_identity(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+class Publisher {
+    uORB::Publication<message_s> endpoint;
+
+public:
+    Publisher(bool use_primary) :
+        endpoint(use_primary ? ORB_ID(primary_topic) : ORB_ID(secondary_topic))
+    {}
+};
+""",
+    )
+
+    endpoints = sorted(facts.published_topics, key=lambda item: item.topic)
+    assert [(item.variable, item.topic) for item in endpoints] == [
+        ("endpoint", "primary_topic"),
+        ("endpoint", "secondary_topic"),
+    ]
+    by_topic = {item.topic: item for item in endpoints}
+    assert by_topic["primary_topic"].control_predicates == ["use_primary"]
+    assert by_topic["secondary_topic"].control_predicates == ["!(use_primary)"]
+    assert all(
+        item.control_expression_refs
+        and item.control_expression_refs[0].input_symbols == ["use_primary"]
+        for item in endpoints
+    )
 
 
 def test_storage_aliases_do_not_leak_between_switch_cases(tmp_path):

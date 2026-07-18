@@ -363,6 +363,144 @@ void Reader::calculate()
     assert "status.nav_state" in dag.unresolved_symbols
 
 
+def test_class_owned_payload_published_from_sibling_method_is_observed(
+    tmp_path, source_backend
+):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/publisher.cpp": """
+class Publisher {
+    uORB::Publication<status_s> _publisher{ORB_ID(status)};
+    status_s _status{};
+
+    void calculate(float input)
+    {
+        _status.value = input;
+    }
+
+    void Run()
+    {
+        _publisher.publish(_status);
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        ["src/modules/example/publisher.cpp"],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+
+    write = next(
+        item
+        for item in inputs.bindings
+        if item["target_symbol"] == "_status.value"
+    )
+    assert write["logged_signal"] == "status.value"
+
+
+def test_conditional_publication_candidates_remain_explicit(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/publisher.cpp": """
+class Publisher {
+    uORB::Publication<status_s> _publisher;
+    status_s _status{};
+    float output{};
+
+public:
+    Publisher(bool primary) :
+        _publisher(primary ? ORB_ID(status) : ORB_ID(virtual_status))
+    {}
+
+    void calculate(float input)
+    {
+        _status.value = input;
+    }
+
+    void Run()
+    {
+        _publisher.publish(_status);
+    }
+
+    void review()
+    {
+        output = _status.value;
+    }
+};
+""",
+        },
+        backend="tree_sitter",
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        ["src/modules/example/publisher.cpp"],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+
+    write = next(
+        item
+        for item in inputs.bindings
+        if item["target_symbol"] == "_status.value"
+    )
+    assert write["logged_signal"] == ""
+    candidates = write["logged_signal_candidates"]
+    assert {
+        (item["topic"], tuple(item["control_predicates"]))
+        for item in candidates
+    } == {
+        ("status", ("primary",)),
+        ("virtual_status", ("!(primary)",)),
+    }
+
+    selected = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/example/publisher.cpp",
+        logged_signals={"status.value"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+    selected_checkpoints = [
+        vertex
+        for vertex in selected.vertices
+        if vertex.kind == "evidence"
+        and (vertex.metadata or {}).get("derivation")
+        == "published_storage_checkpoint"
+    ]
+    assert [vertex.signal_name for vertex in selected_checkpoints] == [
+        "status.value"
+    ]
+
+    ambiguous = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/example/publisher.cpp",
+        logged_signals={"status.value", "virtual_status.value"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+    assert not [
+        vertex
+        for vertex in ambiguous.vertices
+        if vertex.kind == "evidence"
+        and (vertex.metadata or {}).get("derivation")
+        == "published_storage_checkpoint"
+    ]
+
+
 def _mini_tree(tmp_path, files: dict[str, str], *, backend: str = "legacy"):
     root = tmp_path / "PX4-Autopilot"
     for rel, text in files.items():
@@ -909,6 +1047,148 @@ void Example::update()
         "B",
         "var",
         "vehicle_state.mut",
+    } & set(dag.unresolved_symbols)
+
+
+def test_helper_call_instance_reaches_member_writer_in_sibling_method(
+    tmp_path, source_backend
+):
+    source_file = "src/modules/example/member_call.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+class Control {
+    float state;
+    float output;
+
+    float read_state() const
+    {
+        return state;
+    }
+
+    void update(float input)
+    {
+        state = input;
+    }
+
+    void run()
+    {
+        output = read_state();
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        [source_file],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+    )
+
+    assert any(
+        vertex.kind == "operation" and vertex.variable == "state"
+        for vertex in dag.vertices
+    )
+    assert "state" not in dag.unresolved_symbols
+
+
+def test_terminal_formal_rebinding_crosses_nested_caller_paths(
+    tmp_path, source_backend
+):
+    source_file = "src/modules/example/nested_calls.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+struct point_s { float value; };
+struct triplet_s { point_s current; };
+
+class Control {
+    uORB::Subscription _triplet_sub{ORB_ID(triplet)};
+    triplet_s _triplet{};
+
+    void poll()
+    {
+        _triplet_sub.copy(&_triplet);
+    }
+
+    void inner(const point_s &setpoint)
+    {
+        float target = setpoint.value;
+        consume(target);
+    }
+
+    void outer(const point_s &incoming)
+    {
+        const point_s &forwarded = incoming;
+        inner(forwarded);
+    }
+
+    void Run()
+    {
+        outer(_triplet.current);
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        [source_file],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+    inner = next(
+        item
+        for item in inputs.structure.callables_by_id.values()
+        if item["name"] == "Control::inner"
+    )
+    terminal_identity = inputs.structure.symbol_identity(
+        "target",
+        file=source_file,
+        callable_id=inner["callable_id"],
+        function_name=inner["name"],
+        function_parameters=inner["parameters"],
+    )
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "target",
+        terminal_file=source_file,
+        terminal_identity=terminal_identity,
+        logged_signals={"triplet.current.value"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+
+    assert any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "triplet.current.value"
+        for vertex in dag.vertices
+    )
+    assert not {
+        "setpoint.value",
+        "forwarded.value",
+        "incoming.value",
+        "_triplet.current.value",
     } & set(dag.unresolved_symbols)
 
 

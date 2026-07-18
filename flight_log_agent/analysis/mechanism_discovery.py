@@ -74,6 +74,8 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         "source_symbol": str(ref.get("expression") or ""),
         "function": str(ref.get("function") or ""),
         "callable_id": str(ref.get("callable_id") or ""),
+        "function_owner": str(ref.get("owner") or ""),
+        "target_identity": dict(ref.get("target_identity") or {}),
         "function_parameters": list(ref.get("function_parameters") or []),
         "declaration_kind": str(ref.get("declaration_kind") or ""),
         "assignment_operator": str(ref.get("assignment_operator") or "="),
@@ -140,6 +142,7 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
     seen_calls: set[tuple[Any, ...]] = set()
 
     entries = [_as_dict(facts_entry) for facts_entry in facts]
+    inputs.structure = SourceStructureIndex.from_facts(entries)
 
     class_bases: dict[str, list[str]] = {}
     callable_owners: dict[str, str] = {}
@@ -187,19 +190,34 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                         "function": str(ref.get("function") or ""),
                         "callable_id": str(ref.get("callable_id") or ""),
                         "source_owner": str(ref.get("variable_owner") or ""),
+                        "source_identity": dict(
+                            ref.get("variable_identity") or {}
+                        ),
                         "endpoint_kind": str(ref.get("endpoint_kind") or ""),
                         "source_site_id": str(ref.get("source_site_id") or ""),
                         "provenance": str(ref.get("api") or direction_key),
+                        "control_predicates": [
+                            str(value)
+                            for value in (ref.get("control_predicates") or [])
+                        ],
+                        "control_expression_refs": [
+                            dict(value)
+                            for value in (ref.get("control_expression_refs") or [])
+                        ],
+                        "reachability_exact": bool(
+                            ref.get("reachability_exact", True)
+                        ),
                     }
                 )
 
-    def unique_boundary(
+    def scoped_boundaries(
         variable: str,
         direction: str,
         source_file: str,
         callable_id: str,
         caller_owner: str,
-    ) -> tuple[str, Any] | None:
+        source_identity: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
         receiver = variable.replace("->", ".")
         if receiver.startswith("this."):
             receiver = receiver[5:]
@@ -212,6 +230,20 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
         ]
         scoped: list[dict[str, Any]] = []
         for item in candidates:
+            endpoint_identity = dict(item.get("source_identity") or {})
+            if source_identity and endpoint_identity:
+                reference = SourceSymbolIdentity.model_validate(source_identity)
+                producer = SourceSymbolIdentity.model_validate(endpoint_identity)
+                if "unknown" in {reference.kind, producer.kind}:
+                    continue
+                if (
+                    reference.declaration_proven
+                    and producer.declaration_proven
+                    and not inputs.structure.storage_compatible(
+                        reference, producer
+                    )
+                ):
+                    continue
             endpoint_kind = str(item.get("endpoint_kind") or "")
             item_owner = str(item.get("source_owner") or "")
             item_callable = str(item.get("callable_id") or "")
@@ -229,12 +261,34 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                     scoped.append(item)
             elif endpoint_kind == "global" and source_file and item_file == source_file:
                 scoped.append(item)
-        candidates = scoped
-        placements = {
-            (str(item.get("topic") or ""), item.get("instance"))
-            for item in candidates
-        }
-        return next(iter(placements)) if len(placements) == 1 else None
+        return scoped
+
+    def source_storage_key(
+        symbol: str,
+        *,
+        file: str,
+        callable_id: str,
+        owner_hint: str = "",
+        identity: Optional[dict[str, Any]] = None,
+    ) -> tuple[str, ...]:
+        if identity:
+            resolved = SourceSymbolIdentity.model_validate(identity).model_copy(
+                update={"symbol": exact_symbol(symbol)}
+            )
+            return resolved.storage_key()
+        callable_record = inputs.structure.callables_by_id.get(callable_id) or {}
+        identity = inputs.structure.symbol_identity(
+            symbol,
+            file=file,
+            callable_id=callable_id,
+            function_name=str(callable_record.get("name") or ""),
+            function_parameters=[
+                str(value)
+                for value in (callable_record.get("parameters") or [])
+            ],
+            class_owner_hint=owner_hint,
+        )
+        return identity.storage_key()
 
     inputs.boundary_bindings.extend(
         item
@@ -261,55 +315,97 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             caller_owner = callable_owners.get(callable_id, "")
             if not caller_owner and "::" in function:
                 caller_owner = function.rpartition("::")[0]
-            placement = unique_boundary(
+            endpoints = scoped_boundaries(
                 receiver or "this",
                 direction,
                 file,
                 callable_id,
                 caller_owner,
+                source_identity=dict(call.get("receiver_identity") or {}),
             )
-            if not placement:
+            if not endpoints:
                 continue
-            topic, instance = placement
             source_symbol = args[0].lstrip("&*").strip()
             if not source_symbol:
                 continue
             root = source_symbol.replace("->", ".").split(".", 1)[0]
-            inputs.boundary_bindings.append(
-                {
-                    "source_symbol": source_symbol,
-                    "topic": topic,
-                    "instance": instance,
-                    "direction": direction,
-                    "file": file,
-                    "function": function,
-                    "callable_id": callable_id,
-                    "source_owner": str(
-                        (call.get("argument_owners") or {}).get(root) or ""
-                    ),
-                    "source_site_id": str(call.get("source_site_id") or ""),
-                    "provenance": f"{receiver}.{name}",
-                }
+            source_owner = str(
+                (call.get("argument_owners") or {}).get(root) or ""
             )
+            argument_identity: dict[str, Any] = {}
+            argument_refs = list(call.get("argument_expressions") or [])
+            if argument_refs:
+                identities = dict(
+                    (argument_refs[0] or {}).get("input_identities") or {}
+                )
+                argument_identity = dict(
+                    identities.get(exact_symbol(source_symbol))
+                    or identities.get(exact_symbol(root))
+                    or {}
+                )
+                if argument_identity:
+                    source_owner = (
+                        str(
+                            argument_identity.get("declaring_class")
+                            or argument_identity.get("class_owner")
+                            or source_owner
+                        )
+                        if argument_identity.get("kind") == "member"
+                        else ""
+                    )
+            for endpoint in endpoints:
+                inputs.boundary_bindings.append(
+                    {
+                        "source_symbol": source_symbol,
+                        "topic": str(endpoint.get("topic") or ""),
+                        "instance": endpoint.get("instance"),
+                        "direction": direction,
+                        "file": file,
+                        "function": function,
+                        "callable_id": callable_id,
+                        "source_owner": source_owner,
+                        "source_identity": argument_identity,
+                        "source_site_id": str(call.get("source_site_id") or ""),
+                        "provenance": f"{receiver}.{name}",
+                        "control_predicates": [
+                            *(
+                                str(value)
+                                for value in endpoint.get("control_predicates") or []
+                            ),
+                            *(
+                                str(value)
+                                for value in call.get("control_predicates") or []
+                            ),
+                        ],
+                        "control_expression_refs": [
+                            *(
+                                dict(value)
+                                for value in endpoint.get("control_expression_refs") or []
+                            ),
+                            *(
+                                dict(value)
+                                for value in call.get("control_expression_refs") or []
+                            ),
+                        ],
+                        "reachability_exact": bool(
+                            endpoint.get("reachability_exact", True)
+                        ) and bool(call.get("reachability_exact", True)),
+                    }
+                )
 
-    publish_candidates: dict[tuple[str, str, str], set[tuple[str, Any]]] = {}
+    publish_candidates: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     for item in inputs.boundary_bindings:
         callable_id = str(item.get("callable_id") or "")
         if item.get("direction") != "publish" or not callable_id:
             continue
-        key = (
+        key = source_storage_key(
             str(item.get("source_symbol") or ""),
-            str(item.get("file") or ""),
-            callable_id,
+            file=str(item.get("file") or ""),
+            callable_id=callable_id,
+            owner_hint=str(item.get("source_owner") or ""),
+            identity=dict(item.get("source_identity") or {}),
         )
-        publish_candidates.setdefault(key, set()).add(
-            (str(item.get("topic") or ""), item.get("instance"))
-        )
-    publish_roots = {
-        key: next(iter(placements))
-        for key, placements in publish_candidates.items()
-        if len(placements) == 1
-    }
+        publish_candidates.setdefault(key, []).append(item)
 
     for entry in entries:
 
@@ -329,13 +425,33 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             root, dot, field_path = target.replace("->", ".").partition(".")
             file = str(ref.get("file") or entry.get("file") or "")
             callable_id = str(ref.get("callable_id") or "")
-            placement = publish_roots.get((root, file, callable_id))
-            if placement and dot and field_path:
-                topic, instance = placement
+            storage_key = source_storage_key(
+                root,
+                file=file,
+                callable_id=callable_id,
+                owner_hint=str(ref.get("owner") or ""),
+                identity=dict(ref.get("target_identity") or {}),
+            )
+            publication_candidates = publish_candidates.get(storage_key, [])
+            placements = {
+                (str(item.get("topic") or ""), item.get("instance"))
+                for item in publication_candidates
+                if item.get("topic")
+            }
+            if len(placements) == 1 and dot and field_path:
+                topic, instance = next(iter(placements))
                 topic_identity = (
                     f"{topic}[{instance}]" if instance is not None else topic
                 )
                 binding["logged_signal"] = f"{topic_identity}.{field_path}"
+            elif publication_candidates and dot and field_path:
+                binding["logged_signal_candidates"] = [
+                    {
+                        **dict(item),
+                        "signal_field": field_path,
+                    }
+                    for item in publication_candidates
+                ]
             inputs.bindings.append(binding)
 
         for helper in entry.get("helper_expressions") or []:
@@ -387,7 +503,6 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                 if member:
                     inputs.parameter_aliases.setdefault(str(member), str(name))
 
-    inputs.structure = SourceStructureIndex.from_facts(entries)
     inputs.bindings = inputs.structure.enrich_bindings(inputs.bindings)
     inputs.call_statements = inputs.structure.enrich_calls(inputs.call_statements)
     return inputs

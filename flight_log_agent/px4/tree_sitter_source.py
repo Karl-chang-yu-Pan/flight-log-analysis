@@ -34,10 +34,12 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceExpressionRef,
     SourceIncludeRef,
     SourceMemberRef,
+    SourceStorageRef,
     TopicRef,
     _HelperLoweringFailed,
     split_source_field,
 )
+from flight_log_agent.symbols import exact_symbol
 
 
 _CPP_LANGUAGE = Language(tree_sitter_cpp.language())
@@ -55,6 +57,7 @@ class _ControlTerm:
     line: int
     site_id: str
     input_symbols: tuple[str, ...] = ()
+    input_identities: tuple[tuple[str, SourceStorageRef], ...] = ()
     inputs_exact: bool = False
 
 
@@ -78,6 +81,15 @@ class _Callable:
     capture_arguments: list[str] = field(default_factory=list)
     is_lambda: bool = False
     capture_exact: bool = True
+
+
+@dataclass(frozen=True)
+class _LocalDeclaration:
+    name: str
+    declaration_id: str
+    start_byte: int
+    scope_start: int
+    scope_end: int
 
 
 @dataclass
@@ -194,6 +206,9 @@ class _ExtractionState:
     storage_aliases: dict[str, str] = field(default_factory=dict)
     alias_capable_symbols: set[str] = field(default_factory=set)
     reference_alias_symbols: set[str] = field(default_factory=set)
+    local_declarations: dict[str, list[_LocalDeclaration]] = field(
+        default_factory=dict
+    )
 
 
 def _walk(node: Node) -> Iterator[Node]:
@@ -337,10 +352,12 @@ class TreeSitterSourceExtractor:
         self._index_parameter_members(context)
         states = [self._extract_callable(primary, context, item) for item in primary.callables]
         global_assignments = self._extract_global_constants(primary)
+        member_initializers = self._extract_member_initializers(primary, context)
         topics = self._extract_topics(primary, context, states)
         params = self._extract_parameters(primary, context)
         assignments = [
             *global_assignments,
+            *member_initializers,
             *(item for state in states for item in state.assignments),
         ]
         calls = [item for state in states for item in state.calls]
@@ -442,6 +459,15 @@ class TreeSitterSourceExtractor:
                     self._admission_assignments(primary, callable_item)
                 )
             assignments.extend(self._extract_global_constants(primary))
+            admission_context = _SourceContext([primary])
+            assignments.extend(
+                item
+                for item in self._extract_member_initializers(
+                    primary, admission_context
+                )
+                if not requested_root
+                or exact_symbol(item.target).split(".", 1)[0] == requested_root
+            )
 
         return SourceFileFacts(
             file=file_path,
@@ -1236,6 +1262,7 @@ class TreeSitterSourceExtractor:
             context=context,
             callable=callable,
             struct_variables=struct_variables,
+            local_declarations=self._local_declarations(unit, callable),
             lambda_bindings={
                 item.name.rsplit("::", 1)[-1]: item
                 for item in unit.callables
@@ -1249,6 +1276,35 @@ class TreeSitterSourceExtractor:
             exact=not callable.body.has_error,
         )
         return state
+
+    def _local_declarations(
+        self, unit: _ParsedUnit, callable: _Callable
+    ) -> dict[str, list[_LocalDeclaration]]:
+        """Index lexical local declarations by their exact block scope."""
+        declarations: dict[str, list[_LocalDeclaration]] = {}
+        for node in _walk_operations(callable.body):
+            if node.type != "declaration":
+                continue
+            scope = self._declaration_scope(node, callable.body)
+            if scope is None:
+                continue
+            for declarator in _declaration_declarators(node):
+                name_node = _last_identifier(declarator)
+                name = unit.text(name_node).strip()
+                if not name:
+                    continue
+                declarations.setdefault(name, []).append(
+                    _LocalDeclaration(
+                        name=name,
+                        declaration_id=unit.site_id(name_node or declarator),
+                        start_byte=declarator.start_byte,
+                        scope_start=scope.start_byte,
+                        scope_end=scope.end_byte,
+                    )
+                )
+        for values in declarations.values():
+            values.sort(key=lambda item: item.start_byte)
+        return declarations
 
     def _struct_variables(
         self, unit: _ParsedUnit, context: _SourceContext, callable: _Callable
@@ -1369,6 +1425,7 @@ class TreeSitterSourceExtractor:
                 line=unit.line(node),
                 site_id=unit.site_id(node),
                 input_symbols=tuple(condition_ref.input_symbols),
+                input_identities=tuple(condition_ref.input_identities.items()),
                 inputs_exact=condition_ref.exact,
             )
             self._record_branch(state, "if", term, node)
@@ -1398,6 +1455,9 @@ class TreeSitterSourceExtractor:
                             line=unit.line(alternative),
                             site_id=unit.site_id(alternative),
                             input_symbols=tuple(condition_ref.input_symbols),
+                            input_identities=tuple(
+                                condition_ref.input_identities.items()
+                            ),
                             inputs_exact=condition_ref.exact,
                         ),
                     ],
@@ -1422,6 +1482,7 @@ class TreeSitterSourceExtractor:
                 line=unit.line(node),
                 site_id=unit.site_id(node),
                 input_symbols=tuple(condition_ref.input_symbols),
+                input_identities=tuple(condition_ref.input_identities.items()),
                 inputs_exact=condition_ref.exact,
             )
             self._record_branch(state, node.type.removesuffix("_statement"), term, node)
@@ -1487,6 +1548,11 @@ class TreeSitterSourceExtractor:
                                     for symbol in item.input_symbols
                                 )
                             ),
+                            input_identities={
+                                symbol: identity
+                                for item in controls
+                                for symbol, identity in item.input_identities
+                            },
                             exact=all(item.inputs_exact for item in controls),
                         ).model_dump(exclude_none=True),
                         "file": unit.file,
@@ -1567,6 +1633,9 @@ class TreeSitterSourceExtractor:
                 line=unit.line(site),
                 site_id=unit.site_id(site),
                 input_symbols=tuple(discriminant_ref.input_symbols),
+                input_identities=tuple(
+                    discriminant_ref.input_identities.items()
+                ),
                 # The synthetic expression also contains case labels and
                 # fallthrough state; until those are represented as syntax
                 # nodes, retain the complete string-parser fallback.
@@ -1658,6 +1727,7 @@ class TreeSitterSourceExtractor:
                         for symbol in term.input_symbols
                         if self._storage_target(state, symbol)
                     ],
+                    input_identities=dict(term.input_identities),
                     exact=term.inputs_exact,
                 ),
             )
@@ -1950,6 +2020,8 @@ class TreeSitterSourceExtractor:
             evidence=state.unit.evidence(node),
             function=state.callable.name,
             callable_id=state.callable.callable_id,
+            owner=state.callable.owner,
+            target_identity=self._storage_identity(target, node, state=state),
             function_parameters=state.callable.parameters,
             target_topic=topic,
             target_field=field_name if topic else None,
@@ -1975,6 +2047,7 @@ class TreeSitterSourceExtractor:
                         for symbol in item.input_symbols
                         if self._storage_target(state, symbol)
                     ],
+                    input_identities=dict(item.input_identities),
                     exact=item.inputs_exact,
                 )
                 for item in controls
@@ -2022,7 +2095,14 @@ class TreeSitterSourceExtractor:
             argument_expressions = [
                 SourceExpressionRef(
                     text=capture,
-                    input_symbols=[self._storage_target(state, capture)],
+                    input_symbols=[
+                        resolved := self._storage_target(state, capture)
+                    ],
+                    input_identities={
+                        exact_symbol(resolved): self._storage_identity(
+                            resolved, node, state=state
+                        )
+                    },
                     exact=True,
                 )
                 for capture in lambda_callable.capture_arguments
@@ -2048,6 +2128,11 @@ class TreeSitterSourceExtractor:
         return FunctionCallRef(
             name=name,
             receiver=receiver,
+            receiver_identity=(
+                self._storage_identity(receiver, node, state=state)
+                if receiver
+                else None
+            ),
             args=args,
             argument_topics=argument_topics,
             control_predicates=predicates,
@@ -2076,6 +2161,7 @@ class TreeSitterSourceExtractor:
                         for symbol in item.input_symbols
                         if self._storage_target(state, symbol)
                     ],
+                    input_identities=dict(item.input_identities),
                     exact=item.inputs_exact,
                 )
                 for item in controls
@@ -2116,6 +2202,9 @@ class TreeSitterSourceExtractor:
                             file=unit.file,
                             line=unit.line(declarator),
                             evidence=unit.evidence(declarator),
+                            target_identity=self._storage_identity(
+                                name, declarator, unit=unit, force_global=True
+                            ),
                             assignment_operator="=",
                             declaration_kind="constexpr",
                             source_site_id=unit.site_id(declarator),
@@ -2141,6 +2230,12 @@ class TreeSitterSourceExtractor:
                         file=unit.file,
                         line=unit.line(node),
                         evidence=unit.evidence(node),
+                        target_identity=self._storage_identity(
+                            unit.text(name_node).strip(),
+                            node,
+                            unit=unit,
+                            force_global=True,
+                        ),
                         assignment_operator="=",
                         declaration_kind="enum",
                         source_site_id=unit.site_id(node),
@@ -2166,6 +2261,9 @@ class TreeSitterSourceExtractor:
                         file=unit.file,
                         line=unit.line(node),
                         evidence=unit.evidence(node),
+                        target_identity=self._storage_identity(
+                            name, node, unit=unit, force_global=True
+                        ),
                         assignment_operator="=",
                         declaration_kind="define",
                         source_site_id=unit.site_id(node),
@@ -2177,6 +2275,57 @@ class TreeSitterSourceExtractor:
                         ),
                     )
                 )
+        return refs
+
+    def _extract_member_initializers(
+        self, unit: _ParsedUnit, context: _SourceContext
+    ) -> list[SourceAssignmentRef]:
+        """Emit class-owned default member writes with declaration identity."""
+        refs: list[SourceAssignmentRef] = []
+        for node in _walk(unit.tree.root_node):
+            if node.type != "field_declaration":
+                continue
+            owner = unit.class_owner(node)
+            value_node = node.child_by_field_name("default_value")
+            declarator = node.child_by_field_name("declarator")
+            name_node = _last_identifier(declarator)
+            target = unit.text(name_node).strip()
+            if not owner or not target or value_node is None:
+                continue
+            value_text = _strip_initializer_delimiters(unit.text(value_node))
+            declaration_text = unit.text(node)
+            refs.append(
+                SourceAssignmentRef(
+                    target=target,
+                    expression=self.profiler._normalize_source_expression(value_text),
+                    file=unit.file,
+                    line=unit.line(node),
+                    evidence=unit.evidence(node),
+                    owner=owner,
+                    target_identity=self._storage_identity(
+                        target,
+                        node,
+                        unit=unit,
+                        context=context,
+                        declared_owner=owner,
+                    ),
+                    assignment_operator="=",
+                    declaration_kind=(
+                        "constexpr"
+                        if re.search(r"\bconstexpr\b", declaration_text)
+                        else "member_initializer"
+                    ),
+                    source_site_id=unit.site_id(node),
+                    expression_ref=self._expression_ref(
+                        None,
+                        value_node,
+                        unit=unit,
+                        context=context,
+                        declared_owner=owner,
+                        text=value_text,
+                    ),
+                )
+            )
         return refs
 
     def _extract_topics(
@@ -2214,15 +2363,18 @@ class TreeSitterSourceExtractor:
                 topics = self._orb_topics(
                     unit, topic_root if topic_root is not None else node
                 )
-                for index, (topic, instance, orb_node) in enumerate(topics):
+                for topic, instance, orb_node in topics:
                     consumed_orb_sites.add((orb_node.start_byte, orb_node.end_byte))
-                    scoped_variable = (
-                        f"{variable}[{index}]" if len(topics) > 1 else variable
+                    control_predicates, control_refs = self._endpoint_controls(
+                        unit,
+                        orb_node,
+                        topic_root if topic_root is not None else node,
+                        state,
                     )
                     owner, endpoint_kind = self._endpoint_scope(
                         context,
                         callable,
-                        scoped_variable,
+                        variable,
                         declared_owner=class_owner,
                     )
                     refs[direction].append(
@@ -2234,14 +2386,27 @@ class TreeSitterSourceExtractor:
                             evidence=unit.evidence(declarator),
                             struct=self._struct_type(type_text)
                             or self.profiler._struct_from_topic(topic),
-                            variable=scoped_variable,
+                            variable=variable,
                             api=self._uorb_api(type_text),
                             instance=instance,
                             function=callable.name if callable else None,
                             callable_id=callable.callable_id if callable else None,
                             variable_owner=owner,
                             endpoint_kind=endpoint_kind,
+                            variable_identity=self._storage_identity(
+                                variable,
+                                declarator,
+                                state=state,
+                                unit=unit,
+                                context=context,
+                                declared_owner=class_owner,
+                                force_global=(
+                                    callable is None and class_owner is None
+                                ),
+                            ),
                             source_site_id=unit.site_id(declarator),
+                            control_predicates=control_predicates,
+                            control_expression_refs=control_refs,
                         )
                     )
 
@@ -2260,13 +2425,14 @@ class TreeSitterSourceExtractor:
             callable = self._enclosing_callable(unit, node)
             variable = self._canonical_symbol(unit.text(left))
             topics = self._orb_topics(unit, right)
-            for index, (topic, instance, orb_node) in enumerate(topics):
+            state = state_by_callable.get(callable.callable_id) if callable else None
+            for topic, instance, orb_node in topics:
                 consumed_orb_sites.add((orb_node.start_byte, orb_node.end_byte))
-                scoped_variable = (
-                    f"{variable}[{index}]" if len(topics) > 1 else variable
+                control_predicates, control_refs = self._endpoint_controls(
+                    unit, orb_node, right, state
                 )
                 owner, endpoint_kind = self._endpoint_scope(
-                    context, callable, scoped_variable
+                    context, callable, variable
                 )
                 refs[direction].append(
                     TopicRef(
@@ -2277,14 +2443,24 @@ class TreeSitterSourceExtractor:
                         evidence=unit.evidence(node),
                         struct=self._struct_type(type_text)
                         or self.profiler._struct_from_topic(topic),
-                        variable=scoped_variable,
+                        variable=variable,
                         api=self._uorb_api(type_text),
                         instance=instance,
                         function=callable.name if callable else None,
                         callable_id=callable.callable_id if callable else None,
                         variable_owner=owner,
                         endpoint_kind=endpoint_kind,
+                        variable_identity=self._storage_identity(
+                            variable,
+                            node,
+                            state=state,
+                            unit=unit,
+                            context=context,
+                            force_global=callable is None,
+                        ),
                         source_site_id=unit.site_id(node),
+                        control_predicates=control_predicates,
+                        control_expression_refs=control_refs,
                     )
                 )
 
@@ -2304,10 +2480,11 @@ class TreeSitterSourceExtractor:
             topics = self._orb_topics(unit, node)
             base_endpoint = member is None and self._uorb_direction(initializer_name)
             variable = "this" if base_endpoint else root_name
-            for index, (topic, instance, orb_node) in enumerate(topics):
+            state = state_by_callable.get(callable.callable_id)
+            for topic, instance, orb_node in topics:
                 consumed_orb_sites.add((orb_node.start_byte, orb_node.end_byte))
-                scoped_variable = (
-                    f"{variable}[{index}]" if len(topics) > 1 and not base_endpoint else variable
+                control_predicates, control_refs = self._endpoint_controls(
+                    unit, orb_node, node, state
                 )
                 refs[direction].append(
                     TopicRef(
@@ -2318,14 +2495,36 @@ class TreeSitterSourceExtractor:
                         evidence=unit.evidence(node),
                         struct=self._struct_type(type_text)
                         or self.profiler._struct_from_topic(topic),
-                        variable=scoped_variable,
+                        variable=variable,
                         api=self._uorb_api(type_text),
                         instance=instance,
                         function=callable.name,
                         callable_id=callable.callable_id,
                         variable_owner=callable.owner,
                         endpoint_kind="base" if base_endpoint else "member",
+                        variable_identity=(
+                            self._storage_identity(
+                                variable,
+                                node,
+                                state=state,
+                                context=context,
+                            )
+                            if not base_endpoint
+                            else SourceStorageRef(
+                                kind="member",
+                                symbol="this",
+                                root="this",
+                                file=unit.file,
+                                callable_id=callable.callable_id,
+                                class_owner=str(callable.owner or ""),
+                                declaring_class=str(callable.owner or ""),
+                                declaration_id=f"{callable.callable_id}:base",
+                                declaration_proven=True,
+                            )
+                        ),
                         source_site_id=unit.site_id(node),
+                        control_predicates=control_predicates,
+                        control_expression_refs=control_refs,
                     )
                 )
 
@@ -2350,6 +2549,7 @@ class TreeSitterSourceExtractor:
             arguments = node.child_by_field_name("arguments")
             args = _argument_nodes(arguments)
             callable = self._enclosing_callable(unit, node)
+            state = state_by_callable.get(callable.callable_id) if callable else None
             boundary_symbol: Optional[str] = None
             if short_name.startswith(("orb_copy", "orb_publish", "orb_advertise")) and args:
                 boundary_symbol = self.profiler._boundary_argument_symbol(unit.text(args[-1]))
@@ -2375,6 +2575,18 @@ class TreeSitterSourceExtractor:
                         callable_id=callable.callable_id if callable else None,
                         variable_owner=owner,
                         endpoint_kind=endpoint_kind,
+                        variable_identity=(
+                            self._storage_identity(
+                                boundary_symbol,
+                                node,
+                                state=state,
+                                unit=unit,
+                                context=context,
+                                force_global=callable is None,
+                            )
+                            if boundary_symbol
+                            else None
+                        ),
                         source_site_id=unit.site_id(node),
                     )
                 )
@@ -2399,6 +2611,61 @@ class TreeSitterSourceExtractor:
                 )
             )
         return refs
+
+    def _endpoint_controls(
+        self,
+        unit: _ParsedUnit,
+        endpoint_node: Node,
+        root: Node,
+        state: Optional[_ExtractionState],
+    ) -> tuple[list[str], list[SourceExpressionRef]]:
+        """Return source predicates selecting one conditional endpoint."""
+        terms: list[tuple[str, SourceExpressionRef]] = []
+        current: Optional[Node] = endpoint_node
+        while current is not None and current != root:
+            parent = current.parent
+            if parent is None:
+                break
+            if parent.type == "conditional_expression":
+                condition = parent.child_by_field_name("condition")
+                consequence = parent.child_by_field_name("consequence")
+                alternative = parent.child_by_field_name("alternative")
+                selected: Optional[str] = None
+                if consequence is not None and (
+                    consequence.start_byte <= endpoint_node.start_byte
+                    and endpoint_node.end_byte <= consequence.end_byte
+                ):
+                    selected = self.profiler._normalize_source_expression(
+                        unit.text(condition)
+                    )
+                elif alternative is not None and (
+                    alternative.start_byte <= endpoint_node.start_byte
+                    and endpoint_node.end_byte <= alternative.end_byte
+                ):
+                    selected = _not(
+                        self.profiler._normalize_source_expression(
+                            unit.text(condition)
+                        )
+                    )
+                if selected and condition is not None:
+                    expression_ref = self._expression_ref(
+                        state,
+                        condition,
+                        unit=unit,
+                        text=unit.text(condition),
+                    )
+                    terms.append(
+                        (
+                            selected,
+                            expression_ref.model_copy(update={"text": selected}),
+                        )
+                    )
+            current = parent
+        terms.reverse()
+        return (
+            [predicate for predicate, _ref in terms],
+            [ref for _predicate, ref in terms],
+        )
 
     def _orb_topics(
         self, unit: _ParsedUnit, root: Node
@@ -2857,6 +3124,115 @@ class TreeSitterSourceExtractor:
             return target
         return self._apply_storage_aliases(target, state.storage_aliases)
 
+    def _storage_identity(
+        self,
+        symbol: str,
+        node: Node,
+        *,
+        state: Optional[_ExtractionState] = None,
+        unit: Optional[_ParsedUnit] = None,
+        context: Optional[_SourceContext] = None,
+        declared_owner: Optional[str] = None,
+        force_global: bool = False,
+    ) -> SourceStorageRef:
+        """Resolve one symbol to the declaration visible at ``node``."""
+        parsed_unit = state.unit if state is not None else unit
+        if parsed_unit is None:
+            raise ValueError("storage identity requires a parsed source unit")
+        source_context = state.context if state is not None else context
+        callable_item = state.callable if state is not None else None
+        canonical = exact_symbol(symbol)
+        normalized = canonical.replace("->", ".")
+        parts = [part for part in normalized.split(".") if part]
+        root = parts[0].lstrip("&*") if parts else canonical
+        if root == "this" and len(parts) > 1:
+            root = parts[1]
+
+        owner = declared_owner or (
+            callable_item.owner if callable_item is not None else None
+        )
+        if state is not None:
+            local_candidates = [
+                item
+                for item in state.local_declarations.get(root, ())
+                if item.start_byte <= node.start_byte
+                and item.scope_start <= node.start_byte
+                and node.end_byte <= item.scope_end
+            ]
+            if local_candidates:
+                declaration = min(
+                    local_candidates,
+                    key=lambda item: (
+                        item.scope_end - item.scope_start,
+                        -item.start_byte,
+                    ),
+                )
+                return SourceStorageRef(
+                    kind="local",
+                    symbol=canonical,
+                    root=root,
+                    file=parsed_unit.file,
+                    callable_id=callable_item.callable_id,
+                    class_owner=str(owner or ""),
+                    declaration_id=declaration.declaration_id,
+                    declaration_proven=True,
+                )
+            if root in callable_item.parameters:
+                parameter_index = callable_item.parameters.index(root)
+                return SourceStorageRef(
+                    kind="local",
+                    symbol=canonical,
+                    root=root,
+                    file=parsed_unit.file,
+                    callable_id=callable_item.callable_id,
+                    class_owner=str(owner or ""),
+                    declaration_id=(
+                        f"{callable_item.callable_id}:parameter:{parameter_index}"
+                    ),
+                    declaration_proven=True,
+                )
+
+        member = (
+            source_context.declaring_member(owner, root)
+            if source_context is not None and owner
+            else None
+        )
+        if member is not None:
+            return SourceStorageRef(
+                kind="member",
+                symbol=canonical,
+                root=root,
+                file=parsed_unit.file,
+                callable_id=(callable_item.callable_id if callable_item else ""),
+                class_owner=str(owner or member.owner),
+                declaring_class=member.owner,
+                declaration_id=f"{member.file}:{member.line}:member:{member.name}",
+                declaration_proven=True,
+            )
+
+        if force_global:
+            namespace = parsed_unit.namespace_owner(node) or ""
+            return SourceStorageRef(
+                kind="global",
+                symbol=canonical,
+                root=root,
+                file=parsed_unit.file,
+                namespace_owner=namespace,
+                declaration_id=parsed_unit.site_id(node),
+                declaration_proven=True,
+            )
+
+        return SourceStorageRef(
+            kind="unknown",
+            symbol=canonical,
+            root=root,
+            file=parsed_unit.file,
+            callable_id=(callable_item.callable_id if callable_item else ""),
+            class_owner=str(owner or ""),
+            namespace_owner=parsed_unit.namespace_owner(node) or "",
+            declaration_proven=False,
+        )
+
     @staticmethod
     def _apply_storage_aliases(expression: str, aliases: dict[str, str]) -> str:
         value = str(expression or "")
@@ -2883,6 +3259,8 @@ class TreeSitterSourceExtractor:
         node: Optional[Node],
         *,
         unit: Optional[_ParsedUnit] = None,
+        context: Optional[_SourceContext] = None,
+        declared_owner: Optional[str] = None,
         text: Optional[str] = None,
         extra_inputs: Sequence[str] = (),
     ) -> SourceExpressionRef:
@@ -2898,8 +3276,15 @@ class TreeSitterSourceExtractor:
             raise ValueError("an expression node requires its parsed source unit")
 
         inputs: list[str] = [str(value) for value in extra_inputs if str(value)]
+        identities: dict[str, SourceStorageRef] = {}
+        if state is not None:
+            for value in inputs:
+                canonical = exact_symbol(value)
+                identities[canonical] = self._storage_identity(
+                    value, node, state=state
+                )
 
-        def add_symbol(raw: str) -> None:
+        def add_symbol(raw: str, source_node: Node) -> None:
             symbol = (
                 self._storage_target(state, raw)
                 if state is not None
@@ -2907,6 +3292,16 @@ class TreeSitterSourceExtractor:
             )
             if symbol and symbol not in inputs:
                 inputs.append(symbol)
+            if symbol:
+                canonical = exact_symbol(symbol)
+                identities[canonical] = self._storage_identity(
+                    symbol,
+                    source_node,
+                    state=state,
+                    unit=parsed_unit,
+                    context=context,
+                    declared_owner=declared_owner,
+                )
 
         def visit(current: Optional[Node]) -> None:
             if current is None:
@@ -2946,33 +3341,41 @@ class TreeSitterSourceExtractor:
                         state, parsed_unit.text(receiver_node)
                     )
                     field_name = parsed_unit.text(field_node).strip()
+                    parameter_accessor = False
                     if field_name == "get" and receiver:
                         parameter = state.context.parameter_for_member(
                             state.callable.owner,
                             receiver.split(".", 1)[0],
                         )
                         if parameter:
-                            add_symbol(f"{receiver}.get()")
+                            add_symbol(f"{receiver}.get()", function_node)
+                            parameter_accessor = True
+                    if not parameter_accessor:
+                        # A non-static member call has the receiver as its
+                        # implicit object argument. Helper expansion may later
+                        # prove that only part of that storage is read, but the
+                        # syntax fact must not omit the object dependency.
+                        visit(receiver_node)
                 for argument in arguments:
                     visit(argument)
                 return
             if node_type == "field_expression":
-                add_symbol(parsed_unit.text(current))
+                add_symbol(parsed_unit.text(current), current)
                 return
             if node_type == "subscript_expression":
                 argument = current.child_by_field_name("argument")
                 index = current.child_by_field_name("index")
                 if index is not None and index.type == "number_literal":
-                    add_symbol(parsed_unit.text(current))
+                    add_symbol(parsed_unit.text(current), current)
                 else:
                     visit(argument)
                     visit(index)
                 return
             if node_type == "qualified_identifier":
-                add_symbol(parsed_unit.text(current))
+                add_symbol(parsed_unit.text(current), current)
                 return
             if node_type in {"identifier", "field_identifier"}:
-                add_symbol(parsed_unit.text(current))
+                add_symbol(parsed_unit.text(current), current)
                 return
             for child in current.named_children:
                 visit(child)
@@ -2981,6 +3384,7 @@ class TreeSitterSourceExtractor:
         return SourceExpressionRef(
             text=str(text if text is not None else parsed_unit.text(node)).strip(),
             input_symbols=inputs,
+            input_identities=identities,
             exact=not node.has_error,
         )
 
@@ -3042,6 +3446,11 @@ class TreeSitterSourceExtractor:
                 "file": assignment.file,
                 "line": assignment.line,
                 "source_site_id": assignment.source_site_id or "",
+                "target_identity": (
+                    assignment.target_identity.model_dump()
+                    if assignment.target_identity is not None
+                    else {}
+                ),
             }
             for assignment in state.assignments
         }
@@ -3058,6 +3467,11 @@ class TreeSitterSourceExtractor:
                         for symbol in ref.input_symbols
                     )
                 ),
+                input_identities={
+                    symbol: identity
+                    for ref in return_refs
+                    for symbol, identity in ref.input_identities.items()
+                },
                 exact=all(ref.exact for ref in return_refs),
             )
         output_alias_params = {

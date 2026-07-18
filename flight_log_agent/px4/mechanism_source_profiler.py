@@ -31,7 +31,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -62,6 +62,36 @@ class SourceFileHit(BaseModel):
     matches: List[SourceMatch] = Field(default_factory=list)
 
 
+class SourceStorageRef(BaseModel):
+    """Declaration-derived identity for one C++ storage location."""
+
+    kind: Literal["local", "member", "global", "unknown"]
+    symbol: str
+    root: str
+    file: str = ""
+    callable_id: str = ""
+    class_owner: str = ""
+    declaring_class: str = ""
+    namespace_owner: str = ""
+    declaration_id: str = ""
+    declaration_proven: bool = False
+
+
+class SourceExpressionRef(BaseModel):
+    """Structured dependencies for one source expression.
+
+    ``text`` preserves the source spelling while ``input_symbols`` contains
+    only value references. C++ syntax names, cast target types, and callees are
+    not inputs. ``exact`` is true only when the syntax backend proved that the
+    list is complete.
+    """
+
+    text: str
+    input_symbols: List[str] = Field(default_factory=list)
+    input_identities: Dict[str, SourceStorageRef] = Field(default_factory=dict)
+    exact: bool = False
+
+
 class TopicRef(BaseModel):
     topic: str
     direction: str  # "publish", "subscribe", or "unknown"
@@ -82,7 +112,11 @@ class TopicRef(BaseModel):
     # and ``local`` endpoints are resolved by owner/callable scope; ``base``
     # denotes an initialized base subobject and uses ``this`` as its receiver.
     endpoint_kind: Optional[str] = None
+    variable_identity: Optional[SourceStorageRef] = None
     source_site_id: Optional[str] = None
+    control_predicates: List[str] = Field(default_factory=list)
+    control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
+    reachability_exact: bool = True
 
 
 class ParameterRef(BaseModel):
@@ -106,26 +140,13 @@ class FieldRef(BaseModel):
     assignment_operator: Optional[str] = None
 
 
-class SourceExpressionRef(BaseModel):
-    """Structured dependencies for one source expression.
-
-    ``text`` preserves the source spelling while ``input_symbols`` contains
-    only value references. C++ syntax names, cast target types, and callees are
-    not inputs. ``exact`` is true only when the syntax backend proved that the
-    list is complete.
-    """
-
-    text: str
-    input_symbols: List[str] = Field(default_factory=list)
-    exact: bool = False
-
-
 class FunctionCallRef(BaseModel):
     name: str
     file: str
     line: int
     evidence: str
     receiver: Optional[str] = None
+    receiver_identity: Optional[SourceStorageRef] = None
     args: List[str] = Field(default_factory=list)
     argument_topics: Dict[str, str] = Field(default_factory=dict)
     control_predicates: List[str] = Field(default_factory=list)
@@ -157,6 +178,8 @@ class SourceAssignmentRef(BaseModel):
     evidence: str
     function: Optional[str] = None
     callable_id: Optional[str] = None
+    owner: Optional[str] = None
+    target_identity: Optional[SourceStorageRef] = None
     function_parameters: List[str] = Field(default_factory=list)
     target_topic: Optional[str] = None
     target_field: Optional[str] = None

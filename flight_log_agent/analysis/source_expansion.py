@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.px4.mechanism_source_profiler import (
     MechanismSourceProfiler,
+    SourceStorageRef,
     callable_accepts_argument_count,
     callable_parameter_count,
 )
@@ -29,16 +30,8 @@ SymbolKind = Literal["local", "member", "global", "unknown"]
 GapKind = Literal["symbol", "callable", "constant", "class"]
 
 
-class SourceSymbolIdentity(BaseModel):
+class SourceSymbolIdentity(SourceStorageRef):
     """Lossless source identity used for producer admission and wiring."""
-
-    kind: SymbolKind
-    symbol: str
-    root: str
-    file: str = ""
-    callable_id: str = ""
-    class_owner: str = ""
-    declaring_class: str = ""
 
     def key(self) -> tuple[str, ...]:
         return (
@@ -48,6 +41,9 @@ class SourceSymbolIdentity(BaseModel):
             self.callable_id,
             self.class_owner,
             self.declaring_class,
+            self.namespace_owner,
+            self.declaration_id,
+            str(self.declaration_proven),
         )
 
     def storage_key(self) -> tuple[str, ...]:
@@ -59,7 +55,13 @@ class SourceSymbolIdentity(BaseModel):
         available scope component rather than being merged by spelling.
         """
         if self.kind == "local":
-            return (self.kind, self.symbol, self.file, self.callable_id)
+            return (
+                self.kind,
+                self.symbol,
+                self.file,
+                self.callable_id,
+                self.declaration_id,
+            )
         if self.kind == "member":
             return (
                 self.kind,
@@ -67,7 +69,12 @@ class SourceSymbolIdentity(BaseModel):
                 self.declaring_class or self.class_owner,
             )
         if self.kind == "global":
-            return (self.kind, self.symbol, self.file)
+            return (
+                self.kind,
+                self.symbol,
+                self.namespace_owner or self.file,
+                self.declaration_id,
+            )
         return (
             self.kind,
             self.symbol,
@@ -267,6 +274,7 @@ class SourceStructureIndex:
         callable_id: str,
         function_name: str = "",
         function_parameters: Sequence[str] = (),
+        class_owner_hint: str = "",
     ) -> SourceSymbolIdentity:
         canonical = exact_symbol(symbol)
         normalized = canonical.replace("->", ".")
@@ -275,8 +283,12 @@ class SourceStructureIndex:
         explicit_this = root == "this" and len(parts) > 1
         if explicit_this:
             root = parts[1]
-        owner = self.callable_owner(callable_id, function_name)
-        if root in {str(value) for value in function_parameters}:
+        owner = self.resolve_class_name(class_owner_hint) if class_owner_hint else (
+            self.callable_owner(callable_id, function_name)
+        )
+        parameter_names = [str(value) for value in function_parameters]
+        if root in set(parameter_names):
+            parameter_index = parameter_names.index(root)
             return SourceSymbolIdentity(
                 kind="local",
                 symbol=canonical,
@@ -284,9 +296,14 @@ class SourceStructureIndex:
                 file=file,
                 callable_id=callable_id,
                 class_owner=owner,
+                declaration_id=f"{callable_id}:parameter:{parameter_index}",
+                declaration_proven=bool(callable_id),
             )
         declaring_owner = self.declaring_member_owner(owner, root) if owner else None
         if declaring_owner or (explicit_this and owner):
+            declaration = self.members.get((declaring_owner or owner, root)) or {}
+            declaration_file = str(declaration.get("file") or "")
+            declaration_line = int(declaration.get("line") or 0)
             return SourceSymbolIdentity(
                 kind="member",
                 symbol=canonical,
@@ -295,6 +312,12 @@ class SourceStructureIndex:
                 callable_id=callable_id,
                 class_owner=owner,
                 declaring_class=declaring_owner or owner,
+                declaration_id=(
+                    f"{declaration_file}:{declaration_line}:member:{root}"
+                    if declaration_file or declaration_line
+                    else ""
+                ),
+                declaration_proven=bool(declaring_owner),
             )
         if callable_id:
             return SourceSymbolIdentity(
@@ -304,6 +327,7 @@ class SourceStructureIndex:
                 file=file,
                 callable_id=callable_id,
                 class_owner=owner,
+                declaration_proven=False,
             )
         if canonical:
             return SourceSymbolIdentity(
@@ -311,6 +335,7 @@ class SourceStructureIndex:
                 symbol=canonical,
                 root=root,
                 file=file,
+                declaration_proven=False,
             )
         return SourceSymbolIdentity(kind="unknown", symbol=canonical, root=root, file=file)
 
@@ -322,11 +347,18 @@ class SourceStructureIndex:
         if not symbol_produces_reference(producer.symbol, reference.symbol):
             return False
         if reference.kind == "local" or producer.kind == "local":
-            return (
+            same_callable = (
                 reference.kind == producer.kind == "local"
                 and bool(reference.callable_id)
                 and reference.callable_id == producer.callable_id
             )
+            if not same_callable:
+                return False
+            if reference.declaration_proven and producer.declaration_proven:
+                return bool(reference.declaration_id) and (
+                    reference.declaration_id == producer.declaration_id
+                )
+            return reference.file == producer.file
         if reference.kind == "member" or producer.kind == "member":
             owner_compatible = (
                 not reference.class_owner
@@ -340,8 +372,16 @@ class SourceStructureIndex:
                 and owner_compatible
             )
         if reference.kind == producer.kind == "global":
-            return True
-        return reference.file == producer.file and bool(reference.file)
+            if reference.declaration_proven and producer.declaration_proven:
+                return bool(reference.declaration_id) and (
+                    reference.declaration_id == producer.declaration_id
+                )
+            return (
+                bool(reference.file)
+                and reference.file == producer.file
+                and reference.namespace_owner == producer.namespace_owner
+            )
+        return False
 
     @staticmethod
     def storage_compatible(
@@ -354,20 +394,35 @@ class SourceStructureIndex:
         if reference.kind != producer.kind:
             return False
         if reference.kind == "local":
-            return (
+            same_callable = (
                 bool(reference.file)
                 and reference.file == producer.file
                 and bool(reference.callable_id)
                 and reference.callable_id == producer.callable_id
             )
+            if not same_callable:
+                return False
+            if reference.declaration_proven and producer.declaration_proven:
+                return bool(reference.declaration_id) and (
+                    reference.declaration_id == producer.declaration_id
+                )
+            return True
         if reference.kind == "member":
             return (
                 bool(reference.declaring_class)
                 and reference.declaring_class == producer.declaring_class
             )
         if reference.kind == "global":
-            return bool(reference.file) and reference.file == producer.file
-        return reference.storage_key() == producer.storage_key()
+            if reference.declaration_proven and producer.declaration_proven:
+                return bool(reference.declaration_id) and (
+                    reference.declaration_id == producer.declaration_id
+                )
+            return (
+                bool(reference.file)
+                and reference.file == producer.file
+                and reference.namespace_owner == producer.namespace_owner
+            )
+        return False
 
     def enrich_bindings(self, bindings: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         enriched: list[dict[str, Any]] = []
@@ -380,25 +435,76 @@ class SourceStructureIndex:
             function = str(binding.get("function") or "")
             parameters = [str(value) for value in binding.get("function_parameters") or []]
             target = str(binding.get("target_symbol") or binding.get("target") or "")
-            binding["target_identity"] = self.symbol_identity(
-                target,
-                file=file,
-                callable_id=callable_id,
-                function_name=function,
-                function_parameters=parameters,
-            ).model_dump()
-            expression = str(binding.get("source_symbol") or binding.get("expression") or "")
-            reference_identities: dict[str, dict[str, Any]] = {}
-            for symbol in source_expression_names(expression):
-                reference_identities[exact_symbol(symbol)] = self.symbol_identity(
-                    symbol,
+            raw_target_identity = binding.get("target_identity") or {}
+            if raw_target_identity:
+                target_identity = SourceSymbolIdentity.model_validate(
+                    raw_target_identity
+                ).model_copy(update={"symbol": exact_symbol(target)})
+            else:
+                target_identity = self.symbol_identity(
+                    target,
                     file=file,
                     callable_id=callable_id,
                     function_name=function,
                     function_parameters=parameters,
-                ).model_dump()
+                    class_owner_hint=str(binding.get("function_owner") or ""),
+                )
+            binding["target_identity"] = target_identity.model_dump()
+            reference_identities: dict[str, dict[str, Any]] = {}
+            expression_refs = [
+                binding.get("expression_ref")
+                or {
+                    "text": str(
+                        binding.get("source_symbol")
+                        or binding.get("expression")
+                        or ""
+                    ),
+                    "exact": False,
+                },
+                *(binding.get("control_expression_refs") or []),
+            ]
+            for expression_ref in expression_refs:
+                if hasattr(expression_ref, "model_dump"):
+                    expression_ref = expression_ref.model_dump(exclude_none=True)
+                expression_ref = (
+                    dict(expression_ref) if isinstance(expression_ref, dict) else {}
+                )
+                expression = str(expression_ref.get("text") or "")
+                symbols = [
+                    str(value)
+                    for value in (expression_ref.get("input_symbols") or [])
+                    if str(value)
+                ]
+                if not bool(expression_ref.get("exact", False)):
+                    symbols = list(
+                        dict.fromkeys(
+                            [*symbols, *source_expression_names(expression)]
+                        )
+                    )
+                provided = dict(expression_ref.get("input_identities") or {})
+                for symbol in symbols:
+                    canonical = exact_symbol(symbol)
+                    raw_identity = provided.get(canonical) or provided.get(symbol)
+                    if raw_identity:
+                        identity = SourceSymbolIdentity.model_validate(
+                            raw_identity
+                        ).model_copy(update={"symbol": canonical})
+                    else:
+                        identity = self.symbol_identity(
+                            symbol,
+                            file=file,
+                            callable_id=callable_id,
+                            function_name=function,
+                            function_parameters=parameters,
+                            class_owner_hint=str(
+                                binding.get("function_owner") or ""
+                            ),
+                        )
+                    reference_identities[canonical] = identity.model_dump()
             binding["reference_identities"] = reference_identities
-            binding["function_owner"] = self.callable_owner(callable_id, function)
+            binding["function_owner"] = str(binding.get("function_owner") or "") or (
+                self.callable_owner(callable_id, function)
+            )
             enriched.append(binding)
         return enriched
 
@@ -414,6 +520,19 @@ class SourceStructureIndex:
             receiver_type = self.member_receiver_type(owner, root) if owner and root else ""
             call["caller_owner"] = owner
             call["receiver_type"] = receiver_type
+            if receiver and not call.get("receiver_identity"):
+                record = self.callables_by_id.get(callable_id) or {}
+                call["receiver_identity"] = self.symbol_identity(
+                    receiver,
+                    file=str(call.get("file") or ""),
+                    callable_id=callable_id,
+                    function_name=function,
+                    function_parameters=[
+                        str(value)
+                        for value in (record.get("parameters") or [])
+                    ],
+                    class_owner_hint=owner,
+                ).model_dump()
             enriched.append(call)
         return enriched
 
