@@ -405,6 +405,7 @@ class TreeSitterSourceExtractor:
         units = [unit for path in paths if (unit := self._parse(path)) is not None]
         primary = next((unit for unit in units if unit.file == file_path), None)
         if primary is None:
+            self._release_units(units)
             return SourceFileFacts(
                 file=file_path,
                 source_hash=source_hash,
@@ -437,7 +438,7 @@ class TreeSitterSourceExtractor:
         )
         diagnostics = self._diagnostics(primary)
 
-        return SourceFileFacts(
+        facts = SourceFileFacts(
             file=file_path,
             source_hash=source_hash,
             parser_backend="tree_sitter",
@@ -472,6 +473,21 @@ class TreeSitterSourceExtractor:
             ],
             includes=primary.includes,
         )
+        # The derived facts above hold only plain data. Release each parsed
+        # unit's tree, source bytes, and callable AST nodes now — keeping
+        # them would retain every accepted file's AST for the whole run,
+        # while admission re-parses on demand from source.
+        self._release_units(units)
+        return facts
+
+    def _release_units(self, units: Sequence[_ParsedUnit]) -> None:
+        """Drop the heavy parse state for ``units`` (tree, source bytes,
+        and callable nodes), keeping the ``None`` markers that record an
+        unreadable file so it is not re-read. Nothing in the returned
+        facts references these units, so the AST is collectible."""
+        for unit in units:
+            self._fully_structured_units.discard(unit.file)
+            self._units.pop(unit.file, None)
 
     def extract_admission(
         self,
