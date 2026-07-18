@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+from flight_log_agent.analysis.mechanism_dag import (
+    _evaluate_predicate_intervals,
+    build_mechanism_dag,
+    evaluate_feasibility,
+    ground_expression_via_edges,
+)
 from flight_log_agent.analysis.mechanism_discovery import (
     binding_from_assignment,
     dag_inputs_from_facts,
@@ -1365,6 +1370,207 @@ void run()
         edge.source_id == inner_returns[0].id
         and edge.target_id == outer_returns[0].id
         and edge.role == "call:inner"
+        for edge in dag.edges
+    )
+
+
+def test_source_grounded_helper_condition_is_backend_interchangeable(
+    tmp_path, source_backend
+):
+    """Source-resolved calls, parameters, enums, and logged gates compose.
+
+    Both parser backends must carry the same source mechanism through the
+    shared DAG consumer even though they represent helper internals
+    differently.
+    """
+    source_file = "src/modules/example/acceptance.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+struct status_s {
+    int vehicle_type;
+};
+
+struct controller_status_s {
+    bool valid;
+    float radius;
+};
+
+class Control {
+    status_s vehicle_status{};
+    controller_status_s controller_status{};
+    float destination{};
+    float floor{};
+
+    DEFINE_PARAMETERS(
+        (ParamFloat<px4::params::ACCEPT_RADIUS>) _param_accept_radius
+    )
+
+    float default_radius();
+    float acceptance_radius();
+    void run();
+};
+
+float Control::default_radius()
+{
+    return _param_accept_radius.get();
+}
+
+float Control::acceptance_radius()
+{
+    float selected = default_radius();
+
+    if (vehicle_status.vehicle_type != status_s::ROTARY
+        && controller_status.valid) {
+        selected = max(selected, controller_status.radius);
+    }
+
+    return selected;
+}
+
+void Control::run()
+{
+    floor = destination + 2.0f * acceptance_radius();
+}
+""",
+        },
+        backend=source_backend,
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(profiler, tmp_path / "cache", [source_file], "hash")
+    )
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "floor",
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        parameter_names=inputs.parameter_names,
+        parameter_aliases=inputs.parameter_aliases,
+        logged_signals={"destination", "vehicle_status.vehicle_type"},
+        enum_registry={"status": {"ROTARY": 1}},
+        source_structure=inputs.structure,
+    )
+
+    annotated = evaluate_feasibility(
+        dag,
+        parameter_values={"ACCEPT_RADIUS": 10.0},
+        signal_samples={
+            "destination": [(0.0, 100.0), (1.0, 100.0)],
+            "vehicle_status.vehicle_type": [(0.0, 1), (1.0, 1)],
+        },
+        signal_policies={
+            "destination": {"method": "linear"},
+            "vehicle_status.vehicle_type": {"method": "discrete_hold"},
+        },
+        prune_dead=False,
+    )
+
+    override_branches = [
+        vertex
+        for vertex in annotated.vertices
+        if vertex.kind == "branch"
+        and "vehicle_status" in str(vertex.predicate_raw or "")
+    ]
+    if source_backend == "tree_sitter":
+        # Replacement-only topology assertion: the legacy extractor embeds
+        # this selection in its flattened helper expression. The shared
+        # numerical contract below remains identical for both backends.
+        assert override_branches
+    assert all(
+        vertex.feasibility_verdict == "always_false"
+        for vertex in override_branches
+    )
+
+    terminal = next(
+        vertex
+        for vertex in annotated.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+        and "acceptance_radius" in str(vertex.expression or "")
+    )
+    grounded = ground_expression_via_edges(
+        str(terminal.expression or ""), terminal.id, annotated
+    )
+    assert grounded is not None
+    assert "destination" in grounded
+    assert "ACCEPT_RADIUS" in grounded
+    assert "acceptance_radius" not in grounded
+    assert "_param_accept_radius" not in grounded
+    assert "status_s" not in grounded
+    assert "ROTARY" not in grounded
+
+    matches_expected_floor = _evaluate_predicate_intervals(
+        f"abs(({grounded}) - (destination + 20.0)) < 0.001",
+        {"ACCEPT_RADIUS": 10.0},
+        {},
+        {
+            "destination": [(0.0, 100.0), (1.0, 100.0)],
+            "vehicle_status.vehicle_type": [(0.0, 1), (1.0, 1)],
+        },
+        {
+            "destination": {"method": "linear"},
+            "vehicle_status.vehicle_type": {"method": "discrete_hold"},
+        },
+    )
+    assert matches_expected_floor == [(0.0, 1.0)]
+
+
+def test_tree_sitter_exact_callable_survives_without_owner_rederivation(tmp_path):
+    source_file = "src/modules/example/exact_call.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+class Service {
+public:
+    float read() { return input; }
+    float input{};
+};
+
+class Control {
+    Service service{};
+    float output{};
+    void run() { output = service.read(); }
+};
+""",
+        },
+        backend="tree_sitter",
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(profiler, tmp_path / "cache", [source_file], "hash")
+    )
+    call = next(item for item in inputs.call_statements if item["name"] == "read")
+    assert call.get("resolved_callable_id")
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        logged_signals={"input"},
+        # The exact callable carried by the call fact is authoritative. The
+        # graph must not need the receiver owner's declaration a second time.
+        source_structure=SourceStructureIndex(),
+    )
+
+    helper_return = next(
+        vertex
+        for vertex in dag.vertices
+        if str(vertex.provenance or "").startswith("helper_return:read@")
+    )
+    terminal = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+        and "service.read" in str(vertex.expression or "")
+    )
+    assert any(
+        edge.source_id == helper_return.id
+        and edge.target_id == terminal.id
+        and edge.role == "call:read"
         for edge in dag.edges
     )
 

@@ -83,6 +83,9 @@ class _ExpressionCall:
     argument_expressions: tuple[Any, ...]
     offset: int
     source_site_id: str
+    helper_key: Optional[tuple[str, str]] = None
+    call_text: str = ""
+    result_text: str = ""
     result_path: str = ""
 
 
@@ -1069,12 +1072,10 @@ class _DAGBuilder:
                     scope_file=scope[0],
                     scope_function=scope[1],
                 )
-                helper_key = self._pick_helper_key(
-                    invocation.name,
-                    scope[0],
+                helper_key = self._helper_key_for_invocation(
+                    invocation,
+                    scope_file=scope[0],
                     scope_function=scope[1],
-                    receiver=invocation.receiver,
-                    argument_count=len(invocation.args),
                 )
                 helper = self.helper_index.get(helper_key) if helper_key else None
                 if not helper:
@@ -2976,15 +2977,14 @@ class _DAGBuilder:
             line=line,
             expression_ref=expression_ref,
         ):
-            helper_key = self._pick_helper_key(
-                invocation.name,
-                file,
+            helper_key = self._helper_key_for_invocation(
+                invocation,
+                scope_file=file,
                 scope_function=scope_function,
-                receiver=invocation.receiver,
-                argument_count=len(invocation.args),
             )
             if helper_key is None:
                 continue
+            self._record_call_grounding_roles(target_id, invocation)
             instance_key = self._helper_instance_key(
                 helper_key, invocation, scope_function
             )
@@ -3057,6 +3057,28 @@ class _DAGBuilder:
                 scope_function=scope_function,
             )
 
+    def _record_call_grounding_roles(
+        self, target_id: str, invocation: _ExpressionCall
+    ) -> None:
+        """Keep exact source call spellings with the operation that reads them.
+
+        Edge ``role`` remains the stable semantic label used by renderers.
+        Grounding uses this source-site map to replace the actual call syntax
+        rather than trying to reconstruct receivers and arguments from a
+        short helper name.
+        """
+        vertex = self.vertices.get(target_id)
+        if vertex is None or not invocation.call_text:
+            return
+        metadata = dict(vertex.metadata or {})
+        call_roles = dict(metadata.get("source_call_roles") or {})
+        call_roles[invocation.source_site_id] = {
+            "call": invocation.call_text,
+            "result": invocation.result_text or invocation.call_text,
+        }
+        metadata["source_call_roles"] = call_roles
+        vertex.metadata = metadata
+
     def _emit_helper_pointer_output_writes(
         self,
         invocation: _ExpressionCall,
@@ -3077,12 +3099,10 @@ class _DAGBuilder:
         :meth:`_emit_operation_vertex` so a source_assignments-derived binding
         for the same call site does not double-emit.
         """
-        helper_key = self._pick_helper_key(
-            invocation.name,
-            file,
+        helper_key = self._helper_key_for_invocation(
+            invocation,
+            scope_file=file,
             scope_function=scope_function,
-            receiver=invocation.receiver,
-            argument_count=len(invocation.args),
         )
         if helper_key is None:
             return
@@ -3160,12 +3180,10 @@ class _DAGBuilder:
         scope_function: str = "",
     ) -> None:
         """Wire one call occurrence's actuals to its private formals."""
-        helper_key = self._pick_helper_key(
-            invocation.name,
-            file,
+        helper_key = self._helper_key_for_invocation(
+            invocation,
+            scope_file=file,
             scope_function=scope_function,
-            receiver=invocation.receiver,
-            argument_count=len(invocation.args),
         )
         if helper_key is None:
             return
@@ -4188,6 +4206,10 @@ class _DAGBuilder:
             close = self._matching_parenthesis(expression, match.end() - 1)
             if close is None:
                 continue
+            call_start = (
+                receiver_match.start(1) if receiver_match is not None else match.start()
+            )
+            call_text = expression[call_start : close + 1].strip()
             raw_args = expression[match.end() : close]
             args = tuple(
                 arg.strip()
@@ -4223,7 +4245,11 @@ class _DAGBuilder:
                     (
                         str(scope_file or ""),
                         _base_callable_scope(scope_function),
-                        int(line or 0),
+                        (
+                            0
+                            if _CALL_SCOPE_MARKER in scope_function
+                            else int(line or 0)
+                        ),
                         match.start(),
                         candidate,
                         receiver,
@@ -4339,6 +4365,14 @@ class _DAGBuilder:
                 args,
                 caller_callable=scope_function,
             )
+            result_path = structured_entry[1] if structured_entry else ""
+            result_text = call_text
+            if result_path:
+                result_text += (
+                    result_path
+                    if result_path.startswith("[")
+                    else f".{result_path}"
+                )
             matches.append(
                 _ExpressionCall(
                     name=candidate,
@@ -4349,7 +4383,10 @@ class _DAGBuilder:
                     ),
                     offset=match.start(),
                     source_site_id=runtime_site_id,
-                    result_path=(structured_entry[1] if structured_entry else ""),
+                    helper_key=helper_key,
+                    call_text=call_text,
+                    result_text=result_text,
+                    result_path=result_path,
                 )
             )
         return matches
@@ -4365,6 +4402,33 @@ class _DAGBuilder:
                 if depth == 0:
                     return index
         return None
+
+    def _helper_key_for_invocation(
+        self,
+        invocation: _ExpressionCall,
+        *,
+        scope_file: Optional[str] = None,
+        scope_function: str = "",
+    ) -> Optional[tuple[str, str]]:
+        """Return the source-resolved callable retained by an invocation.
+
+        Expression discovery has already resolved the callable with the full
+        source record, including receiver type and exact callable identity.
+        Later graph passes must not discard that proof and try to infer the
+        owner again from whichever source files happen to remain loaded.
+        """
+        retained = invocation.helper_key or self._resolved_helper_key_by_call_site.get(
+            invocation.source_site_id
+        )
+        if retained in self.helper_index:
+            return retained
+        return self._pick_helper_key(
+            invocation.name,
+            scope_file,
+            scope_function=scope_function,
+            receiver=invocation.receiver,
+            argument_count=len(invocation.args),
+        )
 
     def _materialize_helper_subgraph(
         self,
@@ -4382,12 +4446,10 @@ class _DAGBuilder:
         When ``wire_edges`` is False, only vertices are emitted (pass 1).
         Edges are wired by :meth:`_wire_helper_subgraph_edges` in pass 2.
         """
-        helper_key = self._pick_helper_key(
-            invocation.name,
-            scope_file,
+        helper_key = self._helper_key_for_invocation(
+            invocation,
+            scope_file=scope_file,
             scope_function=scope_function,
-            receiver=invocation.receiver,
-            argument_count=len(invocation.args),
         )
         if helper_key is None:
             return None
@@ -5185,13 +5247,30 @@ def ground_expression_via_edges(
         return None
 
     def ground(text: str, target_id: str, depth: int, seen: frozenset[str]) -> Optional[str]:
-        # Edge roles carry the ``.``-collapsed form; align the text so
-        # ``struct_s::NAME`` and ``obj->field`` references substitute.
+        # Align source spellings before matching edge roles. Tree-sitter
+        # preserves qualified names exactly, while fallback extraction may
+        # already have collapsed them.
         result = text.replace("->", ".").replace("::", ".")
         edges_by_role: dict[str, list[DAGEdge]] = defaultdict(list)
+        target = vertices_by_id.get(target_id)
+        call_roles = (
+            dict((target.metadata or {}).get("source_call_roles") or {})
+            if target
+            else {}
+        )
         for edge in edges_by_target.get(target_id, []):
-            edges_by_role[str(edge.role)].append(edge)
-        for role, role_edges in edges_by_role.items():
+            role = str(edge.role)
+            if edge.via and role.startswith("call:"):
+                role = str((call_roles.get(edge.via) or {}).get("call") or role)
+            elif edge.via and role.startswith("call-result:"):
+                role = str((call_roles.get(edge.via) or {}).get("result") or role)
+            canonical_role = role.replace("->", ".").replace("::", ".")
+            edges_by_role[canonical_role].append(edge)
+        # A projected call is longer than its base call. Replace it first so
+        # a source-proven logged projection wins before recursive helper
+        # grounding considers the base result.
+        for role in sorted(edges_by_role, key=len, reverse=True):
+            role_edges = edges_by_role[role]
             replacements = {
                 replacement
                 for edge in role_edges

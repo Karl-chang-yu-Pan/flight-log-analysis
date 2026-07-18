@@ -3632,6 +3632,12 @@ class TreeSitterSourceExtractor:
                     declared_owner=declared_owner,
                 )
 
+        def add_parameter_accessor(raw: str) -> None:
+            """Record a declaration-proven parameter read as a value leaf."""
+            accessor = str(raw or "").strip()
+            if accessor and accessor not in inputs:
+                inputs.append(accessor)
+
         def visit_call(current: Node, *, record_result: bool) -> None:
             function_node = current.child_by_field_name("function")
             function_text = parsed_unit.text(function_node).strip()
@@ -3659,7 +3665,7 @@ class TreeSitterSourceExtractor:
                         receiver.split(".", 1)[0],
                     )
                     if parameter:
-                        add_symbol(f"{receiver}.get()", function_node)
+                        add_parameter_accessor(f"{receiver}.get()")
                         parameter_accessor = True
                 if not parameter_accessor:
                     visit(receiver_node)
@@ -3826,6 +3832,16 @@ class TreeSitterSourceExtractor:
                         continue
                     seen_return_calls.add(key)
                     return_call_results.append(result)
+            lowered_changes_return = bool(lowered) and (
+                not return_expression
+                or self.profiler._normalize_source_expression(lowered)
+                != self.profiler._normalize_source_expression(return_expression)
+            )
+            lowering_adds_value_flow = (
+                len(returns) != 1
+                or bool(state.assignments)
+                or bool(state.return_paths)
+            )
             return_expression_ref = SourceExpressionRef(
                 text=return_expression or lowered or " | ".join(
                     ref.text for ref in return_refs
@@ -3850,7 +3866,12 @@ class TreeSitterSourceExtractor:
                     for symbol, identity in ref.input_identities.items()
                 },
                 call_results=return_call_results,
-                exact=all(ref.exact for ref in return_refs),
+                exact=(
+                    all(ref.exact for ref in return_refs)
+                    and not (
+                        lowered_changes_return and lowering_adds_value_flow
+                    )
+                ),
             )
         output_alias_params = {
             name

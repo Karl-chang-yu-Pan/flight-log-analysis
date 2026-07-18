@@ -90,10 +90,12 @@ class SourceExpressionRef(BaseModel):
 
     ``text`` preserves the source spelling while ``lowered_text`` carries the
     source-derived alias substitution used by the DAG. ``input_symbols``
-    contains only storage reads; call results are represented separately so a
-    projection such as ``object.read().field`` cannot become storage owned by
-    ``object``. ``exact`` is true only when the syntax backend proved that the
-    dependency lists are complete.
+    contains storage reads and source-resolved parameter accessor leaves;
+    parameter accessors are values but do not receive storage identities.
+    Call results are represented separately so a projection such as
+    ``object.read().field`` cannot become storage owned by ``object``.
+    ``exact`` is true only when the syntax backend proved that the dependency
+    lists are complete for ``lowered_text``.
     """
 
     text: str
