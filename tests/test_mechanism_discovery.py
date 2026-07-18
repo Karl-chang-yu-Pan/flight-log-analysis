@@ -2900,3 +2900,51 @@ void Ctrl::run()
 
     assert result.terminal_validation.status == "valid"
     assert {v.variable for v in result.dag.vertices if v.kind == "operation"} == {"speed_sp"}
+
+
+def test_internal_global_gap_never_falls_back_to_repository_search(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/ctrl.cpp": """
+struct Queue { float size; };
+static Queue work_queue;
+static float output;
+
+void run()
+{
+    output = work_queue.size;
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+
+    def fail_search(*args, **kwargs):
+        raise AssertionError("proven internal storage must not use source search")
+
+    profiler.search_related_source_files = fail_search  # type: ignore[assignment]
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=[],
+        terminal="output",
+        source_hash="hash",
+        preranked_files=["src/modules/example/ctrl.cpp"],
+        terminal_file="src/modules/example/ctrl.cpp",
+    )
+
+    references = [
+        item
+        for item in result.dag.unresolved_references
+        if item.kind == "storage_writers"
+    ]
+    declaration_ids = {
+        item.identity.declaration_id
+        for item in references
+        if item.identity is not None
+    }
+    assert len(references) == len(declaration_ids)
+    assert "work_queue.size" in result.dag.unresolved_symbols

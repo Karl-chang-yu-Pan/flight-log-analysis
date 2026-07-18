@@ -77,6 +77,25 @@ class SourceStorageRef(BaseModel):
     declaration_proven: bool = False
 
 
+class SourceDeclarationRef(BaseModel):
+    """One source-declared storage entity and its linkage/scope."""
+
+    name: str
+    qualified_name: str
+    type: Optional[str] = None
+    file: str
+    line: int
+    end_line: int
+    callable_id: str = ""
+    class_owner: str = ""
+    namespace_owner: str = ""
+    linkage: Literal["automatic", "member", "internal", "external", "unknown"]
+    is_definition: bool = True
+    scope_start: Optional[int] = None
+    scope_end: Optional[int] = None
+    identity: SourceStorageRef
+
+
 class SourceCallResultRef(BaseModel):
     """One value projection rooted at a source-proven call expression."""
 

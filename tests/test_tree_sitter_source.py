@@ -316,6 +316,209 @@ class Control
     assert outer_read["declaration_id"] == member_write["target_identity"]["declaration_id"]
 
 
+def test_file_static_global_projection_resolves_to_declared_storage(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+struct Queue { int size; };
+static Queue work_queue;
+static int output;
+
+void write_queue()
+{
+    work_queue.size = 3;
+}
+
+void read_queue()
+{
+    output = work_queue.size;
+}
+""",
+    )
+
+    declarations = {
+        item.name: item
+        for item in facts.declarations
+        if item.identity.kind == "global"
+    }
+    assert declarations["work_queue"].linkage == "internal"
+    inputs = dag_inputs_from_facts([facts])
+    writer = next(
+        item for item in inputs.bindings if item["target_symbol"] == "work_queue.size"
+    )
+    reader = next(
+        item for item in inputs.bindings if item["target_symbol"] == "output"
+    )
+    read_identity = reader["reference_identities"]["work_queue.size"]
+
+    assert writer["target_identity"]["kind"] == "global"
+    assert read_identity["kind"] == "global"
+    assert read_identity["declaration_id"] == declarations[
+        "work_queue"
+    ].identity.declaration_id
+    assert writer["target_identity"]["declaration_id"] == read_identity[
+        "declaration_id"
+    ]
+
+
+def test_update_expressions_emit_declared_storage_writes(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+struct Queue { int size; };
+static Queue work_queue;
+
+void mutate_queue()
+{
+    ++work_queue.size;
+    work_queue.size--;
+}
+""",
+    )
+
+    declaration = next(
+        item for item in facts.declarations if item.name == "work_queue"
+    )
+    updates = [
+        item
+        for item in facts.source_assignments
+        if item.target == "work_queue.size"
+    ]
+
+    assert [item.assignment_operator for item in updates] == ["+=", "-="]
+    assert all(
+        item.target_identity.declaration_id
+        == declaration.identity.declaration_id
+        for item in updates
+    )
+    assert all(
+        item.expression_ref.input_identities[
+            "work_queue.size"
+        ].declaration_id
+        == declaration.identity.declaration_id
+        for item in updates
+    )
+
+
+def test_file_static_globals_with_same_name_have_distinct_identity(tmp_path):
+    root = tmp_path / "PX4-Autopilot"
+    files = [
+        "src/modules/example/first.cpp",
+        "src/modules/example/second.cpp",
+    ]
+    for relative in files:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("static int state;", encoding="utf-8")
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+    facts = [
+        extract_facts_for_file(profiler, relative, "source-hash")
+        for relative in files
+    ]
+
+    identities = {
+        entry.declarations[0].identity.declaration_id for entry in facts
+    }
+    assert len(identities) == 2
+
+
+def test_header_static_global_identity_is_translation_unit_scoped(tmp_path):
+    root = tmp_path / "PX4-Autopilot"
+    module = root / "src" / "modules" / "example"
+    module.mkdir(parents=True)
+    (module / "shared.h").write_text(
+        "static int state;",
+        encoding="utf-8",
+    )
+    files = ["first.cpp", "second.cpp"]
+    for name in files:
+        (module / name).write_text(
+            '#include "shared.h"\nstatic int output;\n'
+            "void run() { output = state; }",
+            encoding="utf-8",
+        )
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+
+    identities = set()
+    for name in files:
+        facts = extract_facts_for_file(
+            profiler,
+            f"src/modules/example/{name}",
+            "source-hash",
+        )
+        inputs = dag_inputs_from_facts([facts])
+        reader = next(
+            item for item in inputs.bindings if item["target_symbol"] == "output"
+        )
+        identities.add(
+            reader["reference_identities"]["state"]["declaration_id"]
+        )
+
+    assert len(identities) == 2
+    assert all("shared.h" not in identity for identity in identities)
+
+
+def test_out_of_class_static_member_initializer_uses_member_identity(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+class Control
+{
+    static int value;
+};
+
+int Control::value = 4;
+""",
+    )
+
+    assignment = next(
+        item
+        for item in facts.source_assignments
+        if item.declaration_kind == "global"
+    )
+    member = next(item for item in facts.members if item.name == "value")
+
+    assert assignment.target == "Control.value"
+    assert assignment.target_identity.kind == "member"
+    assert assignment.target_identity.declaration_id == (
+        f"{member.file}:{member.line}:member:{member.name}"
+    )
+
+
+def test_declarator_identity_handles_symbolic_arrays_and_function_pointers(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+static int values[COUNT];
+static int (*callback)(int);
+int *function();
+
+void run()
+{
+    int local_values[LIMIT];
+    int (*handler)(int);
+    consume(values, callback, local_values, handler);
+}
+""",
+    )
+
+    declarations = {item.name: item for item in facts.declarations}
+    assert {"values", "callback", "local_values", "handler"} <= declarations.keys()
+    assert "COUNT" not in declarations
+    assert "LIMIT" not in declarations
+    assert "function" not in declarations
+    assert declarations["callback"].identity.kind == "global"
+    assert declarations["handler"].identity.kind == "local"
+
+
 def test_companion_member_declaration_survives_primary_fact_aggregation(tmp_path):
     root = tmp_path / "PX4-Autopilot"
     module = root / "src" / "modules" / "example"

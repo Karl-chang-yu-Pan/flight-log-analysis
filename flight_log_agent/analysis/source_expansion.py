@@ -27,7 +27,14 @@ from flight_log_agent.utils import dedupe_keep_order
 
 
 SymbolKind = Literal["local", "member", "global", "unknown"]
-GapKind = Literal["symbol", "callable", "constant", "class", "member_writers"]
+GapKind = Literal[
+    "symbol",
+    "callable",
+    "constant",
+    "class",
+    "member_writers",
+    "storage_writers",
+]
 
 
 class SourceSymbolIdentity(SourceStorageRef):
@@ -85,6 +92,14 @@ class SourceSymbolIdentity(SourceStorageRef):
         )
 
 
+def _source_symbol_identity(value: Any) -> SourceSymbolIdentity:
+    if isinstance(value, SourceSymbolIdentity):
+        return value
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    return SourceSymbolIdentity.model_validate(value)
+
+
 class UnresolvedSourceReference(BaseModel):
     """A typed DAG frontier item with its originating source context."""
 
@@ -131,6 +146,14 @@ class SourceStructureIndex:
     callables_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
     callables_by_name: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     includes: dict[str, set[str]] = field(default_factory=dict)
+    declarations_by_id: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    declarations_by_callable: dict[tuple[str, str], list[dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    global_declarations: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    authoritative_declarations: bool = False
     _declared_owners: Optional[frozenset[str]] = field(
         default=None, init=False, repr=False
     )
@@ -147,6 +170,9 @@ class SourceStructureIndex:
         raw_bases: dict[str, set[str]] = {}
         for raw in facts:
             entry = raw.model_dump(exclude_none=True) if hasattr(raw, "model_dump") else dict(raw)
+            parser_backend = str(entry.get("parser_backend") or "")
+            if "tree_sitter" in parser_backend:
+                index.authoritative_declarations = True
             for class_ref in entry.get("classes") or []:
                 item = _as_dict(class_ref)
                 name = str(item.get("name") or "")
@@ -184,6 +210,28 @@ class SourceStructureIndex:
                 included = str(item.get("included_file") or "")
                 if source and included:
                     index.includes.setdefault(source, set()).add(included)
+            for declaration_ref in entry.get("declarations") or []:
+                item = _as_dict(declaration_ref)
+                raw_identity = item.get("identity") or {}
+                try:
+                    identity = _source_symbol_identity(raw_identity)
+                except (TypeError, ValueError):
+                    continue
+                declaration_id = identity.declaration_id
+                if declaration_id:
+                    index.declarations_by_id.setdefault(
+                        declaration_id, []
+                    ).append(item)
+                name = str(item.get("name") or identity.root or "")
+                callable_id = str(item.get("callable_id") or "")
+                if callable_id and name:
+                    index.declarations_by_callable.setdefault(
+                        (callable_id, name), []
+                    ).append(item)
+                if identity.kind == "global" and name:
+                    qualified = str(item.get("qualified_name") or name)
+                    for key in {name, qualified}:
+                        index.global_declarations.setdefault(key, []).append(item)
         declared = set(raw_bases)
         for owner, bases in raw_bases.items():
             index.direct_bases.setdefault(owner, set())
@@ -307,13 +355,18 @@ class SourceStructureIndex:
         function_parameters: Sequence[str] = (),
         class_owner_hint: str = "",
     ) -> SourceSymbolIdentity:
-        canonical = exact_symbol(symbol)
+        raw_symbol = str(symbol or "").strip()
+        canonical = exact_symbol(raw_symbol)
         normalized = canonical.replace("->", ".")
         parts = [part for part in normalized.split(".") if part]
         root = parts[0].lstrip("&*") if parts else canonical
         explicit_this = root == "this" and len(parts) > 1
         if explicit_this:
             root = parts[1]
+        storage_head = raw_symbol.replace("->", ".").split(".", 1)[0]
+        qualified_global = storage_head.strip("&*:") if "::" in storage_head else ""
+        if qualified_global:
+            root = qualified_global.rsplit("::", 1)[-1]
         owner = self.resolve_class_name(class_owner_hint) if class_owner_hint else (
             self.callable_owner(callable_id, function_name)
         )
@@ -329,6 +382,26 @@ class SourceStructureIndex:
                 class_owner=owner,
                 declaration_id=f"{callable_id}:parameter:{parameter_index}",
                 declaration_proven=bool(callable_id),
+            )
+        local_declarations = self.declarations_by_callable.get(
+            (callable_id, root), []
+        )
+        local_identities = {
+            str((item.get("identity") or {}).get("declaration_id") or "")
+            for item in local_declarations
+            if (item.get("identity") or {}).get("kind") == "local"
+        }
+        local_identities.discard("")
+        if len(local_identities) == 1:
+            raw_identity = local_declarations[0].get("identity") or {}
+            return _source_symbol_identity(raw_identity).model_copy(
+                update={
+                    "symbol": canonical,
+                    "root": root,
+                    "file": file,
+                    "callable_id": callable_id,
+                    "class_owner": owner,
+                }
             )
         declaring_owner = self.declaring_member_owner(owner, root) if owner else None
         if declaring_owner or (explicit_this and owner):
@@ -350,6 +423,43 @@ class SourceStructureIndex:
                 ),
                 declaration_proven=bool(declaring_owner),
             )
+        global_candidates: list[dict[str, Any]] = []
+        global_keys = [qualified_global] if qualified_global else [root]
+        for key in global_keys:
+            for item in self.global_declarations.get(key, ()):
+                identity = item.get("identity") or {}
+                if (
+                    str(item.get("linkage") or "") == "internal"
+                    and str(item.get("file") or "") != file
+                ):
+                    continue
+                global_candidates.append(item)
+        global_ids = {
+            str((item.get("identity") or {}).get("declaration_id") or "")
+            for item in global_candidates
+        }
+        global_ids.discard("")
+        if len(global_ids) == 1:
+            raw_identity = global_candidates[0].get("identity") or {}
+            return _source_symbol_identity(raw_identity).model_copy(
+                update={
+                    "symbol": canonical,
+                    "root": root,
+                    "file": file,
+                    "callable_id": callable_id,
+                    "class_owner": owner,
+                }
+            )
+        if self.authoritative_declarations:
+            return SourceSymbolIdentity(
+                kind="unknown",
+                symbol=canonical,
+                root=root,
+                file=file,
+                callable_id=callable_id,
+                class_owner=owner,
+                declaration_proven=False,
+            )
         if callable_id:
             return SourceSymbolIdentity(
                 kind="local",
@@ -369,6 +479,18 @@ class SourceStructureIndex:
                 declaration_proven=False,
             )
         return SourceSymbolIdentity(kind="unknown", symbol=canonical, root=root, file=file)
+
+    def declaration_for_identity(
+        self, identity: SourceSymbolIdentity
+    ) -> Optional[dict[str, Any]]:
+        """Return the unique declaration entity for a proven identity."""
+        if not identity.declaration_proven or not identity.declaration_id:
+            return None
+        candidates = self.declarations_by_id.get(identity.declaration_id, [])
+        if not candidates:
+            return None
+        definitions = [item for item in candidates if item.get("is_definition", True)]
+        return (definitions or candidates)[0]
 
     def compatible(
         self,
@@ -454,6 +576,20 @@ class SourceStructureIndex:
                 and reference.namespace_owner == producer.namespace_owner
             )
         return False
+
+    @staticmethod
+    def same_declaration_entity(
+        reference: SourceSymbolIdentity,
+        candidate: SourceSymbolIdentity,
+    ) -> bool:
+        """Whether two projections are owned by one proven declaration."""
+        return bool(
+            reference.declaration_proven
+            and candidate.declaration_proven
+            and reference.kind == candidate.kind
+            and reference.declaration_id
+            and reference.declaration_id == candidate.declaration_id
+        )
 
     def enrich_bindings(self, bindings: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         enriched: list[dict[str, Any]] = []
@@ -618,6 +754,16 @@ def source_reference_resolution_key(
             reference.resolved_callable_file,
             contextual_file,
         )
+    if (
+        reference.kind == "storage_writers"
+        and reference.identity is not None
+        and reference.identity.declaration_proven
+    ):
+        return (
+            reference.kind,
+            reference.identity.kind,
+            reference.identity.declaration_id,
+        )
     if reference.identity is not None:
         return (reference.kind, reference.identity.storage_key())
     return reference.visit_key()
@@ -695,6 +841,7 @@ class _AdmissionAssignment:
     owner: str
     declaration_kind: str
     source_site_id: str
+    identity: Optional[SourceSymbolIdentity] = None
 
 
 @dataclass(frozen=True)
@@ -703,6 +850,7 @@ class _AdmissionCall:
     owner: str
     arguments: tuple[str, ...]
     source_site_id: str
+    argument_identities: tuple[SourceSymbolIdentity, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -794,6 +942,13 @@ class SourceExpansionResolver:
                     ),
                     declaration_kind=str(item.declaration_kind or ""),
                     source_site_id=str(item.source_site_id or item.callable_id or ""),
+                    identity=(
+                        _source_symbol_identity(
+                            item.target_identity
+                        )
+                        if item.target_identity is not None
+                        else None
+                    ),
                 )
                 for item in facts.source_assignments
             ),
@@ -805,6 +960,11 @@ class SourceExpansionResolver:
                     ),
                     arguments=tuple(str(value) for value in item.args),
                     source_site_id=str(item.source_site_id or item.callable_id or ""),
+                    argument_identities=tuple(
+                        _source_symbol_identity(raw_identity)
+                        for expression_ref in item.argument_expressions
+                        for raw_identity in expression_ref.input_identities.values()
+                    ),
                 )
                 for item in facts.function_calls
             ),
@@ -817,12 +977,18 @@ class SourceExpansionResolver:
         reference: UnresolvedSourceReference,
         structure: SourceStructureIndex,
     ) -> list[ExpansionCandidate]:
-        if reference.kind == "member_writers":
-            return self._resolve_member_writers(reference, structure)
+        if reference.kind in {"member_writers", "storage_writers"}:
+            return self._resolve_storage_writers(reference, structure)
         if (
             reference.kind == "symbol"
             and reference.identity is not None
-            and reference.identity.kind == "local"
+            and (
+                reference.identity.kind == "local"
+                or (
+                    structure.authoritative_declarations
+                    and reference.identity.kind == "unknown"
+                )
+            )
         ):
             # All producers for a local belong to the same callable, whose
             # admitted file facts have already been indexed. A tree-wide
@@ -877,33 +1043,84 @@ class SourceExpansionResolver:
                 return self._unique_entity(reference, candidates)
         return []
 
-    def _resolve_member_writers(
+    def _resolve_storage_writers(
         self,
         reference: UnresolvedSourceReference,
         structure: SourceStructureIndex,
     ) -> list[ExpansionCandidate]:
         identity = reference.identity
-        if identity is None or identity.kind != "member":
+        if identity is None or not identity.declaration_proven:
             return []
-        owner = identity.class_owner or identity.declaring_class
-        owners = tuple(structure.lineage(owner)) or ((owner,) if owner else ())
-        if not owners:
+        if identity.kind == "local":
             return []
+        if identity.kind == "member":
+            owner = identity.class_owner or identity.declaring_class
+            owners = tuple(structure.lineage(owner)) or ((owner,) if owner else ())
+            if not owners:
+                return []
+            direct_files = [
+                file_path
+                for candidate_owner in owners
+                for declared_file in sorted(
+                    structure.class_files.get(candidate_owner, ())
+                )
+                for file_path in [
+                    declared_file,
+                    *self.companion_files(declared_file),
+                ]
+            ]
+            hits = self.profiler.search_related_source_files(
+                [f"{candidate_owner}::" for candidate_owner in owners],
+                max_files=None,
+                expand_query_tokens=False,
+            )
+            return self._admit_files(
+                reference,
+                structure,
+                [*direct_files, *(hit.file for hit in hits)],
+            )
+        if identity.kind != "global":
+            return []
+
+        declaration = structure.declaration_for_identity(identity)
+        declarations = structure.declarations_by_id.get(
+            identity.declaration_id, []
+        )
         direct_files = [
-            file_path
-            for candidate_owner in owners
-            for declared_file in sorted(structure.class_files.get(candidate_owner, ()))
-            for file_path in [declared_file, *self.companion_files(declared_file)]
+            candidate
+            for item in declarations
+            for declared_file in [str(item.get("file") or "")]
+            if declared_file
+            for candidate in [
+                declared_file,
+                *self.companion_files(declared_file),
+            ]
         ]
+        if not direct_files and identity.file:
+            direct_files = [identity.file, *self.companion_files(identity.file)]
+        internal = bool(
+            (declaration and declaration.get("linkage") == "internal")
+            or identity.declaration_id.startswith("global:internal:")
+        )
+        if internal:
+            return self._admit_files(reference, structure, direct_files)
+
+        candidates = self._admit_files(reference, structure, direct_files)
+        if candidates:
+            return candidates
+        root = identity.root
+        queries = dedupe_keep_order(
+            [f"{root} =", f"{root}=", f"{root}{{", f"{root};"]
+        )
         hits = self.profiler.search_related_source_files(
-            [f"{candidate_owner}::" for candidate_owner in owners],
+            queries,
             max_files=None,
             expand_query_tokens=False,
         )
         return self._admit_files(
             reference,
             structure,
-            [*direct_files, *(hit.file for hit in hits)],
+            [hit.file for hit in hits],
         )
 
     def resolution_key(
@@ -981,16 +1198,20 @@ class SourceExpansionResolver:
         candidates: list[ExpansionCandidate] = []
         for file_path in dedupe_keep_order(str(value) for value in files if value):
             admission = self._admission_index_for(file_path)
-            if reference.kind == "member_writers":
-                match = self._member_writer_index_match(
+            if reference.kind in {"member_writers", "storage_writers"}:
+                match = self._storage_writer_index_match(
                     reference, admission, structure
                 )
+                if not match:
+                    continue
+                full_facts = self.facts_for(file_path)
+                match = self._exact_match(reference, full_facts, structure)
                 if not match:
                     continue
                 candidates.append(
                     ExpansionCandidate(
                         file=file_path,
-                        facts=self.facts_for(file_path),
+                        facts=full_facts,
                         matched_kind=reference.kind,
                         matched_identity=match,
                     )
@@ -1097,17 +1318,31 @@ class SourceExpansionResolver:
         return [item for item in matches if not item.owner]
 
     @staticmethod
-    def _member_writer_index_match(
+    def _storage_writer_index_match(
         reference: UnresolvedSourceReference,
         admission: _AdmissionIndex,
         structure: SourceStructureIndex,
     ) -> str:
         identity = reference.identity
-        if identity is None or identity.kind != "member":
+        if identity is None or not identity.declaration_proven:
+            return ""
+        symbol = exact_symbol(reference.symbol)
+        for assignment in admission.assignments:
+            if assignment.identity is not None and structure.same_declaration_entity(
+                identity,
+                assignment.identity.model_copy(
+                    update={"symbol": assignment.target}
+                ),
+            ):
+                return assignment.source_site_id
+        for call in admission.calls:
+            for candidate in call.argument_identities:
+                if structure.same_declaration_entity(identity, candidate):
+                    return call.source_site_id
+        if identity.kind != "member":
             return ""
         owner = identity.class_owner or identity.declaring_class
         owners = set(structure.lineage(owner)) or ({owner} if owner else set())
-        symbol = exact_symbol(reference.symbol)
         for assignment in admission.assignments:
             if assignment.owner in owners and symbol_produces_reference(
                 assignment.target, symbol
@@ -1165,12 +1400,23 @@ class SourceExpansionResolver:
             )
         else:
             structure: dict[str, list[Any]] = {}
-            if reference.kind in {"callable", "class", "symbol", "member_writers"}:
+            if reference.kind in {
+                "callable",
+                "class",
+                "symbol",
+                "member_writers",
+                "storage_writers",
+            }:
                 structure = self.profiler.extract_source_structure_from_source(
                     [file_path], expand_companions=False
                 )
             assignments = []
-            if reference.kind in {"symbol", "constant", "member_writers"}:
+            if reference.kind in {
+                "symbol",
+                "constant",
+                "member_writers",
+                "storage_writers",
+            }:
                 assignments = [
                     item
                     for item in self.profiler.extract_source_assignments_from_source(
@@ -1182,7 +1428,7 @@ class SourceExpansionResolver:
                     if item.file == file_path
                 ]
             calls = []
-            if reference.kind == "member_writers":
+            if reference.kind in {"member_writers", "storage_writers"}:
                 calls = [
                     item
                     for item in self.profiler.extract_function_calls_from_source(
@@ -1336,6 +1582,68 @@ class SourceExpansionResolver:
             )
             return matches[0].callable_id if len(matches) == 1 else ""
 
+        if reference.kind == "storage_writers":
+            identity = reference.identity
+            if identity is None or not identity.declaration_proven:
+                return ""
+            for assignment in facts.source_assignments:
+                if assignment.target_identity is not None:
+                    candidate = _source_symbol_identity(
+                        assignment.target_identity
+                    ).model_copy(
+                        update={"symbol": exact_symbol(assignment.target)}
+                    )
+                else:
+                    candidate = structure.symbol_identity(
+                        assignment.target,
+                        file=assignment.file,
+                        callable_id=str(
+                            assignment.callable_id or assignment.function or ""
+                        ),
+                        function_name=str(assignment.function or ""),
+                        function_parameters=assignment.function_parameters,
+                        class_owner_hint=str(assignment.owner or ""),
+                    )
+                if not candidate.declaration_proven:
+                    candidate = structure.symbol_identity(
+                        assignment.target,
+                        file=assignment.file,
+                        callable_id=str(
+                            assignment.callable_id or assignment.function or ""
+                        ),
+                        function_name=str(assignment.function or ""),
+                        function_parameters=assignment.function_parameters,
+                        class_owner_hint=str(assignment.owner or ""),
+                    )
+                if structure.same_declaration_entity(identity, candidate):
+                    return str(
+                        assignment.source_site_id
+                        or candidate.declaration_id
+                    )
+            for call in facts.function_calls:
+                owner = structure.callable_owner(
+                    str(call.callable_id or ""), str(call.function or "")
+                )
+                for argument_index, expression_ref in enumerate(
+                    call.argument_expressions
+                ):
+                    for raw_identity in expression_ref.input_identities.values():
+                        candidate = _source_symbol_identity(raw_identity)
+                        if (
+                            not candidate.declaration_proven
+                            and argument_index < len(call.args)
+                        ):
+                            candidate = structure.symbol_identity(
+                                call.args[argument_index],
+                                file=call.file,
+                                callable_id=str(call.callable_id or ""),
+                                function_name=str(call.function or ""),
+                                class_owner_hint=owner,
+                            )
+                        if structure.same_declaration_entity(identity, candidate):
+                            return str(call.source_site_id or call.callable_id or "")
+            return ""
+
         bindings = []
         for assignment in facts.source_assignments:
             target = exact_symbol(assignment.target)
@@ -1394,6 +1702,22 @@ class SourceExpansionResolver:
             callables_by_id={**structure.callables_by_id, **local_structure.callables_by_id},
             callables_by_name=callables_by_name,
             includes=includes,
+            declarations_by_id={
+                **structure.declarations_by_id,
+                **local_structure.declarations_by_id,
+            },
+            declarations_by_callable={
+                **structure.declarations_by_callable,
+                **local_structure.declarations_by_callable,
+            },
+            global_declarations={
+                **structure.global_declarations,
+                **local_structure.global_declarations,
+            },
+            authoritative_declarations=(
+                structure.authoritative_declarations
+                or local_structure.authoritative_declarations
+            ),
         )
         for assignment in bindings:
             candidate = combined.symbol_identity(

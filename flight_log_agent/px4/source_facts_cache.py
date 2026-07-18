@@ -49,6 +49,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceAssignmentRef,
     SourceCallableRef,
     SourceClassRef,
+    SourceDeclarationRef,
     SourceExpressionRef,
     SourceIncludeRef,
     SourceMemberRef,
@@ -81,6 +82,7 @@ class SourceFileFacts(BaseModel):
     helper_expressions: List[HelperExpressionRef] = Field(default_factory=list)
     branch_conditions: List[BranchConditionRef] = Field(default_factory=list)
     parameter_predicates: List[ParameterPredicateRef] = Field(default_factory=list)
+    declarations: List[SourceDeclarationRef] = Field(default_factory=list)
     classes: List[SourceClassRef] = Field(default_factory=list)
     members: List[SourceMemberRef] = Field(default_factory=list)
     callables: List[SourceCallableRef] = Field(default_factory=list)

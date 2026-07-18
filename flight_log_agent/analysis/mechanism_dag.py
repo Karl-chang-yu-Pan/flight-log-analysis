@@ -2441,7 +2441,7 @@ class _DAGBuilder:
     ) -> None:
         identity = (
             self._reference_identity(symbol, file, scope_function, line)
-            if kind in {"symbol", "member_writers"}
+            if kind in {"symbol", "member_writers", "storage_writers"}
             else None
         )
         owner = self._source_structure.callable_owner(
@@ -2463,8 +2463,19 @@ class _DAGBuilder:
             source_expression=source_expression,
             identity=identity,
         )
-        self._unresolved_references.setdefault(reference.visit_key(), reference)
-        if kind != "member_writers":
+        reference_key: tuple[Any, ...] = reference.visit_key()
+        if (
+            kind == "storage_writers"
+            and identity is not None
+            and identity.declaration_proven
+        ):
+            reference_key = (
+                kind,
+                identity.kind,
+                identity.declaration_id,
+            )
+        self._unresolved_references.setdefault(reference_key, reference)
+        if kind not in {"member_writers", "storage_writers"}:
             self.unresolved_symbols.add(symbol)
 
     def _binding_site_scope(self, binding: dict[str, Any]) -> tuple[str, str]:
@@ -3419,10 +3430,10 @@ class _DAGBuilder:
         identity = self._reference_identity(
             symbol_raw, file, scope_function, line
         )
-        if identity.kind == "member" and identity.declaration_proven:
+        if identity.declaration_proven and identity.kind in {"member", "global"}:
             self._record_unresolved(
-                symbol_raw,
-                kind="member_writers",
+                identity.root,
+                kind="storage_writers",
                 file=file,
                 line=line,
                 scope_function=scope_function,
@@ -3666,13 +3677,21 @@ class _DAGBuilder:
                     "opaque_symbol", symbol_raw, file=file, line=line
                 )
             ]
-        self._record_unresolved(
-            symbol_raw,
-            file=file,
-            line=line,
-            scope_function=scope_function,
-            source_expression=source_expression,
-        )
+        if identity.declaration_proven and identity.kind == "local":
+            self.unresolved_symbols.add(symbol_raw)
+        elif identity.declaration_proven and identity.kind in {"member", "global"}:
+            self.unresolved_symbols.add(symbol_raw)
+        elif not (
+            identity.declaration_proven
+            and identity.kind in {"member", "global"}
+        ):
+            self._record_unresolved(
+                symbol_raw,
+                file=file,
+                line=line,
+                scope_function=scope_function,
+                source_expression=source_expression,
+            )
         return [self._emit_evidence("opaque_symbol", symbol_raw, file=file, line=line)]
 
     def _observed_checkpoint_for_source_symbol(
