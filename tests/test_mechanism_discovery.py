@@ -3,10 +3,9 @@ from __future__ import annotations
 import pytest
 
 from flight_log_agent.analysis.mechanism_dag import (
-    _evaluate_predicate_intervals,
     build_mechanism_dag,
+    evaluate_dag_vertex_series,
     evaluate_feasibility,
-    ground_expression_via_edges,
 )
 from flight_log_agent.analysis.mechanism_discovery import (
     binding_from_assignment,
@@ -1197,6 +1196,108 @@ class Control {
     } & set(dag.unresolved_symbols)
 
 
+def test_terminal_formal_field_rebinding_crosses_gated_value_copy(
+    tmp_path, source_backend
+):
+    """Call gates control reachability, not formal-to-actual identity."""
+    source_file = "src/modules/example/gated_calls.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+struct point_s { float latitude; float speed; };
+struct triplet_s { point_s current; };
+
+class Control {
+    uORB::Subscription _triplet_sub{ORB_ID(triplet)};
+    triplet_s _triplet{};
+
+    void poll() { _triplet_sub.copy(&_triplet); }
+    void adjust(point_s &setpoint) { setpoint.latitude = 1.0f; }
+
+    void inner(const point_s &setpoint)
+    {
+        float target = setpoint.speed;
+        consume(target);
+    }
+
+    void outer(const point_s &incoming)
+    {
+        point_s current = incoming;
+        adjust(current);
+
+        if (enabled) {
+            inner(current);
+        }
+    }
+
+    void Run()
+    {
+        if (automatic) {
+            outer(_triplet.current);
+        }
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        [source_file],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+    inner = next(
+        item
+        for item in inputs.structure.callables_by_id.values()
+        if item["name"] == "Control::inner"
+    )
+    terminal_identity = inputs.structure.symbol_identity(
+        "target",
+        file=source_file,
+        callable_id=inner["callable_id"],
+        function_name=inner["name"],
+        function_parameters=inner["parameters"],
+    )
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "target",
+        terminal_file=source_file,
+        terminal_identity=terminal_identity,
+        logged_signals={"triplet.current.speed"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+
+    assert any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "triplet.current.speed"
+        for vertex in dag.vertices
+    )
+    assert not {
+        "setpoint.speed",
+        "current.speed",
+        "incoming.speed",
+        "_triplet.current.speed",
+    } & set(dag.unresolved_symbols)
+    gated_terminal = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+    )
+    assert any(
+        edge.kind == "control" and edge.target_id == gated_terminal.id
+        for edge in dag.edges
+    )
+
+
 def test_plain_self_read_assignment_reaches_caller_actual(
     tmp_path, source_backend
 ):
@@ -1490,31 +1591,27 @@ void Control::run()
         and (vertex.metadata or {}).get("is_terminal")
         and "acceptance_radius" in str(vertex.expression or "")
     )
-    grounded = ground_expression_via_edges(
-        str(terminal.expression or ""), terminal.id, annotated
-    )
-    assert grounded is not None
-    assert "destination" in grounded
-    assert "ACCEPT_RADIUS" in grounded
-    assert "acceptance_radius" not in grounded
-    assert "_param_accept_radius" not in grounded
-    assert "status_s" not in grounded
-    assert "ROTARY" not in grounded
-
-    matches_expected_floor = _evaluate_predicate_intervals(
-        f"abs(({grounded}) - (destination + 20.0)) < 0.001",
-        {"ACCEPT_RADIUS": 10.0},
-        {},
-        {
+    reconstructed = evaluate_dag_vertex_series(
+        annotated,
+        terminal.id,
+        parameter_values={"ACCEPT_RADIUS": 10.0},
+        signal_samples={
             "destination": [(0.0, 100.0), (1.0, 100.0)],
             "vehicle_status.vehicle_type": [(0.0, 1), (1.0, 1)],
         },
-        {
+        signal_policies={
             "destination": {"method": "linear"},
             "vehicle_status.vehicle_type": {"method": "discrete_hold"},
         },
+        timestamps=[0.0, 1.0],
+        evaluation_windows=[(0.0, 1.0)],
     )
-    assert matches_expected_floor == [(0.0, 1.0)]
+    assert reconstructed.complete is True
+    assert set(reconstructed.referenced_signals) == {
+        "destination",
+        "vehicle_status.vehicle_type",
+    }
+    assert [value for _timestamp, value in reconstructed.samples] == [120.0, 120.0]
 
 
 def test_tree_sitter_exact_callable_survives_without_owner_rederivation(tmp_path):

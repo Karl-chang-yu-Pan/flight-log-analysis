@@ -816,6 +816,123 @@ def test_replay_combines_mutually_exclusive_writers_piecewise(monkeypatch):
     assert all(result["match_fraction"] == 1.0 for result in replay["results"])
 
 
+def test_replay_reconstructs_nested_internal_flow_from_dag_edges():
+    from flight_log_agent.analysis import dag_pipeline
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    bindings = [
+        {
+            "target_symbol": "internal",
+            "source_symbol": "input.value * 2.0",
+            "assignment_path": [
+                {"file": "a.cpp", "line": 10, "expression": "input.value * 2.0"}
+            ],
+            "control_predicates": [],
+            "function": "A::run",
+        },
+        {
+            "target_symbol": "output",
+            "source_symbol": "max(internal, 3.0)",
+            "assignment_path": [
+                {"file": "a.cpp", "line": 20, "expression": "max(internal, 3.0)"}
+            ],
+            "logged_signal": "output.value",
+            "control_predicates": [],
+            "function": "A::run",
+        },
+    ]
+    samples = {
+        "input.value": [(0.0, 1.0), (10.0, 2.0)],
+        "output.value": [(0.0, 3.0), (10.0, 4.0)],
+    }
+    policies = {
+        "input.value": {"method": "linear"},
+        "output.value": {"method": "linear"},
+    }
+    dag = build_mechanism_dag(
+        bindings,
+        "output",
+        logged_signals=set(samples),
+    )
+
+    replay = dag_pipeline.replay_terminal_expressions(
+        dag,
+        Path("/unused.ulg"),
+        {},
+        set(samples),
+        signal_policies=policies,
+        signal_samples=samples,
+    )
+
+    assert replay["status"] == "matched"
+    assert replay["complete"] is True
+    assert replay["results"][0]["evaluation_mode"] == "dag_value_plan"
+    assert replay["results"][0]["grounded"] is None
+
+
+def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges():
+    from flight_log_agent.analysis import dag_pipeline
+    from flight_log_agent.analysis.mechanism_dag import (
+        build_mechanism_dag,
+        evaluate_feasibility,
+    )
+
+    def binding(target, expression, line, *, controls=None, logged_signal=""):
+        return {
+            "target_symbol": target,
+            "source_symbol": expression,
+            "assignment_path": [
+                {"file": "a.cpp", "line": line, "expression": expression}
+            ],
+            "logged_signal": logged_signal,
+            "control_predicates": controls or [],
+            "control_predicate_lines": [line - 1 for _ in controls or []],
+            "function": "A::run",
+        }
+
+    bindings = [
+        binding("selected", "input.first", 10, controls=["mode.state == 0"]),
+        binding("selected", "input.second", 12, controls=["mode.state == 1"]),
+        binding("output", "selected", 20, logged_signal="output.value"),
+    ]
+    samples = {
+        "mode.state": [(0.0, 0), (5.0, 1), (10.0, 1)],
+        "input.first": [(0.0, 1.0), (10.0, 1.0)],
+        "input.second": [(0.0, 2.0), (10.0, 2.0)],
+        "output.value": [(0.0, 1.0), (5.0, 2.0), (10.0, 2.0)],
+    }
+    policies = {
+        "mode.state": {"method": "discrete_hold"},
+        "input.first": {"method": "linear"},
+        "input.second": {"method": "linear"},
+        "output.value": {"method": "linear"},
+    }
+    dag = build_mechanism_dag(
+        bindings,
+        "output",
+        logged_signals=set(samples),
+    )
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples=samples,
+        signal_policies=policies,
+        prune_dead=False,
+    )
+
+    replay = dag_pipeline.replay_terminal_expressions(
+        annotated,
+        Path("/unused.ulg"),
+        {},
+        set(samples),
+        signal_policies=policies,
+        signal_samples=samples,
+    )
+
+    assert replay["status"] == "matched"
+    assert replay["complete"] is True
+    assert replay["results"][0]["match_fraction"] == 1.0
+
+
 def test_validation_downgrade_resynchronizes_confirmation_lists():
     from flight_log_agent.analysis.report_validation import (
         enforce_validation_downgrades,

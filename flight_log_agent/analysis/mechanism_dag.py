@@ -30,6 +30,7 @@ from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
+from flight_log_agent.analysis.dag_value import DAGValuePlan
 from flight_log_agent.analysis.parameter_lookup import (
     CXX_STDLIB_CONSTANTS,
     is_px4_parameter_name,
@@ -1844,6 +1845,9 @@ class _DAGBuilder:
                         call.get("reachability_exact", True)
                     )
                     and bool(original.get("reachability_exact", True)),
+                    "invocation_control_predicate_count": len(
+                        caller_predicates
+                    ),
                     "call_site_id": source_site_id,
                     "call_instance_scope": call_scope,
                     "callable_id": call_scope,
@@ -1912,6 +1916,9 @@ class _DAGBuilder:
                     "control_expression_refs": caller_predicate_refs,
                     "reachability_exact": bool(
                         call.get("reachability_exact", True)
+                    ),
+                    "invocation_control_predicate_count": len(
+                        caller_predicates
                     ),
                     "struct_variables": {},
                     "scope_file": helper_file,
@@ -3353,6 +3360,25 @@ class _DAGBuilder:
                 break
         return reaching + [producer_id for producer_id in unordered if producer_id not in reaching]
 
+    @staticmethod
+    def _binding_is_unconditional_in_invocation(
+        binding: dict[str, Any],
+    ) -> bool:
+        """Whether a simple copy is unconditional once its call executes.
+
+        Invocation predicates are copied onto every operation in a private
+        call scope so reachability remains exact. They do not make a formal
+        binding or an otherwise-unconditional local copy ambiguous inside
+        that invocation. Predicates originating in the callee still do.
+        """
+        controls = list(binding.get("control_predicates") or [])
+        inherited = int(
+            binding.get("invocation_control_predicate_count") or 0
+        )
+        return bool(binding.get("synthetic_call_binding")) or (
+            len(controls) == inherited
+        )
+
     def _resolve_symbol_producers(
         self,
         symbol_norm: str,
@@ -3455,7 +3481,7 @@ class _DAGBuilder:
                     (file or "", scope_function),
                     excluded_call_effect_site=excluded_call_effect_site,
                 )
-                if not b.get("control_predicates")
+                if self._binding_is_unconditional_in_invocation(b)
                 and re.fullmatch(
                     r"[A-Za-z_][\w.]*",
                     str(b.get("source_symbol") or "").strip(),
@@ -5210,9 +5236,12 @@ def ground_expression_via_edges(
     enum_values: Optional[dict[str, Any]] = None,
     max_depth: int = 6,
 ) -> Optional[str]:
-    """Lower ``expression`` toward logged form using the graph itself.
+    """Render ``expression`` with graph producers for diagnostics only.
 
-    Each symbol the vertex reads (its incoming data edges' roles) is
+    This compatibility renderer is not used for feasibility or replay.
+    Those paths evaluate producer values through :class:`DAGValuePlan` so
+    symbol identity and producer selection remain graph-native. For display,
+    each symbol the vertex reads (its incoming data edges' roles) is
     substituted with its producer's grounded form: a logged-signal leaf
     substitutes its signal name, a constant/parameter leaf its value or
     name, and an operation recursively grounds its own expression.
@@ -5338,8 +5367,8 @@ def evaluate_feasibility(
             continue
 
         predicate = vertex.predicate_raw or vertex.predicate_lowered or ""
-        evaluated_predicate = predicate
         prepared_predicate: Optional[_PreparedPredicate] = None
+        graph_evaluation: Optional[DAGValueSeries] = None
         verdict = _reduce_predicate(predicate, params, enums)
         windows: list[tuple[float, float]] = []
 
@@ -5362,48 +5391,50 @@ def evaluate_feasibility(
                 else None
             )
             if evaluated is None:
-                # Internal-state predicate (``_flare_states.flaring``) —
-                # no direct param/logged reference. Ground it through the
-                # graph: substitute each symbol with its producer's logged
-                # form via the branch's own data edges, then retry.
-                grounded = ground_expression_via_edges(
-                    predicate, vertex.id, dag, enum_values=enums
+                plan = DAGValuePlan(dag, vertex.id)
+                static_result = plan.evaluate(
+                    None,
+                    parameter_values=params,
+                    enum_values=enums,
                 )
-                if grounded and grounded != predicate:
-                    evaluated_predicate = grounded
-                    verdict = _reduce_predicate(grounded, params, enums)
-                    if verdict == "unknown" and samples:
-                        prepared_predicate = _prepare_predicate(
-                            grounded,
-                            samples,
-                            policies,
-                            prepared_series=prepared_series,
-                        )
-                        evaluated = _evaluate_predicate_intervals(
-                            grounded,
-                            params,
-                            enums,
-                            samples,
-                            policies,
-                            prepared=prepared_predicate,
-                            prepared_series=prepared_series,
+                if static_result.status == "value":
+                    verdict = (
+                        "always_true" if bool(static_result.value) else "always_false"
+                    )
+                elif samples:
+                    graph_evaluation = evaluate_dag_vertex_series(
+                        dag,
+                        vertex.id,
+                        parameter_values=params,
+                        enum_values=enums,
+                        signal_samples=samples,
+                        signal_policies=policies,
+                        prepared_signal_series=prepared_series,
+                    )
+                    if graph_evaluation.complete:
+                        evaluated = boolean_sample_windows(
+                            graph_evaluation.samples
                         )
             if verdict == "unknown" and evaluated is not None:
                 windows = evaluated
-                if prepared_predicate is None:
-                    prepared_predicate = _prepare_predicate(
-                        evaluated_predicate,
+                if graph_evaluation is not None:
+                    predicate_span = graph_evaluation.span
+                    policies_complete = graph_evaluation.policies_complete
+                else:
+                    if prepared_predicate is None:
+                        prepared_predicate = _prepare_predicate(
+                            predicate,
+                            samples,
+                            policies,
+                            prepared_series=prepared_series,
+                        )
+                    predicate_span = prepared_predicate.span
+                    policies_complete = _predicate_policies_complete(
+                        predicate,
                         samples,
                         policies,
-                        prepared_series=prepared_series,
+                        prepared=prepared_predicate,
                     )
-                predicate_span = prepared_predicate.span
-                policies_complete = _predicate_policies_complete(
-                    evaluated_predicate,
-                    samples,
-                    policies,
-                    prepared=prepared_predicate,
-                )
                 if not windows and policies_complete:
                     verdict = "always_false"
                 elif (
@@ -5415,22 +5446,29 @@ def evaluate_feasibility(
 
         verdicts[vertex.id] = verdict
         metadata = dict(vertex.metadata or {})
-        if samples and prepared_predicate is None:
+        if graph_evaluation is not None:
+            evaluation_span = graph_evaluation.span
+            metadata["evaluation_mode"] = "dag_value_plan"
+            metadata["sampling_policies"] = graph_evaluation.policy_summary
+        elif samples and prepared_predicate is None:
             prepared_predicate = _prepare_predicate(
-                evaluated_predicate,
+                predicate,
                 samples,
                 policies,
                 prepared_series=prepared_series,
             )
-        evaluation_span = prepared_predicate.span if prepared_predicate else None
+            evaluation_span = prepared_predicate.span
+        else:
+            evaluation_span = prepared_predicate.span if prepared_predicate else None
         if evaluation_span is not None:
             metadata["evaluation_domain"] = list(evaluation_span)
-            metadata["sampling_policies"] = _predicate_policy_summary(
-                evaluated_predicate,
-                samples,
-                policies,
-                prepared=prepared_predicate,
-            )
+            if graph_evaluation is None:
+                metadata["sampling_policies"] = _predicate_policy_summary(
+                    predicate,
+                    samples,
+                    policies,
+                    prepared=prepared_predicate,
+                )
         updated_vertices.append(
             vertex.model_copy(
                 update={
@@ -5553,6 +5591,19 @@ class PreparedSignalSeries:
     times: tuple[float, ...]
     span: Optional[tuple[float, float]]
     policy: Optional[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class DAGValueSeries:
+    """Timestamped values reconstructed from one MechanismDAG vertex."""
+
+    samples: tuple[tuple[float, Any], ...]
+    span: Optional[tuple[float, float]]
+    referenced_signals: tuple[str, ...]
+    policy_summary: dict[str, str]
+    policies_complete: bool
+    complete: bool
+    reason: str = ""
 
 
 def prepare_signal_series(
@@ -5735,6 +5786,174 @@ def _sample_value_at(
     if method == "linear":
         return before_f + fraction * (after_f - before_f)
     return None
+
+
+def sample_prepared_signal(
+    prepared_signal_series: dict[str, PreparedSignalSeries],
+    signal: str,
+    timestamp: float,
+) -> Optional[Any]:
+    """Read one already-prepared signal without sorting it again."""
+    series = prepared_signal_series.get(signal)
+    if series is None:
+        return None
+    return _sample_value_at(
+        series.samples, series.times, timestamp, series.policy
+    )
+
+
+def evaluate_dag_vertex_series(
+    dag: MechanismDAG,
+    vertex_id: str,
+    *,
+    parameter_values: Optional[dict[str, Any]] = None,
+    enum_values: Optional[dict[str, Any]] = None,
+    signal_samples: Optional[dict[str, list[tuple[float, Any]]]] = None,
+    signal_policies: Optional[dict[str, Any]] = None,
+    prepared_signal_series: Optional[dict[str, PreparedSignalSeries]] = None,
+    timestamps: Optional[Iterable[float]] = None,
+    evaluation_windows: Optional[list[tuple[float, float]]] = None,
+) -> DAGValueSeries:
+    """Evaluate one vertex from graph edges over its observed input domain.
+
+    The operation text applies only local operators. Every operand value is
+    selected from an incoming DAG edge by :class:`DAGValuePlan`; this function
+    supplies timestamp alignment and schema-derived resampling policy.
+    """
+    samples = signal_samples or {}
+    policies = signal_policies or {}
+    plan = DAGValuePlan(dag, vertex_id)
+    referenced = plan.logged_signals
+    prepared = dict(prepared_signal_series or {})
+    missing = {
+        signal: samples.get(signal, [])
+        for signal in referenced
+        if signal not in prepared and signal in samples
+    }
+    if missing:
+        prepared.update(prepare_signal_series(missing, policies))
+    unavailable = [signal for signal in referenced if signal not in prepared]
+    policy_summary = {
+        signal: str((prepared.get(signal).policy or {}).get("method") or "unknown")
+        if prepared.get(signal) is not None
+        else "unknown"
+        for signal in referenced
+    }
+    policies_complete = bool(referenced) and all(
+        prepared.get(signal) is not None
+        and prepared[signal].policy is not None
+        for signal in referenced
+    )
+    if unavailable:
+        return DAGValueSeries(
+            samples=(),
+            span=None,
+            referenced_signals=referenced,
+            policy_summary=policy_summary,
+            policies_complete=False,
+            complete=False,
+            reason=f"missing observed inputs: {unavailable}",
+        )
+
+    span: Optional[tuple[float, float]] = None
+    if referenced:
+        spans = [prepared[signal].span for signal in referenced]
+        if any(item is None for item in spans):
+            return DAGValueSeries(
+                samples=(),
+                span=None,
+                referenced_signals=referenced,
+                policy_summary=policy_summary,
+                policies_complete=policies_complete,
+                complete=False,
+                reason="one or more observed inputs have no samples",
+            )
+        start = max(item[0] for item in spans if item is not None)
+        end = min(item[1] for item in spans if item is not None)
+        if start > end:
+            return DAGValueSeries(
+                samples=(),
+                span=None,
+                referenced_signals=referenced,
+                policy_summary=policy_summary,
+                policies_complete=policies_complete,
+                complete=False,
+                reason="observed input domains do not overlap",
+            )
+        span = (start, end)
+
+    requested_windows = list(evaluation_windows or [])
+    timeline = {float(timestamp) for timestamp in (timestamps or ())}
+    for signal in referenced:
+        timeline.update(prepared[signal].times)
+    if span is not None:
+        timeline.update(span)
+    for start, end in requested_windows:
+        timeline.update((float(start), float(end)))
+
+    def in_domain(timestamp: float) -> bool:
+        if span is not None and not (span[0] <= timestamp <= span[1]):
+            return False
+        return not requested_windows or any(
+            start <= timestamp <= end for start, end in requested_windows
+        )
+
+    scheduled = sorted(timestamp for timestamp in timeline if in_domain(timestamp))
+    if not scheduled:
+        return DAGValueSeries(
+            samples=(),
+            span=span,
+            referenced_signals=referenced,
+            policy_summary=policy_summary,
+            policies_complete=policies_complete,
+            complete=False,
+            reason="no timestamps in the common evaluation domain",
+        )
+
+    values: list[tuple[float, Any]] = []
+    failures: list[str] = []
+
+    def resolve(signal: str, timestamp: float) -> Optional[Any]:
+        return sample_prepared_signal(prepared, signal, timestamp)
+
+    for timestamp in scheduled:
+        result = plan.evaluate(
+            timestamp,
+            parameter_values=parameter_values,
+            enum_values=enum_values,
+            sample_resolver=resolve,
+        )
+        if result.status == "value":
+            values.append((timestamp, result.value))
+        else:
+            failures.append(result.reason or result.status)
+    return DAGValueSeries(
+        samples=tuple(values),
+        span=span,
+        referenced_signals=referenced,
+        policy_summary=policy_summary,
+        policies_complete=policies_complete,
+        complete=len(values) == len(scheduled),
+        reason="; ".join(dict.fromkeys(failures)),
+    )
+
+
+def boolean_sample_windows(
+    samples: Sequence[tuple[float, Any]],
+) -> list[tuple[float, float]]:
+    windows: list[tuple[float, float]] = []
+    current_start: Optional[float] = None
+    last_timestamp: Optional[float] = None
+    for timestamp, value in samples:
+        last_timestamp = timestamp
+        if bool(value) and current_start is None:
+            current_start = timestamp
+        elif not bool(value) and current_start is not None:
+            windows.append((current_start, timestamp))
+            current_start = None
+    if current_start is not None and last_timestamp is not None:
+        windows.append((current_start, last_timestamp))
+    return windows
 
 
 def _covers_span(

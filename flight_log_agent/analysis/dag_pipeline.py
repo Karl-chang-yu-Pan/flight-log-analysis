@@ -18,10 +18,14 @@ from typing import Any, Literal, Optional, Union
 
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.mechanism_dag import (
+    DAGValueSeries,
     MechanismDAG,
     PreparedSignalSeries,
+    boolean_sample_windows,
+    evaluate_dag_vertex_series,
     evaluate_feasibility,
     prepare_signal_series,
+    sample_prepared_signal,
 )
 from flight_log_agent.analysis.mechanism_discovery import DiscoveryResult
 from flight_log_agent.analysis.mechanism_judge import (
@@ -547,22 +551,15 @@ def replay_terminal_expressions(
     signal_samples: Optional[dict[str, list[tuple[float, Any]]]] = None,
     prepared_signal_series: Optional[dict[str, PreparedSignalSeries]] = None,
 ) -> dict[str, Any]:
-    """Numerically compare the mechanism against the log: ground each
-    terminal write's expression through the graph, evaluate it over the
-    log, and measure how long it matches the observed signal within
-    tolerance.
+    """Numerically compare terminal writes with their observed output.
 
-    Fully structural: grounding walks DAG edges, the observed signal must
-    have exact terminal-publication provenance, and each writer is compared
-    only inside the intersection of its gating branch windows. A definitive
-    match/mismatch is emitted only when exact writer domains are non-
-    overlapping and cover the observed output domain.
+    Producer values and writer selection are evaluated directly from DAG
+    edges. Source text is used only for the local operators within one
+    operation; no recursively substituted expression participates in the
+    result. Each writer is compared only inside its gating branch windows.
+    A definitive match/mismatch requires exact, non-overlapping writer
+    domains that cover the observed output domain.
     """
-    from flight_log_agent.analysis.mechanism_dag import (
-        _evaluate_predicate_intervals,
-        _predicate_policies_complete,
-        ground_expression_via_edges,
-    )
 
     def not_attempted(reason: str) -> dict[str, Any]:
         return {"status": "not_attempted", "complete": False, "reason": reason}
@@ -656,55 +653,83 @@ def replay_terminal_expressions(
             if domain:
                 domain = _intersect_windows(domain, branch_domain)
 
-        grounded = ground_expression_via_edges(
-            str(op.expression or ""), op.id, annotated
-        )
-        if not grounded:
+        if not domain:
             results.append(
                 {
                     "operation_id": op.id,
                     "expression": op.expression,
                     "grounded": None,
-                    "evaluable": False,
+                    "evaluation_mode": "dag_value_plan",
+                    "evaluable": True,
                     "active_windows": domain,
+                    "active_duration": 0.0,
+                    "matched_duration": 0.0,
+                    "match_fraction": None,
                 }
             )
-            complete = False
+            writer_domains.append((op.id, domain))
+            complete = complete and writer_complete
             continue
-        match_windows = _evaluate_predicate_intervals(
-            f"abs(({grounded}) - ({observed})) <= {tolerance}",
-            parameter_values,
-            {},
-            samples,
-            signal_policies,
-            prepared_series=prepared_series,
+
+        reconstructed: DAGValueSeries = evaluate_dag_vertex_series(
+            annotated,
+            op.id,
+            parameter_values=parameter_values,
+            signal_samples=samples,
+            signal_policies=signal_policies,
+            prepared_signal_series=prepared_series,
+            timestamps=(timestamp for timestamp, _value in observed_samples),
+            evaluation_windows=domain,
         )
-        if match_windows is None:
+        comparison_samples: list[tuple[float, bool]] = []
+        comparison_complete = reconstructed.complete
+        for timestamp, expected_value in reconstructed.samples:
+            observed_value = sample_prepared_signal(
+                prepared_series, observed, timestamp
+            )
+            if not isinstance(expected_value, (int, float)) or not isinstance(
+                observed_value, (int, float)
+            ):
+                comparison_complete = False
+                continue
+            comparison_samples.append(
+                (
+                    timestamp,
+                    abs(float(expected_value) - float(observed_value))
+                    <= tolerance,
+                )
+            )
+        if not comparison_samples:
             results.append(
                 {
                     "operation_id": op.id,
                     "expression": op.expression,
-                    "grounded": grounded,
+                    "grounded": None,
+                    "evaluation_mode": "dag_value_plan",
                     "evaluable": False,
                     "active_windows": domain,
+                    "reason": reconstructed.reason,
                 }
             )
             complete = False
             continue
-        if not _predicate_policies_complete(
-            f"abs(({grounded}) - ({observed})) <= {tolerance}",
-            samples,
-            signal_policies or {},
-            prepared_series=prepared_series,
-        ):
+        input_policies_complete = (
+            reconstructed.policies_complete
+            if reconstructed.referenced_signals
+            else True
+        )
+        if not input_policies_complete or observed_policy is None:
             writer_complete = False
+        writer_complete = writer_complete and comparison_complete
+        match_windows = boolean_sample_windows(comparison_samples)
         active_duration = _window_duration(domain)
         matched_duration = _window_duration(_intersect_windows(match_windows, domain))
         results.append(
             {
                 "operation_id": op.id,
                 "expression": op.expression,
-                "grounded": grounded,
+                "grounded": None,
+                "evaluation_mode": "dag_value_plan",
                 "evaluable": True,
                 "active_windows": domain,
                 "active_duration": round(active_duration, 6),
@@ -736,10 +761,10 @@ def replay_terminal_expressions(
 
     if not results:
         status: ReplayStatus = "unevaluable"
-        reason = "no terminal expression grounded through the graph"
+        reason = "no terminal operation was available for DAG replay"
     elif not any(r.get("evaluable") for r in results):
         status = "unevaluable"
-        reason = "no grounded expression was evaluable over the log"
+        reason = "no terminal operation was evaluable through DAG edges"
     elif not complete:
         status = "partial"
         reason = (
@@ -928,7 +953,9 @@ def build_report_from_dag(
         RelationshipCheckSpec(
             type="derived_expression",
             actual=str(replay.get("observed") or ""),
-            expression=str(result.get("grounded") or ""),
+            expression=str(
+                result.get("grounded") or result.get("expression") or ""
+            ),
             metric="match_fraction",
             value=result.get("match_fraction"),
             description=f"DAG replay status: {replay_status}",

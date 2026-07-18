@@ -441,6 +441,60 @@ def test_feasibility_reuses_prepared_signal_series(monkeypatch):
     assert len([vertex for vertex in reduced.vertices if vertex.kind == "branch"]) == 2
 
 
+def test_feasibility_evaluates_internal_predicate_from_dag_edges():
+    bindings = [
+        _fake_binding(
+            binding_id="state",
+            target="internal_state",
+            expression="topic.flag",
+            file="src/modules/example/ctrl.cpp",
+            line=10,
+            logged_signal="",
+            function="Control::run",
+        ),
+        _fake_binding(
+            binding_id="terminal",
+            target="output",
+            expression="topic.value",
+            file="src/modules/example/ctrl.cpp",
+            line=20,
+            logged_signal="output.value",
+            control_predicates=["internal_state > 0"],
+            function="Control::run",
+        ),
+    ]
+    samples = {
+        "topic.flag": [(0.0, 0), (5.0, 1), (10.0, 1)],
+        "topic.value": [(0.0, 2.0), (10.0, 2.0)],
+        "output.value": [(0.0, 2.0), (10.0, 2.0)],
+    }
+    policies = {
+        "topic.flag": {"method": "discrete_hold"},
+        "topic.value": {"method": "linear"},
+        "output.value": {"method": "linear"},
+    }
+    dag = build_mechanism_dag(
+        bindings,
+        "output",
+        logged_signals=set(samples),
+    )
+
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples=samples,
+        signal_policies=policies,
+        prune_dead=False,
+    )
+
+    branch = next(vertex for vertex in annotated.vertices if vertex.kind == "branch")
+    assert branch.active_windows == [(5.0, 10.0)]
+    assert branch.feasibility_verdict == "unknown"
+    assert branch.metadata["evaluation_mode"] == "dag_value_plan"
+    assert branch.metadata["sampling_policies"] == {
+        "topic.flag": "discrete_hold"
+    }
+
+
 def test_feasibility_prunes_always_false_gated_operation():
     predicate = "_param_rtl_cone_half_angle_deg.get() > 0"
     bindings = [
