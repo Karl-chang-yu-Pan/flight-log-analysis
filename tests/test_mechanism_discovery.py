@@ -1192,6 +1192,252 @@ class Control {
     } & set(dag.unresolved_symbols)
 
 
+def test_plain_self_read_assignment_reaches_caller_actual(
+    tmp_path, source_backend
+):
+    source_file = "src/modules/example/self_read_call.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+class Control {
+    float source;
+
+    float adapt(float value)
+    {
+        return value * 2.0f;
+    }
+
+    void consume(float floor, float &setpoint)
+    {
+        setpoint = max(setpoint, floor);
+    }
+
+    void Run()
+    {
+        float candidate = adapt(source);
+        consume(1.0f, candidate);
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        [source_file],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+    consume = next(
+        item
+        for item in inputs.structure.callables_by_id.values()
+        if item["name"] == "Control::consume"
+    )
+    terminal_identity = inputs.structure.symbol_identity(
+        "setpoint",
+        file=source_file,
+        callable_id=consume["callable_id"],
+        function_name=consume["name"],
+        function_parameters=consume["parameters"],
+    )
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "setpoint",
+        terminal_file=source_file,
+        terminal_identity=terminal_identity,
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+    )
+
+    operations = [
+        vertex for vertex in dag.vertices if vertex.kind == "operation"
+    ]
+    terminal = next(
+        vertex
+        for vertex in operations
+        if vertex.variable == "setpoint"
+        and vertex.expression == "max(setpoint, floor)"
+    )
+    formal_bindings = [
+        vertex
+        for vertex in operations
+        if vertex.variable == "setpoint"
+        and vertex.expression == "candidate"
+        and (vertex.metadata or {}).get("synthetic_call_binding")
+    ]
+    assert formal_bindings, [
+        (
+            vertex.variable,
+            vertex.expression,
+            (vertex.metadata or {}).get("target_scope"),
+            (vertex.metadata or {}).get("site_scope"),
+        )
+        for vertex in operations
+    ]
+    formal_binding = formal_bindings[0]
+    candidate = next(
+        vertex
+        for vertex in operations
+        if vertex.variable == "candidate"
+        and vertex.expression == "adapt(source)"
+    )
+    assert any(
+        edge.source_id == formal_binding.id
+        and edge.target_id == terminal.id
+        and edge.role == "setpoint"
+        for edge in dag.edges
+    )
+    assert any(
+        edge.source_id == candidate.id
+        and edge.target_id == formal_binding.id
+        and edge.role == "candidate"
+        for edge in dag.edges
+    )
+
+
+def test_nested_helper_return_dataflow_is_backend_interchangeable(
+    tmp_path, source_backend
+):
+    source_file = "src/modules/example/nested_returns.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+float inner(float value)
+{
+    return value * 2.0f;
+}
+
+float outer(float value)
+{
+    return inner(value);
+}
+
+void run()
+{
+    output = outer(input);
+}
+""",
+        },
+        backend=source_backend,
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(
+            profiler,
+            tmp_path / "cache",
+            [source_file],
+            "hash",
+        )
+    )
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+    )
+
+    outer_returns = [
+        vertex
+        for vertex in dag.vertices
+        if str(vertex.provenance or "").startswith("helper_return:outer@")
+    ]
+    inner_returns = [
+        vertex
+        for vertex in dag.vertices
+        if str(vertex.provenance or "").startswith("helper_return:inner@")
+    ]
+    assert len(outer_returns) == 1
+    if source_backend == "legacy":
+        # The retiring parser lowers the nested call into the outer formula.
+        assert "value * 2.0" in str(outer_returns[0].expression or "")
+        assert inner_returns == []
+        return
+
+    assert len(inner_returns) == 1
+    assert any(
+        edge.source_id == inner_returns[0].id
+        and edge.target_id == outer_returns[0].id
+        and edge.role == "call:inner"
+        for edge in dag.edges
+    )
+
+
+def test_terminal_formal_rebinding_preserves_diamond_caller_paths(
+    tmp_path, source_backend
+):
+    source_file = "src/modules/example/diamond_calls.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+struct point_s { float value; };
+struct pair_s { point_s first; point_s second; };
+
+class Control {
+    uORB::Subscription _pair_sub{ORB_ID(pair)};
+    pair_s _pair{};
+
+    void poll() { _pair_sub.copy(&_pair); }
+    void inner(const point_s &setpoint) { float target = setpoint.value; }
+    void left(const point_s &value) { inner(value); }
+    void right(const point_s &value) { inner(value); }
+    void Run()
+    {
+        left(_pair.first);
+        right(_pair.second);
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        [source_file],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+    inner = next(
+        item
+        for item in inputs.structure.callables_by_id.values()
+        if item["name"] == "Control::inner"
+    )
+    terminal_identity = inputs.structure.symbol_identity(
+        "target",
+        file=source_file,
+        callable_id=inner["callable_id"],
+        function_name=inner["name"],
+        function_parameters=inner["parameters"],
+    )
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "target",
+        terminal_file=source_file,
+        terminal_identity=terminal_identity,
+        logged_signals={"pair.first.value", "pair.second.value"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+
+    observed = {
+        vertex.signal_name
+        for vertex in dag.vertices
+        if vertex.kind == "evidence" and vertex.sub_kind == "logged_signal"
+    }
+    assert {"pair.first.value", "pair.second.value"} <= observed
+
+
 def test_tree_sitter_default_argument_expands_and_binds_in_dag(tmp_path):
     profiler = _mini_tree(
         tmp_path,
@@ -1342,6 +1588,88 @@ void Mode::run()
     assert "global_position.alt" not in dag.unresolved_symbols
 
 
+def test_split_file_call_result_discovers_class_owned_runtime_writer(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/mode/navigator.h": """
+struct position_s { float alt; };
+class Navigator {
+public:
+    position_s *get_position() { return &_position; }
+    void update();
+private:
+    uORB::Subscription _position_sub{ORB_ID(position)};
+    position_s _position{};
+};
+""",
+            "src/modules/mode/mode.cpp": """
+#include "navigator.h"
+class Mode {
+    Navigator *_navigator;
+    float output;
+    void run();
+};
+void Mode::run()
+{
+    const position_s &position = *_navigator->get_position();
+    output = position.alt;
+}
+""",
+            "src/modules/mode/navigator_main.cpp": """
+#include "navigator.h"
+void Navigator::update()
+{
+    _position_sub.copy(&_position);
+}
+""",
+            "src/modules/other/other.cpp": """
+class Other {
+    float _position;
+    void update() { _position = 42.0f; }
+};
+""",
+        },
+        backend="tree_sitter",
+    )
+    queries: list[str] = []
+    original_search = profiler.search_related_source_files
+
+    def record_search(values, *args, **kwargs):
+        queries.extend([values] if isinstance(values, str) else values)
+        return original_search(values, *args, **kwargs)
+
+    profiler.search_related_source_files = record_search  # type: ignore[assignment]
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        [],
+        "output",
+        "hash",
+        terminal_file="src/modules/mode/mode.cpp",
+        inventory={
+            "topic_fields": {"position": ["alt"]},
+            "available_topics": ["position"],
+        },
+        logged_signals={"position.alt"},
+    )
+
+    assert result.dag is not None
+    assert "src/modules/mode/navigator.h" in result.files_loaded
+    assert "src/modules/mode/navigator_main.cpp" in result.files_loaded
+    assert "src/modules/other/other.cpp" not in result.files_loaded
+    assert "alt" not in queries
+    assert any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "position.alt"
+        for vertex in result.dag.vertices
+    )
+
+
 def test_tree_sitter_expansion_admission_uses_selected_backend(tmp_path):
     profiler = _mini_tree(
         tmp_path,
@@ -1368,6 +1696,73 @@ void Controller::run()
 
     assert len(candidates) == 1
     assert candidates[0].facts.parser_backend == "tree_sitter"
+
+
+def test_rejected_admission_facts_are_not_retained(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/candidate.cpp": """
+void Candidate::run()
+{
+    consume(output);
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+    resolver = SourceExpansionResolver(profiler, "hash")
+
+    candidates = resolver.resolve(
+        UnresolvedSourceReference(symbol="output"),
+        SourceStructureIndex(),
+    )
+
+    assert candidates == []
+    assert resolver._facts == {}
+    assert not hasattr(resolver, "_candidate_facts")
+
+
+def test_candidate_file_builds_one_compact_admission_index_per_run(
+    tmp_path, monkeypatch
+):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/candidate.cpp": """
+void Candidate::run()
+{
+    output = input;
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+    from flight_log_agent.px4.tree_sitter_source import TreeSitterSourceExtractor
+
+    calls = 0
+    original = TreeSitterSourceExtractor.extract_admission
+
+    def count_admission(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        TreeSitterSourceExtractor,
+        "extract_admission",
+        count_admission,
+    )
+    resolver = SourceExpansionResolver(profiler, "hash")
+    structure = SourceStructureIndex()
+
+    assert resolver.resolve(
+        UnresolvedSourceReference(symbol="output"), structure
+    )
+    assert resolver.resolve(
+        UnresolvedSourceReference(symbol="input"), structure
+    ) == []
+    assert calls == 1
 
 
 def _vt_binding(

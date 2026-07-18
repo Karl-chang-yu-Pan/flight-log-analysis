@@ -77,18 +77,30 @@ class SourceStorageRef(BaseModel):
     declaration_proven: bool = False
 
 
+class SourceCallResultRef(BaseModel):
+    """One value projection rooted at a source-proven call expression."""
+
+    call_source_site_id: str
+    result_path: str = ""
+    text: str = ""
+
+
 class SourceExpressionRef(BaseModel):
     """Structured dependencies for one source expression.
 
-    ``text`` preserves the source spelling while ``input_symbols`` contains
-    only value references. C++ syntax names, cast target types, and callees are
-    not inputs. ``exact`` is true only when the syntax backend proved that the
-    list is complete.
+    ``text`` preserves the source spelling while ``lowered_text`` carries the
+    source-derived alias substitution used by the DAG. ``input_symbols``
+    contains only storage reads; call results are represented separately so a
+    projection such as ``object.read().field`` cannot become storage owned by
+    ``object``. ``exact`` is true only when the syntax backend proved that the
+    dependency lists are complete.
     """
 
     text: str
+    lowered_text: Optional[str] = None
     input_symbols: List[str] = Field(default_factory=list)
     input_identities: Dict[str, SourceStorageRef] = Field(default_factory=dict)
+    call_results: List[SourceCallResultRef] = Field(default_factory=list)
     exact: bool = False
 
 
@@ -147,6 +159,10 @@ class FunctionCallRef(BaseModel):
     evidence: str
     receiver: Optional[str] = None
     receiver_identity: Optional[SourceStorageRef] = None
+    receiver_type: Optional[str] = None
+    resolved_callable_id: Optional[str] = None
+    resolved_callable_file: Optional[str] = None
+    resolved_callable_owner: Optional[str] = None
     args: List[str] = Field(default_factory=list)
     argument_topics: Dict[str, str] = Field(default_factory=dict)
     control_predicates: List[str] = Field(default_factory=list)

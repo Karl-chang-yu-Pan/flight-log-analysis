@@ -27,7 +27,7 @@ from flight_log_agent.utils import dedupe_keep_order
 
 
 SymbolKind = Literal["local", "member", "global", "unknown"]
-GapKind = Literal["symbol", "callable", "constant", "class"]
+GapKind = Literal["symbol", "callable", "constant", "class", "member_writers"]
 
 
 class SourceSymbolIdentity(SourceStorageRef):
@@ -95,6 +95,10 @@ class UnresolvedSourceReference(BaseModel):
     callable_id: str = ""
     class_owner: str = ""
     receiver: str = ""
+    receiver_type: str = ""
+    resolved_callable_id: str = ""
+    resolved_callable_file: str = ""
+    resolved_callable_owner: str = ""
     argument_count: Optional[int] = None
     source_expression: str = ""
     identity: Optional[SourceSymbolIdentity] = None
@@ -107,6 +111,10 @@ class UnresolvedSourceReference(BaseModel):
             self.callable_id,
             self.class_owner,
             self.receiver,
+            self.receiver_type,
+            self.resolved_callable_id,
+            self.resolved_callable_file,
+            self.resolved_callable_owner,
             self.argument_count,
             self.identity.key() if self.identity is not None else None,
         )
@@ -123,6 +131,15 @@ class SourceStructureIndex:
     callables_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
     callables_by_name: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     includes: dict[str, set[str]] = field(default_factory=dict)
+    _declared_owners: Optional[frozenset[str]] = field(
+        default=None, init=False, repr=False
+    )
+    _resolved_classes: dict[tuple[str, str], str] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _lineages: dict[tuple[str, str], tuple[str, ...]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     @classmethod
     def from_facts(cls, facts: Iterable[Any]) -> "SourceStructureIndex":
@@ -192,22 +209,30 @@ class SourceStructureIndex:
         name = _source_type_name(class_name)
         if not name:
             return ""
-        declared = set(self.declared_classes)
-        declared.update(self.direct_bases)
-        declared.update(owner for owner, _member in self.members)
-        declared.update(
-            str(item.get("owner") or "")
-            for item in self.callables_by_id.values()
-            if item.get("owner")
-        )
+        owner = _source_type_name(lexical_owner)
+        cache_key = (name, owner)
+        if cache_key in self._resolved_classes:
+            return self._resolved_classes[cache_key]
+        if self._declared_owners is None:
+            declared = set(self.declared_classes)
+            declared.update(self.direct_bases)
+            declared.update(owner for owner, _member in self.members)
+            declared.update(
+                str(item.get("owner") or "")
+                for item in self.callables_by_id.values()
+                if item.get("owner")
+            )
+            self._declared_owners = frozenset(declared)
+        declared = self._declared_owners
         if name in declared:
+            self._resolved_classes[cache_key] = name
             return name
 
-        owner = _source_type_name(lexical_owner)
         owner_parts = owner.split("::") if owner else []
         for depth in range(len(owner_parts), -1, -1):
             candidate = "::".join([*owner_parts[:depth], name])
             if candidate in declared:
+                self._resolved_classes[cache_key] = candidate
                 return candidate
 
         suffix = f"::{name}"
@@ -216,10 +241,15 @@ class SourceStructureIndex:
             for candidate in declared
             if candidate == name or candidate.endswith(suffix)
         )
-        return matches[0] if len(matches) == 1 else name
+        resolved = matches[0] if len(matches) == 1 else name
+        self._resolved_classes[cache_key] = resolved
+        return resolved
 
     def lineage(self, class_name: str, lexical_owner: str = "") -> list[str]:
         """Return ``class_name`` followed by all derivable base classes."""
+        cache_key = (_source_type_name(class_name), _source_type_name(lexical_owner))
+        if cache_key in self._lineages:
+            return list(self._lineages[cache_key])
         ordered: list[str] = []
         resolved = self.resolve_class_name(class_name, lexical_owner)
         frontier = [resolved] if resolved else []
@@ -231,6 +261,7 @@ class SourceStructureIndex:
             seen.add(current)
             ordered.append(current)
             frontier.extend(sorted(self.direct_bases.get(current, ())))
+        self._lineages[cache_key] = tuple(ordered)
         return ordered
 
     def declaring_member_owner(self, class_name: str, member: str) -> Optional[str]:
@@ -519,7 +550,7 @@ class SourceStructureIndex:
             root = receiver.split(".", 1)[0].lstrip("&*")
             receiver_type = self.member_receiver_type(owner, root) if owner and root else ""
             call["caller_owner"] = owner
-            call["receiver_type"] = receiver_type
+            call["receiver_type"] = str(call.get("receiver_type") or receiver_type)
             if receiver and not call.get("receiver_identity"):
                 record = self.callables_by_id.get(callable_id) or {}
                 call["receiver_identity"] = self.symbol_identity(
@@ -551,7 +582,7 @@ def callable_dispatch_context(
     bare = symbol.rsplit(".", 1)[-1].rsplit("::", 1)[-1].strip("()")
     explicitly_qualified = "::" in symbol and not reference.receiver
     if reference.receiver:
-        receiver_type = structure.member_receiver_type(
+        receiver_type = reference.receiver_type or structure.member_receiver_type(
             reference.class_owner, reference.receiver
         )
         owners = tuple(structure.lineage(receiver_type)) if receiver_type else ()
@@ -583,6 +614,8 @@ def source_reference_resolution_key(
             bare,
             owners,
             reference.argument_count,
+            reference.resolved_callable_id,
+            reference.resolved_callable_file,
             contextual_file,
         )
     if reference.identity is not None:
@@ -640,6 +673,46 @@ class ExpansionCandidate:
     matched_identity: str
 
 
+@dataclass(frozen=True)
+class _AdmissionCallable:
+    name: str
+    callable_id: str
+    owner: str
+    parameter_count: int
+    required_parameter_count: int
+
+    def accepts(self, argument_count: Optional[int], *, defaults: bool) -> bool:
+        if argument_count is None:
+            return True
+        minimum = self.required_parameter_count if defaults else 0
+        return minimum <= argument_count <= self.parameter_count
+
+
+@dataclass(frozen=True)
+class _AdmissionAssignment:
+    target: str
+    callable_id: str
+    owner: str
+    declaration_kind: str
+    source_site_id: str
+
+
+@dataclass(frozen=True)
+class _AdmissionCall:
+    callable_id: str
+    owner: str
+    arguments: tuple[str, ...]
+    source_site_id: str
+
+
+@dataclass(frozen=True)
+class _AdmissionIndex:
+    classes: frozenset[str]
+    callables: tuple[_AdmissionCallable, ...]
+    assignments: tuple[_AdmissionAssignment, ...]
+    calls: tuple[_AdmissionCall, ...]
+
+
 class SourceExpansionResolver:
     """Resolve owners first, then admit only exact source definitions."""
 
@@ -651,7 +724,7 @@ class SourceExpansionResolver:
         self.profiler = profiler
         self.source_hash = source_hash
         self._facts: dict[str, SourceFileFacts] = {}
-        self._candidate_facts: dict[tuple[Any, ...], SourceFileFacts] = {}
+        self._admission_indexes: dict[str, _AdmissionIndex] = {}
 
     def facts_for(self, file_path: str) -> SourceFileFacts:
         if file_path not in self._facts:
@@ -669,11 +742,83 @@ class SourceExpansionResolver:
                 out.append(candidate)
         return out
 
+    def _admission_index_for(self, file_path: str) -> _AdmissionIndex:
+        cached = self._admission_indexes.get(file_path)
+        if cached is not None:
+            return cached
+        facts = self._candidate_facts_for(
+            file_path,
+            UnresolvedSourceReference(
+                symbol="",
+                kind="member_writers",
+                file=file_path,
+            ),
+        )
+        callable_owner: dict[str, str] = {}
+        callables: list[_AdmissionCallable] = []
+        for item in facts.callables:
+            defaults = list(item.parameter_defaults or [])
+            if len(defaults) < len(item.parameters):
+                defaults.extend([None] * (len(item.parameters) - len(defaults)))
+            required = len(defaults)
+            while required and defaults[required - 1] is not None:
+                required -= 1
+            owner = str(item.owner or "")
+            callable_owner[item.callable_id] = owner
+            callables.append(
+                _AdmissionCallable(
+                    name=item.name,
+                    callable_id=item.callable_id,
+                    owner=owner,
+                    parameter_count=len(item.parameters),
+                    required_parameter_count=required,
+                )
+            )
+
+        def owner_for(callable_id: str, function: str) -> str:
+            direct = callable_owner.get(callable_id)
+            if direct is not None:
+                return direct
+            owner, separator, _name = str(function or "").rpartition("::")
+            return owner if separator else ""
+
+        index = _AdmissionIndex(
+            classes=frozenset(item.name for item in facts.classes),
+            callables=tuple(callables),
+            assignments=tuple(
+                _AdmissionAssignment(
+                    target=exact_symbol(item.target),
+                    callable_id=str(item.callable_id or ""),
+                    owner=owner_for(
+                        str(item.callable_id or ""), str(item.function or "")
+                    ),
+                    declaration_kind=str(item.declaration_kind or ""),
+                    source_site_id=str(item.source_site_id or item.callable_id or ""),
+                )
+                for item in facts.source_assignments
+            ),
+            calls=tuple(
+                _AdmissionCall(
+                    callable_id=str(item.callable_id or ""),
+                    owner=owner_for(
+                        str(item.callable_id or ""), str(item.function or "")
+                    ),
+                    arguments=tuple(str(value) for value in item.args),
+                    source_site_id=str(item.source_site_id or item.callable_id or ""),
+                )
+                for item in facts.function_calls
+            ),
+        )
+        self._admission_indexes[file_path] = index
+        return index
+
     def resolve(
         self,
         reference: UnresolvedSourceReference,
         structure: SourceStructureIndex,
     ) -> list[ExpansionCandidate]:
+        if reference.kind == "member_writers":
+            return self._resolve_member_writers(reference, structure)
         if (
             reference.kind == "symbol"
             and reference.identity is not None
@@ -684,7 +829,7 @@ class SourceExpansionResolver:
             # spelling search cannot discover a valid local producer.
             return []
         if reference.kind == "callable" and reference.receiver:
-            receiver_type = structure.member_receiver_type(
+            receiver_type = reference.receiver_type or structure.member_receiver_type(
                 reference.class_owner, reference.receiver
             )
             if not receiver_type:
@@ -732,6 +877,35 @@ class SourceExpansionResolver:
                 return self._unique_entity(reference, candidates)
         return []
 
+    def _resolve_member_writers(
+        self,
+        reference: UnresolvedSourceReference,
+        structure: SourceStructureIndex,
+    ) -> list[ExpansionCandidate]:
+        identity = reference.identity
+        if identity is None or identity.kind != "member":
+            return []
+        owner = identity.class_owner or identity.declaring_class
+        owners = tuple(structure.lineage(owner)) or ((owner,) if owner else ())
+        if not owners:
+            return []
+        direct_files = [
+            file_path
+            for candidate_owner in owners
+            for declared_file in sorted(structure.class_files.get(candidate_owner, ()))
+            for file_path in [declared_file, *self.companion_files(declared_file)]
+        ]
+        hits = self.profiler.search_related_source_files(
+            [f"{candidate_owner}::" for candidate_owner in owners],
+            max_files=None,
+            expand_query_tokens=False,
+        )
+        return self._admit_files(
+            reference,
+            structure,
+            [*direct_files, *(hit.file for hit in hits)],
+        )
+
     def resolution_key(
         self,
         reference: UnresolvedSourceReference,
@@ -746,10 +920,22 @@ class SourceExpansionResolver:
     ) -> list[str]:
         _dispatch, _bare, owners = callable_dispatch_context(reference, structure)
         return dedupe_keep_order(
-            file_path
-            for owner in owners
-            for declared_file in sorted(structure.class_files.get(owner, ()))
-            for file_path in [declared_file, *self.companion_files(declared_file)]
+            [
+                *(
+                    [reference.resolved_callable_file]
+                    if reference.resolved_callable_file
+                    else []
+                ),
+                *(
+                    file_path
+                    for owner in owners
+                    for declared_file in sorted(structure.class_files.get(owner, ()))
+                    for file_path in [
+                        declared_file,
+                        *self.companion_files(declared_file),
+                    ]
+                ),
+            ]
         )
 
     @staticmethod
@@ -794,11 +980,26 @@ class SourceExpansionResolver:
     ) -> list[ExpansionCandidate]:
         candidates: list[ExpansionCandidate] = []
         for file_path in dedupe_keep_order(str(value) for value in files if value):
-            candidate_facts = self._candidate_facts_for(file_path, reference)
+            admission = self._admission_index_for(file_path)
+            if reference.kind == "member_writers":
+                match = self._member_writer_index_match(
+                    reference, admission, structure
+                )
+                if not match:
+                    continue
+                candidates.append(
+                    ExpansionCandidate(
+                        file=file_path,
+                        facts=self.facts_for(file_path),
+                        matched_kind=reference.kind,
+                        matched_identity=match,
+                    )
+                )
+                continue
             if reference.kind == "callable":
-                if not self._callable_matches(
+                if not self._callable_index_matches(
                     reference,
-                    candidate_facts,
+                    admission,
                     structure,
                     defaults_required=False,
                 ):
@@ -816,20 +1017,110 @@ class SourceExpansionResolver:
                     )
                 )
                 continue
-            if not self._contains_exact_definition(reference, candidate_facts):
+            if not self._admission_contains(reference, admission):
                 continue
-            match = self._exact_match(reference, candidate_facts, structure)
+            full_facts = self.facts_for(file_path)
+            match = self._exact_match(reference, full_facts, structure)
             if not match:
                 continue
             candidates.append(
                 ExpansionCandidate(
                     file=file_path,
-                    facts=self.facts_for(file_path),
+                    facts=full_facts,
                     matched_kind=reference.kind,
                     matched_identity=match,
                 )
             )
         return candidates
+
+    @staticmethod
+    def _admission_contains(
+        reference: UnresolvedSourceReference,
+        admission: _AdmissionIndex,
+    ) -> bool:
+        bare = reference.symbol.replace("->", ".").rsplit(".", 1)[-1].strip("()")
+        if reference.kind == "class":
+            return bare in admission.classes
+        symbol = exact_symbol(reference.symbol)
+        return any(
+            symbol_produces_reference(item.target, symbol)
+            and (
+                reference.kind != "constant"
+                or item.declaration_kind in {"enum", "define", "constexpr"}
+            )
+            for item in admission.assignments
+        )
+
+    @staticmethod
+    def _callable_index_matches(
+        reference: UnresolvedSourceReference,
+        admission: _AdmissionIndex,
+        structure: SourceStructureIndex,
+        *,
+        defaults_required: bool,
+    ) -> list[_AdmissionCallable]:
+        bare = reference.symbol.replace("->", ".").rsplit(".", 1)[-1].strip("()")
+        matches = [
+            item
+            for item in admission.callables
+            if item.name == reference.symbol
+            or item.name.rsplit("::", 1)[-1] == bare
+        ]
+        if reference.resolved_callable_id:
+            matches = [
+                item
+                for item in matches
+                if item.callable_id == reference.resolved_callable_id
+            ]
+        matches = [
+            item
+            for item in matches
+            if item.accepts(reference.argument_count, defaults=defaults_required)
+        ]
+        dispatch, _short, owners = callable_dispatch_context(reference, structure)
+        owner_set = set(owners)
+        if dispatch == "receiver":
+            return [item for item in matches if item.owner in owner_set]
+        if dispatch == "qualified":
+            return [
+                item
+                for item in matches
+                if item.owner in owner_set
+                or (
+                    not item.owner
+                    and item.name.rpartition("::")[0] in owner_set
+                )
+            ]
+        if dispatch == "unqualified_member":
+            owned = [item for item in matches if item.owner in owner_set]
+            return owned or [item for item in matches if not item.owner]
+        return [item for item in matches if not item.owner]
+
+    @staticmethod
+    def _member_writer_index_match(
+        reference: UnresolvedSourceReference,
+        admission: _AdmissionIndex,
+        structure: SourceStructureIndex,
+    ) -> str:
+        identity = reference.identity
+        if identity is None or identity.kind != "member":
+            return ""
+        owner = identity.class_owner or identity.declaring_class
+        owners = set(structure.lineage(owner)) or ({owner} if owner else set())
+        symbol = exact_symbol(reference.symbol)
+        for assignment in admission.assignments:
+            if assignment.owner in owners and symbol_produces_reference(
+                assignment.target, symbol
+            ):
+                return assignment.source_site_id
+        for call in admission.calls:
+            if call.owner not in owners:
+                continue
+            for argument in call.arguments:
+                storage = _argument_storage(argument)
+                if storage and symbol_produces_reference(storage, symbol):
+                    return call.source_site_id
+        return ""
 
     @staticmethod
     def _unique_entity(
@@ -848,14 +1139,6 @@ class SourceExpansionResolver:
         file_path: str,
         reference: UnresolvedSourceReference,
     ) -> SourceFileFacts:
-        key = (
-            file_path,
-            reference.kind,
-            exact_symbol(reference.symbol),
-        )
-        cached = self._candidate_facts.get(key)
-        if cached is not None:
-            return cached
         backend = str(
             getattr(self.profiler, "source_parser_backend", "legacy")
         )
@@ -882,12 +1165,12 @@ class SourceExpansionResolver:
             )
         else:
             structure: dict[str, list[Any]] = {}
-            if reference.kind in {"callable", "class", "symbol"}:
+            if reference.kind in {"callable", "class", "symbol", "member_writers"}:
                 structure = self.profiler.extract_source_structure_from_source(
                     [file_path], expand_companions=False
                 )
             assignments = []
-            if reference.kind in {"symbol", "constant"}:
+            if reference.kind in {"symbol", "constant", "member_writers"}:
                 assignments = [
                     item
                     for item in self.profiler.extract_source_assignments_from_source(
@@ -898,17 +1181,26 @@ class SourceExpansionResolver:
                     )
                     if item.file == file_path
                 ]
+            calls = []
+            if reference.kind == "member_writers":
+                calls = [
+                    item
+                    for item in self.profiler.extract_function_calls_from_source(
+                        [file_path]
+                    )
+                    if item.file == file_path
+                ]
             facts = SourceFileFacts(
                 file=file_path,
                 source_hash=self.source_hash,
                 parser_backend="legacy:admission",
                 source_assignments=assignments,
+                function_calls=calls,
                 classes=list(structure.get("classes") or []),
                 members=list(structure.get("members") or []),
                 callables=list(structure.get("callables") or []),
                 includes=list(structure.get("includes") or []),
             )
-        self._candidate_facts[key] = facts
         return facts
 
     @staticmethod
@@ -977,6 +1269,12 @@ class SourceExpansionResolver:
             if item.name == reference.symbol
             or item.name.rsplit("::", 1)[-1] == bare
         ]
+        if reference.resolved_callable_id:
+            matches = [
+                item
+                for item in matches
+                if item.callable_id == reference.resolved_callable_id
+            ]
         if reference.argument_count is not None:
             if defaults_required:
                 matches = [
@@ -1125,3 +1423,17 @@ def _source_type_name(value: str) -> str:
     text = text.replace("*", " ").replace("&", " ")
     text = " ".join(text.split()).strip().lstrip(":")
     return text.split("<", 1)[0].strip()
+
+
+def _argument_storage(value: str) -> str:
+    """Return a call argument's source storage identity, if syntax permits."""
+    text = str(value or "").strip()
+    while text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    text = text.lstrip("&*").strip()
+    if not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|->)[A-Za-z_][A-Za-z0-9_]*|\[[^\]]+\])*",
+        text,
+    ):
+        return ""
+    return exact_symbol(text)

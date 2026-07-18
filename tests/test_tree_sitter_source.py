@@ -57,6 +57,110 @@ def test_admission_parses_one_file_without_retaining_rejected_ast(tmp_path):
     assert profiler._text_cache == {}
 
 
+def test_call_result_alias_preserves_projection_and_resolved_callee(tmp_path):
+    root = tmp_path / "PX4-Autopilot"
+    module = root / "src" / "modules" / "example"
+    module.mkdir(parents=True)
+    (module / "navigator.h").write_text(
+        """
+struct Position { float alt; };
+class Navigator {
+public:
+    Position *get_position() { return &_position; }
+private:
+    Position _position{};
+};
+""",
+        encoding="utf-8",
+    )
+    (module / "mode.cpp").write_text(
+        """
+#include "navigator.h"
+class Mode {
+    Navigator *_navigator;
+    float output;
+    void run();
+};
+void Mode::run()
+{
+    const Position &first = *_navigator->get_position();
+    const Position &position = first;
+    output = position.alt;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+
+    facts = extract_facts_for_file(
+        profiler,
+        "src/modules/example/mode.cpp",
+        "source-hash",
+    )
+
+    getter_call = next(item for item in facts.function_calls if item.name == "get_position")
+    output = next(item for item in facts.source_assignments if item.target == "output")
+    assert getter_call.receiver_type == "Navigator"
+    assert getter_call.resolved_callable_id
+    assert getter_call.resolved_callable_file == "src/modules/example/navigator.h"
+    assert output.expression_ref is not None
+    assert output.expression_ref.lowered_text == "_navigator.get_position().alt"
+    assert output.expression_ref.input_symbols == []
+    assert [item.call_source_site_id for item in output.expression_ref.call_results] == [
+        getter_call.source_site_id
+    ]
+    assert [item.result_path for item in output.expression_ref.call_results] == ["alt"]
+
+
+def test_untyped_receiver_does_not_resolve_unrelated_bare_method(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+class Unrelated {
+public:
+    float getState() const { return state; }
+    float state;
+};
+
+class Caller {
+    ExternalType service;
+    float run() { return service.getState(); }
+};
+""",
+    )
+
+    call = next(item for item in facts.function_calls if item.name == "getState")
+    assert call.receiver == "service"
+    assert call.receiver_type is None
+    assert call.resolved_callable_id is None
+    assert call.resolved_callable_file is None
+
+
+def test_direct_call_projection_is_not_a_storage_symbol(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+struct Result { float values[2]; };
+class Provider { public: Result read(); };
+class Consumer {
+    Provider _provider;
+    float output;
+    void run() { output = _provider.read().values[1]; }
+};
+""",
+    )
+
+    output = next(item for item in facts.source_assignments if item.target == "output")
+    assert output.expression_ref is not None
+    assert "_provider.read().values[1]" not in output.expression_ref.input_symbols
+    assert "values" not in output.expression_ref.input_symbols
+    assert output.expression_ref.call_results[0].result_path == "values[1]"
+
+
 def test_tree_sitter_extracts_assignment_heap_base_and_c_api_boundaries(tmp_path):
     facts = _facts(
         tmp_path,

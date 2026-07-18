@@ -29,6 +29,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     ParameterPredicateRef,
     ParameterRef,
     SourceAssignmentRef,
+    SourceCallResultRef,
     SourceCallableRef,
     SourceClassRef,
     SourceExpressionRef,
@@ -37,6 +38,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceStorageRef,
     TopicRef,
     _HelperLoweringFailed,
+    callable_accepts_argument_count,
     split_source_field,
 )
 from flight_log_agent.symbols import exact_symbol
@@ -58,6 +60,7 @@ class _ControlTerm:
     site_id: str
     input_symbols: tuple[str, ...] = ()
     input_identities: tuple[tuple[str, SourceStorageRef], ...] = ()
+    call_results: tuple[SourceCallResultRef, ...] = ()
     inputs_exact: bool = False
 
 
@@ -189,6 +192,68 @@ class _SourceContext:
                 return value
         return None
 
+    def resolve_class_name(
+        self, type_text: Optional[str], lexical_owner: Optional[str] = None
+    ) -> str:
+        value = re.sub(
+            r"\b(?:const|volatile|class|struct|typename)\b", " ", str(type_text or "")
+        )
+        value = value.replace("*", " ").replace("&", " ").strip()
+        value = value.split("<", 1)[0].strip().lstrip(":")
+        if not value:
+            return ""
+        if value in self.classes:
+            return value
+        suffix = f"::{value}"
+        candidates = [
+            candidate
+            for candidate in self.classes
+            if candidate == value or candidate.endswith(suffix)
+        ]
+        if lexical_owner:
+            owner_parts = lexical_owner.split("::")[:-1]
+            scoped = [
+                "::".join([*owner_parts[:depth], value])
+                for depth in range(len(owner_parts), -1, -1)
+            ]
+            for candidate in scoped:
+                if candidate in self.classes:
+                    return candidate
+        return candidates[0] if len(candidates) == 1 else ""
+
+    def resolve_callable(
+        self,
+        caller: _Callable,
+        name: str,
+        argument_count: int,
+        *,
+        receiver_type: str = "",
+    ) -> Optional[_Callable]:
+        short_name = name.rsplit("::", 1)[-1]
+        candidates = [
+            item
+            for item in self.callables.values()
+            if item.name.rsplit("::", 1)[-1] == short_name
+            and callable_accepts_argument_count(item, argument_count)
+        ]
+        if receiver_type:
+            owners = set(self.lineage(receiver_type))
+            candidates = [item for item in candidates if item.owner in owners]
+        elif "::" in name:
+            explicit_owner = name.rpartition("::")[0].lstrip(":")
+            resolved_owner = self.resolve_class_name(explicit_owner, caller.owner)
+            candidates = [
+                item
+                for item in candidates
+                if item.owner == (resolved_owner or explicit_owner)
+            ]
+        elif caller.owner:
+            owners = set(self.lineage(caller.owner))
+            owned = [item for item in candidates if item.owner in owners]
+            if owned:
+                candidates = owned
+        return candidates[0] if len(candidates) == 1 else None
+
 
 @dataclass
 class _ExtractionState:
@@ -204,6 +269,7 @@ class _ExtractionState:
     seen_calls: set[tuple[int, int]] = field(default_factory=set)
     lambda_bindings: dict[str, _Callable] = field(default_factory=dict)
     storage_aliases: dict[str, str] = field(default_factory=dict)
+    call_result_aliases: dict[str, SourceCallResultRef] = field(default_factory=dict)
     alias_capable_symbols: set[str] = field(default_factory=set)
     reference_alias_symbols: set[str] = field(default_factory=set)
     local_declarations: dict[str, list[_LocalDeclaration]] = field(
@@ -444,7 +510,8 @@ class TreeSitterSourceExtractor:
         self._resolve_class_bases([primary])
         self._merge_callable_defaults([primary])
         assignments: list[SourceAssignmentRef] = []
-        if kind in {"symbol", "constant"}:
+        calls: list[FunctionCallRef] = []
+        if kind in {"symbol", "constant", "member_writers"}:
             requested = str(symbol or "").replace("->", ".")
             root_match = re.search(r"[A-Za-z_][A-Za-z0-9_]*", requested)
             requested_root = root_match.group(0) if root_match else ""
@@ -458,6 +525,8 @@ class TreeSitterSourceExtractor:
                 assignments.extend(
                     self._admission_assignments(primary, callable_item)
                 )
+                if kind == "member_writers":
+                    calls.extend(self._admission_calls(primary, callable_item))
             assignments.extend(self._extract_global_constants(primary))
             admission_context = _SourceContext([primary])
             assignments.extend(
@@ -480,6 +549,7 @@ class TreeSitterSourceExtractor:
                 "has_error": bool(primary.tree.root_node.has_error)
             },
             source_assignments=self._dedupe(assignments),
+            function_calls=self._dedupe(calls),
             classes=primary.classes,
             members=primary.members,
             callables=[
@@ -575,6 +645,44 @@ class TreeSitterSourceExtractor:
                 )
             )
         return assignments
+
+    def _admission_calls(
+        self, unit: _ParsedUnit, callable_item: _Callable
+    ) -> list[FunctionCallRef]:
+        """Collect call arguments needed to admit potential storage effects."""
+        calls: list[FunctionCallRef] = []
+        for node in _walk_operations(callable_item.body):
+            if node.type != "call_expression":
+                continue
+            function = node.child_by_field_name("function")
+            if function is None:
+                continue
+            receiver: Optional[str] = None
+            name = unit.text(function).strip()
+            if function.type == "field_expression":
+                receiver_node = function.child_by_field_name("argument")
+                field_node = function.child_by_field_name("field")
+                receiver = self._canonical_symbol(unit.text(receiver_node))
+                name = unit.text(field_node).strip()
+            calls.append(
+                FunctionCallRef(
+                    name=name,
+                    receiver=receiver,
+                    args=[
+                        self.profiler._normalize_source_expression(unit.text(arg))
+                        for arg in _argument_nodes(
+                            node.child_by_field_name("arguments")
+                        )
+                    ],
+                    function=callable_item.name,
+                    callable_id=callable_item.callable_id,
+                    file=unit.file,
+                    line=unit.line(node),
+                    evidence=unit.evidence(node),
+                    source_site_id=unit.site_id(node),
+                )
+            )
+        return calls
 
     def _parse(
         self, path: Path, *, full_structure: bool = True
@@ -1393,9 +1501,11 @@ class TreeSitterSourceExtractor:
         exact = exact and not node.has_error
         if node.type == "compound_statement":
             saved_aliases = state.storage_aliases
+            saved_call_results = state.call_result_aliases
             saved_capable = state.alias_capable_symbols
             saved_references = state.reference_alias_symbols
             state.storage_aliases = dict(saved_aliases)
+            state.call_result_aliases = dict(saved_call_results)
             state.alias_capable_symbols = set(saved_capable)
             state.reference_alias_symbols = set(saved_references)
             try:
@@ -1408,6 +1518,7 @@ class TreeSitterSourceExtractor:
                 )
             finally:
                 state.storage_aliases = saved_aliases
+                state.call_result_aliases = saved_call_results
                 state.alias_capable_symbols = saved_capable
                 state.reference_alias_symbols = saved_references
             return
@@ -1426,6 +1537,7 @@ class TreeSitterSourceExtractor:
                 site_id=unit.site_id(node),
                 input_symbols=tuple(condition_ref.input_symbols),
                 input_identities=tuple(condition_ref.input_identities.items()),
+                call_results=tuple(condition_ref.call_results),
                 inputs_exact=condition_ref.exact,
             )
             self._record_branch(state, "if", term, node)
@@ -1458,6 +1570,7 @@ class TreeSitterSourceExtractor:
                             input_identities=tuple(
                                 condition_ref.input_identities.items()
                             ),
+                            call_results=tuple(condition_ref.call_results),
                             inputs_exact=condition_ref.exact,
                         ),
                     ],
@@ -1483,15 +1596,18 @@ class TreeSitterSourceExtractor:
                 site_id=unit.site_id(node),
                 input_symbols=tuple(condition_ref.input_symbols),
                 input_identities=tuple(condition_ref.input_identities.items()),
+                call_results=tuple(condition_ref.call_results),
                 inputs_exact=condition_ref.exact,
             )
             self._record_branch(state, node.type.removesuffix("_statement"), term, node)
             initializer = node.child_by_field_name("initializer")
             update = node.child_by_field_name("update")
             saved_aliases = state.storage_aliases
+            saved_call_results = state.call_result_aliases
             saved_capable = state.alias_capable_symbols
             saved_references = state.reference_alias_symbols
             state.storage_aliases = dict(saved_aliases)
+            state.call_result_aliases = dict(saved_call_results)
             state.alias_capable_symbols = set(saved_capable)
             state.reference_alias_symbols = set(saved_references)
             self._collect_operations(state, initializer, controls=controls, exact=False)
@@ -1515,6 +1631,7 @@ class TreeSitterSourceExtractor:
                 )
             finally:
                 state.storage_aliases = saved_aliases
+                state.call_result_aliases = saved_call_results
                 state.alias_capable_symbols = saved_capable
                 state.reference_alias_symbols = saved_references
             return
@@ -1553,6 +1670,11 @@ class TreeSitterSourceExtractor:
                                 for item in controls
                                 for symbol, identity in item.input_identities
                             },
+                            call_results=[
+                                result
+                                for item in controls
+                                for result in item.call_results
+                            ],
                             exact=all(item.inputs_exact for item in controls),
                         ).model_dump(exclude_none=True),
                         "file": unit.file,
@@ -1581,9 +1703,11 @@ class TreeSitterSourceExtractor:
         exit_context: Optional[str],
     ) -> None:
         saved_aliases = state.storage_aliases
+        saved_call_results = state.call_result_aliases
         saved_capable = state.alias_capable_symbols
         saved_references = state.reference_alias_symbols
         state.storage_aliases = dict(saved_aliases)
+        state.call_result_aliases = dict(saved_call_results)
         state.alias_capable_symbols = set(saved_capable)
         state.reference_alias_symbols = set(saved_references)
         try:
@@ -1596,6 +1720,7 @@ class TreeSitterSourceExtractor:
             )
         finally:
             state.storage_aliases = saved_aliases
+            state.call_result_aliases = saved_call_results
             state.alias_capable_symbols = saved_capable
             state.reference_alias_symbols = saved_references
 
@@ -1622,6 +1747,7 @@ class TreeSitterSourceExtractor:
         ) or "true"
         fallthrough = "false"
         switch_aliases = state.storage_aliases
+        switch_call_results = state.call_result_aliases
         switch_capable = state.alias_capable_symbols
         switch_references = state.reference_alias_symbols
         fallthrough_alias_ambiguous = False
@@ -1636,6 +1762,7 @@ class TreeSitterSourceExtractor:
                 input_identities=tuple(
                     discriminant_ref.input_identities.items()
                 ),
+                call_results=tuple(discriminant_ref.call_results),
                 # The synthetic expression also contains case labels and
                 # fallthrough state; until those are represented as syntax
                 # nodes, retain the complete string-parser fallback.
@@ -1649,6 +1776,7 @@ class TreeSitterSourceExtractor:
             # conservative for fallthrough aliases and prevents one case's
             # assignment from being applied to an unrelated case.
             state.storage_aliases = dict(switch_aliases)
+            state.call_result_aliases = dict(switch_call_results)
             state.alias_capable_symbols = set(switch_capable)
             state.reference_alias_symbols = set(switch_references)
             self._walk_sequence(
@@ -1663,7 +1791,10 @@ class TreeSitterSourceExtractor:
             )
             if (
                 exit_expression != "true"
-                and state.storage_aliases != switch_aliases
+                and (
+                    state.storage_aliases != switch_aliases
+                    or state.call_result_aliases != switch_call_results
+                )
             ):
                 # The next section has a direct-entry environment and a
                 # different fallthrough environment. One scalar alias map
@@ -1674,6 +1805,7 @@ class TreeSitterSourceExtractor:
             fallthrough = _and(active, _not(exit_expression))
             exact = exact and exit_exact
         state.storage_aliases = switch_aliases
+        state.call_result_aliases = switch_call_results
         state.alias_capable_symbols = switch_capable
         state.reference_alias_symbols = switch_references
 
@@ -2042,12 +2174,16 @@ class TreeSitterSourceExtractor:
                     text=self._apply_storage_aliases(
                         item.expression, state.storage_aliases
                     ),
+                    lowered_text=self._apply_storage_aliases(
+                        item.expression, state.storage_aliases
+                    ),
                     input_symbols=[
                         self._storage_target(state, symbol)
                         for symbol in item.input_symbols
                         if self._storage_target(state, symbol)
                     ],
                     input_identities=dict(item.input_identities),
+                    call_results=list(item.call_results),
                     exact=item.inputs_exact,
                 )
                 for item in controls
@@ -2121,6 +2257,41 @@ class TreeSitterSourceExtractor:
             member = state.context.declaring_member(state.callable.owner, root)
             if member is not None:
                 argument_owners[root] = member.owner
+        receiver_identity = (
+            self._storage_identity(receiver, node, state=state)
+            if receiver
+            else None
+        )
+        receiver_type = ""
+        if receiver:
+            receiver_root = receiver.replace("->", ".").split(".", 1)[0].lstrip("&*")
+            if receiver_root == "this":
+                receiver_type = state.context.resolve_class_name(
+                    state.callable.owner, state.callable.owner
+                )
+            else:
+                member = state.context.declaring_member(
+                    state.callable.owner, receiver_root
+                )
+                if member is not None:
+                    receiver_type = state.context.resolve_class_name(
+                        member.type, member.owner
+                    )
+        # A receiver call cannot be resolved by bare-name uniqueness when
+        # this source family does not contain the receiver's declaration.
+        # Aggregation may derive its type from another loaded file later;
+        # until then, unresolved is more accurate than binding a same-named
+        # method owned by an unrelated class.
+        resolved_callable = (
+            state.context.resolve_callable(
+                state.callable,
+                name,
+                len(args),
+                receiver_type=receiver_type,
+            )
+            if receiver is None or receiver_type
+            else None
+        )
         predicates = [
             self._apply_storage_aliases(item.expression, state.storage_aliases)
             for item in controls
@@ -2128,10 +2299,16 @@ class TreeSitterSourceExtractor:
         return FunctionCallRef(
             name=name,
             receiver=receiver,
-            receiver_identity=(
-                self._storage_identity(receiver, node, state=state)
-                if receiver
-                else None
+            receiver_identity=receiver_identity,
+            receiver_type=receiver_type or None,
+            resolved_callable_id=(
+                resolved_callable.callable_id if resolved_callable else None
+            ),
+            resolved_callable_file=(
+                resolved_callable.file if resolved_callable else None
+            ),
+            resolved_callable_owner=(
+                resolved_callable.owner if resolved_callable else None
             ),
             args=args,
             argument_topics=argument_topics,
@@ -2156,12 +2333,16 @@ class TreeSitterSourceExtractor:
                     text=self._apply_storage_aliases(
                         item.expression, state.storage_aliases
                     ),
+                    lowered_text=self._apply_storage_aliases(
+                        item.expression, state.storage_aliases
+                    ),
                     input_symbols=[
                         self._storage_target(state, symbol)
                         for symbol in item.input_symbols
                         if self._storage_target(state, symbol)
                     ],
                     input_identities=dict(item.input_identities),
+                    call_results=list(item.call_results),
                     exact=item.inputs_exact,
                 )
                 for item in controls
@@ -3051,6 +3232,15 @@ class TreeSitterSourceExtractor:
                 state.storage_aliases[name] = replacement
             else:
                 state.storage_aliases.pop(name, None)
+            call_result = self._call_result_from_node(state, value)
+            if call_result is None and value is not None:
+                call_result = self._aliased_call_result(
+                    state, state.unit.text(value)
+                )
+            if call_result is not None:
+                state.call_result_aliases[name] = call_result
+            else:
+                state.call_result_aliases.pop(name, None)
 
     def _update_storage_alias(self, state: _ExtractionState, node: Node) -> None:
         """Update or invalidate a previously declared pointer/reference alias."""
@@ -3071,11 +3261,99 @@ class TreeSitterSourceExtractor:
                 state.storage_aliases[target] = replacement
             else:
                 state.storage_aliases.pop(target, None)
+            call_result = self._call_result_from_node(state, right)
+            if call_result is None:
+                call_result = self._aliased_call_result(
+                    state, state.unit.text(right)
+                )
+            if call_result is not None:
+                state.call_result_aliases[target] = call_result
+            else:
+                state.call_result_aliases.pop(target, None)
         elif node.type == "update_expression":
             argument = node.child_by_field_name("argument")
             target = self._canonical_symbol(state.unit.text(argument))
             if target in state.alias_capable_symbols:
                 state.storage_aliases.pop(target, None)
+                state.call_result_aliases.pop(target, None)
+
+    def _call_result_from_node(
+        self,
+        state: _ExtractionState,
+        node: Optional[Node],
+    ) -> Optional[SourceCallResultRef]:
+        """Return the call site and projection represented by one AST value."""
+        if node is None:
+            return None
+        current = node
+        projection: list[str] = []
+        while True:
+            if current.type == "parenthesized_expression" and current.named_children:
+                current = current.named_children[0]
+                continue
+            if current.type == "pointer_expression" and current.named_children:
+                current = current.named_children[0]
+                continue
+            if current.type == "field_expression":
+                argument = current.child_by_field_name("argument")
+                field_node = current.child_by_field_name("field")
+                if argument is None or field_node is None:
+                    return None
+                projection.insert(0, state.unit.text(field_node).strip())
+                current = argument
+                continue
+            if current.type == "subscript_expression":
+                argument = current.child_by_field_name("argument")
+                indices = (
+                    current.child_by_field_name("indices")
+                    or current.child_by_field_name("index")
+                )
+                if argument is None or indices is None:
+                    return None
+                raw_indices = state.unit.text(indices).strip()
+                suffix = (
+                    raw_indices if raw_indices.startswith("[") else f"[{raw_indices}]"
+                )
+                projection.insert(0, suffix)
+                current = argument
+                continue
+            break
+        if current.type != "call_expression":
+            return None
+        result_path = ""
+        for segment in projection:
+            if segment.startswith("["):
+                result_path += segment
+            else:
+                result_path = f"{result_path}.{segment}" if result_path else segment
+        return SourceCallResultRef(
+            call_source_site_id=state.unit.site_id(current),
+            result_path=result_path,
+            text=self._apply_storage_aliases(
+                self.profiler._normalize_source_expression(state.unit.text(node)),
+                state.storage_aliases,
+            ),
+        )
+
+    def _aliased_call_result(
+        self, state: _ExtractionState, text: str
+    ) -> Optional[SourceCallResultRef]:
+        canonical = self._canonical_symbol(text).lstrip("&*")
+        root_match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", canonical)
+        if root_match is None:
+            return None
+        result = state.call_result_aliases.get(root_match.group(0))
+        if result is None:
+            return None
+        suffix = canonical[root_match.end() :].lstrip(".")
+        path = result.result_path
+        if suffix:
+            path = (
+                f"{path}{suffix}"
+                if suffix.startswith("[")
+                else f"{path}.{suffix}" if path else suffix
+            )
+        return result.model_copy(update={"result_path": path})
 
     def _storage_alias_value(
         self,
@@ -3266,9 +3544,21 @@ class TreeSitterSourceExtractor:
     ) -> SourceExpressionRef:
         """Extract value reads from an expression without flattening syntax."""
         parsed_unit = state.unit if state is not None else unit
+        source_text = str(
+            text if text is not None else parsed_unit.text(node) if parsed_unit and node else ""
+        ).strip()
+        lowered_text = (
+            self._apply_storage_aliases(
+                self.profiler._normalize_source_expression(source_text),
+                state.storage_aliases,
+            )
+            if state is not None
+            else self.profiler._normalize_source_expression(source_text)
+        )
         if node is None:
             return SourceExpressionRef(
-                text=str(text or ""),
+                text=source_text,
+                lowered_text=lowered_text,
                 input_symbols=list(dict.fromkeys(extra_inputs)),
                 exact=False,
             )
@@ -3277,6 +3567,8 @@ class TreeSitterSourceExtractor:
 
         inputs: list[str] = [str(value) for value in extra_inputs if str(value)]
         identities: dict[str, SourceStorageRef] = {}
+        call_results: list[SourceCallResultRef] = []
+        seen_call_results: set[tuple[str, str]] = set()
         if state is not None:
             for value in inputs:
                 canonical = exact_symbol(value)
@@ -3284,12 +3576,49 @@ class TreeSitterSourceExtractor:
                     value, node, state=state
                 )
 
+        def add_call_result(
+            result: SourceCallResultRef,
+            suffix: str = "",
+        ) -> None:
+            path = result.result_path
+            clean_suffix = suffix.lstrip(".")
+            if clean_suffix:
+                path = (
+                    f"{path}{clean_suffix}"
+                    if clean_suffix.startswith("[")
+                    else f"{path}.{clean_suffix}" if path else clean_suffix
+                )
+            key = (result.call_source_site_id, path)
+            if key in seen_call_results:
+                return
+            seen_call_results.add(key)
+            call_results.append(
+                result.model_copy(update={"result_path": path})
+            )
+
+        def aliased_call_result(raw: str) -> bool:
+            if state is None:
+                return False
+            result = self._aliased_call_result(state, raw)
+            if result is None:
+                return False
+            add_call_result(result)
+            return True
+
         def add_symbol(raw: str, source_node: Node) -> None:
+            if aliased_call_result(raw):
+                return
             symbol = (
                 self._storage_target(state, raw)
                 if state is not None
                 else self._canonical_symbol(raw)
             )
+            if "(" in symbol:
+                # Call syntax is never a storage location. Syntax-aware paths
+                # record it through ``call_results``; unresolved legacy text
+                # remains available through ``lowered_text`` for retirement
+                # comparison without contaminating canonical storage identity.
+                return
             if symbol and symbol not in inputs:
                 inputs.append(symbol)
             if symbol:
@@ -3302,6 +3631,61 @@ class TreeSitterSourceExtractor:
                     context=context,
                     declared_owner=declared_owner,
                 )
+
+        def visit_call(current: Node, *, record_result: bool) -> None:
+            function_node = current.child_by_field_name("function")
+            function_text = parsed_unit.text(function_node).strip()
+            base_name = function_text.split("<", 1)[0].rsplit("::", 1)[-1]
+            arguments = _argument_nodes(current.child_by_field_name("arguments"))
+            if base_name in _CXX_NAMED_CASTS:
+                for argument in arguments:
+                    visit(argument)
+                return
+            parameter_accessor = False
+            if (
+                state is not None
+                and function_node is not None
+                and function_node.type == "field_expression"
+            ):
+                receiver_node = function_node.child_by_field_name("argument")
+                field_node = function_node.child_by_field_name("field")
+                receiver = self._storage_target(
+                    state, parsed_unit.text(receiver_node)
+                )
+                field_name = parsed_unit.text(field_node).strip()
+                if field_name == "get" and receiver:
+                    parameter = state.context.parameter_for_member(
+                        state.callable.owner,
+                        receiver.split(".", 1)[0],
+                    )
+                    if parameter:
+                        add_symbol(f"{receiver}.get()", function_node)
+                        parameter_accessor = True
+                if not parameter_accessor:
+                    visit(receiver_node)
+            if record_result and not parameter_accessor and state is not None:
+                result = self._call_result_from_node(state, current)
+                if result is not None:
+                    add_call_result(result)
+            for argument in arguments:
+                visit(argument)
+
+        def visit_call_projection(current: Node) -> bool:
+            if state is None:
+                return False
+            result = self._call_result_from_node(state, current)
+            if result is None:
+                return False
+            add_call_result(result)
+            call_node = current
+            while call_node.type != "call_expression":
+                if not call_node.named_children:
+                    break
+                argument = call_node.child_by_field_name("argument")
+                call_node = argument or call_node.named_children[0]
+            if call_node.type == "call_expression":
+                visit_call(call_node, record_result=False)
+            return True
 
         def visit(current: Optional[Node]) -> None:
             if current is None:
@@ -3322,54 +3706,29 @@ class TreeSitterSourceExtractor:
             } or node_type.endswith("type") or node_type.endswith("type_descriptor"):
                 return
             if node_type == "call_expression":
-                function_node = current.child_by_field_name("function")
-                function_text = parsed_unit.text(function_node).strip()
-                base_name = function_text.split("<", 1)[0].rsplit("::", 1)[-1]
-                arguments = _argument_nodes(current.child_by_field_name("arguments"))
-                if base_name in _CXX_NAMED_CASTS:
-                    for argument in arguments:
-                        visit(argument)
-                    return
-                if (
-                    state is not None
-                    and function_node is not None
-                    and function_node.type == "field_expression"
-                ):
-                    receiver_node = function_node.child_by_field_name("argument")
-                    field_node = function_node.child_by_field_name("field")
-                    receiver = self._storage_target(
-                        state, parsed_unit.text(receiver_node)
-                    )
-                    field_name = parsed_unit.text(field_node).strip()
-                    parameter_accessor = False
-                    if field_name == "get" and receiver:
-                        parameter = state.context.parameter_for_member(
-                            state.callable.owner,
-                            receiver.split(".", 1)[0],
-                        )
-                        if parameter:
-                            add_symbol(f"{receiver}.get()", function_node)
-                            parameter_accessor = True
-                    if not parameter_accessor:
-                        # A non-static member call has the receiver as its
-                        # implicit object argument. Helper expansion may later
-                        # prove that only part of that storage is read, but the
-                        # syntax fact must not omit the object dependency.
-                        visit(receiver_node)
-                for argument in arguments:
-                    visit(argument)
+                visit_call(current, record_result=True)
                 return
             if node_type == "field_expression":
+                if visit_call_projection(current):
+                    return
                 add_symbol(parsed_unit.text(current), current)
                 return
             if node_type == "subscript_expression":
+                if visit_call_projection(current):
+                    return
                 argument = current.child_by_field_name("argument")
-                index = current.child_by_field_name("index")
-                if index is not None and index.type == "number_literal":
+                indices = (
+                    current.child_by_field_name("indices")
+                    or current.child_by_field_name("index")
+                )
+                index_values = list(indices.named_children) if indices is not None else []
+                if index_values and all(
+                    value.type == "number_literal" for value in index_values
+                ):
                     add_symbol(parsed_unit.text(current), current)
                 else:
                     visit(argument)
-                    visit(index)
+                    visit(indices)
                 return
             if node_type == "qualified_identifier":
                 add_symbol(parsed_unit.text(current), current)
@@ -3382,9 +3741,11 @@ class TreeSitterSourceExtractor:
 
         visit(node)
         return SourceExpressionRef(
-            text=str(text if text is not None else parsed_unit.text(node)).strip(),
+            text=source_text,
+            lowered_text=lowered_text,
             input_symbols=inputs,
             input_identities=identities,
+            call_results=call_results,
             exact=not node.has_error,
         )
 
@@ -3456,9 +3817,25 @@ class TreeSitterSourceExtractor:
         }
         return_expression_ref: Optional[SourceExpressionRef] = None
         if return_refs:
+            return_call_results: list[SourceCallResultRef] = []
+            seen_return_calls: set[tuple[str, str]] = set()
+            for ref in return_refs:
+                for result in ref.call_results:
+                    key = (result.call_source_site_id, result.result_path)
+                    if key in seen_return_calls:
+                        continue
+                    seen_return_calls.add(key)
+                    return_call_results.append(result)
             return_expression_ref = SourceExpressionRef(
                 text=return_expression or lowered or " | ".join(
                     ref.text for ref in return_refs
+                ),
+                lowered_text=(
+                    lowered
+                    or return_expression
+                    or " | ".join(
+                        ref.lowered_text or ref.text for ref in return_refs
+                    )
                 ),
                 input_symbols=list(
                     dict.fromkeys(
@@ -3472,6 +3849,7 @@ class TreeSitterSourceExtractor:
                     for ref in return_refs
                     for symbol, identity in ref.input_identities.items()
                 },
+                call_results=return_call_results,
                 exact=all(ref.exact for ref in return_refs),
             )
         output_alias_params = {
