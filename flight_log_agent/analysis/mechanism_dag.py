@@ -80,6 +80,7 @@ class _ExpressionCall:
     name: str
     receiver: str
     args: tuple[str, ...]
+    argument_expressions: tuple[Any, ...]
     offset: int
     source_site_id: str
 
@@ -816,13 +817,30 @@ class _DAGBuilder:
         self._emitted_ids: set[int] = set()
         self._emitted_bindings: list[dict[str, Any]] = []
 
-        def enqueue_expression(expression: str, scope: Scope) -> None:
+        def enqueue_expression(
+            expression: str,
+            scope: Scope,
+            expression_ref: Any = None,
+            *,
+            read_before_write_target: str = "",
+        ) -> None:
             if not expression:
                 return
-            normalized_expr = _normalize_cpp_expression(str(expression))
-            for raw in dedupe_keep_order(source_expression_names(normalized_expr)):
+            target_norm = exact_symbol(read_before_write_target)
+            for raw in self._wire_symbols(expression, expression_ref):
                 if raw:
-                    frontier.append(("symbol", raw, scope))
+                    symbol_scope = scope
+                    if (
+                        target_norm
+                        and exact_symbol(raw) == target_norm
+                        and scope[2] is not None
+                    ):
+                        # Compound writes read the value reaching the source
+                        # site before they write the new value. Excluding the
+                        # current line prevents the write from producing its
+                        # own input while retaining prior local definitions.
+                        symbol_scope = (scope[0], scope[1], scope[2] - 1)
+                    frontier.append(("symbol", raw, symbol_scope))
             for invocation in self._find_helper_calls(
                 expression,
                 scope[0],
@@ -903,6 +921,12 @@ class _DAGBuilder:
                         enqueue_expression(
                             str(binding.get("source_symbol") or binding.get("expression") or ""),
                             self._binding_walk_scope(binding),
+                            binding.get("expression_ref"),
+                            read_before_write_target=(
+                                str(binding.get("target_symbol") or "")
+                                if str(binding.get("assignment_operator") or "=") != "="
+                                else ""
+                            ),
                         )
                         # A branch's inputs are part of the mechanism:
                         # walking predicate symbols emits the internal-state
@@ -913,6 +937,12 @@ class _DAGBuilder:
                             enqueue_expression(
                                 str(predicate),
                                 self._binding_predicate_scope(binding, position),
+                                (
+                                    (binding.get("control_expression_refs") or [])[position]
+                                    if position
+                                    < len(binding.get("control_expression_refs") or [])
+                                    else None
+                                ),
                             )
                 elif "." in norm:
                     # A member read can be rooted in a source assignment to
@@ -935,6 +965,12 @@ class _DAGBuilder:
                                 or ""
                             ),
                             self._binding_walk_scope(binding),
+                            binding.get("expression_ref"),
+                            read_before_write_target=(
+                                str(binding.get("target_symbol") or "")
+                                if str(binding.get("assignment_operator") or "=") != "="
+                                else ""
+                            ),
                         )
                 elif (
                     "." not in norm
@@ -985,16 +1021,35 @@ class _DAGBuilder:
                 helper = self.helper_index.get(helper_key) if helper_key else None
                 if not helper:
                     continue
-                body_expressions = [str(v) for v in (helper.get("assignments") or {}).values()]
+                body_expressions: list[tuple[str, Any, str]] = []
+                assignment_refs = helper.get("assignment_expression_refs") or {}
+                assignment_operators = helper.get("assignment_operators") or {}
+                for target, value in (helper.get("assignments") or {}).items():
+                    operator = str(assignment_operators.get(target) or "=")
+                    body_expressions.append(
+                        (
+                            str(value),
+                            assignment_refs.get(target),
+                            str(target) if operator != "=" else "",
+                        )
+                    )
                 return_expression = (
                     helper.get("lowered_return_expression")
                     or helper.get("return_expression")
                     or ""
                 )
                 if return_expression:
-                    body_expressions.append(str(return_expression))
+                    body_expressions.append(
+                        (
+                            str(return_expression),
+                            helper.get("return_expression_ref"),
+                            "",
+                        )
+                    )
                 for pointer_write in helper.get("pointer_output_writes") or []:
-                    body_expressions.append(str(pointer_write.get("expression") or ""))
+                    body_expressions.append(
+                        (str(pointer_write.get("expression") or ""), None, "")
+                    )
                 body_scope: Scope = (
                     str(helper.get("file") or ""),
                     _callable_instance_scope(
@@ -1004,10 +1059,15 @@ class _DAGBuilder:
                     ),
                     None,
                 )
-                for expression in body_expressions:
+                for expression, expression_ref, read_target in body_expressions:
                     # The (b) fix: helper-body symbols drive the same frontier,
                     # so their writers get emitted instead of going opaque.
-                    enqueue_expression(expression, body_scope)
+                    enqueue_expression(
+                        expression,
+                        body_scope,
+                        expression_ref,
+                        read_before_write_target=read_target,
+                    )
 
         # Wire edges now that every producer vertex has been emitted.
         for binding in self._emitted_bindings:
@@ -1028,12 +1088,34 @@ class _DAGBuilder:
     # Native backward-walk helpers
     # ------------------------------------------------------------
 
-    def _walk_symbols(self, expression: str) -> list[str]:
+    @staticmethod
+    def _structured_expression_symbols(expression_ref: Any) -> Optional[list[str]]:
+        """Return parser-proven value inputs, or ``None`` for fallback."""
+        if hasattr(expression_ref, "model_dump"):
+            expression_ref = expression_ref.model_dump(exclude_none=True)
+        if not isinstance(expression_ref, dict) or not bool(
+            expression_ref.get("exact", False)
+        ):
+            return None
+        return dedupe_keep_order(
+            str(value)
+            for value in (expression_ref.get("input_symbols") or [])
+            if str(value)
+        )
+
+    def _walk_symbols(
+        self, expression: str, expression_ref: Any = None
+    ) -> list[str]:
         """Normalized symbols referenced by ``expression``.
 
         C++ operators/casts are normalized first so ``&&`` / ``->`` / ``::``
         and cast-wrapped arguments still yield their symbols.
         """
+        structured = self._structured_expression_symbols(expression_ref)
+        if structured is not None:
+            return dedupe_keep_order(
+                exact_symbol(name) for name in structured if exact_symbol(name)
+            )
         if not expression:
             return []
         normalized = _normalize_cpp_expression(str(expression))
@@ -1041,7 +1123,9 @@ class _DAGBuilder:
             exact_symbol(name) for name in source_expression_names(normalized)
         )
 
-    def _wire_symbols(self, expression: str) -> list[str]:
+    def _wire_symbols(
+        self, expression: str, expression_ref: Any = None
+    ) -> list[str]:
         """Raw symbol names referenced by ``expression``, extracted after
         normalizing C++ syntax.
 
@@ -1054,6 +1138,9 @@ class _DAGBuilder:
         signals — are silently dropped from the graph. Mirrors the
         normalization :meth:`_walk_symbols` already applies during the walk.
         """
+        structured = self._structured_expression_symbols(expression_ref)
+        if structured is not None:
+            return structured
         if not expression:
             return []
         return dedupe_keep_order(
@@ -1117,15 +1204,28 @@ class _DAGBuilder:
         }
         if not formals:
             return False
-        expressions = [
-            str(binding.get("source_symbol") or binding.get("expression") or ""),
-            *(
-                str(value)
-                for value in (binding.get("control_predicates") or [])
-            ),
+        expressions: list[tuple[str, Any]] = [
+            (
+                str(
+                    binding.get("source_symbol")
+                    or binding.get("expression")
+                    or ""
+                ),
+                binding.get("expression_ref"),
+            )
         ]
-        for expression in expressions:
-            for symbol in self._wire_symbols(expression):
+        control_refs = binding.get("control_expression_refs") or []
+        expressions.extend(
+            (
+                str(value),
+                control_refs[position] if position < len(control_refs) else None,
+            )
+            for position, value in enumerate(
+                binding.get("control_predicates") or []
+            )
+        )
+        for expression, expression_ref in expressions:
+            for symbol in self._wire_symbols(expression, expression_ref):
                 root = symbol.replace("->", ".").split(".", 1)[0]
                 if exact_symbol(root) in formals:
                     return True
@@ -1480,6 +1580,10 @@ class _DAGBuilder:
         caller_predicate_sites = list(
             call.get("control_predicate_site_ids") or []
         )
+        caller_predicate_refs = list(
+            call.get("control_expression_refs") or []
+        )
+        argument_refs = list(call.get("argument_expressions") or [])
         instance_bindings: list[dict[str, Any]] = []
 
         # Clone source-definition bindings into this invocation scope. The
@@ -1500,6 +1604,7 @@ class _DAGBuilder:
             callee_sites = list(
                 original.get("control_predicate_site_ids") or []
             )
+            callee_refs = list(original.get("control_expression_refs") or [])
             clone.update(
                 {
                     "scope_file": helper_file,
@@ -1519,6 +1624,10 @@ class _DAGBuilder:
                     "control_predicate_site_ids": [
                         *caller_predicate_sites,
                         *callee_sites,
+                    ],
+                    "control_expression_refs": [
+                        *caller_predicate_refs,
+                        *callee_refs,
                     ],
                     "control_predicate_files": [
                         *(caller_file for _ in caller_predicates),
@@ -1580,6 +1689,12 @@ class _DAGBuilder:
                 {
                     "target_symbol": formal,
                     "source_symbol": actual,
+                    "assignment_operator": "=",
+                    "expression_ref": (
+                        argument_refs[index]
+                        if index < explicit_count and index < len(argument_refs)
+                        else None
+                    ),
                     "assignment_path": [
                         {
                             "file": expression_file,
@@ -1591,6 +1706,7 @@ class _DAGBuilder:
                     "control_predicates": caller_predicates,
                     "control_predicate_lines": caller_predicate_lines,
                     "control_predicate_site_ids": caller_predicate_sites,
+                    "control_expression_refs": caller_predicate_refs,
                     "reachability_exact": bool(
                         call.get("reachability_exact", True)
                     ),
@@ -1641,31 +1757,55 @@ class _DAGBuilder:
         for binding in self._source_bindings:
             if self._binding_target_scope(binding)[1] != helper_callable:
                 continue
-            texts = [
-                str(
-                    binding.get("source_symbol")
-                    or binding.get("expression")
-                    or ""
-                ),
-                *(str(value) for value in binding.get("control_predicates") or []),
+            texts: list[tuple[str, Any]] = [
+                (
+                    str(
+                        binding.get("source_symbol")
+                        or binding.get("expression")
+                        or ""
+                    ),
+                    binding.get("expression_ref"),
+                )
             ]
-            for text in texts:
-                for symbol in self._wire_symbols(text):
+            control_refs = binding.get("control_expression_refs") or []
+            texts.extend(
+                (
+                    str(value),
+                    control_refs[position]
+                    if position < len(control_refs)
+                    else None,
+                )
+                for position, value in enumerate(
+                    binding.get("control_predicates") or []
+                )
+            )
+            for text, expression_ref in texts:
+                for symbol in self._wire_symbols(text, expression_ref):
                     root = symbol.replace("->", ".").split(".", 1)[0]
                     if exact_symbol(root) == exact_symbol(formal):
                         return True
-        helper_texts = [
-            str(helper.get("return_expression") or ""),
-            str(helper.get("lowered_return_expression") or ""),
-            *(str(value) for value in (helper.get("assignments") or {}).values()),
+        helper_texts: list[tuple[str, Any]] = [
+            (
+                str(
+                    helper.get("lowered_return_expression")
+                    or helper.get("return_expression")
+                    or ""
+                ),
+                helper.get("return_expression_ref"),
+            )
         ]
+        assignment_refs = helper.get("assignment_expression_refs") or {}
+        helper_texts.extend(
+            (str(value), assignment_refs.get(target))
+            for target, value in (helper.get("assignments") or {}).items()
+        )
         return any(
             any(
                 exact_symbol(symbol.replace("->", ".").split(".", 1)[0])
                 == exact_symbol(formal)
-                for symbol in self._wire_symbols(text)
+                for symbol in self._wire_symbols(text, expression_ref)
             )
-            for text in helper_texts
+            for text, expression_ref in helper_texts
         )
 
     def _register_member_output_calls(
@@ -2354,6 +2494,17 @@ class _DAGBuilder:
                 ],
                 "exact": bool(binding.get("reachability_exact", True)),
             }
+            metadata["assignment_operator"] = str(
+                binding.get("assignment_operator") or "="
+            )
+            expression_ref = binding.get("expression_ref")
+            if isinstance(expression_ref, dict):
+                metadata["source_expression"] = str(
+                    expression_ref.get("text") or expression
+                )
+                metadata["expression_inputs_exact"] = bool(
+                    expression_ref.get("exact", False)
+                )
             target_file, target_callable = self._binding_target_scope(binding)
             site_file, site_callable = self._binding_site_scope(binding)
             control_file, control_callable = self._binding_control_scope(binding)
@@ -2417,6 +2568,10 @@ class _DAGBuilder:
         predicate_callables = binding.get("control_predicate_callables") or []
         control_file, control_callable = self._binding_control_scope(binding)
         for position, predicate in enumerate(binding.get("control_predicates") or []):
+            control_refs = binding.get("control_expression_refs") or []
+            condition_ref = (
+                control_refs[position] if position < len(control_refs) else None
+            )
             site = (
                 int(predicate_sites[position])
                 if position < len(predicate_sites)
@@ -2440,6 +2595,7 @@ class _DAGBuilder:
                     if position < len(predicate_site_ids)
                     else ""
                 ),
+                condition_ref=condition_ref,
             )
             self._add_edge(branch_id, op_id, kind="control")
 
@@ -2447,20 +2603,29 @@ class _DAGBuilder:
         # resolved in the binding's own callable scope.
         expression_file, scope_function = self._binding_site_scope(binding)
         expression_line = self._binding_walk_scope(binding)[2]
-        for symbol in self._wire_symbols(expression):
+        assignment_operator = str(binding.get("assignment_operator") or "=")
+        for symbol in self._wire_symbols(expression, binding.get("expression_ref")):
             normalized = exact_symbol(symbol)
+            reads_prior_target = (
+                normalized == target_norm
+                and assignment_operator != "="
+            )
             if not normalized or (
                 normalized == target_norm
+                and not reads_prior_target
                 and not binding.get("synthetic_pointer_output_binding")
                 and not binding.get("synthetic_member_output_binding")
             ):
                 continue
+            resolution_line = expression_line
+            if reads_prior_target and resolution_line is not None:
+                resolution_line -= 1
             producer_ids = self._resolve_symbol_producers(
                 normalized,
                 symbol,
                 expression,
                 expression_file or file,
-                expression_line,
+                resolution_line,
                 scope_function=scope_function,
             )
             if binding.get("synthetic_pointer_output_binding"):
@@ -2658,7 +2823,13 @@ class _DAGBuilder:
             argument_file = helper_file if uses_default else file
             argument_line = helper_line if uses_default else line
             argument_scope = instance_key[2] if uses_default else scope_function
-            for symbol in self._wire_symbols(arg_text):
+            argument_ref = (
+                invocation.argument_expressions[index]
+                if not uses_default
+                and index < len(invocation.argument_expressions)
+                else None
+            )
+            for symbol in self._wire_symbols(arg_text, argument_ref):
                 normalized = exact_symbol(symbol)
                 if not normalized:
                     continue
@@ -3219,6 +3390,14 @@ class _DAGBuilder:
         """
         if not symbol_raw or not source_expression:
             return None
+        direct = _HELPER_CHAIN_RE.fullmatch(symbol_raw.strip())
+        if direct is not None:
+            return self._resolve_helper_chain(
+                direct.group("chain"),
+                direct.group("field"),
+                file=file,
+                scope_function=scope_function,
+            )
         # Find ``symbol_raw().field`` in the surrounding expression.
         pattern = re.compile(
             rf"{re.escape(symbol_raw)}\s*\(\s*\)\s*(?:\.|->)\s*(?P<field>[A-Za-z_][A-Za-z0-9_]*)"
@@ -3415,6 +3594,7 @@ class _DAGBuilder:
         line: Optional[int],
         scope_function: str = "",
         source_site_id: str = "",
+        condition_ref: Any = None,
     ) -> str:
         canonical = _canonical_predicate(predicate)
         # Branch identity is the SOURCE SITE plus the canonical predicate
@@ -3455,7 +3635,7 @@ class _DAGBuilder:
         # ``&&``/``->``/``::`` predicates yield their symbols (parameters,
         # accessor chains) instead of failing ast extraction wholesale.
         symbol_source = _normalize_cpp_expression(predicate)
-        for symbol in dedupe_keep_order(source_expression_names(symbol_source)):
+        for symbol in self._wire_symbols(predicate, condition_ref):
             normalized = exact_symbol(symbol)
             if not normalized:
                 continue
@@ -3630,6 +3810,9 @@ class _DAGBuilder:
                     name=candidate,
                     receiver=receiver,
                     args=args,
+                    argument_expressions=tuple(
+                        (source_record or {}).get("argument_expressions") or ()
+                    ),
                     offset=match.start(),
                     source_site_id=runtime_site_id,
                 )
@@ -3721,8 +3904,14 @@ class _DAGBuilder:
             formals.append((formal_str, param_id))
         self._helper_parameter_vertices[instance_key] = formals
 
+        assignment_refs = helper.get("assignment_expression_refs") or {}
+        assignment_operators = helper.get("assignment_operators") or {}
+        assignment_sites = helper.get("assignment_sites") or {}
         for var, expression in (helper.get("assignments") or {}).items():
             var_norm = exact_symbol(var)
+            assignment_site = assignment_sites.get(var) or {}
+            assignment_file = str(assignment_site.get("file") or file or "")
+            assignment_line = int(assignment_site.get("line") or line or 0) or None
             op_id = self._make_id(
                 "op",
                 (
@@ -3731,6 +3920,8 @@ class _DAGBuilder:
                     invocation.source_site_id,
                     var_norm,
                     expression,
+                    assignment_file,
+                    assignment_line or 0,
                 ),
             )
             if op_id not in self.vertices:
@@ -3738,9 +3929,9 @@ class _DAGBuilder:
                     id=op_id,
                     kind="operation",
                     sub_kind="assign",
-                    file=file,
-                    line=line,
-                    snippet=self._snippet(file, line),
+                    file=assignment_file or file,
+                    line=assignment_line,
+                    snippet=self._snippet(assignment_file or file, assignment_line),
                     variable=var,
                     expression=expression,
                     provenance=f"helper_body:{helper_key[0]}@{helper_key[1]}",
@@ -3749,6 +3940,18 @@ class _DAGBuilder:
                         "target_scope": {"file": str(file or ""), "callable": scope_function},
                         "site_scope": {"file": str(file or ""), "callable": scope_function},
                         "reachability": {"all_of": [], "exact": False},
+                        "assignment_operator": str(
+                            assignment_operators.get(var) or "="
+                        ),
+                        "source_expression": str(
+                            (assignment_refs.get(var) or {}).get("text")
+                            if isinstance(assignment_refs.get(var), dict)
+                            else expression
+                        ),
+                        "expression_inputs_exact": bool(
+                            isinstance(assignment_refs.get(var), dict)
+                            and assignment_refs[var].get("exact", False)
+                        ),
                         "call_site_id": invocation.source_site_id,
                         "call_instance_scope": scope_function,
                     },
@@ -3821,8 +4024,15 @@ class _DAGBuilder:
             for formal, vertex_id in self._helper_parameter_vertices.get(instance_key, ())
         }
 
+        assignment_refs = helper.get("assignment_expression_refs") or {}
+        assignment_operators = helper.get("assignment_operators") or {}
+        assignment_sites = helper.get("assignment_sites") or {}
         for var, expression in (helper.get("assignments") or {}).items():
             var_norm = exact_symbol(var)
+            assignment_operator = str(assignment_operators.get(var) or "=")
+            assignment_site = assignment_sites.get(var) or {}
+            assignment_file = str(assignment_site.get("file") or file or "")
+            assignment_line = int(assignment_site.get("line") or line or 0) or None
             op_id = self._make_id(
                 "op",
                 (
@@ -3831,11 +4041,18 @@ class _DAGBuilder:
                     call_site_id,
                     var_norm,
                     expression,
+                    assignment_file,
+                    assignment_line or 0,
                 ),
             )
-            for symbol in self._wire_symbols(str(expression)):
+            for symbol in self._wire_symbols(
+                str(expression), assignment_refs.get(var)
+            ):
                 normalized = exact_symbol(symbol)
-                if not normalized or normalized == var_norm:
+                reads_prior_target = (
+                    normalized == var_norm and assignment_operator != "="
+                )
+                if not normalized or (normalized == var_norm and not reads_prior_target):
                     continue
                 producer_ids = (
                     [local_scope[normalized]]
@@ -3844,11 +4061,21 @@ class _DAGBuilder:
                         normalized,
                         symbol,
                         str(expression),
-                        file,
-                        line,
+                        assignment_file or file,
+                        (
+                            assignment_line - 1
+                            if reads_prior_target and assignment_line is not None
+                            else assignment_line
+                        ),
                         scope_function=scope_function,
                     )
                 )
+                if reads_prior_target:
+                    producer_ids = [
+                        producer_id
+                        for producer_id in producer_ids
+                        if producer_id != op_id
+                    ]
                 for producer_id in producer_ids:
                     self._add_edge(producer_id, op_id, kind="data", role=symbol)
 
@@ -3869,7 +4096,9 @@ class _DAGBuilder:
                     return_expression,
                 ),
             )
-            for symbol in self._wire_symbols(str(return_expression)):
+            for symbol in self._wire_symbols(
+                str(return_expression), helper.get("return_expression_ref")
+            ):
                 normalized = exact_symbol(symbol)
                 if not normalized:
                     continue
@@ -3903,13 +4132,16 @@ class _DAGBuilder:
                 line=int(branch.get("line") or line or 0) or None,
                 scope_function=scope_function,
                 source_site_id=str(branch.get("source_site_id") or ""),
+                condition_ref=branch.get("condition_ref"),
             )
             if terminal_id is not None:
                 self._add_edge(branch_id, terminal_id, kind="selection")
             value_expression = str(branch.get("expression") or "")
             if terminal_id is None or not value_expression:
                 continue
-            for symbol in self._wire_symbols(value_expression):
+            for symbol in self._wire_symbols(
+                value_expression, branch.get("expression_ref")
+            ):
                 normalized = exact_symbol(symbol)
                 if not normalized:
                     continue

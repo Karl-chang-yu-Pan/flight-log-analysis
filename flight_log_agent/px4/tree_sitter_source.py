@@ -31,6 +31,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceAssignmentRef,
     SourceCallableRef,
     SourceClassRef,
+    SourceExpressionRef,
     SourceIncludeRef,
     SourceMemberRef,
     TopicRef,
@@ -40,6 +41,12 @@ from flight_log_agent.px4.mechanism_source_profiler import (
 
 
 _CPP_LANGUAGE = Language(tree_sitter_cpp.language())
+_CXX_NAMED_CASTS = {
+    "const_cast",
+    "dynamic_cast",
+    "reinterpret_cast",
+    "static_cast",
+}
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,8 @@ class _ControlTerm:
     expression: str
     line: int
     site_id: str
+    input_symbols: tuple[str, ...] = ()
+    inputs_exact: bool = False
 
 
 @dataclass
@@ -1349,6 +1358,9 @@ class TreeSitterSourceExtractor:
         if node.type == "if_statement":
             condition_node = node.child_by_field_name("condition")
             condition = self._condition_text(unit, condition_node)
+            condition_ref = self._expression_ref(
+                state, condition_node, text=condition
+            )
             self._collect_operations(
                 state, condition_node, controls=controls, exact=exact
             )
@@ -1356,6 +1368,8 @@ class TreeSitterSourceExtractor:
                 expression=condition,
                 line=unit.line(node),
                 site_id=unit.site_id(node),
+                input_symbols=tuple(condition_ref.input_symbols),
+                inputs_exact=condition_ref.exact,
             )
             self._record_branch(state, "if", term, node)
             consequence = node.child_by_field_name("consequence")
@@ -1381,8 +1395,10 @@ class TreeSitterSourceExtractor:
                         *controls,
                         _ControlTerm(
                             expression=_not(condition),
-                            line=unit.line(node),
-                            site_id=unit.site_id(node),
+                            line=unit.line(alternative),
+                            site_id=unit.site_id(alternative),
+                            input_symbols=tuple(condition_ref.input_symbols),
+                            inputs_exact=condition_ref.exact,
                         ),
                     ],
                     exact=exact,
@@ -1395,6 +1411,9 @@ class TreeSitterSourceExtractor:
         if node.type in {"while_statement", "for_statement", "do_statement"}:
             condition_node = node.child_by_field_name("condition")
             condition = self._condition_text(unit, condition_node) or "true"
+            condition_ref = self._expression_ref(
+                state, condition_node, text=condition
+            )
             self._collect_operations(
                 state, condition_node, controls=controls, exact=False
             )
@@ -1402,6 +1421,8 @@ class TreeSitterSourceExtractor:
                 expression=condition,
                 line=unit.line(node),
                 site_id=unit.site_id(node),
+                input_symbols=tuple(condition_ref.input_symbols),
+                inputs_exact=condition_ref.exact,
             )
             self._record_branch(state, node.type.removesuffix("_statement"), term, node)
             initializer = node.child_by_field_name("initializer")
@@ -1438,7 +1459,8 @@ class TreeSitterSourceExtractor:
             return
         if node.type == "return_statement":
             self._collect_operations(state, node, controls=controls, exact=exact)
-            expression = unit.text(node.named_children[0]) if node.named_children else ""
+            return_value = node.named_children[0] if node.named_children else None
+            expression = unit.text(return_value) if return_value is not None else ""
             if expression and controls:
                 condition = " && ".join(
                     f"({item.expression})" for item in controls
@@ -1453,6 +1475,20 @@ class TreeSitterSourceExtractor:
                             self.profiler._normalize_source_expression(expression),
                             state.storage_aliases,
                         ),
+                        "expression_ref": self._expression_ref(
+                            state, return_value, text=expression
+                        ).model_dump(exclude_none=True),
+                        "condition_ref": SourceExpressionRef(
+                            text=condition,
+                            input_symbols=list(
+                                dict.fromkeys(
+                                    symbol
+                                    for item in controls
+                                    for symbol in item.input_symbols
+                                )
+                            ),
+                            exact=all(item.inputs_exact for item in controls),
+                        ).model_dump(exclude_none=True),
                         "file": unit.file,
                         "line": unit.line(node),
                         "source_site_id": unit.site_id(node),
@@ -1508,6 +1544,9 @@ class TreeSitterSourceExtractor:
         unit = state.unit
         condition_node = node.child_by_field_name("condition")
         discriminant = self._condition_text(unit, condition_node)
+        discriminant_ref = self._expression_ref(
+            state, condition_node, text=discriminant
+        )
         self._collect_operations(state, condition_node, controls=controls, exact=exact)
         body = node.child_by_field_name("body")
         sections = self._switch_sections(unit, body)
@@ -1527,6 +1566,11 @@ class TreeSitterSourceExtractor:
                 expression=active,
                 line=unit.line(site),
                 site_id=unit.site_id(site),
+                input_symbols=tuple(discriminant_ref.input_symbols),
+                # The synthetic expression also contains case labels and
+                # fallthrough state; until those are represented as syntax
+                # nodes, retain the complete string-parser fallback.
+                inputs_exact=False,
             )
             kind = "default" if label is None else "case"
             self._record_branch(state, kind, term, site)
@@ -1607,6 +1651,15 @@ class TreeSitterSourceExtractor:
                 line=term.line,
                 evidence=state.unit.evidence(node),
                 source_site_id=term.site_id,
+                condition_ref=SourceExpressionRef(
+                    text=term.expression,
+                    input_symbols=[
+                        self._storage_target(state, symbol)
+                        for symbol in term.input_symbols
+                        if self._storage_target(state, symbol)
+                    ],
+                    exact=term.inputs_exact,
+                ),
             )
         )
 
@@ -1807,6 +1860,12 @@ class TreeSitterSourceExtractor:
             if operator == "="
             else self.profiler._compound_assignment_expression(target, operator, rhs)
         )
+        expression_ref = self._expression_ref(
+            state,
+            right,
+            text=unit.text(right),
+            extra_inputs=(target,) if operator != "=" else (),
+        )
         return self._make_assignment(
             state,
             node,
@@ -1814,6 +1873,7 @@ class TreeSitterSourceExtractor:
             expression=expression,
             operator=operator,
             declaration_kind=None,
+            expression_ref=expression_ref,
             controls=controls,
             exact=exact,
         )
@@ -1844,6 +1904,11 @@ class TreeSitterSourceExtractor:
         declaration = node.parent
         declaration_text = unit.text(declaration) if declaration is not None else unit.text(node)
         kind = "constexpr" if re.search(r"\bconstexpr\b", declaration_text) else None
+        expression_ref = self._expression_ref(
+            state,
+            value,
+            text=_strip_initializer_delimiters(unit.text(value)),
+        )
         return self._make_assignment(
             state,
             node,
@@ -1851,6 +1916,7 @@ class TreeSitterSourceExtractor:
             expression=expression,
             operator="=",
             declaration_kind=kind,
+            expression_ref=expression_ref,
             controls=controls,
             exact=exact,
         )
@@ -1864,6 +1930,7 @@ class TreeSitterSourceExtractor:
         expression: str,
         operator: str,
         declaration_kind: Optional[str],
+        expression_ref: SourceExpressionRef,
         controls: list[_ControlTerm],
         exact: bool,
     ) -> SourceAssignmentRef:
@@ -1897,6 +1964,21 @@ class TreeSitterSourceExtractor:
             ),
             struct_variables=state.struct_variables,
             source_site_id=state.unit.site_id(node),
+            expression_ref=expression_ref,
+            control_expression_refs=[
+                SourceExpressionRef(
+                    text=self._apply_storage_aliases(
+                        item.expression, state.storage_aliases
+                    ),
+                    input_symbols=[
+                        self._storage_target(state, symbol)
+                        for symbol in item.input_symbols
+                        if self._storage_target(state, symbol)
+                    ],
+                    exact=item.inputs_exact,
+                )
+                for item in controls
+            ],
         )
 
     def _call_ref(
@@ -1914,18 +1996,37 @@ class TreeSitterSourceExtractor:
             return None
         receiver: Optional[str] = None
         name = unit.text(function_node).strip()
+        base_name = name.split("<", 1)[0].rsplit("::", 1)[-1]
+        if base_name in _CXX_NAMED_CASTS:
+            # Named casts are language syntax represented as call nodes by
+            # tree-sitter-cpp. Their argument remains an expression input,
+            # but the cast itself is not a callable/helper candidate.
+            return None
         if function_node.type == "field_expression":
             receiver_node = function_node.child_by_field_name("argument")
             field_node = function_node.child_by_field_name("field")
             receiver = self._storage_target(state, unit.text(receiver_node))
             name = unit.text(field_node).strip()
+        argument_nodes = _argument_nodes(arguments_node)
         args = [
             self._apply_storage_aliases(unit.text(arg).strip(), state.storage_aliases)
-            for arg in _argument_nodes(arguments_node)
+            for arg in argument_nodes
+        ]
+        argument_expressions = [
+            self._expression_ref(state, arg, text=unit.text(arg))
+            for arg in argument_nodes
         ]
         lambda_callable = state.lambda_bindings.get(name) if receiver is None else None
         if lambda_callable is not None:
             args = [*lambda_callable.capture_arguments, *args]
+            argument_expressions = [
+                SourceExpressionRef(
+                    text=capture,
+                    input_symbols=[self._storage_target(state, capture)],
+                    exact=True,
+                )
+                for capture in lambda_callable.capture_arguments
+            ] + argument_expressions
         argument_topics: dict[str, str] = {}
         argument_owners: dict[str, str] = {}
         for arg in args:
@@ -1964,12 +2065,69 @@ class TreeSitterSourceExtractor:
             line=unit.line(node),
             evidence=unit.evidence(node),
             source_site_id=unit.site_id(node),
+            argument_expressions=argument_expressions,
+            control_expression_refs=[
+                SourceExpressionRef(
+                    text=self._apply_storage_aliases(
+                        item.expression, state.storage_aliases
+                    ),
+                    input_symbols=[
+                        self._storage_target(state, symbol)
+                        for symbol in item.input_symbols
+                        if self._storage_target(state, symbol)
+                    ],
+                    exact=item.inputs_exact,
+                )
+                for item in controls
+            ],
         )
 
     def _extract_global_constants(self, unit: _ParsedUnit) -> list[SourceAssignmentRef]:
         refs: list[SourceAssignmentRef] = []
         for node in _walk(unit.tree.root_node):
-            if node.type == "enumerator":
+            if (
+                node.type == "declaration"
+                and self._enclosing_callable(unit, node) is None
+                and re.search(r"\bconstexpr\b", unit.text(node))
+            ):
+                for declarator in (
+                    child
+                    for child in node.named_children
+                    if child.type == "init_declarator"
+                ):
+                    if declarator.type != "init_declarator":
+                        continue
+                    name_node = _last_identifier(
+                        declarator.child_by_field_name("declarator")
+                    )
+                    value_node = declarator.child_by_field_name("value")
+                    name = unit.text(name_node).strip()
+                    if not name or value_node is None:
+                        continue
+                    value_text = _strip_initializer_delimiters(
+                        unit.text(value_node)
+                    )
+                    refs.append(
+                        SourceAssignmentRef(
+                            target=name,
+                            expression=self.profiler._normalize_source_expression(
+                                value_text
+                            ),
+                            file=unit.file,
+                            line=unit.line(declarator),
+                            evidence=unit.evidence(declarator),
+                            assignment_operator="=",
+                            declaration_kind="constexpr",
+                            source_site_id=unit.site_id(declarator),
+                            expression_ref=self._expression_ref(
+                                None,
+                                value_node,
+                                unit=unit,
+                                text=value_text,
+                            ),
+                        )
+                    )
+            elif node.type == "enumerator":
                 name_node = node.child_by_field_name("name")
                 value_node = node.child_by_field_name("value")
                 if name_node is None or value_node is None:
@@ -1986,6 +2144,12 @@ class TreeSitterSourceExtractor:
                         assignment_operator="=",
                         declaration_kind="enum",
                         source_site_id=unit.site_id(node),
+                        expression_ref=self._expression_ref(
+                            None,
+                            value_node,
+                            unit=unit,
+                            text=unit.text(value_node),
+                        ),
                     )
                 )
             elif node.type == "preproc_def":
@@ -2005,6 +2169,12 @@ class TreeSitterSourceExtractor:
                         assignment_operator="=",
                         declaration_kind="define",
                         source_site_id=unit.site_id(node),
+                        expression_ref=self._expression_ref(
+                            None,
+                            value_node,
+                            unit=unit,
+                            text=value,
+                        ),
                     )
                 )
         return refs
@@ -2707,6 +2877,113 @@ class TreeSitterSourceExtractor:
             value = value[5:]
         return value
 
+    def _expression_ref(
+        self,
+        state: Optional[_ExtractionState],
+        node: Optional[Node],
+        *,
+        unit: Optional[_ParsedUnit] = None,
+        text: Optional[str] = None,
+        extra_inputs: Sequence[str] = (),
+    ) -> SourceExpressionRef:
+        """Extract value reads from an expression without flattening syntax."""
+        parsed_unit = state.unit if state is not None else unit
+        if node is None:
+            return SourceExpressionRef(
+                text=str(text or ""),
+                input_symbols=list(dict.fromkeys(extra_inputs)),
+                exact=False,
+            )
+        if parsed_unit is None:
+            raise ValueError("an expression node requires its parsed source unit")
+
+        inputs: list[str] = [str(value) for value in extra_inputs if str(value)]
+
+        def add_symbol(raw: str) -> None:
+            symbol = (
+                self._storage_target(state, raw)
+                if state is not None
+                else self._canonical_symbol(raw)
+            )
+            if symbol and symbol not in inputs:
+                inputs.append(symbol)
+
+        def visit(current: Optional[Node]) -> None:
+            if current is None:
+                return
+            node_type = current.type
+            if node_type in {
+                "boolean_literal",
+                "char_literal",
+                "comment",
+                "concatenated_string",
+                "false",
+                "null",
+                "nullptr",
+                "number_literal",
+                "raw_string_literal",
+                "string_literal",
+                "true",
+            } or node_type.endswith("type") or node_type.endswith("type_descriptor"):
+                return
+            if node_type == "call_expression":
+                function_node = current.child_by_field_name("function")
+                function_text = parsed_unit.text(function_node).strip()
+                base_name = function_text.split("<", 1)[0].rsplit("::", 1)[-1]
+                arguments = _argument_nodes(current.child_by_field_name("arguments"))
+                if base_name in _CXX_NAMED_CASTS:
+                    for argument in arguments:
+                        visit(argument)
+                    return
+                if (
+                    state is not None
+                    and function_node is not None
+                    and function_node.type == "field_expression"
+                ):
+                    receiver_node = function_node.child_by_field_name("argument")
+                    field_node = function_node.child_by_field_name("field")
+                    receiver = self._storage_target(
+                        state, parsed_unit.text(receiver_node)
+                    )
+                    field_name = parsed_unit.text(field_node).strip()
+                    if field_name == "get" and receiver:
+                        parameter = state.context.parameter_for_member(
+                            state.callable.owner,
+                            receiver.split(".", 1)[0],
+                        )
+                        if parameter:
+                            add_symbol(f"{receiver}.get()")
+                for argument in arguments:
+                    visit(argument)
+                return
+            if node_type == "field_expression":
+                add_symbol(parsed_unit.text(current))
+                return
+            if node_type == "subscript_expression":
+                argument = current.child_by_field_name("argument")
+                index = current.child_by_field_name("index")
+                if index is not None and index.type == "number_literal":
+                    add_symbol(parsed_unit.text(current))
+                else:
+                    visit(argument)
+                    visit(index)
+                return
+            if node_type == "qualified_identifier":
+                add_symbol(parsed_unit.text(current))
+                return
+            if node_type in {"identifier", "field_identifier"}:
+                add_symbol(parsed_unit.text(current))
+                return
+            for child in current.named_children:
+                visit(child)
+
+        visit(node)
+        return SourceExpressionRef(
+            text=str(text if text is not None else parsed_unit.text(node)).strip(),
+            input_symbols=inputs,
+            exact=not node.has_error,
+        )
+
     def _helper_from_state(self, state: _ExtractionState) -> HelperExpressionRef:
         statements = self._helper_statements(state.unit, state.callable.body)
         unresolved = self._helper_unsupported_reason(state.callable.body)
@@ -2725,6 +3002,14 @@ class TreeSitterSourceExtractor:
             and node.named_children
         ]
         return_expression: Optional[str] = None
+        return_refs: list[SourceExpressionRef] = []
+        for return_node in returns:
+            return_value = return_node.named_children[0]
+            return_refs.append(
+                self._expression_ref(
+                    state, return_value, text=state.unit.text(return_value)
+                )
+            )
         if len(returns) == 1:
             return_value = returns[0].named_children[0]
             # Pointer-return accessors commonly expose member storage with
@@ -2743,6 +3028,38 @@ class TreeSitterSourceExtractor:
             assignment.target: assignment.expression
             for assignment in state.assignments
         }
+        assignment_operators = {
+            assignment.target: str(assignment.assignment_operator or "=")
+            for assignment in state.assignments
+        }
+        assignment_expression_refs = {
+            assignment.target: assignment.expression_ref
+            for assignment in state.assignments
+            if assignment.expression_ref is not None
+        }
+        assignment_sites = {
+            assignment.target: {
+                "file": assignment.file,
+                "line": assignment.line,
+                "source_site_id": assignment.source_site_id or "",
+            }
+            for assignment in state.assignments
+        }
+        return_expression_ref: Optional[SourceExpressionRef] = None
+        if return_refs:
+            return_expression_ref = SourceExpressionRef(
+                text=return_expression or lowered or " | ".join(
+                    ref.text for ref in return_refs
+                ),
+                input_symbols=list(
+                    dict.fromkeys(
+                        symbol
+                        for ref in return_refs
+                        for symbol in ref.input_symbols
+                    )
+                ),
+                exact=all(ref.exact for ref in return_refs),
+            )
         output_alias_params = {
             name
             for name, type_text in zip(
@@ -2789,7 +3106,17 @@ class TreeSitterSourceExtractor:
             parameter_defaults=state.callable.parameter_defaults,
             statements=statements if unresolved is None else [],
             assignments=assignments if unresolved is None else {},
+            assignment_operators=(
+                assignment_operators if unresolved is None else {}
+            ),
+            assignment_expression_refs=(
+                assignment_expression_refs if unresolved is None else {}
+            ),
+            assignment_sites=assignment_sites if unresolved is None else {},
             return_expression=return_expression if unresolved is None else None,
+            return_expression_ref=(
+                return_expression_ref if unresolved is None else None
+            ),
             lowered_return_expression=lowered if unresolved is None else None,
             branches=state.return_paths if unresolved is None else [],
             symbol_bindings=symbol_bindings if unresolved is None else {},
@@ -2896,7 +3223,13 @@ class TreeSitterSourceExtractor:
                 "body": self._helper_statements(unit, body) if body is not None else [],
             }
         if node.type == "for_range_loop":
-            return {"kind": "for_range", "header": unit.evidence(node), "body": []}
+            collection = node.child_by_field_name("right")
+            body = node.child_by_field_name("body")
+            return {
+                "kind": "for_range",
+                "header": f"range: {unit.text(collection).strip()}",
+                "body": self._helper_statements(unit, body) if body is not None else [],
+            }
         if node.type in {"while_statement", "do_statement"}:
             body = node.child_by_field_name("body")
             return {

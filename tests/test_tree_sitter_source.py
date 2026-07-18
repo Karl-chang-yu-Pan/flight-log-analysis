@@ -627,25 +627,6 @@ void fill(float value, output_s &out, float &direct)
     ]
 
 
-def test_tree_sitter_literal_for_loop_uses_step_ir(tmp_path):
-    facts = _facts(
-        tmp_path,
-        """
-int pick_iter()
-{
-    for (int i = 2; i < 3; i++) {
-        return i;
-    }
-    return 0;
-}
-""",
-    )
-
-    helper = next(item for item in facts.helper_expressions if item.name == "pick_iter")
-    assert helper.unresolved_reason is None
-    assert helper.lowered_return_expression == "(2)"
-
-
 def test_parse_errors_are_reported_without_legacy_fallback(tmp_path):
     facts = _facts(
         tmp_path,

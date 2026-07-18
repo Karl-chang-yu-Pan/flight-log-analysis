@@ -76,6 +76,13 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         "callable_id": str(ref.get("callable_id") or ""),
         "function_parameters": list(ref.get("function_parameters") or []),
         "declaration_kind": str(ref.get("declaration_kind") or ""),
+        "assignment_operator": str(ref.get("assignment_operator") or "="),
+        "source_site_id": str(ref.get("source_site_id") or ""),
+        "expression_ref": dict(ref.get("expression_ref") or {}),
+        "control_expression_refs": [
+            dict(value)
+            for value in (ref.get("control_expression_refs") or [])
+        ],
         "assignment_path": [
             {
                 "file": str(ref.get("file") or ""),

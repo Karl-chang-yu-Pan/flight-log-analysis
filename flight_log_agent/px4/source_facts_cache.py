@@ -49,10 +49,12 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceAssignmentRef,
     SourceCallableRef,
     SourceClassRef,
+    SourceExpressionRef,
     SourceIncludeRef,
     SourceMemberRef,
     TopicRef,
 )
+from flight_log_agent.analysis.source_expression import source_expression_names
 
 
 class SourceFileFacts(BaseModel):
@@ -399,6 +401,76 @@ def _extract_legacy_facts(
         files, expand_companions=False
     )
 
+    def expression_ref(text: Any) -> SourceExpressionRef:
+        normalized = profiler._normalize_source_expression(str(text or ""))
+        return SourceExpressionRef(
+            text=str(text or ""),
+            input_symbols=source_expression_names(normalized),
+            # The scanner does not prove that its textual rewrite retained
+            # every C++ value reference. Consumers must therefore preserve
+            # the legacy expression parser as the fallback for this backend.
+            exact=False,
+        )
+
+    source_assignments = [
+        item.model_copy(
+            update={
+                "expression_ref": expression_ref(item.expression),
+                "control_expression_refs": [
+                    expression_ref(predicate)
+                    for predicate in item.control_predicates
+                ],
+            }
+        )
+        for item in from_exact_file(
+            profiler.extract_source_assignments_from_source(files)
+        )
+    ]
+    function_calls = [
+        item.model_copy(
+            update={
+                "argument_expressions": [
+                    expression_ref(arg) for arg in item.args
+                ],
+                "control_expression_refs": [
+                    expression_ref(predicate)
+                    for predicate in item.control_predicates
+                ],
+            }
+        )
+        for item in from_exact_file(
+            profiler.extract_function_calls_from_source(files)
+        )
+    ]
+    helper_expressions = [
+        item.model_copy(
+            update={
+                "assignment_expression_refs": {
+                    target: expression_ref(value)
+                    for target, value in item.assignments.items()
+                },
+                "return_expression_ref": (
+                    expression_ref(
+                        item.return_expression
+                        or item.lowered_return_expression
+                        or ""
+                    )
+                    if item.return_expression or item.lowered_return_expression
+                    else None
+                ),
+            }
+        )
+        for item in from_exact_file(
+            profiler.extract_helper_expressions_from_source(files)
+        )
+    ]
+    branch_conditions = [
+        item.model_copy(update={"condition_ref": expression_ref(item.condition)})
+        for item in from_exact_file(
+            profiler.extract_branch_conditions_from_source(files)
+        )
+    ]
+
     return SourceFileFacts(
         file=file_path,
         source_hash=source_hash,
@@ -415,18 +487,10 @@ def _extract_legacy_facts(
         read_fields=from_exact_file(
             profiler.extract_read_fields_from_source(files)
         ),
-        source_assignments=from_exact_file(
-            profiler.extract_source_assignments_from_source(files)
-        ),
-        function_calls=from_exact_file(
-            profiler.extract_function_calls_from_source(files)
-        ),
-        helper_expressions=from_exact_file(
-            profiler.extract_helper_expressions_from_source(files)
-        ),
-        branch_conditions=from_exact_file(
-            profiler.extract_branch_conditions_from_source(files)
-        ),
+        source_assignments=source_assignments,
+        function_calls=function_calls,
+        helper_expressions=helper_expressions,
+        branch_conditions=branch_conditions,
         parameter_predicates=from_exact_file(
             profiler.extract_parameter_predicates_from_source(files)
         ),

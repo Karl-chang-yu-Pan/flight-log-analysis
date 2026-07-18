@@ -24,6 +24,11 @@ from flight_log_agent.px4.source_facts_cache import SourceFileFacts
 from flight_log_agent.symbols import exact_symbol
 
 
+@pytest.fixture(params=("legacy", "tree_sitter"), ids=("legacy", "tree-sitter"))
+def source_backend(request):
+    return request.param
+
+
 def _assignment(**overrides) -> SourceAssignmentRef:
     base = dict(
         target="_rtl_alt",
@@ -173,7 +178,7 @@ def test_load_facts_extracts_fresh_without_populating_layer1(tmp_path):
     assert not cache_root.exists()
 
 
-def test_facts_to_dag_end_to_end(tmp_path):
+def test_facts_to_dag_end_to_end(tmp_path, source_backend):
     """The full Stage 1 seam: profiler extraction → SourceFileFacts →
     dag_inputs_from_facts → build_mechanism_dag on a real (mini) source
     tree, asserting the DAG grounds the terminal in its operations,
@@ -203,7 +208,11 @@ class Rtl
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+    profiler = MechanismSourceProfiler(
+        tmp_path / "PX4-Autopilot",
+        rg_path="missing-rg",
+        source_parser_backend=source_backend,
+    )
     facts = load_facts(
         profiler,
         tmp_path / "cache",
@@ -245,7 +254,9 @@ class Rtl
         "orb_copy(ORB_ID(vehicle_status), _status_handle, &_status);",
     ],
 )
-def test_class_owned_copy_grounds_a_sibling_method(tmp_path, copy_statement):
+def test_class_owned_copy_grounds_a_sibling_method(
+    tmp_path, copy_statement, source_backend
+):
     profiler = _mini_tree(tmp_path, {
         "src/modules/example/reader.cpp": """
 class Reader {
@@ -265,7 +276,7 @@ void Reader::calculate()
     output = _status.nav_state + 1;
 }
 """.replace("COPY_STATEMENT", copy_statement),
-    })
+    }, backend=source_backend)
     facts = load_facts(
         profiler,
         tmp_path / "cache",
@@ -297,7 +308,9 @@ void Reader::calculate()
     assert "_status.nav_state" not in dag.unresolved_symbols
 
 
-def test_method_local_copy_does_not_ground_same_named_local_in_sibling_method(tmp_path):
+def test_method_local_copy_does_not_ground_same_named_local_in_sibling_method(
+    tmp_path, source_backend
+):
     profiler = _mini_tree(tmp_path, {
         "src/modules/example/reader.cpp": """
 class Reader {
@@ -318,7 +331,7 @@ void Reader::calculate()
     output = status.nav_state + 1;
 }
 """,
-    })
+    }, backend=source_backend)
     facts = load_facts(
         profiler,
         tmp_path / "cache",
@@ -814,6 +827,89 @@ void Base::fill(const mission_item_s &item, position_setpoint_s *sp)
         vertex.kind == "branch" and "item.valid" in (vertex.predicate_raw or "")
         for vertex in dag.vertices
     )
+
+
+def test_expression_dependencies_are_backend_interchangeable_in_dag(
+    tmp_path, source_backend
+):
+    source_file = "src/modules/example/dependencies.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+static constexpr float B = 2.0f;
+
+void Example::update()
+{
+    float var = B;
+    var *= max(static_cast<float>(B), vehicle_state.mut);
+    output = var;
+}
+""",
+        },
+        backend=source_backend,
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        [source_file],
+        "hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        logged_signals={"vehicle_state.mut"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+    )
+
+    var_operations = [
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.variable == "var"
+    ]
+    initial = next(
+        vertex
+        for vertex in var_operations
+        if (vertex.metadata or {}).get("assignment_operator") == "="
+    )
+    compound = next(
+        vertex
+        for vertex in var_operations
+        if (vertex.metadata or {}).get("assignment_operator") == "*="
+    )
+    assert any(
+        edge.source_id == initial.id
+        and edge.target_id == compound.id
+        and edge.kind == "data"
+        and edge.role == "var"
+        for edge in dag.edges
+    )
+    assert any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "vehicle_state.mut"
+        for vertex in dag.vertices
+    )
+    assert any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "constant"
+        and vertex.signal_name == "B"
+        and (vertex.metadata or {}).get("value") == 2.0
+        for vertex in dag.vertices
+    )
+    assert not {
+        "max",
+        "static_cast",
+        "float",
+        "B",
+        "var",
+        "vehicle_state.mut",
+    } & set(dag.unresolved_symbols)
 
 
 def test_tree_sitter_default_argument_expands_and_binds_in_dag(tmp_path):

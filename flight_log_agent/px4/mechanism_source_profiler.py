@@ -106,6 +106,20 @@ class FieldRef(BaseModel):
     assignment_operator: Optional[str] = None
 
 
+class SourceExpressionRef(BaseModel):
+    """Structured dependencies for one source expression.
+
+    ``text`` preserves the source spelling while ``input_symbols`` contains
+    only value references. C++ syntax names, cast target types, and callees are
+    not inputs. ``exact`` is true only when the syntax backend proved that the
+    list is complete.
+    """
+
+    text: str
+    input_symbols: List[str] = Field(default_factory=list)
+    exact: bool = False
+
+
 class FunctionCallRef(BaseModel):
     name: str
     file: str
@@ -131,6 +145,8 @@ class FunctionCallRef(BaseModel):
     function: Optional[str] = None
     callable_id: Optional[str] = None
     source_site_id: Optional[str] = None
+    argument_expressions: List[SourceExpressionRef] = Field(default_factory=list)
+    control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
 
 
 class SourceAssignmentRef(BaseModel):
@@ -163,6 +179,8 @@ class SourceAssignmentRef(BaseModel):
     # depending on the pre-baked ``symbol_bindings`` dict.
     struct_variables: Dict[str, str] = Field(default_factory=dict)
     source_site_id: Optional[str] = None
+    expression_ref: Optional[SourceExpressionRef] = None
+    control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
 
 
 class HelperExpressionRef(BaseModel):
@@ -180,7 +198,13 @@ class HelperExpressionRef(BaseModel):
     parameter_defaults: List[Optional[str]] = Field(default_factory=list)
     statements: List[Dict[str, Any]] = Field(default_factory=list)
     assignments: Dict[str, str] = Field(default_factory=dict)
+    assignment_operators: Dict[str, str] = Field(default_factory=dict)
+    assignment_expression_refs: Dict[str, SourceExpressionRef] = Field(
+        default_factory=dict
+    )
+    assignment_sites: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     return_expression: Optional[str] = None
+    return_expression_ref: Optional[SourceExpressionRef] = None
     lowered_return_expression: Optional[str] = None
     branches: List[Dict[str, Any]] = Field(default_factory=list)
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
@@ -214,6 +238,7 @@ class BranchConditionRef(BaseModel):
     line: int
     evidence: str
     source_site_id: Optional[str] = None
+    condition_ref: Optional[SourceExpressionRef] = None
 
 
 class ParameterPredicateRef(BaseModel):

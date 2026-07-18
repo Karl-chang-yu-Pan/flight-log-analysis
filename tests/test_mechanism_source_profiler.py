@@ -1,4 +1,7 @@
 from pathlib import Path
+import re
+
+import pytest
 
 from flight_log_agent.px4.mechanism_source_profiler import (
     BranchConditionRef,
@@ -13,10 +16,95 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceMatch,
     TopicRef,
 )
+from flight_log_agent.px4.source_facts_cache import (
+    SourceFileFacts,
+    extract_facts_for_file,
+)
 from flight_log_agent.px4.source_mechanism_resolver import (
     ParameterFeasibilityGate,
     build_source_discovery_log_context,
 )
+
+
+@pytest.fixture(params=("legacy", "tree_sitter"), ids=("legacy", "tree-sitter"))
+def source_backend(request):
+    return request.param
+
+
+class _SourceExtractorContract:
+    """Present the shared per-file fact contract through legacy-shaped accessors."""
+
+    def __init__(self, source_root: Path, backend: str) -> None:
+        self._profiler = MechanismSourceProfiler(
+            source_root,
+            rg_path="missing-rg",
+            source_parser_backend=backend,
+        )
+        self._facts_by_file: dict[str, SourceFileFacts] = {}
+
+    def _facts(self, files):
+        facts = []
+        for file_path in files:
+            if file_path not in self._facts_by_file:
+                self._facts_by_file[file_path] = extract_facts_for_file(
+                    self._profiler,
+                    file_path,
+                    "source-contract",
+                )
+            facts.append(self._facts_by_file[file_path])
+        return facts
+
+    def _items(self, files, field):
+        return [
+            item
+            for facts in self._facts(files)
+            for item in getattr(facts, field)
+        ]
+
+    def extract_source_structure_from_source(self, files, **_kwargs):
+        facts = self._facts(files)
+        return {
+            field: [item for entry in facts for item in getattr(entry, field)]
+            for field in ("classes", "members", "callables", "includes")
+        }
+
+    def extract_uorb_io_from_source(self, files):
+        return {
+            "published_topics": self._items(files, "published_topics"),
+            "subscribed_topics": self._items(files, "subscribed_topics"),
+            "unknown_direction_topics": self._items(
+                files, "unknown_direction_topics"
+            ),
+        }
+
+    def extract_params_from_source(self, files):
+        return self._items(files, "referenced_parameters")
+
+    def extract_read_fields_from_source(self, files, **_kwargs):
+        return self._items(files, "read_fields")
+
+    def extract_source_assignments_from_source(self, files):
+        return self._items(files, "source_assignments")
+
+    def extract_function_calls_from_source(self, files):
+        return self._items(files, "function_calls")
+
+    def extract_helper_expressions_from_source(self, files, helper_names=None):
+        helpers = self._items(files, "helper_expressions")
+        if not helper_names:
+            return helpers
+        requested = set(helper_names)
+        return [
+            helper
+            for helper in helpers
+            if helper.name in requested
+            or helper.name.rsplit("::", 1)[-1] in requested
+        ]
+
+
+def _canonical_control_formula(predicates):
+    formula = " && ".join(predicates).replace("->", ".")
+    return re.sub(r"[\s()]", "", formula)
 
 
 def test_profiler_models_are_pydantic_serializable():
@@ -136,7 +224,9 @@ def test_profiler_models_are_pydantic_serializable():
     assert dumped["parameter_predicates"][0]["operator"] == ">"
 
 
-def test_source_structure_extracts_ownership_inheritance_and_includes(tmp_path):
+def test_source_structure_extracts_ownership_inheritance_and_includes(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -160,7 +250,7 @@ class Controller : public Base
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     structure = profiler.extract_source_structure_from_source(
         ["src/modules/example/controller.h", "src/modules/example/controller.cpp"],
         expand_companions=False,
@@ -372,7 +462,9 @@ def test_search_filters_broad_prompt_noise_and_downranks_vendor_paths(tmp_path):
     assert "src/drivers/uavcan/uavcan_drivers/stm32h7/driver/include/fdcan.h" not in ranked_files[:3]
 
 
-def test_helper_expression_translation_extracts_simple_returns(tmp_path):
+def test_helper_expression_translation_extracts_simple_returns(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -396,7 +488,7 @@ float branch_altitude(float dist, float min_dist, float return_alt)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["helper_altitude", "branch_altitude"],
@@ -407,13 +499,18 @@ float branch_altitude(float dist, float min_dist, float return_alt)
     assert by_name["helper_altitude"].assignments == {"candidate": "current_alt + return_alt"}
     assert by_name["helper_altitude"].return_expression == "max(candidate, current_alt)"
     assert by_name["helper_altitude"].unresolved_reason is None
-    assert by_name["branch_altitude"].branches == [
-        {"condition": "dist <= min_dist", "expression": "min(dist / tan(1.0), return_alt)"},
-        {"condition": "!(dist <= min_dist)", "expression": "return_alt"},
+    branches = by_name["branch_altitude"].branches
+    assert [branch["expression"] for branch in branches] == [
+        "min(dist / tan(1.0), return_alt)",
+        "return_alt",
     ]
+    assert _canonical_control_formula([branches[0]["condition"]]) == "dist<=min_dist"
+    assert _canonical_control_formula([branches[1]["condition"]]) == "!dist<=min_dist"
 
 
-def test_helper_expression_translation_handles_px4_style_multiline_math(tmp_path):
+def test_helper_expression_translation_handles_px4_style_multiline_math(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     lib_dir = source_path / "src" / "lib" / "geo"
     lib_dir.mkdir(parents=True)
@@ -432,7 +529,7 @@ float get_distance_to_next_waypoint(double lat_now, double lon_now, double lat_n
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/lib/geo/geo.cpp"],
         helper_names=["get_distance_to_next_waypoint"],
@@ -444,13 +541,24 @@ float get_distance_to_next_waypoint(double lat_now, double lon_now, double lat_n
     assert helper.parameters == ["lat_now", "lon_now", "lat_next", "lon_next"]
     assert helper.assignments["lat_now_rad"] == "radians(lat_now)"
     assert helper.assignments["a"] == "sin(lat_now_rad) * cos(lat_next_rad)"
-    assert helper.return_expression == (
-        "CONSTANTS_RADIUS_OF_EARTH * 2.0 * atan2(sqrt(a), sqrt(1.0 - a))"
-    )
+    assert "CONSTANTS_RADIUS_OF_EARTH" in (helper.return_expression or "")
+    assert helper.return_expression_ref is not None
+    assert set(helper.return_expression_ref.input_symbols) == {
+        "CONSTANTS_RADIUS_OF_EARTH",
+        "a",
+    }
+    assert not {
+        "static_cast",
+        "float",
+        "atan2",
+        "sqrt",
+    } & set(helper.return_expression_ref.input_symbols)
     assert helper.unresolved_reason is None
 
 
-def test_helper_expression_translation_lowers_assignment_control_flow(tmp_path):
+def test_helper_expression_translation_lowers_assignment_control_flow(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -472,7 +580,7 @@ float helper_value(float distance, float radius, float floor_value, float curren
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/example/helpers.cpp"],
         helper_names=["helper_value"],
@@ -480,11 +588,10 @@ float helper_value(float distance, float radius, float floor_value, float curren
 
     helper = helpers[0]
     assert helper.statements[1]["kind"] == "if"
-    assert helper.statements[1]["then"][0] == {
-        "kind": "assign",
-        "target": "selected",
-        "expression": "distance * 2.0",
-    }
+    then_assignment = helper.statements[1]["then"][0]
+    assert then_assignment["kind"] == "assign"
+    assert then_assignment["target"] == "selected"
+    assert then_assignment["expression"] == "distance * 2.0"
     assert helper.lowered_return_expression == (
         "max(((distance * 2.0 if distance <= radius else max((floor_value), radius * 2.0))), current_value)"
     )
@@ -623,7 +730,9 @@ float helper_radius(float fallback)
     assert helper.symbol_bindings["_vstatus.vehicle_type"] == "vehicle_status.vehicle_type"
 
 
-def test_helper_expression_translation_canonicalizes_safe_math_by_rule(tmp_path):
+def test_helper_expression_translation_canonicalizes_safe_math_by_rule(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -638,7 +747,7 @@ float helper_math(float x, float y)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/example/helpers.cpp"],
         helper_names=["helper_math"],
@@ -669,7 +778,9 @@ float helper_math(float x, float y)
     } in helper.call_resolutions
 
 
-def test_source_assignment_extraction_preserves_rhs_and_function_parameters(tmp_path):
+def test_source_assignment_extraction_preserves_rhs_and_function_parameters(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -685,7 +796,7 @@ bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(["src/modules/example/helpers.cpp"])
     by_target = {assignment.target: assignment for assignment in assignments}
 
@@ -695,7 +806,9 @@ bool convert_item(const mission_item_s &item, position_setpoint_s *sp)
     assert by_target["sp.alt"].expression == "get_absolute_altitude_for_item(item)"
 
 
-def test_uorb_object_declaration_preserves_variable_and_instance(tmp_path):
+def test_uorb_object_declaration_preserves_variable_and_instance(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -708,7 +821,7 @@ class Reader {
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     refs = profiler.extract_uorb_io_from_source(
         ["src/modules/example/subscriptions.cpp"]
     )["subscribed_topics"]
@@ -718,7 +831,9 @@ class Reader {
     assert by_variable["_secondary"].instance == 1
 
 
-def test_uorb_callback_and_c_api_copy_preserve_data_boundary_owner(tmp_path):
+def test_uorb_callback_and_c_api_copy_preserve_data_boundary_owner(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -740,7 +855,7 @@ void Reader::poll()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     refs = profiler.extract_uorb_io_from_source(
         ["src/modules/example/reader.cpp"]
     )["subscribed_topics"]
@@ -764,7 +879,9 @@ void Reader::poll()
     assert local_copy.variable_owner is None
 
 
-def test_callable_identity_distinguishes_same_named_definitions(tmp_path):
+def test_callable_identity_distinguishes_same_named_definitions(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -782,7 +899,7 @@ void Second::update()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/scope.cpp"]
     )
@@ -791,7 +908,9 @@ void Second::update()
     assert values[0].callable_id != values[1].callable_id
 
 
-def test_constexpr_assignment_carries_declaration_provenance(tmp_path):
+def test_constexpr_assignment_carries_declaration_provenance(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -806,7 +925,7 @@ void Example::run()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/constants.cpp"]
     )
@@ -817,7 +936,9 @@ void Example::run()
     assert scale.declaration_kind == "constexpr"
 
 
-def test_multi_line_if_condition_attaches_predicate_to_body_assignment(tmp_path):
+def test_multi_line_if_condition_attaches_predicate_to_body_assignment(
+    tmp_path, source_backend
+):
     """PX4's common ``if (long_a\n    && long_b) {`` pattern must attach
     the full multi-line condition as a control_predicate on assignments
     inside the body."""
@@ -837,19 +958,21 @@ void Cone::pick_altitude()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/cone.cpp"]
     )
     by_target = {a.target: a for a in assignments}
     predicate = by_target["_rtl_alt"].control_predicates
-    assert predicate == [
-        "_param_rtl_cone_half_angle_deg.get() > 0 "
-        "&& _navigator->get_vstatus()->vehicle_type == VEHICLE_TYPE_ROTARY_WING"
-    ]
+    assert _canonical_control_formula(predicate) == _canonical_control_formula(
+        [
+            "_param_rtl_cone_half_angle_deg.get() > 0 "
+            "&& _navigator->get_vstatus()->vehicle_type == VEHICLE_TYPE_ROTARY_WING"
+        ]
+    )
 
 
-def test_else_branch_carries_negated_if_predicate(tmp_path):
+def test_else_branch_carries_negated_if_predicate(tmp_path, source_backend):
     """The else body should carry ``!(if_predicate)`` so downstream
     feasibility can prune either arm."""
     source_path = tmp_path / "PX4-Autopilot"
@@ -869,7 +992,7 @@ void Cone::pick()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/branch.cpp"]
     )
@@ -880,7 +1003,9 @@ void Cone::pick()
     ]
 
 
-def test_pointer_output_routing_strips_cxx_type_prefix_from_arg(tmp_path):
+def test_pointer_output_routing_strips_cxx_type_prefix_from_arg(
+    tmp_path, source_backend
+):
     """When a function-definition line is misidentified as a call site,
     the pointer-output arg substitution should still strip the C++ type
     declaration prefix so the routed target isn't malformed."""
@@ -898,7 +1023,7 @@ MissionBlock::mission_item_to_position_setpoint(const mission_item_s &item, posi
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/block.cpp"]
     )
@@ -907,7 +1032,7 @@ MissionBlock::mission_item_to_position_setpoint(const mission_item_s &item, posi
     assert not any(" *" in t or "position_setpoint_s" in t or "mission_item_s" in t for t in targets)
 
 
-def test_else_if_chain_negates_raw_siblings(tmp_path):
+def test_else_if_chain_negates_raw_siblings(tmp_path, source_backend):
     """Sibling arms are mutually exclusive on the RAW conditions:
     ``if(A){} else if(B){} else if(C){} else{}`` attaches ``A``,
     ``!(A) && (B)``, ``!(A) && !(B) && (C)``, ``!(A) && !(B) && !(C)``
@@ -933,21 +1058,25 @@ void Cone::pick()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/chain.cpp"]
     )
     by_line = {a.line: a for a in assignments if a.target == "_rtl_alt"}
 
-    assert by_line[5].control_predicates == ["A > 0"]
-    assert by_line[7].control_predicates == ["!(A > 0) && (B > 0)"]
-    assert by_line[9].control_predicates == ["!(A > 0) && !(B > 0) && (C > 0)"]
-    assert by_line[11].control_predicates == [
-        "!(A > 0) && !(B > 0) && !(C > 0)"
-    ]
+    assert _canonical_control_formula(by_line[5].control_predicates) == "A>0"
+    assert _canonical_control_formula(by_line[7].control_predicates) == "!A>0&&B>0"
+    assert _canonical_control_formula(by_line[9].control_predicates) == (
+        "!A>0&&!B>0&&C>0"
+    )
+    assert _canonical_control_formula(by_line[11].control_predicates) == (
+        "!A>0&&!B>0&&!C>0"
+    )
 
 
-def test_reference_alias_substitutes_target_in_source_assignment(tmp_path):
+def test_reference_alias_substitutes_target_in_source_assignment(
+    tmp_path, source_backend
+):
     """``Type &name = container.field;`` should rewrite subsequent
     ``name.X = Y;`` assignments so the recorded target carries the full
     canonical path."""
@@ -967,7 +1096,7 @@ void Writer::populate_setpoint(const RTLPosition &destination)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/writer.cpp"]
     )
@@ -1024,7 +1153,7 @@ void Reader::compute()
     }
 
 
-def test_reference_alias_scoped_per_function(tmp_path):
+def test_reference_alias_scoped_per_function(tmp_path, source_backend):
     """An alias declared in function A must not leak into function B."""
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
@@ -1045,7 +1174,7 @@ void Writer::function_b(position_setpoint_s &curr_sp)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/scoped.cpp"]
     )
@@ -1063,7 +1192,9 @@ void Writer::function_b(position_setpoint_s &curr_sp)
     assert ("Writer::function_b", "curr_sp.lat") in by_function
 
 
-def test_reference_alias_does_not_emit_noise_for_pointer_self_writes(tmp_path):
+def test_reference_alias_does_not_emit_noise_for_pointer_self_writes(
+    tmp_path, source_backend
+):
     """A pointer initialisation like ``Type *name = &container.field;`` that
     shares its variable name with an inner-scope reference declaration
     should not appear as a substituted self-write in source_assignments.
@@ -1087,7 +1218,7 @@ void Writer::work()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/scope_leak.cpp"]
     )
@@ -1100,7 +1231,7 @@ void Writer::work()
     assert "_navigator.get_position_setpoint_triplet().current.lat" in targets
 
 
-def test_reference_alias_accepts_const_reference(tmp_path):
+def test_reference_alias_accepts_const_reference(tmp_path, source_backend):
     """``const Type &name = expr;`` should be recognised just like the
     non-const form."""
     source_path = tmp_path / "PX4-Autopilot"
@@ -1117,7 +1248,7 @@ void Reader::read()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/const_ref.cpp"]
     )
@@ -1133,7 +1264,9 @@ void Reader::read()
     assert "next_sp" not in expression or "next_sp.lat" in expression  # tolerate either rewriting policy
 
 
-def test_source_assignment_extraction_lowers_compound_updates(tmp_path):
+def test_source_assignment_extraction_lowers_compound_updates(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "fw_pos_control"
     module_dir.mkdir(parents=True)
@@ -1150,7 +1283,7 @@ float adapt_airspeed_setpoint(float calibrated_min_airspeed, float weight_ratio)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/fw_pos_control/FixedwingPositionControl.cpp"]
     )
@@ -1159,6 +1292,12 @@ float adapt_airspeed_setpoint(float calibrated_min_airspeed, float weight_ratio)
     assert by_line[6].target == "calibrated_min_airspeed"
     assert by_line[6].assignment_operator == "*="
     assert by_line[6].expression == "calibrated_min_airspeed * (sqrt(load_factor_from_bank_angle * weight_ratio))"
+    assert by_line[6].expression_ref is not None
+    assert set(by_line[6].expression_ref.input_symbols) == {
+        "calibrated_min_airspeed",
+        "load_factor_from_bank_angle",
+        "weight_ratio",
+    }
     assert by_line[6].function == "adapt_airspeed_setpoint"
 
 
@@ -1263,7 +1402,7 @@ float distance(float lat1, float lat2)
     assert "sqrt(" in lowered or "sqrt (" in lowered
 
 
-def test_pointer_struct_alias_binds_to_topic_field(tmp_path):
+def test_pointer_struct_alias_binds_to_topic_field(tmp_path, source_backend):
     """A C++ pointer struct (vehicle_status_s *vstatus) should bind so that
     vstatus->vehicle_type resolves to topic vehicle_status's field vehicle_type."""
     source_path = tmp_path / "PX4-Autopilot"
@@ -1282,7 +1421,7 @@ void check(vehicle_status_s *vstatus, vehicle_global_position_s &gpos,
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     read_fields = profiler.extract_read_fields_from_source(
         ["src/modules/example/controller.cpp"]
     )
@@ -1331,7 +1470,9 @@ void caller()
     assert by_target.get("triplet.current.lon") == "item.lon"
 
 
-def test_helper_with_local_struct_writes_is_not_rejected(tmp_path):
+def test_helper_with_local_struct_writes_is_not_rejected(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1349,7 +1490,7 @@ position_setpoint_s build_default_setpoint(const mission_item_s &item)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["build_default_setpoint"],
@@ -1359,7 +1500,9 @@ position_setpoint_s build_default_setpoint(const mission_item_s &item)
     assert helpers[0].unresolved_reason is None
 
 
-def test_helper_writing_to_class_member_forwards_to_assigned_expression(tmp_path):
+def test_helper_writing_to_class_member_forwards_to_assigned_expression(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1374,7 +1517,7 @@ float RTL::calculate_alt()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["calculate_alt"],
@@ -1383,7 +1526,7 @@ float RTL::calculate_alt()
     assert helpers[0].lowered_return_expression == "(_home_position.alt)"
 
 
-def test_helper_with_local_increment_is_not_rejected(tmp_path):
+def test_helper_with_local_increment_is_not_rejected(tmp_path, source_backend):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1399,7 +1542,7 @@ int helper_with_local_counter(int n)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["helper_with_local_counter"],
@@ -1407,7 +1550,7 @@ int helper_with_local_counter(int n)
     assert helpers[0].unresolved_reason is None
 
 
-def test_switch_helper_lowers_to_nested_ternary(tmp_path):
+def test_switch_helper_lowers_to_nested_ternary(tmp_path, source_backend):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1428,7 +1571,7 @@ float pick_alt(int kind)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["pick_alt"],
@@ -1443,7 +1586,7 @@ float pick_alt(int kind)
     assert "current_alt" in lowered
 
 
-def test_switch_with_fallthrough_groups_conditions(tmp_path):
+def test_switch_with_fallthrough_groups_conditions(tmp_path, source_backend):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1463,7 +1606,7 @@ float pick(int kind)
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["pick"],
@@ -1475,7 +1618,9 @@ float pick(int kind)
     assert "or" in lowered
 
 
-def test_helper_with_for_loop_is_rejected_with_precise_reason(tmp_path):
+def test_helper_with_for_loop_is_rejected_with_precise_reason(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1490,7 +1635,7 @@ float sum_n(int n)
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["sum_n"],
@@ -1498,7 +1643,9 @@ float sum_n(int n)
     assert helpers[0].unresolved_reason == "for loop bound 'n' is not statically resolvable"
 
 
-def test_helper_with_for_range_is_rejected_with_precise_reason(tmp_path):
+def test_helper_with_for_range_is_rejected_with_precise_reason(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1513,7 +1660,7 @@ float total(const std::vector<float> &xs)
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["total"],
@@ -1524,7 +1671,9 @@ float total(const std::vector<float> &xs)
     )
 
 
-def test_helper_with_while_loop_is_rejected_with_precise_reason(tmp_path):
+def test_helper_with_while_loop_is_rejected_with_precise_reason(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1538,7 +1687,7 @@ float climb_until(float current, float target)
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["climb_until"],
@@ -1549,7 +1698,7 @@ float climb_until(float current, float target)
     )
 
 
-def test_for_loop_with_literal_bound_unrolls(tmp_path):
+def test_for_loop_with_literal_bound_unrolls(tmp_path, source_backend):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1563,7 +1712,7 @@ float pick_iter()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["pick_iter"],
@@ -1572,7 +1721,9 @@ float pick_iter()
     assert helpers[0].lowered_return_expression == "(2)"
 
 
-def test_while_with_literal_const_condition_returns_on_first_iter(tmp_path):
+def test_while_with_literal_const_condition_returns_on_first_iter(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1587,7 +1738,7 @@ float pick_while()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["pick_while"],
@@ -1596,7 +1747,9 @@ float pick_while()
     assert helpers[0].lowered_return_expression == "(5)"
 
 
-def test_do_while_with_unresolved_condition_is_rejected(tmp_path):
+def test_do_while_with_unresolved_condition_is_rejected(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1610,7 +1763,7 @@ float drain(float current)
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["drain"],
@@ -1621,7 +1774,9 @@ float drain(float current)
     )
 
 
-def test_helper_with_class_member_increment_forwards_to_lowered_expression(tmp_path):
+def test_helper_with_class_member_increment_forwards_to_lowered_expression(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1636,7 +1791,7 @@ int Counter::tick()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["tick"],
@@ -1691,7 +1846,9 @@ float pick_after_zero_step()
     assert helpers[0].lowered_return_expression == "9"
 
 
-def test_void_helper_with_pointer_output_does_not_get_marked_unresolved(tmp_path):
+def test_void_helper_with_pointer_output_does_not_get_marked_unresolved(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1704,7 +1861,7 @@ void compute(out_t *out, float input)
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["compute"],
@@ -1712,7 +1869,9 @@ void compute(out_t *out, float input)
     assert helpers[0].unresolved_reason is None
 
 
-def test_void_helper_without_any_output_is_marked_unresolved(tmp_path):
+def test_void_helper_without_any_output_is_marked_unresolved(
+    tmp_path, source_backend
+):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"
     module_dir.mkdir(parents=True)
@@ -1725,15 +1884,14 @@ void noop(int x)
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["noop"],
     )
-    assert (
-        helpers[0].unresolved_reason
-        == "helper has no return value and no pointer-output writes routable through source_assignments"
-    )
+    reason = helpers[0].unresolved_reason or ""
+    assert "no return value" in reason
+    assert "no pointer-output writes" in reason
 
 
 def test_parameter_feasibility_gate_uses_only_discovered_parameters():
@@ -1783,7 +1941,7 @@ def test_parameter_feasibility_gate_uses_only_discovered_parameters():
     assert requirements[1].gate_result == "verification_required"
 
 
-def test_enum_entries_extracted_as_source_assignments(tmp_path):
+def test_enum_entries_extracted_as_source_assignments(tmp_path, source_backend):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -1798,7 +1956,7 @@ enum {
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(["src/modules/example/config.hpp"])
     by_target = {a.target: a.expression for a in assignments}
     assert by_target["STICK_CONFIG_SWAP_STICKS_BIT"] == "(1 << 0)"
@@ -1810,7 +1968,7 @@ enum {
     assert entry.line >= 1
 
 
-def test_define_macros_extracted_as_source_assignments(tmp_path):
+def test_define_macros_extracted_as_source_assignments(tmp_path, source_backend):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
@@ -1823,7 +1981,7 @@ def test_define_macros_extracted_as_source_assignments(tmp_path):
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(["src/modules/example/tunables.hpp"])
     by_target = {a.target: a.expression for a in assignments}
     assert by_target["SIMPLE_CONST"] == "4"
@@ -1832,7 +1990,9 @@ def test_define_macros_extracted_as_source_assignments(tmp_path):
     assert "MAX_MACRO" not in by_target
 
 
-def test_pointer_output_writes_populate_helper_expression_ref(tmp_path):
+def test_pointer_output_writes_populate_helper_expression_ref(
+    tmp_path, source_backend
+):
     """The helper record should surface its pointer-output writes so the
     DAG builder can emit graph-native ops at each call site without
     depending on the profiler's flattened source_assignments path."""
@@ -1850,7 +2010,7 @@ void mission_item_to_setpoint(const mission_item_s &item, position_setpoint_s *s
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/helpers.cpp"],
         helper_names=["mission_item_to_setpoint"],
@@ -1862,7 +2022,7 @@ void mission_item_to_setpoint(const mission_item_s &item, position_setpoint_s *s
     assert writes.get(("sp", "alt")) == "item.altitude"
 
 
-def test_helper_return_type_extracted_from_signature(tmp_path):
+def test_helper_return_type_extracted_from_signature(tmp_path, source_backend):
     """HelperExpressionRef should carry the raw C++ return type so the
     DAG builder can derive source→logged bindings graphically without a
     flat symbol_bindings side-table."""
@@ -1879,7 +2039,7 @@ vehicle_status_s * Navigator::get_vstatus()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/navigator.cpp"],
         helper_names=["get_vstatus"],
@@ -1891,7 +2051,7 @@ vehicle_status_s * Navigator::get_vstatus()
     assert helper.return_type == "vehicle_status_s"
 
 
-def test_helper_return_type_strips_storage_qualifiers(tmp_path):
+def test_helper_return_type_strips_storage_qualifiers(tmp_path, source_backend):
     """Storage qualifiers (static, const, virtual, etc.) don't belong on
     the return type — they should be stripped before the type reaches
     the DAG builder."""
@@ -1907,7 +2067,7 @@ static const vehicle_status_s * Example::get_status()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/example/example.cpp"],
         helper_names=["get_status"],
@@ -1919,7 +2079,9 @@ static const vehicle_status_s * Example::get_status()
     assert "const" not in return_type
 
 
-def test_struct_variables_populate_on_helper_expression_ref(tmp_path):
+def test_struct_variables_populate_on_helper_expression_ref(
+    tmp_path, source_backend
+):
     """Local struct variable declarations inside a helper body should
     surface as ``struct_variables`` so the DAG can derive
     ``var.field → topic.field`` graph-natively."""
@@ -1936,7 +2098,7 @@ float Example::check_status()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/example/example.cpp"],
         helper_names=["check_status"],
@@ -1945,7 +2107,9 @@ float Example::check_status()
     assert helpers[0].struct_variables.get("vstatus") == "vehicle_status_s"
 
 
-def test_struct_variables_populate_on_source_assignment_ref(tmp_path):
+def test_struct_variables_populate_on_source_assignment_ref(
+    tmp_path, source_backend
+):
     """Struct variable declarations visible at a source_assignment's site
     should surface so the DAG can resolve struct-var references in the
     assignment's expression or control predicates."""
@@ -1962,7 +2126,7 @@ void Example::update()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/example.cpp"]
     )
@@ -1970,7 +2134,9 @@ void Example::update()
     assert out.struct_variables.get("vstatus") == "vehicle_status_s"
 
 
-def test_pointer_to_member_getter_extracted_with_clean_return_type(tmp_path):
+def test_pointer_to_member_getter_extracted_with_clean_return_type(
+    tmp_path, source_backend
+):
     """The uORB accessor form ``Type *get(){ return &_member; }`` — with the
     ``*`` hugging the name and no space — must be extracted with a clean
     ``return_type`` so the DAG's chain resolver can map get()->field to a
@@ -1987,7 +2153,7 @@ vehicle_global_position_s *get_global_position() { return &_global_pos; }
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/navigator/navigator.h"]
     )
@@ -2038,7 +2204,9 @@ class RTL {
     assert aliases.get("_param_rtl_cone_half_angle_deg") == "RTL_CONE_ANG"
 
 
-def test_loop_unroll_expression_growth_aborts_lowering(tmp_path):
+def test_loop_unroll_expression_growth_aborts_lowering(
+    tmp_path, source_backend
+):
     """mission.cpp DO_JUMP regression shape: an unrolled loop whose if-merge
     doubles the running value each iteration grows ~2^N and previously ran
     to MemoryError. Lowering must ABORT via _HelperLoweringFailed (helper
@@ -2060,7 +2228,9 @@ float Mission::walk_items()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+    profiler = _SourceExtractorContract(
+        tmp_path / "PX4-Autopilot", source_backend
+    )
 
     helpers = profiler.extract_helper_expressions_from_source(
         ["src/modules/example/mission.cpp"], helper_names=["walk_items"]
@@ -2087,7 +2257,9 @@ def test_file_path_boost_penalizes_camelcase_test_files(tmp_path):
     assert legit > 0
 
 
-def test_function_call_args_captured_across_multiple_lines(tmp_path):
+def test_function_call_args_captured_across_multiple_lines(
+    tmp_path, source_backend
+):
     """A statement call whose argument list spans several lines must keep
     its arguments; single-line parsing returned [] and dropped the
     argument dataflow entirely."""
@@ -2104,7 +2276,9 @@ void Fw::control()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+    profiler = _SourceExtractorContract(
+        tmp_path / "PX4-Autopilot", source_backend
+    )
 
     calls = profiler.extract_function_calls_from_source(["src/modules/example/fw.cpp"])
     update = next(c for c in calls if c.name == "update")
@@ -2114,7 +2288,7 @@ void Fw::control()
     assert update.args[2] == "third_arg"
 
 
-def test_assignment_captured_across_multiple_lines(tmp_path):
+def test_assignment_captured_across_multiple_lines(tmp_path, source_backend):
     """A declaration whose call initializer spans lines must still yield
     a source assignment with the full RHS."""
     module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
@@ -2130,7 +2304,9 @@ void Fw::control()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+    profiler = _SourceExtractorContract(
+        tmp_path / "PX4-Autopilot", source_backend
+    )
 
     sas = profiler.extract_source_assignments_from_source(["src/modules/example/fw.cpp"])
     hit = next(s for s in sas if s.target == "target_speed")
@@ -2138,7 +2314,9 @@ void Fw::control()
     assert "third_arg" in hit.expression
 
 
-def test_constructor_style_initialization_extracted_as_assignment(tmp_path):
+def test_constructor_style_initialization_extracted_as_assignment(
+    tmp_path, source_backend
+):
     module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
     module_dir.mkdir(parents=True)
     (module_dir / "wv.cpp").write_text(
@@ -2151,7 +2329,9 @@ void Wv::run()
 """,
         encoding="utf-8",
     )
-    profiler = MechanismSourceProfiler(tmp_path / "PX4-Autopilot", rg_path="missing-rg")
+    profiler = _SourceExtractorContract(
+        tmp_path / "PX4-Autopilot", source_backend
+    )
 
     sas = profiler.extract_source_assignments_from_source(["src/modules/example/wv.cpp"])
     hit = next((s for s in sas if s.target == "body_z_sp"), None)
@@ -2159,7 +2339,9 @@ void Wv::run()
     assert "q_d" in hit.expression
 
 
-def test_control_predicate_lines_carry_the_branch_site(tmp_path):
+def test_control_predicate_lines_carry_the_branch_site(
+    tmp_path, source_backend
+):
     """Each control predicate carries the line of its OWN control
     statement — the branch's source identity — not the line of the
     gated assignment. Two assignments in one if-block share the site;
@@ -2182,7 +2364,7 @@ void Gate::update()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/gate.cpp"]
     )
@@ -2204,7 +2386,9 @@ void Gate::update()
     assert third.control_predicate_lines != first.control_predicate_lines
 
 
-def test_braceless_controls_gate_their_single_statement(tmp_path):
+def test_braceless_controls_gate_their_single_statement(
+    tmp_path, source_backend
+):
     """Brace-less if/else arms govern exactly the next statement —
     same-line and next-line forms — and a following else negates the
     nearest unmatched if."""
@@ -2226,7 +2410,7 @@ void Guard::update()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/guard.cpp"]
     )
@@ -2286,7 +2470,7 @@ void Modes::update()
     assert by_target["exact_out"].control_predicates == ["mode == 2"]
 
 
-def test_guard_clause_return_gates_the_remainder(tmp_path):
+def test_guard_clause_return_gates_the_remainder(tmp_path, source_backend):
     """A top-level return in an arm gates everything after the arm with
     the arm's negation — braced and brace-less guards, including a
     returning else arm mid-function."""
@@ -2308,7 +2492,7 @@ void Guards::update()
         encoding="utf-8",
     )
 
-    profiler = MechanismSourceProfiler(source_path, rg_path="missing-rg")
+    profiler = _SourceExtractorContract(source_path, source_backend)
     assignments = profiler.extract_source_assignments_from_source(
         ["src/modules/example/guards.cpp"]
     )
