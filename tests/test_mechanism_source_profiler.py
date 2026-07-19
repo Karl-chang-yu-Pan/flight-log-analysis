@@ -1949,8 +1949,9 @@ def test_enum_entries_extracted_as_source_assignments(tmp_path, source_backend):
         """
 enum {
     STICK_CONFIG_SWAP_STICKS_BIT = (1 << 0),
-    STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT = (1 << 1),
-    STICK_CONFIG_THIRD_BIT = (1 << 2),
+    STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT,
+    STICK_CONFIG_THIRD_BIT = 7,
+    STICK_CONFIG_FOURTH_BIT,
 };
 """,
         encoding="utf-8",
@@ -1960,8 +1961,11 @@ enum {
     assignments = profiler.extract_source_assignments_from_source(["src/modules/example/config.hpp"])
     by_target = {a.target: a.expression for a in assignments}
     assert by_target["STICK_CONFIG_SWAP_STICKS_BIT"] == "(1 << 0)"
-    assert by_target["STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT"] == "(1 << 1)"
-    assert by_target["STICK_CONFIG_THIRD_BIT"] == "(1 << 2)"
+    assert by_target["STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT"] == (
+        "STICK_CONFIG_SWAP_STICKS_BIT + 1"
+    )
+    assert by_target["STICK_CONFIG_THIRD_BIT"] == "7"
+    assert by_target["STICK_CONFIG_FOURTH_BIT"] == "STICK_CONFIG_THIRD_BIT + 1"
     # File and per-entry line preserved.
     entry = next(a for a in assignments if a.target == "STICK_CONFIG_ENABLE_AIRSPEED_SP_MANUAL_BIT")
     assert entry.file.endswith("config.hpp")

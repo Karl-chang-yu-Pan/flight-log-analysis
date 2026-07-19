@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
+import flight_log_agent.analysis.dag_value as dag_value_module
+from flight_log_agent.analysis.dag_value import DAGValueProgram, DAGValueSession
 from flight_log_agent.analysis.mechanism_dag import (
+    DAGEdge,
+    DAGVertex,
+    MechanismDAG,
     build_mechanism_dag,
     evaluate_feasibility,
     layer2_cache_path,
@@ -3562,3 +3569,317 @@ def test_missing_signal_policy_keeps_dynamic_verdict_unknown():
     assert branch.active_windows == [(0.0, 10.0)]
     assert branch.feasibility_verdict == "unknown"
     assert branch.metadata["sampling_policies"] == {"value": "unknown"}
+
+
+def _shared_value_program_dag() -> MechanismDAG:
+    vertices = [
+        DAGVertex(
+            id="signal",
+            kind="evidence",
+            sub_kind="logged_signal",
+            signal_name="sensor.value",
+        ),
+        DAGVertex(
+            id="enabled",
+            kind="evidence",
+            sub_kind="constant",
+            signal_name="ENABLED",
+            metadata={"value": True},
+        ),
+        DAGVertex(
+            id="gate",
+            kind="branch",
+            predicate_raw="ENABLED",
+            feasibility_verdict="unknown",
+        ),
+        DAGVertex(
+            id="shared",
+            kind="operation",
+            variable="shared",
+            expression="sensor.value + 1",
+            file="value.cpp",
+            line=2,
+            metadata={"target_scope": {"file": "value.cpp", "callable": "run"}},
+        ),
+        DAGVertex(
+            id="positive",
+            kind="branch",
+            predicate_raw="shared > 0",
+            feasibility_verdict="unknown",
+        ),
+        DAGVertex(
+            id="bounded",
+            kind="branch",
+            predicate_raw="shared < 10",
+            feasibility_verdict="unknown",
+        ),
+    ]
+    edges = [
+        DAGEdge(
+            id="enabled-gate", source_id="enabled", target_id="gate",
+            kind="data", role="ENABLED",
+        ),
+        DAGEdge(
+            id="gate-shared", source_id="gate", target_id="shared",
+            kind="control",
+        ),
+        DAGEdge(
+            id="signal-shared", source_id="signal", target_id="shared",
+            kind="data", role="sensor.value",
+        ),
+        DAGEdge(
+            id="shared-positive", source_id="shared", target_id="positive",
+            kind="data", role="shared",
+        ),
+        DAGEdge(
+            id="shared-bounded", source_id="shared", target_id="bounded",
+            kind="data", role="shared",
+        ),
+    ]
+    return MechanismDAG(
+        dag_id="shared-program",
+        terminal="shared",
+        vertices=vertices,
+        edges=edges,
+    )
+
+
+def test_dag_value_program_compiles_each_expression_once(monkeypatch):
+    compile_calls = []
+    original = dag_value_module.compile_source_expression
+
+    def counted_compile(expression, operand_names):
+        compile_calls.append(expression)
+        return original(expression, operand_names)
+
+    monkeypatch.setattr(
+        dag_value_module, "compile_source_expression", counted_compile
+    )
+    program = DAGValueProgram(_shared_value_program_dag())
+    session = program.bind(sample_resolver=lambda _signal, _timestamp: 2.0)
+    session.evaluate_many(("positive", "bounded"), 0.0)
+    session.evaluate_many(("positive", "bounded"), 1.0)
+
+    assert len(compile_calls) == 4
+
+
+def test_dag_value_session_normalizes_parameters_once():
+    class CountingParameters(dict):
+        calls = 0
+
+        def items(self):
+            self.calls += 1
+            return super().items()
+
+    dag = build_mechanism_dag(
+        [
+            _fake_binding(
+                binding_id="parameter-gate",
+                target="out",
+                expression="1",
+                file="parameter.cpp",
+                line=2,
+                control_predicates=["_param_limit.get() > 0"],
+            )
+        ],
+        "out",
+    )
+    branch = next(vertex for vertex in dag.vertices if vertex.kind == "branch")
+    parameters = CountingParameters({"LIMIT": 2})
+    session = DAGValueProgram(dag).bind(parameter_values=parameters)
+
+    assert session.evaluate(branch.id, None).value is True
+    assert session.evaluate(branch.id, None).value is True
+    assert parameters.calls == 1
+
+
+def test_dag_value_session_shares_vertex_activity_and_sample_results(monkeypatch):
+    expression_calls = []
+    activity_calls = []
+    sample_calls = []
+    original_expression = DAGValueSession._evaluate_expression_vertex
+    original_activity = DAGValueSession._operation_activity
+
+    def counted_expression(self, vertex, timestamp, active):
+        expression_calls.append((vertex.id, timestamp))
+        return original_expression(self, vertex, timestamp, active)
+
+    def counted_activity(self, vertex_id, timestamp, active):
+        activity_calls.append((vertex_id, timestamp))
+        return original_activity(self, vertex_id, timestamp, active)
+
+    monkeypatch.setattr(
+        DAGValueSession, "_evaluate_expression_vertex", counted_expression
+    )
+    monkeypatch.setattr(DAGValueSession, "_operation_activity", counted_activity)
+    program = DAGValueProgram(_shared_value_program_dag())
+    session = program.bind(
+        sample_resolver=lambda signal, timestamp: (
+            sample_calls.append((signal, timestamp)) or 2.0
+        )
+    )
+
+    results = session.evaluate_many(("positive", "bounded"), 4.0)
+
+    assert all(result.status == "value" for result in results.values())
+    assert max(expression_calls.count(item) for item in set(expression_calls)) == 1
+    assert activity_calls.count(("shared", 4.0)) == 1
+    assert sample_calls == [("sensor.value", 4.0)]
+
+
+def test_feasibility_rejects_a_session_from_another_program():
+    dag = _shared_value_program_dag()
+    program = DAGValueProgram(dag)
+    other_program = DAGValueProgram(dag)
+
+    with pytest.raises(
+        ValueError, match="value_session must be bound to value_program"
+    ):
+        evaluate_feasibility(
+            dag,
+            value_program=program,
+            value_session=other_program.bind(),
+        )
+
+
+def test_dag_value_program_preserves_call_result_operand_identity():
+    dag = MechanismDAG(
+        dag_id="call-result",
+        terminal="output",
+        vertices=[
+            DAGVertex(
+                id="value", kind="evidence", sub_kind="constant",
+                signal_name="reader result", metadata={"value": 4.0},
+            ),
+            DAGVertex(
+                id="output", kind="operation", variable="output",
+                expression="reader().value + 1",
+                metadata={
+                    "source_call_roles": {
+                        "call-site": {
+                            "call": "reader()",
+                            "result": "reader().value",
+                        }
+                    }
+                },
+            ),
+        ],
+        edges=[
+            DAGEdge(
+                id="call-edge", source_id="value", target_id="output",
+                kind="data", role="call-result:value", via="call-site",
+            )
+        ],
+    )
+
+    result = DAGValueProgram(dag).bind().evaluate("output", None)
+
+    assert result.status == "value"
+    assert result.value == 5.0
+
+
+def test_implicit_enum_chain_is_available_to_static_feasibility():
+    bindings = [
+        _fake_binding(
+            binding_id="enum-a", target="MODE_A", expression="0",
+            file="mode.h", line=1, logged_signal="", declaration_kind="enum",
+        ),
+        _fake_binding(
+            binding_id="enum-b", target="MODE_B", expression="MODE_A + 1",
+            file="mode.h", line=2, logged_signal="", declaration_kind="enum",
+        ),
+        _fake_binding(
+            binding_id="enum-c", target="MODE_C", expression="MODE_B + 1",
+            file="mode.h", line=3, logged_signal="", declaration_kind="enum",
+        ),
+        _fake_binding(
+            binding_id="terminal", target="out", expression="1",
+            file="mode.cpp", line=4, control_predicates=["mode == MODE_C"],
+        ),
+    ]
+    dag = build_mechanism_dag(bindings, "out")
+
+    annotated = evaluate_feasibility(
+        dag, enum_values={"mode": 2}, prune_dead=False
+    )
+
+    branch = next(vertex for vertex in annotated.vertices if vertex.kind == "branch")
+    assert branch.feasibility_verdict == "always_true"
+
+
+def test_static_short_circuit_does_not_request_dynamic_operand():
+    dag = MechanismDAG(
+        dag_id="short-circuit",
+        terminal="gate",
+        vertices=[
+            DAGVertex(
+                id="disabled", kind="evidence", sub_kind="constant",
+                signal_name="DISABLED", metadata={"value": False},
+            ),
+            DAGVertex(
+                id="signal", kind="evidence", sub_kind="logged_signal",
+                signal_name="sensor.value",
+            ),
+            DAGVertex(
+                id="gate", kind="branch",
+                predicate_raw="DISABLED && sensor.value > 0",
+                feasibility_verdict="unknown",
+            ),
+        ],
+        edges=[
+            DAGEdge(
+                id="disabled-edge", source_id="disabled", target_id="gate",
+                kind="data", role="DISABLED",
+            ),
+            DAGEdge(
+                id="signal-edge", source_id="signal", target_id="gate",
+                kind="data", role="sensor.value",
+            ),
+        ],
+    )
+    sample_calls = []
+    session = DAGValueProgram(dag).bind(
+        sample_resolver=lambda signal, timestamp: sample_calls.append(
+            (signal, timestamp)
+        )
+    )
+
+    result = session.evaluate("gate", None)
+
+    assert result.status == "value"
+    assert result.value is False
+    assert sample_calls == []
+
+
+def test_static_unevaluable_branch_schedules_no_timestamps(monkeypatch):
+    dag = build_mechanism_dag(
+        [
+            _fake_binding(
+                binding_id="unsupported-gate",
+                target="out",
+                expression="1",
+                file="static.cpp",
+                line=2,
+                control_predicates=["unknown_value > 0"],
+            )
+        ],
+        "out",
+    )
+    timestamps = []
+    original = DAGValueSession.evaluate_many
+
+    def counted(self, vertex_ids, timestamp):
+        timestamps.append(timestamp)
+        return original(self, vertex_ids, timestamp)
+
+    monkeypatch.setattr(DAGValueSession, "evaluate_many", counted)
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples={"unrelated": [(0.0, 1), (1.0, 2)]},
+        signal_policies={"unrelated": {"method": "linear"}},
+        prune_dead=False,
+    )
+
+    branch = next(vertex for vertex in annotated.vertices if vertex.kind == "branch")
+    assert branch.feasibility_verdict == "unknown"
+    assert timestamps == [None]

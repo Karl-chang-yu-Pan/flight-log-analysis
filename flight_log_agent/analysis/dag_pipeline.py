@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
+from flight_log_agent.analysis.dag_value import DAGValueProgram
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.mechanism_dag import (
     DAGValueSeries,
@@ -619,6 +620,15 @@ def replay_terminal_expressions(
     tolerance = _replay_tolerance(observed_samples, observed_policy)
     observed_span = (observed_samples[0][0], observed_samples[-1][0])
     span_duration = observed_span[1] - observed_span[0]
+    value_program = DAGValueProgram(annotated)
+
+    def resolve_sample(signal: str, timestamp: float) -> Optional[Any]:
+        return sample_prepared_signal(prepared_series, signal, timestamp)
+
+    value_session = value_program.bind(
+        parameter_values=parameter_values,
+        sample_resolver=resolve_sample,
+    )
 
     vertices = {vertex.id: vertex for vertex in annotated.vertices}
     controls_by_op: dict[str, list[str]] = {}
@@ -680,6 +690,8 @@ def replay_terminal_expressions(
             prepared_signal_series=prepared_series,
             timestamps=(timestamp for timestamp, _value in observed_samples),
             evaluation_windows=domain,
+            value_program=value_program,
+            value_session=value_session,
         )
         comparison_samples: list[tuple[float, bool]] = []
         comparison_complete = reconstructed.complete
@@ -1073,6 +1085,7 @@ async def run_dag_discovery_stage(
             dict[str, PreparedSignalSeries],
         ],
     ] = {}
+    value_programs: dict[int, DAGValueProgram] = {}
 
     def annotate(result: DiscoveryResult) -> Optional[MechanismDAG]:
         if result.dag is None:
@@ -1084,12 +1097,17 @@ async def run_dag_discovery_stage(
             signal_data[id(result)] = (samples, prepared_series)
         else:
             samples, prepared_series = prepared_data
+        program = value_programs.get(id(result))
+        if program is None:
+            program = DAGValueProgram(result.dag)
+            value_programs[id(result)] = program
         return evaluate_feasibility(
             result.dag,
             parameter_values=parameter_values,
             signal_samples=samples,
             signal_policies=signal_policies,
             prepared_signal_series=prepared_series,
+            value_program=program,
         )
 
     logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}

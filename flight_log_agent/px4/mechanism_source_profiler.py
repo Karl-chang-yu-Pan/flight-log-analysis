@@ -676,10 +676,6 @@ class MechanismSourceProfiler:
         r"\{(?P<body>[^{}]*)\}",
         re.DOTALL,
     )
-    _ENUM_ENTRY_PATTERN = re.compile(
-        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>[^,\n]+?)\s*(?:,|$)",
-        re.MULTILINE,
-    )
     # Simple object-like ``#define NAME VALUE`` macro. Function-like macros
     # (``#define NAME(args) body``) don't match because they lack the
     # required whitespace between NAME and the body.
@@ -1555,14 +1551,29 @@ class MechanismSourceProfiler:
 
         for block in self._ENUM_BLOCK_PATTERN.finditer(cleaned):
             body = block.group("body")
+            enum_body = re.sub(
+                r"//[^\n]*",
+                lambda match: " " * len(match.group(0)),
+                body,
+            )
             body_start = block.start("body")
             body_line_offset = cleaned[:body_start].count("\n")
-            for entry in self._ENUM_ENTRY_PATTERN.finditer(body):
-                name = entry.group("name").strip()
-                value = entry.group("value").strip()
-                if not name or not value:
+            previous_name = ""
+            for entry_text, entry_offset in split_top_level_args_with_offsets(enum_body):
+                entry = re.fullmatch(
+                    r"\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+                    r"(?:\s*=\s*(?P<value>.*?))?\s*",
+                    entry_text,
+                    re.DOTALL,
+                )
+                if entry is None:
                     continue
-                line_no = body_line_offset + body[:entry.start()].count("\n") + 1
+                name = entry.group("name")
+                explicit_value = str(entry.group("value") or "").strip()
+                value = explicit_value or (
+                    f"{previous_name} + 1" if previous_name else "0"
+                )
+                line_no = body_line_offset + enum_body[:entry_offset].count("\n") + 1
                 refs.append(
                     SourceAssignmentRef(
                         target=name,
@@ -1580,6 +1591,7 @@ class MechanismSourceProfiler:
                         symbol_bindings={},
                     )
                 )
+                previous_name = name
 
         for match in self._DEFINE_PATTERN.finditer(cleaned):
             name = match.group("name").strip()
@@ -4427,6 +4439,25 @@ def split_top_level_args(args: str) -> List[str]:
     tail = args[start:].strip()
     if tail:
         out.append(tail)
+    return out
+
+
+def split_top_level_args_with_offsets(args: str) -> List[Tuple[str, int]]:
+    """Split comma-delimited source while retaining each item's byte offset."""
+    out: List[Tuple[str, int]] = []
+    start = 0
+    depth = 0
+    for index, char in enumerate(args):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0:
+            out.append((args[start:index], start))
+            start = index + 1
+    tail = args[start:]
+    if tail.strip():
+        out.append((tail, start))
     return out
 
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from functools import cache
 import math
 import re
+from collections.abc import Callable, Mapping
 from typing import Any, Iterable
 
 from flight_log_agent.expression_math import SAFE_MATH_FUNCTIONS, normalize_expression_function_names
@@ -61,7 +63,9 @@ def alias_dotted_names(expression: str, names: Iterable[str]) -> tuple[str, dict
     """
     rewritten = expression
     alias_to_name: dict[str, str] = {}
-    sorted_names = sorted({name for name in names if name}, key=len, reverse=True)
+    sorted_names = sorted(
+        {name for name in names if name}, key=lambda name: (-len(name), name)
+    )
     for index, name in enumerate(sorted_names):
         alias = f"__alias_{index}"
         new_rewritten = re.sub(
@@ -180,15 +184,74 @@ def _source_expression_names_cached(expression: str) -> tuple[str, ...]:
     )
 
 
-def evaluate_source_expression(expression: str, env: dict[str, Any]) -> Any:
+@dataclass(frozen=True)
+class CompiledSourceExpression:
+    """One normalized local expression with stable operand aliases."""
+
+    source: str
+    normalized: str
+    tree: ast.Expression
+    alias_to_operand: tuple[tuple[str, str], ...]
+
+    @property
+    def operands(self) -> tuple[str, ...]:
+        return tuple(operand for _alias, operand in self.alias_to_operand)
+
+    def evaluate(self, resolve_operand: Callable[[str], Any]) -> Any:
+        return evaluate_node(
+            self.tree,
+            _LazyOperandEnvironment(dict(self.alias_to_operand), resolve_operand),
+        )
+
+
+class _LazyOperandEnvironment(Mapping[str, Any]):
+    """Resolve an operand only if short-circuit evaluation reaches it."""
+
+    def __init__(
+        self,
+        aliases: dict[str, str],
+        resolver: Callable[[str], Any],
+    ) -> None:
+        self._aliases = aliases
+        self._resolver = resolver
+        self._values: dict[str, Any] = {}
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._aliases:
+            raise KeyError(key)
+        if key not in self._values:
+            self._values[key] = self._resolver(self._aliases[key])
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._aliases)
+
+    def __len__(self) -> int:
+        return len(self._aliases)
+
+
+def compile_source_expression(
+    expression: str,
+    operand_names: Iterable[str],
+) -> CompiledSourceExpression:
+    """Compile one source expression against parser/DAG-proven operands."""
     normalized = normalize_source_expression(expression)
-    rewritten, alias_to_name = alias_dotted_names(normalized, env.keys())
-    bound_env = {alias: env[name] for alias, name in alias_to_name.items()}
+    rewritten, alias_to_name = alias_dotted_names(normalized, operand_names)
     try:
         tree = ast.parse(rewritten, mode="eval")
     except SyntaxError as exc:
         raise SourceExpressionError("invalid expression syntax") from exc
-    return evaluate_node(tree, bound_env)
+    return CompiledSourceExpression(
+        source=str(expression or ""),
+        normalized=normalized,
+        tree=tree,
+        alias_to_operand=tuple(alias_to_name.items()),
+    )
+
+
+def evaluate_source_expression(expression: str, env: dict[str, Any]) -> Any:
+    compiled = compile_source_expression(expression, env.keys())
+    return compiled.evaluate(lambda operand: env[operand])
 
 
 def attribute_name(node: ast.Attribute) -> str | None:
@@ -203,7 +266,7 @@ def attribute_name(node: ast.Attribute) -> str | None:
     return ".".join(reversed(parts))
 
 
-def evaluate_node(node: ast.AST, env: dict[str, Any]) -> Any:
+def evaluate_node(node: ast.AST, env: Mapping[str, Any]) -> Any:
     if isinstance(node, ast.Expression):
         return evaluate_node(node.body, env)
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float, bool)):

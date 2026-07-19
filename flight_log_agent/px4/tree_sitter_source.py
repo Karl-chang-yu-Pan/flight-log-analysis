@@ -2935,6 +2935,7 @@ class TreeSitterSourceExtractor:
         context: Optional[_SourceContext] = None,
     ) -> list[SourceAssignmentRef]:
         refs: list[SourceAssignmentRef] = []
+        previous_enumerator: dict[tuple[int, int], str] = {}
         for node in _walk(unit.tree.root_node):
             if (
                 node.type == "declaration"
@@ -2993,19 +2994,47 @@ class TreeSitterSourceExtractor:
             elif node.type == "enumerator":
                 name_node = node.child_by_field_name("name")
                 value_node = node.child_by_field_name("value")
-                if name_node is None or value_node is None:
+                if name_node is None:
                     continue
+                name = unit.text(name_node).strip()
+                parent = node.parent
+                enum_key = (
+                    int(parent.start_byte if parent is not None else node.start_byte),
+                    int(parent.end_byte if parent is not None else node.end_byte),
+                )
+                previous = previous_enumerator.get(enum_key, "")
+                value_text = (
+                    unit.text(value_node).strip()
+                    if value_node is not None
+                    else f"{previous} + 1" if previous else "0"
+                )
+                expression_ref = (
+                    self._expression_ref(
+                        None,
+                        value_node,
+                        unit=unit,
+                        context=context,
+                        text=value_text,
+                    )
+                    if value_node is not None
+                    else SourceExpressionRef(
+                        text=value_text,
+                        lowered_text=value_text,
+                        input_symbols=[previous] if previous else [],
+                        exact=True,
+                    )
+                )
                 refs.append(
                     SourceAssignmentRef(
-                        target=unit.text(name_node).strip(),
+                        target=name,
                         expression=self.profiler._normalize_source_expression(
-                            unit.text(value_node)
+                            value_text
                         ),
                         file=unit.file,
                         line=unit.line(node),
                         evidence=unit.evidence(node),
                         target_identity=self._storage_identity(
-                            unit.text(name_node).strip(),
+                            name,
                             node,
                             unit=unit,
                             context=context,
@@ -3014,15 +3043,10 @@ class TreeSitterSourceExtractor:
                         assignment_operator="=",
                         declaration_kind="enum",
                         source_site_id=unit.site_id(node),
-                        expression_ref=self._expression_ref(
-                            None,
-                            value_node,
-                            unit=unit,
-                            context=context,
-                            text=unit.text(value_node),
-                        ),
+                        expression_ref=expression_ref,
                     )
                 )
+                previous_enumerator[enum_key] = name
             elif node.type == "preproc_def":
                 name_node = node.child_by_field_name("name")
                 value_node = node.child_by_field_name("value")

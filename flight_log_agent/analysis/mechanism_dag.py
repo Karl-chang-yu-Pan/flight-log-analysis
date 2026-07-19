@@ -30,7 +30,10 @@ from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
-from flight_log_agent.analysis.dag_value import DAGValuePlan
+from flight_log_agent.analysis.dag_value import (
+    DAGValueProgram,
+    DAGValueSession,
+)
 from flight_log_agent.analysis.parameter_lookup import (
     CXX_STDLIB_CONSTANTS,
     is_px4_parameter_name,
@@ -209,6 +212,49 @@ def _as_binding_dict(binding: Any) -> dict[str, Any]:
     return dict(vars(binding))
 
 
+def _source_expression_metadata(
+    expression_ref: Any,
+    fallback_text: str,
+) -> dict[str, Any]:
+    """Serialize parser-proven local expression semantics on a DAG vertex."""
+    if hasattr(expression_ref, "model_dump"):
+        expression_ref = expression_ref.model_dump(exclude_none=True)
+    if not isinstance(expression_ref, dict):
+        return {
+            "source_expression": str(fallback_text or ""),
+            "expression_inputs_exact": False,
+        }
+    record = {
+        "text": str(expression_ref.get("text") or fallback_text or ""),
+        "lowered_text": str(
+            expression_ref.get("lowered_text")
+            or expression_ref.get("text")
+            or fallback_text
+            or ""
+        ),
+        "input_symbols": [
+            str(value)
+            for value in (expression_ref.get("input_symbols") or [])
+            if str(value)
+        ],
+        "input_identities": dict(expression_ref.get("input_identities") or {}),
+        "call_results": [
+            (
+                value.model_dump(exclude_none=True)
+                if hasattr(value, "model_dump")
+                else dict(value)
+            )
+            for value in (expression_ref.get("call_results") or [])
+        ],
+        "exact": bool(expression_ref.get("exact", False)),
+    }
+    return {
+        "source_expression": record["text"],
+        "source_expression_ref": record,
+        "expression_inputs_exact": record["exact"],
+    }
+
+
 def _logged_signals_from_inventory(inventory: Optional[dict[str, Any]]) -> set[str]:
     """Derive the ``topic.field`` logged-signal set from an inventory.
 
@@ -218,14 +264,15 @@ def _logged_signals_from_inventory(inventory: Optional[dict[str, Any]]) -> set[s
     return observed_signals_from_inventory(inventory)
 
 
-def _parse_numeric_literal(expression: str) -> Optional[Any]:
+def _parse_numeric_literal(
+    expression: str,
+    known_constants: Optional[dict[str, Any]] = None,
+) -> Optional[Any]:
     """Return the numeric value of a compile-time-constant expression, else None.
 
     Handles bare int/float/hex literals and simple constant arithmetic
-    (``(1 << 5)``) via the restricted evaluator. References to other names
-    fail (empty env), so only genuine literals resolve — which is exactly
-    what a source-defined constant (enum entry / ``#define`` / ``constexpr``)
-    should be.
+    (``(1 << 5)``) via the restricted evaluator. References resolve only from
+    ``known_constants`` supplied by other source-proven declarations.
     """
     text = (expression or "").strip().rstrip(";").strip()
     if not text:
@@ -245,7 +292,7 @@ def _parse_numeric_literal(expression: str) -> Optional[Any]:
         eval_expression,
     )
     try:
-        value = eval_expression(text, {})
+        value = eval_expression(text, dict(known_constants or {}))
     except (ExpressionEvaluationError, TypeError, ValueError, ZeroDivisionError, SyntaxError):
         return None
     return value if isinstance(value, (int, float, bool)) else None
@@ -490,10 +537,13 @@ class _DAGBuilder:
 
         # Source-defined numeric constants (enum entry / ``#define`` /
         # ``constexpr``), resolved natively from the bindings: a single
-        # unconditional write whose RHS is a compile-time numeric literal.
+        # unconditional declaration whose RHS is a compile-time expression.
+        # A fixed point derives implicit enumerators represented as
+        # ``PREVIOUS + 1`` from their preceding declaration.
         # Replaces the old dependency on ``BindingIndex.assignment_resolutions``
         # (which stored SliceResult objects the DAG mis-typed).
         self._source_constants: dict[str, Any] = {}
+        constant_bindings: list[tuple[str, dict[str, Any]]] = []
         for binding in self._all_bindings:
             target = exact_symbol(
                 str(binding.get("target_symbol") or binding.get("target") or "")
@@ -506,11 +556,28 @@ class _DAGBuilder:
                 continue
             if binding.get("control_predicates"):
                 continue
-            value = _parse_numeric_literal(
-                str(binding.get("source_symbol") or binding.get("expression") or "")
-            )
-            if value is not None:
+            constant_bindings.append((target, binding))
+        pending_constants = list(constant_bindings)
+        while pending_constants:
+            unresolved: list[tuple[str, dict[str, Any]]] = []
+            progress = False
+            for target, binding in pending_constants:
+                value = _parse_numeric_literal(
+                    str(
+                        binding.get("source_symbol")
+                        or binding.get("expression")
+                        or ""
+                    ),
+                    self._source_constants,
+                )
+                if value is None:
+                    unresolved.append((target, binding))
+                    continue
                 self._source_constants.setdefault(target, value)
+                progress = True
+            if not progress:
+                break
+            pending_constants = unresolved
 
         # Struct-typed variable → struct type map, aggregated from every
         # source binding and helper record. Used by
@@ -2812,14 +2879,11 @@ class _DAGBuilder:
             metadata["assignment_operator"] = str(
                 binding.get("assignment_operator") or "="
             )
-            expression_ref = binding.get("expression_ref")
-            if isinstance(expression_ref, dict):
-                metadata["source_expression"] = str(
-                    expression_ref.get("text") or expression
+            metadata.update(
+                _source_expression_metadata(
+                    binding.get("expression_ref"), expression
                 )
-                metadata["expression_inputs_exact"] = bool(
-                    expression_ref.get("exact", False)
-                )
+            )
             target_file, target_callable = self._binding_target_scope(binding)
             site_file, site_callable = self._binding_site_scope(binding)
             control_file, control_callable = self._binding_control_scope(binding)
@@ -4152,6 +4216,7 @@ class _DAGBuilder:
             return existing
         vertex_id = self._make_id("br", site_key)
         metadata = self._branch_metadata_from_parameter_predicate(canonical)
+        metadata.update(_source_expression_metadata(condition_ref, predicate))
         lowered, variables = self._lower_predicate(canonical)
         if variables:
             metadata["variables"] = variables
@@ -4188,6 +4253,19 @@ class _DAGBuilder:
             )
             for producer_id in producer_ids:
                 self._add_edge(producer_id, vertex_id, kind="data", role=symbol)
+
+        self._wire_expression_helper_calls(
+            predicate,
+            (
+                condition_ref.model_dump(exclude_none=True)
+                if hasattr(condition_ref, "model_dump")
+                else condition_ref
+            ),
+            vertex_id,
+            file=file,
+            line=line,
+            scope_function=scope_function,
+        )
 
         return vertex_id
 
@@ -4577,6 +4655,9 @@ class _DAGBuilder:
                 ),
             )
             if op_id not in self.vertices:
+                expression_metadata = _source_expression_metadata(
+                    assignment_refs.get(var), str(expression)
+                )
                 self.vertices[op_id] = DAGVertex(
                     id=op_id,
                     kind="operation",
@@ -4595,15 +4676,7 @@ class _DAGBuilder:
                         "assignment_operator": str(
                             assignment_operators.get(var) or "="
                         ),
-                        "source_expression": str(
-                            (assignment_refs.get(var) or {}).get("text")
-                            if isinstance(assignment_refs.get(var), dict)
-                            else expression
-                        ),
-                        "expression_inputs_exact": bool(
-                            isinstance(assignment_refs.get(var), dict)
-                            and assignment_refs[var].get("exact", False)
-                        ),
+                        **expression_metadata,
                         "call_site_id": invocation.source_site_id,
                         "call_instance_scope": scope_function,
                         "target_identity": target_identity,
@@ -4630,6 +4703,9 @@ class _DAGBuilder:
             ),
         )
         if terminal_id not in self.vertices:
+            return_expression_metadata = _source_expression_metadata(
+                helper.get("return_expression_ref"), str(return_expression)
+            )
             self.vertices[terminal_id] = DAGVertex(
                 id=terminal_id,
                 kind="operation",
@@ -4648,6 +4724,7 @@ class _DAGBuilder:
                     "reachability": {"all_of": [], "exact": False},
                     "call_site_id": invocation.source_site_id,
                     "call_instance_scope": scope_function,
+                    **return_expression_metadata,
                 },
             )
         self._helper_subgraph_return_id[instance_key] = terminal_id
@@ -5258,7 +5335,7 @@ def ground_expression_via_edges(
     """Render ``expression`` with graph producers for diagnostics only.
 
     This compatibility renderer is not used for feasibility or replay.
-    Those paths evaluate producer values through :class:`DAGValuePlan` so
+    Those paths evaluate producer values through :class:`DAGValueProgram` so
     symbol identity and producer selection remain graph-native. For display,
     each symbol the vertex reads (its incoming data edges' roles) is
     substituted with its producer's grounded form: a logged-signal leaf
@@ -5347,6 +5424,8 @@ def evaluate_feasibility(
     signal_samples: Optional[dict[str, list[tuple[float, Any]]]] = None,
     signal_policies: Optional[dict[str, Any]] = None,
     prepared_signal_series: Optional[dict[str, "PreparedSignalSeries"]] = None,
+    value_program: Optional[DAGValueProgram] = None,
+    value_session: Optional[DAGValueSession] = None,
     prune_dead: bool = True,
 ) -> MechanismDAG:
     """Pre-evaluate each ``branch`` vertex against known constants and
@@ -5369,8 +5448,6 @@ def evaluate_feasibility(
     resolve to ``always_false`` are removed along with the branches
     themselves (and their orphaned edges).
     """
-    params = {k.upper(): v for k, v in (parameter_values or {}).items()}
-    enums = dict(enum_values or {})
     samples = signal_samples or {}
     policies = signal_policies or {}
     prepared_series = (
@@ -5378,116 +5455,125 @@ def evaluate_feasibility(
         if prepared_signal_series is not None
         else prepare_signal_series(samples, policies)
     )
+    program = value_program or (
+        value_session.program if value_session is not None else DAGValueProgram(dag)
+    )
+    if value_session is not None and value_session.program is not program:
+        raise ValueError("value_session must be bound to value_program")
+
+    def resolve_sample(signal: str, timestamp: float) -> Optional[Any]:
+        return sample_prepared_signal(prepared_series, signal, timestamp)
+
+    session = value_session or program.bind(
+        parameter_values=parameter_values,
+        enum_values=enum_values,
+        sample_resolver=resolve_sample,
+    )
+    branches = [vertex for vertex in dag.vertices if vertex.kind == "branch"]
+    static_results = session.evaluate_many(
+        tuple(vertex.id for vertex in branches), None
+    )
+
+    schedules: dict[str, tuple[float, ...]] = {}
+    spans: dict[str, tuple[float, float]] = {}
+    policy_summaries: dict[str, dict[str, str]] = {}
+    policies_complete: dict[str, bool] = {}
+    dynamic_roots_by_timestamp: dict[float, list[str]] = defaultdict(list)
+    for vertex in branches:
+        if static_results[vertex.id].status == "value":
+            continue
+        referenced = tuple(
+            signal
+            for signal in program.observable_inputs_for(vertex.id)
+            if signal in prepared_series
+        )
+        summary = {
+            signal: str(
+                ((prepared_series.get(signal).policy or {}).get("method") or "unknown")
+                if prepared_series.get(signal) is not None
+                else "unknown"
+            )
+            for signal in referenced
+        }
+        policy_summaries[vertex.id] = summary
+        policies_complete[vertex.id] = bool(referenced) and all(
+            prepared_series.get(signal) is not None
+            and prepared_series[signal].policy is not None
+            for signal in referenced
+        )
+        if not referenced or any(
+            prepared_series.get(signal) is None
+            or prepared_series[signal].span is None
+            for signal in referenced
+        ):
+            continue
+        start = max(prepared_series[signal].span[0] for signal in referenced)
+        end = min(prepared_series[signal].span[1] for signal in referenced)
+        if start > end:
+            continue
+        span = (start, end)
+        timeline = {start, end}
+        for signal in referenced:
+            timeline.update(
+                timestamp
+                for timestamp in prepared_series[signal].times
+                if start <= timestamp <= end
+            )
+        scheduled = tuple(sorted(timeline))
+        if not scheduled:
+            continue
+        spans[vertex.id] = span
+        schedules[vertex.id] = scheduled
+        for timestamp in scheduled:
+            dynamic_roots_by_timestamp[timestamp].append(vertex.id)
+
+    dynamic_results: dict[str, list[tuple[float, Any]]] = defaultdict(list)
+    dynamic_failures: dict[str, list[str]] = defaultdict(list)
+    for timestamp in sorted(dynamic_roots_by_timestamp):
+        timestamp_results = session.evaluate_many(
+            tuple(dynamic_roots_by_timestamp[timestamp]), timestamp
+        )
+        for vertex_id, result in timestamp_results.items():
+            if result.status == "value":
+                dynamic_results[vertex_id].append((timestamp, result.value))
+            else:
+                dynamic_failures[vertex_id].append(result.reason or result.status)
+
     updated_vertices: list[DAGVertex] = []
     verdicts: dict[str, str] = {}
     for vertex in dag.vertices:
         if vertex.kind != "branch":
             updated_vertices.append(vertex)
             continue
-
-        predicate = vertex.predicate_raw or vertex.predicate_lowered or ""
-        prepared_predicate: Optional[_PreparedPredicate] = None
-        graph_evaluation: Optional[DAGValueSeries] = None
-        verdict = _reduce_predicate(predicate, params, enums)
+        static_result = static_results[vertex.id]
+        verdict = "unknown"
         windows: list[tuple[float, float]] = []
-
-        if verdict == "unknown":
-            if samples:
-                prepared_predicate = _prepare_predicate(
-                    predicate, samples, policies, prepared_series=prepared_series
-                )
-            evaluated = (
-                _evaluate_predicate_intervals(
-                    predicate,
-                    params,
-                    enums,
-                    samples,
-                    policies,
-                    prepared=prepared_predicate,
-                    prepared_series=prepared_series,
-                )
-                if samples
-                else None
-            )
-            if evaluated is None:
-                plan = DAGValuePlan(dag, vertex.id)
-                static_result = plan.evaluate(
-                    None,
-                    parameter_values=params,
-                    enum_values=enums,
-                )
-                if static_result.status == "value":
-                    verdict = (
-                        "always_true" if bool(static_result.value) else "always_false"
-                    )
-                elif samples:
-                    graph_evaluation = evaluate_dag_vertex_series(
-                        dag,
-                        vertex.id,
-                        parameter_values=params,
-                        enum_values=enums,
-                        signal_samples=samples,
-                        signal_policies=policies,
-                        prepared_signal_series=prepared_series,
-                    )
-                    if graph_evaluation.complete:
-                        evaluated = boolean_sample_windows(
-                            graph_evaluation.samples
-                        )
-            if verdict == "unknown" and evaluated is not None:
-                windows = evaluated
-                if graph_evaluation is not None:
-                    predicate_span = graph_evaluation.span
-                    policies_complete = graph_evaluation.policies_complete
-                else:
-                    if prepared_predicate is None:
-                        prepared_predicate = _prepare_predicate(
-                            predicate,
-                            samples,
-                            policies,
-                            prepared_series=prepared_series,
-                        )
-                    predicate_span = prepared_predicate.span
-                    policies_complete = _predicate_policies_complete(
-                        predicate,
-                        samples,
-                        policies,
-                        prepared=prepared_predicate,
-                    )
-                if not windows and policies_complete:
+        if static_result.status == "value":
+            verdict = "always_true" if bool(static_result.value) else "always_false"
+        elif vertex.id in schedules:
+            evaluated = dynamic_results.get(vertex.id, [])
+            windows = boolean_sample_windows(evaluated)
+            complete = len(evaluated) == len(schedules[vertex.id])
+            if complete and policies_complete.get(vertex.id, False):
+                if not windows:
                     verdict = "always_false"
-                elif (
-                    policies_complete
-                    and predicate_span is not None
-                    and _covers_span(windows, predicate_span)
-                ):
+                elif _covers_span(windows, spans[vertex.id]):
                     verdict = "always_true"
 
         verdicts[vertex.id] = verdict
         metadata = dict(vertex.metadata or {})
-        if graph_evaluation is not None:
-            evaluation_span = graph_evaluation.span
-            metadata["evaluation_mode"] = "dag_value_plan"
-            metadata["sampling_policies"] = graph_evaluation.policy_summary
-        elif samples and prepared_predicate is None:
-            prepared_predicate = _prepare_predicate(
-                predicate,
-                samples,
-                policies,
-                prepared_series=prepared_series,
+        metadata["evaluation_mode"] = "dag_value_plan"
+        metadata["static_evaluation"] = {
+            "status": static_result.status,
+            "reason": static_result.reason,
+        }
+        if vertex.id in spans:
+            metadata["evaluation_domain"] = list(spans[vertex.id])
+            metadata["sampling_policies"] = policy_summaries.get(vertex.id, {})
+        if dynamic_failures.get(vertex.id):
+            metadata["evaluation_failures"] = list(
+                dict.fromkeys(dynamic_failures[vertex.id])
             )
-            evaluation_span = prepared_predicate.span
-        else:
-            evaluation_span = prepared_predicate.span if prepared_predicate else None
-        if evaluation_span is not None:
-            metadata["evaluation_domain"] = list(evaluation_span)
-            if graph_evaluation is None:
-                metadata["sampling_policies"] = _predicate_policy_summary(
-                    predicate,
-                    samples,
-                    policies,
-                    prepared=prepared_predicate,
-                )
         updated_vertices.append(
             vertex.model_copy(
                 update={
@@ -5832,17 +5918,27 @@ def evaluate_dag_vertex_series(
     prepared_signal_series: Optional[dict[str, PreparedSignalSeries]] = None,
     timestamps: Optional[Iterable[float]] = None,
     evaluation_windows: Optional[list[tuple[float, float]]] = None,
+    value_program: Optional[DAGValueProgram] = None,
+    value_session: Optional[DAGValueSession] = None,
 ) -> DAGValueSeries:
     """Evaluate one vertex from graph edges over its observed input domain.
 
     The operation text applies only local operators. Every operand value is
-    selected from an incoming DAG edge by :class:`DAGValuePlan`; this function
+    selected from an incoming DAG edge by :class:`DAGValueProgram`; this function
     supplies timestamp alignment and schema-derived resampling policy.
     """
     samples = signal_samples or {}
     policies = signal_policies or {}
-    plan = DAGValuePlan(dag, vertex_id)
-    referenced = plan.logged_signals
+    program = value_program or (
+        value_session.program if value_session is not None else DAGValueProgram(dag)
+    )
+    if value_session is not None and value_session.program is not program:
+        raise ValueError("value_session must be bound to value_program")
+    referenced = tuple(
+        signal
+        for signal in program.observable_inputs_for(vertex_id)
+        if signal in samples or signal in (prepared_signal_series or {})
+    )
     prepared = dict(prepared_signal_series or {})
     missing = {
         signal: samples.get(signal, [])
@@ -5935,13 +6031,14 @@ def evaluate_dag_vertex_series(
     def resolve(signal: str, timestamp: float) -> Optional[Any]:
         return sample_prepared_signal(prepared, signal, timestamp)
 
+    session = value_session or program.bind(
+        parameter_values=parameter_values,
+        enum_values=enum_values,
+        sample_resolver=resolve,
+    )
+
     for timestamp in scheduled:
-        result = plan.evaluate(
-            timestamp,
-            parameter_values=parameter_values,
-            enum_values=enum_values,
-            sample_resolver=resolve,
-        )
+        result = session.evaluate(vertex_id, timestamp)
         if result.status == "value":
             values.append((timestamp, result.value))
         else:
