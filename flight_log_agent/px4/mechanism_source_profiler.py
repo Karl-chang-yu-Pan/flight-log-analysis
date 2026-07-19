@@ -179,6 +179,7 @@ class FunctionCallRef(BaseModel):
     line: int
     evidence: str
     receiver: Optional[str] = None
+    receiver_access: Literal["value", "pointer", "unknown"] = "unknown"
     receiver_identity: Optional[SourceStorageRef] = None
     receiver_type: Optional[str] = None
     resolved_callable_id: Optional[str] = None
@@ -222,6 +223,11 @@ class SourceAssignmentRef(BaseModel):
     target_field: Optional[str] = None
     assignment_operator: Optional[str] = None
     declaration_kind: Optional[str] = None
+    # Source-derived qualification scopes for declared constants. For an
+    # enumerator nested in ``Owner::Mode``, this contains ``Owner`` and
+    # ``Owner::Mode`` so consumers can resolve both valid C++ spellings
+    # without placing enum names in a maintained registry.
+    constant_scopes: List[str] = Field(default_factory=list)
     control_predicates: List[str] = Field(default_factory=list)
     # Source line of each governing control statement, aligned with
     # ``control_predicates`` — the branch's own SITE identity, distinct

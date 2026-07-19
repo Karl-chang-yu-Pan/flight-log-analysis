@@ -645,6 +645,184 @@ float Rtl::calc_gain(float base_in)
     assert "src/lib/gain/gain.cpp" in result.files_loaded
 
 
+def test_receiver_getter_reads_state_written_by_prior_call_site(tmp_path):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/control.cpp": """
+class State {
+public:
+    void set(float value) { _value = value; }
+    float get() const { return _value; }
+private:
+    float _value{};
+};
+
+class Control {
+public:
+    void run(float input, float later)
+    {
+        state.set(input);
+        output = state.get();
+        state.set(later);
+    }
+private:
+    State state{};
+    float output{};
+};
+""",
+        },
+        backend="tree_sitter",
+    )
+    facts = load_facts(
+        profiler,
+        tmp_path / "cache",
+        ["src/modules/example/control.cpp"],
+        "source-hash",
+    )
+    inputs = dag_inputs_from_facts(facts)
+    output_binding = next(
+        binding
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "output"
+        and binding["function"] == "Control::run"
+    )
+    setter_calls = [
+        call for call in inputs.call_statements if call["name"] == "set"
+    ]
+    assert [call["receiver_access"] for call in setter_calls] == [
+        "value",
+        "value",
+    ]
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+        terminal_file="src/modules/example/control.cpp",
+        terminal_identity=output_binding["target_identity"],
+    )
+
+    output_vertex = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and vertex.variable == "output"
+        and vertex.expression == "state.get()"
+    )
+    predecessors: dict[str, set[str]] = {}
+    for edge in dag.edges:
+        if edge.kind == "data":
+            predecessors.setdefault(edge.target_id, set()).add(edge.source_id)
+    reachable = {output_vertex.id}
+    pending = [output_vertex.id]
+    while pending:
+        current = pending.pop()
+        for predecessor in predecessors.get(current, set()):
+            if predecessor not in reachable:
+                reachable.add(predecessor)
+                pending.append(predecessor)
+
+    assert any(
+        vertex.id in reachable
+        and vertex.kind == "operation"
+        and vertex.variable == "state._value"
+        and vertex.expression == "_value"
+        for vertex in dag.vertices
+    )
+    member_output_sites = {
+        str((vertex.metadata or {}).get("call_site_id") or "")
+        for vertex in dag.vertices
+        if (vertex.metadata or {}).get("synthetic_member_output_binding")
+    }
+    assert member_output_sites == {setter_calls[0]["source_site_id"]}
+    assert any(
+        vertex.id in reachable
+        and vertex.kind == "operation"
+        and vertex.variable == "_value"
+        and vertex.expression == "value"
+        for vertex in dag.vertices
+    )
+
+
+def test_fixpoint_does_not_expand_reference_from_proven_dead_branch(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/control.cpp": """
+extern float missing_value;
+class Control {
+    float output;
+    void run()
+    {
+        if (false) {
+            output = missing_value;
+        } else {
+            output = 1.0f;
+        }
+    }
+};
+""",
+            "src/modules/example/missing.cpp": "float missing_value = 4.0f;",
+        },
+        backend="tree_sitter",
+    )
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        [],
+        "output",
+        "source-hash",
+        terminal_file="src/modules/example/control.cpp",
+    )
+
+    assert result.dag is not None
+    assert "src/modules/example/missing.cpp" not in result.files_loaded
+
+
+def test_fixpoint_keeps_reference_from_unknown_branch(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/control.cpp": """
+extern float missing_value;
+class Control {
+    float output;
+    void run()
+    {
+        if (external_gate) {
+            output = missing_value;
+        } else {
+            output = 1.0f;
+        }
+    }
+};
+""",
+            "src/modules/example/missing.cpp": "float missing_value = 4.0f;",
+        },
+        backend="tree_sitter",
+    )
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        [],
+        "output",
+        "source-hash",
+        terminal_file="src/modules/example/control.cpp",
+    )
+
+    assert result.dag is not None
+    assert "src/modules/example/missing.cpp" in result.files_loaded
+
+
 def test_fixpoint_bootstraps_from_terminal_without_seeds(tmp_path):
     from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
 

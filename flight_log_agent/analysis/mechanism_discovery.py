@@ -34,6 +34,7 @@ from flight_log_agent.analysis.mechanism_dag import (
     MechanismDAG,
     _DAGBuilder,
     build_mechanism_dag,
+    evaluate_feasibility,
 )
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.px4.source_facts_cache import (
@@ -67,6 +68,7 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
     proves that the target object crosses a publication boundary.
     """
     ref = _as_dict(assignment)
+    expression_ref = dict(ref.get("expression_ref") or {})
     topic = ref.get("target_topic")
     field_name = ref.get("target_field")
     return {
@@ -78,9 +80,19 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         "target_identity": dict(ref.get("target_identity") or {}),
         "function_parameters": list(ref.get("function_parameters") or []),
         "declaration_kind": str(ref.get("declaration_kind") or ""),
+        "constant_scopes": [
+            str(value) for value in (ref.get("constant_scopes") or []) if value
+        ],
         "assignment_operator": str(ref.get("assignment_operator") or "="),
         "source_site_id": str(ref.get("source_site_id") or ""),
-        "expression_ref": dict(ref.get("expression_ref") or {}),
+        "expression_ref": expression_ref,
+        "reference_identities": {
+            exact_symbol(str(symbol)): dict(identity)
+            for symbol, identity in (
+                expression_ref.get("input_identities") or {}
+            ).items()
+            if exact_symbol(str(symbol)) and isinstance(identity, dict)
+        },
         "control_expression_refs": [
             dict(value)
             for value in (ref.get("control_expression_refs") or [])
@@ -1332,6 +1344,53 @@ class DiscoveryResult:
     terminal_validation: Optional[TerminalValidation] = None
 
 
+def _reachable_source_sites(dag: MechanismDAG) -> set[tuple[str, int]]:
+    """Return source sites on backward paths from surviving terminal writes."""
+    vertices = {vertex.id: vertex for vertex in dag.vertices}
+    terminal_ids = {
+        vertex.id
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and bool((vertex.metadata or {}).get("is_terminal"))
+    }
+    incoming: dict[str, list[str]] = {}
+    for edge in dag.edges:
+        incoming.setdefault(edge.target_id, []).append(edge.source_id)
+    reachable = set(terminal_ids)
+    pending = list(terminal_ids)
+    while pending:
+        current = pending.pop()
+        for predecessor in incoming.get(current, ()):
+            if predecessor not in reachable:
+                reachable.add(predecessor)
+                pending.append(predecessor)
+    return {
+        (str(vertex.file or ""), int(vertex.line))
+        for vertex_id, vertex in vertices.items()
+        if vertex_id in reachable and vertex.file and vertex.line is not None
+    }
+
+
+def _reachable_frontier_references(
+    references: Sequence[UnresolvedSourceReference],
+    full_dag: MechanismDAG,
+    feasible_dag: MechanismDAG,
+) -> list[UnresolvedSourceReference]:
+    """Drop only references proven to originate solely on removed paths."""
+    full_sites = _reachable_source_sites(full_dag)
+    feasible_sites = _reachable_source_sites(feasible_dag)
+    kept: list[UnresolvedSourceReference] = []
+    for reference in references:
+        site = (
+            str(reference.file or ""),
+            int(reference.line) if reference.line is not None else 0,
+        )
+        if site[0] and site[1] and site in full_sites and site not in feasible_sites:
+            continue
+        kept.append(reference)
+    return kept
+
+
 def discover_mechanism_dag(
     profiler: MechanismSourceProfiler,
     cache_root: Union[str, Path],
@@ -1351,6 +1410,7 @@ def discover_mechanism_dag(
     parameter_values: Optional[dict[str, Any]] = None,
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
     preranked_files: Optional[Sequence[str]] = None,
+    round_annotator: Optional[Callable[[MechanismDAG], MechanismDAG]] = None,
 ) -> DiscoveryResult:
     """Build a DAG by exact, provenance-checked fixed-point expansion.
 
@@ -1537,7 +1597,18 @@ def discover_mechanism_dag(
             )
         )
 
-        references = list(dag.unresolved_references)
+        frontier_dag = (
+            round_annotator(dag)
+            if round_annotator is not None
+            else evaluate_feasibility(
+                dag,
+                parameter_values=parameter_values,
+                prune_dead=True,
+            )
+        )
+        references = _reachable_frontier_references(
+            list(dag.unresolved_references), dag, frontier_dag
+        )
         known_classes = set(inputs.structure.direct_bases)
         for owner, bases in inputs.structure.direct_bases.items():
             owner_record = next(

@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional, Sequence
+from typing import Any, Iterable, Iterator, Literal, Optional, Sequence
 
 from tree_sitter import Language, Node, Parser, Tree
 import tree_sitter_cpp
@@ -2721,6 +2721,7 @@ class TreeSitterSourceExtractor:
         if function_node is None:
             return None
         receiver: Optional[str] = None
+        receiver_access: Literal["value", "pointer", "unknown"] = "unknown"
         name = unit.text(function_node).strip()
         base_name = name.split("<", 1)[0].rsplit("::", 1)[-1]
         if base_name in _CXX_NAMED_CASTS:
@@ -2733,6 +2734,11 @@ class TreeSitterSourceExtractor:
             field_node = function_node.child_by_field_name("field")
             receiver = self._storage_target(state, unit.text(receiver_node))
             name = unit.text(field_node).strip()
+            if receiver_node is not None and field_node is not None:
+                access = unit.source[
+                    receiver_node.end_byte : field_node.start_byte
+                ].decode("utf-8", errors="replace")
+                receiver_access = "pointer" if "->" in access else "value"
         argument_nodes = _argument_nodes(arguments_node)
         args = [
             self._apply_storage_aliases(unit.text(arg).strip(), state.storage_aliases)
@@ -2816,6 +2822,7 @@ class TreeSitterSourceExtractor:
         return FunctionCallRef(
             name=name,
             receiver=receiver,
+            receiver_access=receiver_access,
             receiver_identity=receiver_identity,
             receiver_type=receiver_type or None,
             resolved_callable_id=(
@@ -2998,6 +3005,32 @@ class TreeSitterSourceExtractor:
                     continue
                 name = unit.text(name_node).strip()
                 parent = node.parent
+                enum_node = parent
+                while enum_node is not None and enum_node.type != "enum_specifier":
+                    enum_node = enum_node.parent
+                enum_name_node = (
+                    enum_node.child_by_field_name("name")
+                    if enum_node is not None
+                    else None
+                )
+                enum_name = (
+                    unit.text(enum_name_node).strip()
+                    if enum_name_node is not None
+                    else ""
+                )
+                class_owner = unit.class_owner(enum_node or node) or ""
+                namespace_owner = unit.namespace_owner(enum_node or node) or ""
+                lexical_owner = class_owner or namespace_owner
+                constant_scopes = []
+                if lexical_owner:
+                    constant_scopes.append(lexical_owner)
+                if enum_name:
+                    constant_scopes.append(enum_name)
+                    constant_scopes.append(
+                        f"{lexical_owner}::{enum_name}"
+                        if lexical_owner
+                        else enum_name
+                    )
                 enum_key = (
                     int(parent.start_byte if parent is not None else node.start_byte),
                     int(parent.end_byte if parent is not None else node.end_byte),
@@ -3038,10 +3071,12 @@ class TreeSitterSourceExtractor:
                             node,
                             unit=unit,
                             context=context,
+                            declared_owner=class_owner or None,
                             force_global=True,
                         ),
                         assignment_operator="=",
                         declaration_kind="enum",
+                        constant_scopes=constant_scopes,
                         source_site_id=unit.site_id(node),
                         expression_ref=expression_ref,
                     )
@@ -4191,6 +4226,7 @@ class TreeSitterSourceExtractor:
                 symbol=canonical,
                 root=root,
                 file=parsed_unit.file,
+                class_owner=str(owner or ""),
                 namespace_owner=namespace,
                 declaration_id=parsed_unit.site_id(node),
                 declaration_proven=True,

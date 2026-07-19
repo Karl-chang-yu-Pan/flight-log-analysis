@@ -105,6 +105,7 @@ void Mode::run()
     getter_call = next(item for item in facts.function_calls if item.name == "get_position")
     output = next(item for item in facts.source_assignments if item.target == "output")
     assert getter_call.receiver_type == "Navigator"
+    assert getter_call.receiver_access == "pointer"
     assert getter_call.resolved_callable_id
     assert getter_call.resolved_callable_file == "src/modules/example/navigator.h"
     assert output.expression_ref is not None
@@ -138,6 +139,32 @@ class Caller {
     assert call.receiver_type is None
     assert call.resolved_callable_id is None
     assert call.resolved_callable_file is None
+
+
+def test_nested_enum_entries_preserve_source_qualification_scopes(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+namespace nav {
+class Control {
+public:
+    enum Mode { MODE_IDLE = 0, MODE_ACTIVE };
+};
+}
+""",
+    )
+
+    active = next(
+        item for item in facts.source_assignments if item.target == "MODE_ACTIVE"
+    )
+    assert active.constant_scopes == [
+        "nav::Control",
+        "Mode",
+        "nav::Control::Mode",
+    ]
+    assert active.target_identity is not None
+    assert active.target_identity.class_owner == "nav::Control"
+    assert active.expression == "MODE_IDLE + 1"
 
 
 def test_direct_call_projection_is_not_a_storage_symbol(tmp_path):

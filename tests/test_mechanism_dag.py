@@ -943,6 +943,80 @@ def test_source_enum_resolution_stores_value_on_constant_vertex():
     assert const_vertex.metadata.get("source") == "enum"
 
 
+def test_source_enum_resolution_keeps_conflicting_scopes_distinct():
+    first = _fake_binding(
+        binding_id="first-mode",
+        target="MODE_ACTIVE",
+        expression="1",
+        file="first.hpp",
+        line=3,
+        logged_signal="",
+        declaration_kind="enum",
+    )
+    first.update(
+        {
+            "constant_scopes": ["First", "First::Mode"],
+            "target_identity": {
+                "kind": "global",
+                "symbol": "MODE_ACTIVE",
+                "root": "MODE_ACTIVE",
+                "file": "first.hpp",
+                "class_owner": "First",
+                "declaration_id": "first-mode",
+                "declaration_proven": True,
+            },
+        }
+    )
+    second = _fake_binding(
+        binding_id="second-mode",
+        target="MODE_ACTIVE",
+        expression="2",
+        file="second.hpp",
+        line=3,
+        logged_signal="",
+        declaration_kind="enum",
+    )
+    second.update(
+        {
+            "constant_scopes": ["Second", "Second::Mode"],
+            "target_identity": {
+                "kind": "global",
+                "symbol": "MODE_ACTIVE",
+                "root": "MODE_ACTIVE",
+                "file": "second.hpp",
+                "class_owner": "Second",
+                "declaration_id": "second-mode",
+                "declaration_proven": True,
+            },
+        }
+    )
+    output = _fake_binding(
+        binding_id="output",
+        target="output",
+        expression="First::Mode::MODE_ACTIVE",
+        file="control.cpp",
+        line=10,
+        logged_signal="",
+    )
+
+    dag = build_mechanism_dag([first, second, output], "output")
+
+    constant = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "evidence"
+        and vertex.sub_kind == "constant"
+        and vertex.signal_name == "First.Mode.MODE_ACTIVE"
+    )
+    assert constant.metadata["value"] == 1
+    assert not any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "constant"
+        and vertex.signal_name == "MODE_ACTIVE"
+        for vertex in dag.vertices
+    )
+
+
 def test_cxx_stdlib_constant_stored_on_constant_vertex():
     """A predicate mentioning ``FLT_EPSILON`` should emit an ``evidence:constant``
     vertex with the standard IEEE 754 value from ``CXX_STDLIB_CONSTANTS``."""

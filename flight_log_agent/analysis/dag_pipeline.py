@@ -1085,32 +1085,53 @@ async def run_dag_discovery_stage(
             dict[str, PreparedSignalSeries],
         ],
     ] = {}
+    dag_signal_data: dict[
+        int,
+        tuple[
+            dict[str, list[tuple[float, Any]]],
+            dict[str, PreparedSignalSeries],
+        ],
+    ] = {}
     value_programs: dict[int, DAGValueProgram] = {}
+    dag_annotations: dict[int, MechanismDAG] = {}
 
-    def annotate(result: DiscoveryResult) -> Optional[MechanismDAG]:
-        if result.dag is None:
-            return None
-        prepared_data = signal_data.get(id(result))
+    def annotate_dag(dag: MechanismDAG) -> MechanismDAG:
+        dag_key = id(dag)
+        cached = dag_annotations.get(dag_key)
+        if cached is not None:
+            return cached
+        prepared_data = dag_signal_data.get(dag_key)
         if prepared_data is None:
-            samples = _signal_samples_for_dag(result.dag, log_path)
+            samples = _signal_samples_for_dag(dag, log_path)
             prepared_series = prepare_signal_series(samples, signal_policies)
-            signal_data[id(result)] = (samples, prepared_series)
+            prepared_data = (samples, prepared_series)
+            dag_signal_data[dag_key] = prepared_data
         else:
             samples, prepared_series = prepared_data
-        program = value_programs.get(id(result))
+        program = value_programs.get(dag_key)
         if program is None:
-            program = DAGValueProgram(result.dag)
-            value_programs[id(result)] = program
-        return evaluate_feasibility(
-            result.dag,
+            program = DAGValueProgram(dag)
+            value_programs[dag_key] = program
+        annotated = evaluate_feasibility(
+            dag,
             parameter_values=parameter_values,
             signal_samples=samples,
             signal_policies=signal_policies,
             prepared_signal_series=prepared_series,
             value_program=program,
         )
+        dag_annotations[dag_key] = annotated
+        return annotated
+
+    def annotate(result: DiscoveryResult) -> Optional[MechanismDAG]:
+        if result.dag is None:
+            return None
+        annotated = annotate_dag(result.dag)
+        signal_data[id(result)] = dag_signal_data[id(result.dag)]
+        return annotated
 
     logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
+    discovery_kwargs.setdefault("round_annotator", annotate_dag)
 
     def condition_windows(condition: Any, candidates: Any = None) -> Optional[dict[str, Any]]:
         return evaluate_questioned_condition_windows(
