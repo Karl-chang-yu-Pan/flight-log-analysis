@@ -36,6 +36,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     SourceExpressionRef,
     SourceIncludeRef,
     SourceMemberRef,
+    SourceReturnRef,
     SourceStorageRef,
     TopicRef,
     _HelperLoweringFailed,
@@ -319,6 +320,7 @@ class _ExtractionState:
     calls: list[FunctionCallRef] = field(default_factory=list)
     branches: list[BranchConditionRef] = field(default_factory=list)
     return_paths: list[dict[str, Any]] = field(default_factory=list)
+    return_sites: list[SourceReturnRef] = field(default_factory=list)
     seen_assignments: set[tuple[int, int]] = field(default_factory=set)
     seen_calls: set[tuple[int, int]] = field(default_factory=set)
     lambda_bindings: dict[str, _Callable] = field(default_factory=dict)
@@ -2109,10 +2111,51 @@ class TreeSitterSourceExtractor:
                 state.alias_capable_symbols = saved_capable
                 state.reference_alias_symbols = saved_references
             return
-        if node.type == "return_statement":
+        if node.type in {"return_statement", "co_return_statement"}:
             self._collect_operations(state, node, controls=controls, exact=exact)
             return_value = node.named_children[0] if node.named_children else None
             expression = unit.text(return_value) if return_value is not None else ""
+            if expression:
+                control_refs = [
+                    SourceExpressionRef(
+                        text=item.expression,
+                        lowered_text=self.profiler._normalize_source_expression(
+                            item.expression
+                        ),
+                        input_symbols=list(item.input_symbols),
+                        input_identities=dict(item.input_identities),
+                        call_results=list(item.call_results),
+                        exact=item.inputs_exact,
+                    )
+                    for item in controls
+                ]
+                state.return_sites.append(
+                    SourceReturnRef(
+                        expression=self.profiler._normalize_source_expression(
+                            expression
+                        ),
+                        expression_ref=self._expression_ref(
+                            state, return_value, text=expression
+                        ),
+                        file=unit.file,
+                        line=unit.line(node),
+                        source_site_id=unit.site_id(node),
+                        control_predicates=[
+                            self.profiler._normalize_source_expression(
+                                item.expression
+                            )
+                            for item in controls
+                        ],
+                        control_predicate_lines=[
+                            item.line for item in controls
+                        ],
+                        control_predicate_site_ids=[
+                            item.site_id for item in controls
+                        ],
+                        control_expression_refs=control_refs,
+                        reachability_exact=exact,
+                    )
+                )
             if expression and controls:
                 condition = " && ".join(
                     f"({item.expression})" for item in controls
@@ -2318,9 +2361,8 @@ class TreeSitterSourceExtractor:
         state.branches.append(
             BranchConditionRef(
                 kind=kind,
-                condition=self._apply_storage_aliases(
-                    self.profiler._normalize_source_expression(term.expression),
-                    state.storage_aliases,
+                condition=self.profiler._normalize_source_expression(
+                    term.expression
                 ),
                 file=state.unit.file,
                 line=term.line,
@@ -2328,12 +2370,12 @@ class TreeSitterSourceExtractor:
                 source_site_id=term.site_id,
                 condition_ref=SourceExpressionRef(
                     text=term.expression,
-                    input_symbols=[
-                        self._storage_target(state, symbol)
-                        for symbol in term.input_symbols
-                        if self._storage_target(state, symbol)
-                    ],
+                    lowered_text=self.profiler._normalize_source_expression(
+                        term.expression
+                    ),
+                    input_symbols=list(term.input_symbols),
                     input_identities=dict(term.input_identities),
+                    call_results=list(term.call_results),
                     exact=term.inputs_exact,
                 ),
             )
@@ -2534,10 +2576,7 @@ class TreeSitterSourceExtractor:
         ).strip()
         if operator not in {"=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^="}:
             return None
-        rhs = self._apply_storage_aliases(
-            self.profiler._normalize_source_expression(unit.text(right)),
-            state.storage_aliases,
-        )
+        rhs = self.profiler._normalize_source_expression(unit.text(right))
         expression = (
             rhs
             if operator == "="
@@ -2614,11 +2653,8 @@ class TreeSitterSourceExtractor:
             return None
         if any(child.type == "lambda_expression" for child in _walk(value)):
             return None
-        expression = self._apply_storage_aliases(
-            self.profiler._normalize_source_expression(
-                _strip_initializer_delimiters(unit.text(value))
-            ),
-            state.storage_aliases,
+        expression = self.profiler._normalize_source_expression(
+            _strip_initializer_delimiters(unit.text(value))
         )
         declaration = node.parent
         declaration_text = unit.text(declaration) if declaration is not None else unit.text(node)
@@ -2656,10 +2692,7 @@ class TreeSitterSourceExtractor:
         root, field_name = split_source_field(target)
         struct = state.struct_variables.get(root)
         topic = self.profiler._topic_from_struct(struct) if struct else None
-        predicates = [
-            self._apply_storage_aliases(item.expression, state.storage_aliases)
-            for item in controls
-        ]
+        predicates = [item.expression for item in controls]
         combined = " ".join([target, expression, *predicates])
         return SourceAssignmentRef(
             target=target,
@@ -2688,17 +2721,11 @@ class TreeSitterSourceExtractor:
             expression_ref=expression_ref,
             control_expression_refs=[
                 SourceExpressionRef(
-                    text=self._apply_storage_aliases(
-                        item.expression, state.storage_aliases
+                    text=item.expression,
+                    lowered_text=self.profiler._normalize_source_expression(
+                        item.expression
                     ),
-                    lowered_text=self._apply_storage_aliases(
-                        item.expression, state.storage_aliases
-                    ),
-                    input_symbols=[
-                        self._storage_target(state, symbol)
-                        for symbol in item.input_symbols
-                        if self._storage_target(state, symbol)
-                    ],
+                    input_symbols=list(item.input_symbols),
                     input_identities=dict(item.input_identities),
                     call_results=list(item.call_results),
                     exact=item.inputs_exact,
@@ -2740,10 +2767,7 @@ class TreeSitterSourceExtractor:
                 ].decode("utf-8", errors="replace")
                 receiver_access = "pointer" if "->" in access else "value"
         argument_nodes = _argument_nodes(arguments_node)
-        args = [
-            self._apply_storage_aliases(unit.text(arg).strip(), state.storage_aliases)
-            for arg in argument_nodes
-        ]
+        args = [unit.text(arg).strip() for arg in argument_nodes]
         argument_expressions = [
             self._expression_ref(state, arg, text=unit.text(arg))
             for arg in argument_nodes
@@ -2815,10 +2839,7 @@ class TreeSitterSourceExtractor:
             if receiver is None or receiver_type
             else None
         )
-        predicates = [
-            self._apply_storage_aliases(item.expression, state.storage_aliases)
-            for item in controls
-        ]
+        predicates = [item.expression for item in controls]
         return FunctionCallRef(
             name=name,
             receiver=receiver,
@@ -2854,17 +2875,11 @@ class TreeSitterSourceExtractor:
             argument_expressions=argument_expressions,
             control_expression_refs=[
                 SourceExpressionRef(
-                    text=self._apply_storage_aliases(
-                        item.expression, state.storage_aliases
+                    text=item.expression,
+                    lowered_text=self.profiler._normalize_source_expression(
+                        item.expression
                     ),
-                    lowered_text=self._apply_storage_aliases(
-                        item.expression, state.storage_aliases
-                    ),
-                    input_symbols=[
-                        self._storage_target(state, symbol)
-                        for symbol in item.input_symbols
-                        if self._storage_target(state, symbol)
-                    ],
+                    input_symbols=list(item.input_symbols),
                     input_identities=dict(item.input_identities),
                     call_results=list(item.call_results),
                     exact=item.inputs_exact,
@@ -3205,7 +3220,12 @@ class TreeSitterSourceExtractor:
                 )
                 for topic, instance, orb_node in topics:
                     consumed_orb_sites.add((orb_node.start_byte, orb_node.end_byte))
-                    control_predicates, control_refs = self._endpoint_controls(
+                    (
+                        control_predicates,
+                        control_refs,
+                        control_lines,
+                        control_site_ids,
+                    ) = self._endpoint_controls(
                         unit,
                         orb_node,
                         topic_root if topic_root is not None else node,
@@ -3246,6 +3266,8 @@ class TreeSitterSourceExtractor:
                             ),
                             source_site_id=unit.site_id(declarator),
                             control_predicates=control_predicates,
+                            control_predicate_lines=control_lines,
+                            control_predicate_site_ids=control_site_ids,
                             control_expression_refs=control_refs,
                         )
                     )
@@ -3268,7 +3290,12 @@ class TreeSitterSourceExtractor:
             state = state_by_callable.get(callable.callable_id) if callable else None
             for topic, instance, orb_node in topics:
                 consumed_orb_sites.add((orb_node.start_byte, orb_node.end_byte))
-                control_predicates, control_refs = self._endpoint_controls(
+                (
+                    control_predicates,
+                    control_refs,
+                    control_lines,
+                    control_site_ids,
+                ) = self._endpoint_controls(
                     unit, orb_node, right, state
                 )
                 owner, endpoint_kind = self._endpoint_scope(
@@ -3300,6 +3327,8 @@ class TreeSitterSourceExtractor:
                         ),
                         source_site_id=unit.site_id(node),
                         control_predicates=control_predicates,
+                        control_predicate_lines=control_lines,
+                        control_predicate_site_ids=control_site_ids,
                         control_expression_refs=control_refs,
                     )
                 )
@@ -3323,7 +3352,12 @@ class TreeSitterSourceExtractor:
             state = state_by_callable.get(callable.callable_id)
             for topic, instance, orb_node in topics:
                 consumed_orb_sites.add((orb_node.start_byte, orb_node.end_byte))
-                control_predicates, control_refs = self._endpoint_controls(
+                (
+                    control_predicates,
+                    control_refs,
+                    control_lines,
+                    control_site_ids,
+                ) = self._endpoint_controls(
                     unit, orb_node, node, state
                 )
                 refs[direction].append(
@@ -3364,6 +3398,8 @@ class TreeSitterSourceExtractor:
                         ),
                         source_site_id=unit.site_id(node),
                         control_predicates=control_predicates,
+                        control_predicate_lines=control_lines,
+                        control_predicate_site_ids=control_site_ids,
                         control_expression_refs=control_refs,
                     )
                 )
@@ -3397,6 +3433,14 @@ class TreeSitterSourceExtractor:
                 boundary_symbol = self._enclosing_assignment_target(unit, node)
             for topic, instance, orb_node in topics:
                 consumed_orb_sites.add((orb_node.start_byte, orb_node.end_byte))
+                (
+                    control_predicates,
+                    control_refs,
+                    control_lines,
+                    control_site_ids,
+                ) = self._endpoint_controls(
+                    unit, orb_node, node, state
+                )
                 owner, endpoint_kind = self._endpoint_scope(
                     context, callable, boundary_symbol or ""
                 )
@@ -3428,6 +3472,12 @@ class TreeSitterSourceExtractor:
                             else None
                         ),
                         source_site_id=unit.site_id(node),
+                        transfer=True,
+                        control_predicates=control_predicates,
+                        control_predicate_lines=control_lines,
+                        control_predicate_site_ids=control_site_ids,
+                        control_expression_refs=control_refs,
+                        reachability_exact=not node.has_error,
                     )
                 )
 
@@ -3458,9 +3508,9 @@ class TreeSitterSourceExtractor:
         endpoint_node: Node,
         root: Node,
         state: Optional[_ExtractionState],
-    ) -> tuple[list[str], list[SourceExpressionRef]]:
+    ) -> tuple[list[str], list[SourceExpressionRef], list[int], list[str]]:
         """Return source predicates selecting one conditional endpoint."""
-        terms: list[tuple[str, SourceExpressionRef]] = []
+        terms: list[tuple[str, SourceExpressionRef, Node]] = []
         current: Optional[Node] = endpoint_node
         while current is not None and current != root:
             parent = current.parent
@@ -3498,13 +3548,16 @@ class TreeSitterSourceExtractor:
                         (
                             selected,
                             expression_ref.model_copy(update={"text": selected}),
+                            condition,
                         )
                     )
             current = parent
         terms.reverse()
         return (
-            [predicate for predicate, _ref in terms],
-            [ref for _predicate, ref in terms],
+            [predicate for predicate, _ref, _node in terms],
+            [ref for _predicate, ref, _node in terms],
+            [unit.line(node) for _predicate, _ref, node in terms],
+            [unit.site_id(node) for _predicate, _ref, node in terms],
         )
 
     def _orb_topics(
@@ -3630,15 +3683,17 @@ class TreeSitterSourceExtractor:
     ) -> list[ParameterRef]:
         refs: list[ParameterRef] = []
         covered: set[tuple[int, int]] = set()
-        for parameter, member, _owner, template in self._parameter_declarations(unit):
+        for parameter, member, owner, template in self._parameter_declarations(unit):
             refs.append(
                 ParameterRef(
                     name=parameter,
                     member=member,
+                    owner=owner,
                     file=unit.file,
                     line=unit.line(template),
                     evidence=unit.evidence(template),
                     access_pattern="typed_parameter_declaration",
+                    source_site_id=unit.site_id(template),
                 )
             )
             covered.add((template.start_byte, template.end_byte))
@@ -3658,6 +3713,7 @@ class TreeSitterSourceExtractor:
                         line=unit.line(node),
                         evidence=unit.evidence(node),
                         access_pattern="px4_parameter_identifier",
+                        source_site_id=unit.site_id(node),
                     )
                 )
             elif node.type == "call_expression":
@@ -3675,6 +3731,7 @@ class TreeSitterSourceExtractor:
                                 line=unit.line(node),
                                 evidence=unit.evidence(node),
                                 access_pattern="param_find",
+                                source_site_id=unit.site_id(node),
                             )
                         )
                 if function_node is None or function_node.type != "field_expression":
@@ -3693,10 +3750,16 @@ class TreeSitterSourceExtractor:
                     ParameterRef(
                         name=parameter,
                         member=receiver,
+                        owner=(
+                            callable.owner
+                            if callable
+                            else unit.class_owner(node)
+                        ),
                         file=unit.file,
                         line=unit.line(node),
                         evidence=unit.evidence(node),
                         access_pattern="typed_parameter_get",
+                        source_site_id=unit.site_id(node),
                         confidence="high" if parameter else "low",
                     )
                 )
@@ -3709,11 +3772,6 @@ class TreeSitterSourceExtractor:
         parameters: Sequence[ParameterRef],
     ) -> list[ParameterPredicateRef]:
         refs: list[ParameterPredicateRef] = []
-        direct_members = {
-            item.member: item.name
-            for item in parameters
-            if item.member and item.name
-        }
         for node in _walk(unit.tree.root_node):
             if node.type != "binary_expression":
                 continue
@@ -3727,10 +3785,10 @@ class TreeSitterSourceExtractor:
             if operator not in {"==", "!=", "<", ">", "<=", ">="}:
                 continue
             left_name, left_member = self._parameter_operand(
-                unit, context, node, left, direct_members
+                unit, context, node, left
             )
             right_name, right_member = self._parameter_operand(
-                unit, context, node, right, direct_members
+                unit, context, node, right
             )
             if not left_name and not right_name:
                 continue
@@ -3748,6 +3806,7 @@ class TreeSitterSourceExtractor:
                     file=unit.file,
                     line=unit.line(node),
                     evidence=unit.evidence(node),
+                    source_site_id=unit.site_id(node),
                 )
             )
         return refs
@@ -3758,7 +3817,6 @@ class TreeSitterSourceExtractor:
         context: _SourceContext,
         comparison: Node,
         operand: Node,
-        direct_members: dict[str, str],
     ) -> tuple[Optional[str], Optional[str]]:
         text = unit.text(operand).strip()
         direct = self._parameter_name_from_text(text)
@@ -3782,7 +3840,7 @@ class TreeSitterSourceExtractor:
             receiver = self._canonical_symbol(
                 unit.text(function.child_by_field_name("argument"))
             )
-            name = direct_members.get(receiver) or context.parameter_for_member(
+            name = context.parameter_for_member(
                 owner, receiver.split(".", 1)[0]
             )
             if name:
@@ -3992,11 +4050,39 @@ class TreeSitterSourceExtractor:
         return SourceCallResultRef(
             call_source_site_id=state.unit.site_id(current),
             result_path=result_path,
-            text=self._apply_storage_aliases(
-                self.profiler._normalize_source_expression(state.unit.text(node)),
-                state.storage_aliases,
+            text=self.profiler._normalize_source_expression(
+                state.unit.text(node)
             ),
         )
+
+    def _direct_storage_from_node(
+        self,
+        state: _ExtractionState,
+        node: Optional[Node],
+    ) -> Optional[str]:
+        """Return the storage read when the whole expression is a copy.
+
+        Parentheses and pointer/reference operators do not change which
+        source entity supplies the value. Calls are represented separately by
+        :class:`SourceCallResultRef`; compound expressions are not direct
+        copies and deliberately return ``None``.
+        """
+        current = node
+        while current is not None and current.type in {
+            "parenthesized_expression",
+            "pointer_expression",
+        }:
+            current = current.named_children[0] if current.named_children else None
+        if current is None or current.type not in {
+            "identifier",
+            "field_expression",
+            "subscript_expression",
+            "qualified_identifier",
+        }:
+            return None
+        if any(child.type == "call_expression" for child in _walk(current)):
+            return None
+        return self._canonical_symbol(state.unit.text(current)) or None
 
     def _aliased_call_result(
         self, state: _ExtractionState, text: str
@@ -4279,14 +4365,7 @@ class TreeSitterSourceExtractor:
         source_text = str(
             text if text is not None else parsed_unit.text(node) if parsed_unit and node else ""
         ).strip()
-        lowered_text = (
-            self._apply_storage_aliases(
-                self.profiler._normalize_source_expression(source_text),
-                state.storage_aliases,
-            )
-            if state is not None
-            else self.profiler._normalize_source_expression(source_text)
-        )
+        lowered_text = self.profiler._normalize_source_expression(source_text)
         if node is None:
             return SourceExpressionRef(
                 text=source_text,
@@ -4328,23 +4407,8 @@ class TreeSitterSourceExtractor:
                 result.model_copy(update={"result_path": path})
             )
 
-        def aliased_call_result(raw: str) -> bool:
-            if state is None:
-                return False
-            result = self._aliased_call_result(state, raw)
-            if result is None:
-                return False
-            add_call_result(result)
-            return True
-
         def add_symbol(raw: str, source_node: Node) -> None:
-            if aliased_call_result(raw):
-                return
-            symbol = (
-                self._storage_target(state, raw)
-                if state is not None
-                else self._canonical_symbol(raw)
-            )
+            symbol = self._canonical_symbol(raw)
             if "(" in symbol:
                 # Call syntax is never a storage location. Syntax-aware paths
                 # record it through ``call_results``; unresolved legacy text
@@ -4477,6 +4541,16 @@ class TreeSitterSourceExtractor:
             for child in current.named_children:
                 visit(child)
 
+        direct_call_result = (
+            self._call_result_from_node(state, node)
+            if state is not None
+            else None
+        )
+        direct_storage = (
+            self._direct_storage_from_node(state, node)
+            if state is not None and direct_call_result is None
+            else None
+        )
         visit(node)
         return SourceExpressionRef(
             text=source_text,
@@ -4484,6 +4558,8 @@ class TreeSitterSourceExtractor:
             input_symbols=inputs,
             input_identities=identities,
             call_results=call_results,
+            direct_storage=direct_storage,
+            direct_call_result=direct_call_result,
             exact=not node.has_error,
         )
 
@@ -4662,6 +4738,10 @@ class TreeSitterSourceExtractor:
             return_expression_ref=(
                 return_expression_ref if unresolved is None else None
             ),
+            # Return sites are parser facts, not products of helper formula
+            # lowering. Keep them available even when the retiring flattened
+            # representation cannot model the helper body.
+            return_sites=state.return_sites,
             lowered_return_expression=lowered if unresolved is None else None,
             branches=state.return_paths if unresolved is None else [],
             symbol_bindings=symbol_bindings if unresolved is None else {},

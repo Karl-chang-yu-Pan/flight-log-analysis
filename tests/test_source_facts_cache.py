@@ -303,3 +303,51 @@ void Cone::pick_altitude()
     # means BOTH branches carry a control predicate.
     by_line = {a.line: a for a in facts.source_assignments if a.target == "_rtl_alt"}
     assert any(cp for a in by_line.values() for cp in a.control_predicates)
+
+
+def test_legacy_layer1_keeps_pointer_effects_at_callee_storage(tmp_path):
+    """DAG facts must not contain the profiler's flattened call-site write."""
+    module_dir = tmp_path / "PX4-Autopilot" / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "output.cpp").write_text(
+        """
+struct output_s { float value; };
+
+void fill(float input, output_s *out)
+{
+    out->value = input * 2.0f;
+}
+
+void run(float input)
+{
+    output_s result{};
+    fill(input, &result);
+    consume(result.value);
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(
+        tmp_path / "PX4-Autopilot",
+        rg_path="missing-rg",
+        source_parser_backend="legacy",
+    )
+
+    raw = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/output.cpp"]
+    )
+    assert any(
+        "legacy_pointer_output" in str(item.source_site_id or "")
+        for item in raw
+    )
+
+    facts = extract_facts_for_file(
+        profiler,
+        "src/modules/example/output.cpp",
+        source_hash="abcdef",
+    )
+    assert not any(
+        "legacy_pointer_output" in str(item.source_site_id or "")
+        for item in facts.source_assignments
+    )
+    assert any(item.target == "out.value" for item in facts.source_assignments)

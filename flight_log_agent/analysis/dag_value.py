@@ -78,7 +78,7 @@ class DAGValueProgram:
         )
         self._observable_inputs = MappingProxyType(
             self._derive_leaf_dependencies(
-                vertices, dependents, observed_only=False
+                vertices, dependents, observed_only=True
             )
         )
 
@@ -175,9 +175,9 @@ class DAGValueProgram:
         metadata = vertex.metadata or {}
         expression_ref = metadata.get("source_expression_ref") or {}
         expression = str(
-            vertex.lowered_expression
-            or expression_ref.get("lowered_text")
+            expression_ref.get("lowered_text")
             or expression_ref.get("text")
+            or vertex.lowered_expression
             or metadata.get("source_expression")
             or (
                 vertex.predicate_raw or vertex.predicate_lowered or ""
@@ -318,12 +318,6 @@ class DAGValueSession:
                 return DAGValueResult(
                     "value", value=self.parameters[parameter_name]
                 )
-        if timestamp is not None and self.sample_resolver is not None and name:
-            sample_key = (name, timestamp)
-            if sample_key not in self._sample_cache:
-                self._sample_cache[sample_key] = self.sample_resolver(name, timestamp)
-            if self._sample_cache[sample_key] is not None:
-                return DAGValueResult("value", value=self._sample_cache[sample_key])
         if vertex.sub_kind == "helper_parameter":
             incoming = self.program.data_by_target.get(vertex.id, ())
             if incoming:

@@ -573,9 +573,16 @@ def replay_terminal_expressions(
     if not terminal_ops:
         return not_attempted("no terminal writes in the graph")
     published = {
-        str((op.metadata or {}).get("logged_signal") or "")
+        str(
+            (op.metadata or {}).get("external_target_signal")
+            or (op.metadata or {}).get("logged_signal")
+            or ""
+        )
         for op in terminal_ops
-        if (op.metadata or {}).get("logged_signal")
+        if (
+            (op.metadata or {}).get("external_target_signal")
+            or (op.metadata or {}).get("logged_signal")
+        )
     }
     terminal = str(annotated.terminal or "")
     if len(published) == 1:
@@ -870,10 +877,19 @@ def build_report_from_dag(
                     )
                 )
         elif vertex.kind == "operation" and vertex.file and vertex.metadata.get("is_terminal"):
-            logged_output = str((vertex.metadata or {}).get("logged_signal") or "")
+            logged_output = str(
+                (vertex.metadata or {}).get("external_target_signal")
+                or (vertex.metadata or {}).get("logged_signal")
+                or ""
+            )
+            output_observation = str(
+                (vertex.metadata or {}).get("external_target_observation")
+                or (vertex.metadata or {}).get("logged_observation")
+                or ""
+            )
             if (
                 logged_output
-                and (vertex.metadata or {}).get("logged_observation") == "observed"
+                and output_observation == "observed"
                 and all(item.signal != logged_output for item in signature)
             ):
                 signature.append(

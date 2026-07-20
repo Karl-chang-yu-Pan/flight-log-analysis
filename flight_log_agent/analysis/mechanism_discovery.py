@@ -43,7 +43,8 @@ from flight_log_agent.px4.source_facts_cache import (
 )
 from flight_log_agent.symbols import (
     exact_symbol,
-    strip_symbol_indices,
+    parse_signal_reference,
+    source_storage_produces_reference,
     symbol_produces_reference,
 )
 from flight_log_agent.utils import dedupe_keep_order
@@ -61,11 +62,10 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
     """Convert one profiler ``SourceAssignmentRef`` into a DAG binding dict.
 
     The DAG builder reads ``target_symbol`` / ``source_symbol`` /
-    ``assignment_path`` / ``logged_signal`` — not the profiler's flat
-    ``target`` / ``expression`` / ``file`` / ``line``. A profiler-derived
-    topic/field pair establishes declaration compatibility only. The
-    aggregation pass fills ``logged_signal`` only after source structure
-    proves that the target object crosses a publication boundary.
+    ``assignment_path`` rather than the profiler's flat ``target`` /
+    ``expression`` / ``file`` / ``line``. Message transfers are separate
+    operation bindings; an assignment is never relabelled as a logged value
+    merely because the same object is published later.
     """
     ref = _as_dict(assignment)
     expression_ref = dict(ref.get("expression_ref") or {})
@@ -105,8 +105,6 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
             }
         ],
         # A struct type proves declaration compatibility, not publication.
-        # ``dag_inputs_from_facts`` fills this only after a publish boundary
-        # ties the target object to a topic.
         "declared_signal": f"{topic}.{field_name}" if topic and field_name else "",
         "logged_signal": "",
         "control_predicates": list(ref.get("control_predicates") or []),
@@ -116,7 +114,6 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         ),
         "reachability_exact": bool(ref.get("reachability_exact", True)),
         "struct_variables": dict(ref.get("struct_variables") or {}),
-        "symbol_bindings": dict(ref.get("symbol_bindings") or {}),
     }
 
 
@@ -131,7 +128,7 @@ class DAGInputs:
     bindings: list[dict[str, Any]] = field(default_factory=list)
     helper_expressions: list[dict[str, Any]] = field(default_factory=list)
     parameter_predicates: list[dict[str, Any]] = field(default_factory=list)
-    parameter_aliases: dict[str, str] = field(default_factory=dict)
+    parameter_bindings: list[dict[str, Any]] = field(default_factory=list)
     parameter_names: set[str] = field(default_factory=set)
     call_statements: list[dict[str, Any]] = field(default_factory=list)
     boundary_bindings: list[dict[str, Any]] = field(default_factory=list)
@@ -143,18 +140,24 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
 
     Layer 1 entries are per-file, so duplicates only arise when the same
     file is passed twice or two files declare identical facts (headers);
-    both are deduplicated on content keys. ``parameter_aliases`` maps the
-    PX4 parameter *member* (``_param_wv_roll_min``) to its canonical name
-    (``WV_ROLL_MIN``) from ``ParameterRef.member`` / ``.name``.
+    both are deduplicated on source identity. Parameter members retain their
+    declaring owner instead of being collapsed into a process-wide name map.
     """
     inputs = DAGInputs()
-    seen_bindings: set[tuple[str, str, str, int]] = set()
-    seen_helpers: set[tuple[str, str, int]] = set()
-    seen_predicates: set[tuple[str, str, int]] = set()
+    seen_bindings: set[tuple[Any, ...]] = set()
+    seen_helpers: set[tuple[Any, ...]] = set()
+    seen_predicates: set[tuple[Any, ...]] = set()
     seen_calls: set[tuple[Any, ...]] = set()
+    seen_parameters: set[tuple[Any, ...]] = set()
 
     entries = [_as_dict(facts_entry) for facts_entry in facts]
     inputs.structure = SourceStructureIndex.from_facts(entries)
+    calls_by_source_site = {
+        str(call.get("source_site_id") or ""): call
+        for entry in entries
+        for raw_call in entry.get("function_calls") or []
+        if (call := _as_dict(raw_call)).get("source_site_id")
+    }
 
     class_bases: dict[str, list[str]] = {}
     callable_owners: dict[str, str] = {}
@@ -192,6 +195,9 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                 topic = str(ref.get("topic") or "")
                 if not variable or not topic:
                     continue
+                transfer_call = calls_by_source_site.get(
+                    str(ref.get("source_site_id") or ""), {}
+                ) if ref.get("transfer") else {}
                 topic_refs_by_variable.setdefault(variable, []).append(
                     {
                         "source_symbol": variable,
@@ -199,6 +205,7 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                         "instance": ref.get("instance"),
                         "direction": direction,
                         "file": str(ref.get("file") or entry.get("file") or ""),
+                        "line": int(ref.get("line") or 0),
                         "function": str(ref.get("function") or ""),
                         "callable_id": str(ref.get("callable_id") or ""),
                         "source_owner": str(ref.get("variable_owner") or ""),
@@ -207,17 +214,45 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                         ),
                         "endpoint_kind": str(ref.get("endpoint_kind") or ""),
                         "source_site_id": str(ref.get("source_site_id") or ""),
+                        "transfer": bool(ref.get("transfer", False)),
                         "provenance": str(ref.get("api") or direction_key),
                         "control_predicates": [
                             str(value)
-                            for value in (ref.get("control_predicates") or [])
+                            for value in (
+                                transfer_call.get("control_predicates")
+                                or ref.get("control_predicates")
+                                or []
+                            )
+                        ],
+                        "control_predicate_lines": [
+                            int(value)
+                            for value in (
+                                transfer_call.get("control_predicate_lines")
+                                or ref.get("control_predicate_lines")
+                                or []
+                            )
+                        ],
+                        "control_predicate_site_ids": [
+                            str(value)
+                            for value in (
+                                transfer_call.get("control_predicate_site_ids")
+                                or ref.get("control_predicate_site_ids")
+                                or []
+                            )
                         ],
                         "control_expression_refs": [
                             dict(value)
-                            for value in (ref.get("control_expression_refs") or [])
+                            for value in (
+                                transfer_call.get("control_expression_refs")
+                                or ref.get("control_expression_refs")
+                                or []
+                            )
                         ],
                         "reachability_exact": bool(
-                            ref.get("reachability_exact", True)
+                            transfer_call.get(
+                                "reachability_exact",
+                                ref.get("reachability_exact", True),
+                            )
                         ),
                     }
                 )
@@ -238,7 +273,11 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             item
             for lookup in ({receiver, "this"} if not receiver else {receiver})
             for item in topic_refs_by_variable.get(lookup, [])
-            if item.get("direction") == direction and item.get("topic")
+            if (
+                item.get("direction") == direction
+                and item.get("topic")
+                and not item.get("transfer")
+            )
         ]
         scoped: list[dict[str, Any]] = []
         for item in candidates:
@@ -274,33 +313,6 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             elif endpoint_kind == "global" and source_file and item_file == source_file:
                 scoped.append(item)
         return scoped
-
-    def source_storage_key(
-        symbol: str,
-        *,
-        file: str,
-        callable_id: str,
-        owner_hint: str = "",
-        identity: Optional[dict[str, Any]] = None,
-    ) -> tuple[str, ...]:
-        if identity:
-            resolved = SourceSymbolIdentity.model_validate(identity).model_copy(
-                update={"symbol": exact_symbol(symbol)}
-            )
-            return resolved.storage_key()
-        callable_record = inputs.structure.callables_by_id.get(callable_id) or {}
-        identity = inputs.structure.symbol_identity(
-            symbol,
-            file=file,
-            callable_id=callable_id,
-            function_name=str(callable_record.get("name") or ""),
-            function_parameters=[
-                str(value)
-                for value in (callable_record.get("parameters") or [])
-            ],
-            class_owner_hint=owner_hint,
-        )
-        return identity.storage_key()
 
     inputs.boundary_bindings.extend(
         item
@@ -378,6 +390,8 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                         "source_owner": source_owner,
                         "source_identity": argument_identity,
                         "source_site_id": str(call.get("source_site_id") or ""),
+                        "line": int(call.get("line") or 0),
+                        "transfer": True,
                         "provenance": f"{receiver}.{name}",
                         "control_predicates": [
                             *(
@@ -387,6 +401,26 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                             *(
                                 str(value)
                                 for value in call.get("control_predicates") or []
+                            ),
+                        ],
+                        "control_predicate_lines": [
+                            *(
+                                int(value)
+                                for value in endpoint.get("control_predicate_lines") or []
+                            ),
+                            *(
+                                int(value)
+                                for value in call.get("control_predicate_lines") or []
+                            ),
+                        ],
+                        "control_predicate_site_ids": [
+                            *(
+                                str(value)
+                                for value in endpoint.get("control_predicate_site_ids") or []
+                            ),
+                            *(
+                                str(value)
+                                for value in call.get("control_predicate_site_ids") or []
                             ),
                         ],
                         "control_expression_refs": [
@@ -405,70 +439,142 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                     }
                 )
 
-    publish_candidates: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    def boundary_operation(item: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Lower one source-proven message transfer to an ordinary binding."""
+        if not item.get("transfer"):
+            return None
+        topic = str(item.get("topic") or "")
+        payload = str(item.get("source_symbol") or "")
+        direction = str(item.get("direction") or "")
+        if not topic or not payload or direction not in {"subscribe", "publish"}:
+            return None
+        instance = item.get("instance")
+        topic_identity = f"{topic}[{instance}]" if instance is not None else topic
+        payload_identity = dict(item.get("source_identity") or {})
+        if not payload_identity:
+            callable_id = str(item.get("callable_id") or "")
+            callable_record = inputs.structure.callables_by_id.get(callable_id) or {}
+            derived_identity = inputs.structure.symbol_identity(
+                payload,
+                file=str(item.get("file") or ""),
+                callable_id=callable_id,
+                function_name=str(
+                    callable_record.get("name") or item.get("function") or ""
+                ),
+                function_parameters=[
+                    str(value)
+                    for value in (callable_record.get("parameters") or [])
+                ],
+                class_owner_hint=str(item.get("source_owner") or ""),
+            )
+            if derived_identity.kind != "unknown":
+                payload_identity = derived_identity.model_dump()
+        if direction == "subscribe":
+            target, source = payload, topic_identity
+            target_identity = payload_identity
+            input_identities: dict[str, Any] = {}
+        else:
+            target, source = topic_identity, payload
+            target_identity = {}
+            input_identities = {source: payload_identity} if payload_identity else {}
+        source_site_id = str(item.get("source_site_id") or "")
+        file = str(item.get("file") or "")
+        line = int(item.get("line") or 0)
+        return {
+            "target_symbol": target,
+            "source_symbol": source,
+            "function": str(item.get("function") or ""),
+            "callable_id": str(item.get("callable_id") or ""),
+            "function_owner": str(item.get("source_owner") or ""),
+            "target_identity": target_identity,
+            "assignment_operator": "=",
+            "source_site_id": source_site_id,
+            "expression_ref": {
+                "text": source,
+                "lowered_text": source,
+                "input_symbols": [source],
+                "input_identities": input_identities,
+                "call_results": [],
+                "direct_storage": source,
+                "exact": True,
+            },
+            "reference_identities": input_identities,
+            "assignment_path": [
+                {"file": file, "line": line, "expression": source}
+            ],
+            "declared_signal": topic_identity,
+            "logged_signal": "",
+            "control_predicates": list(item.get("control_predicates") or []),
+            "control_predicate_lines": list(
+                item.get("control_predicate_lines") or []
+            ),
+            "control_predicate_site_ids": list(
+                item.get("control_predicate_site_ids") or []
+            ),
+            "control_expression_refs": list(
+                item.get("control_expression_refs") or []
+            ),
+            "reachability_exact": bool(item.get("reachability_exact", True)),
+            "synthetic_boundary_transfer": True,
+            "boundary_direction": direction,
+            "external_source_signal": direction == "subscribe",
+            "external_target_signal": direction == "publish",
+            "provenance": str(item.get("provenance") or direction),
+        }
+
+    seen_transfers: set[tuple[Any, ...]] = set()
     for item in inputs.boundary_bindings:
-        callable_id = str(item.get("callable_id") or "")
-        if item.get("direction") != "publish" or not callable_id:
+        operation = boundary_operation(item)
+        if operation is None:
             continue
-        key = source_storage_key(
-            str(item.get("source_symbol") or ""),
-            file=str(item.get("file") or ""),
-            callable_id=callable_id,
-            owner_hint=str(item.get("source_owner") or ""),
-            identity=dict(item.get("source_identity") or {}),
+        transfer_key = (
+            str(operation.get("source_site_id") or ""),
+            str(operation.get("target_symbol") or ""),
+            str(operation.get("source_symbol") or ""),
+            str(operation.get("boundary_direction") or ""),
         )
-        publish_candidates.setdefault(key, []).append(item)
+        if transfer_key in seen_transfers:
+            continue
+        seen_transfers.add(transfer_key)
+        inputs.bindings.append(operation)
+
+    endpoint_declarations = {
+        str((item.get("source_identity") or {}).get("declaration_id") or "")
+        for item in inputs.boundary_bindings
+        if not item.get("transfer")
+    }
+    endpoint_declarations.discard("")
 
     for entry in entries:
 
         for assignment in entry.get("source_assignments") or []:
             ref = _as_dict(assignment)
+            target_declaration = str(
+                (ref.get("target_identity") or {}).get("declaration_id") or ""
+            )
+            if target_declaration in endpoint_declarations:
+                # Endpoint construction configures the external transfer; it
+                # is not a runtime value writer for the endpoint object.
+                continue
             key = (
-                str(ref.get("target") or ""),
-                str(ref.get("expression") or ""),
+                str(ref.get("source_site_id") or ""),
+                str(ref.get("callable_id") or ""),
                 str(ref.get("file") or ""),
                 int(ref.get("line") or 0),
+                str(ref.get("target") or ""),
+                str(ref.get("expression") or ""),
             )
             if key in seen_bindings:
                 continue
             seen_bindings.add(key)
             binding = binding_from_assignment(ref)
-            target = str(binding.get("target_symbol") or "")
-            root, dot, field_path = target.replace("->", ".").partition(".")
-            file = str(ref.get("file") or entry.get("file") or "")
-            callable_id = str(ref.get("callable_id") or "")
-            storage_key = source_storage_key(
-                root,
-                file=file,
-                callable_id=callable_id,
-                owner_hint=str(ref.get("owner") or ""),
-                identity=dict(ref.get("target_identity") or {}),
-            )
-            publication_candidates = publish_candidates.get(storage_key, [])
-            placements = {
-                (str(item.get("topic") or ""), item.get("instance"))
-                for item in publication_candidates
-                if item.get("topic")
-            }
-            if len(placements) == 1 and dot and field_path:
-                topic, instance = next(iter(placements))
-                topic_identity = (
-                    f"{topic}[{instance}]" if instance is not None else topic
-                )
-                binding["logged_signal"] = f"{topic_identity}.{field_path}"
-            elif publication_candidates and dot and field_path:
-                binding["logged_signal_candidates"] = [
-                    {
-                        **dict(item),
-                        "signal_field": field_path,
-                    }
-                    for item in publication_candidates
-                ]
             inputs.bindings.append(binding)
 
         for helper in entry.get("helper_expressions") or []:
             helper_dict = _as_dict(helper)
             key = (
+                str(helper_dict.get("source_site_id") or ""),
+                str(helper_dict.get("callable_id") or ""),
                 str(helper_dict.get("name") or ""),
                 str(helper_dict.get("file") or ""),
                 int(helper_dict.get("line") or 0),
@@ -481,6 +587,8 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
         for predicate in entry.get("parameter_predicates") or []:
             predicate_dict = _as_dict(predicate)
             key = (
+                str(predicate_dict.get("source_site_id") or ""),
+                str(predicate_dict.get("callable_id") or ""),
                 str(predicate_dict.get("predicate") or ""),
                 str(predicate_dict.get("file") or ""),
                 int(predicate_dict.get("line") or 0),
@@ -513,7 +621,16 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             if name:
                 inputs.parameter_names.add(str(name))
                 if member:
-                    inputs.parameter_aliases.setdefault(str(member), str(name))
+                    key = (
+                        str(parameter_dict.get("source_site_id") or ""),
+                        str(parameter_dict.get("owner") or ""),
+                        str(member),
+                        str(name),
+                        str(parameter_dict.get("file") or ""),
+                    )
+                    if key not in seen_parameters:
+                        seen_parameters.add(key)
+                        inputs.parameter_bindings.append(parameter_dict)
 
     inputs.bindings = inputs.structure.enrich_bindings(inputs.bindings)
     inputs.call_statements = inputs.structure.enrich_calls(inputs.call_statements)
@@ -866,10 +983,17 @@ def survey_source_files(
         ).strip()
         if not file or not symbol:
             continue
-        identity = SourceSymbolIdentity.model_validate(
-            assignment.get("target_identity") or {}
+        raw_identity = assignment.get("target_identity") or {}
+        identity = (
+            SourceSymbolIdentity.model_validate(raw_identity)
+            if raw_identity
+            else None
         )
-        storage_key = identity.storage_key()
+        storage_key = (
+            identity.storage_key()
+            if identity is not None
+            else ("external_signal", exact_symbol(symbol))
+        )
         source_target_id = hashlib.sha256(
             repr(storage_key).encode("utf-8")
         ).hexdigest()[:24]
@@ -880,7 +1004,7 @@ def survey_source_files(
                 symbol=symbol,
                 source_target_id=source_target_id,
                 callable_id=str(assignment.get("callable_id") or ""),
-                identity=identity.model_dump(),
+                identity=identity.model_dump() if identity is not None else {},
                 function=str(assignment.get("function") or ""),
                 line=int((site or {}).get("line") or 0),
                 expression=str(
@@ -893,8 +1017,11 @@ def survey_source_files(
             targets[storage_key] = target
         target.writes += 1
         target.distance = min(target.distance, distance)
-        published = str(
-            assignment.get("logged_signal") or assignment.get("declared_signal") or ""
+        published = (
+            str(assignment.get("target_symbol") or "")
+            if assignment.get("synthetic_boundary_transfer")
+            and assignment.get("boundary_direction") == "publish"
+            else ""
         )
         if published and not target.published_signal:
             target.published_signal = published
@@ -978,10 +1105,9 @@ class TerminalValidation:
     ``status``:
 
     * ``valid`` — the terminal has write targets in the loaded facts
-      (scoped to ``resolved_file`` when one could be determined) or is
-      an exact member of the observed logged catalogue.
-    * ``absent`` — no write target anywhere in the loaded facts and not
-      a logged output.
+      (scoped to ``resolved_file`` when one could be determined).
+    * ``absent`` — no write target exists in the loaded facts. Observing a
+      field in the ULog does not substitute for its source publish operation.
     * ``absent_in_scope`` — write targets exist, but none in the
       declared terminal file's family or module.
     * ``ambiguous`` — write targets span several unrelated locations
@@ -1009,16 +1135,11 @@ def validate_terminal(
     """Validate a candidate terminal against actual write targets and
     the observed catalogue — never by prompt trust or name shape.
 
-    Matching mirrors the DAG builder's terminal lookup exactly (the
-    EXACT-identity union of written targets and resolved logged signals,
-    index-compatible spellings included), so a terminal validated here
-    is one the slicer can act on. Scope rules mirror the walk's
-    visibility conventions: a member-shaped root (leading or trailing
-    underscore) is visible across its module directory, a local only
-    within its file family — write targets spread wider than that
-    without a declared terminal file are ambiguous, not sliceable. A
-    ``Class::member`` qualifier is used as scope evidence: it selects
-    the writer whose extracted class ownership matches.
+    Matching mirrors the DAG builder's exact written-target lookup, so a
+    terminal validated here is one the slicer can act on. Declaration
+    identity and an explicit terminal file provide scope; spelling and file
+    proximity never choose among unrelated writers. A ``Class::member``
+    qualifier selects only a writer whose extracted ownership matches.
     """
     qualifier, canonical = split_terminal_qualifier(terminal)
     structure = source_structure or SourceStructureIndex()
@@ -1037,19 +1158,13 @@ def validate_terminal(
 
     logged = norm in {exact_symbol(str(s)) for s in logged_signals if s}
 
-    shape = strip_symbol_indices(norm)
     matches: list[dict[str, Any]] = []
     for binding in bindings:
         target = exact_symbol(
             str(binding.get("target_symbol") or binding.get("target") or "")
         )
-        published = exact_symbol(str(binding.get("logged_signal") or ""))
-        for candidate in (target, published):
-            if strip_symbol_indices(candidate) == shape and symbol_produces_reference(
-                candidate, norm
-            ):
-                matches.append(binding)
-                break
+        if source_storage_produces_reference(target, norm):
+            matches.append(binding)
 
     all_matches = list(matches)
     writes_per_file: dict[str, int] = {}
@@ -1060,17 +1175,15 @@ def validate_terminal(
     write_files = sorted(writes_per_file)
 
     if not all_matches:
-        if logged:
-            return TerminalValidation(
-                terminal=canonical,
-                status="valid",
-                logged=True,
-                reason="observed logged output; no publisher loaded yet",
-            )
         return TerminalValidation(
             terminal=canonical,
             status="absent",
-            reason="no write target in loaded facts",
+            logged=logged,
+            reason=(
+                "observed logged output has no source writer in loaded facts"
+                if logged
+                else "no write target in loaded facts"
+            ),
         )
 
     def best_file(files: Iterable[str]) -> Optional[str]:
@@ -1127,21 +1240,20 @@ def validate_terminal(
             terminal_file = best_file(class_files)
 
     if terminal_file:
+        def source_unit_related(candidate_file: str) -> bool:
+            if candidate_file == terminal_file:
+                return True
+            return (
+                terminal_file in structure.includes.get(candidate_file, set())
+                or candidate_file
+                in structure.includes.get(terminal_file, set())
+            )
+
         scoped_matches = [
             binding
             for binding in matches
-            if _DAGBuilder._binding_first_file(binding) == terminal_file
+            if source_unit_related(_DAGBuilder._binding_first_file(binding))
         ]
-        if not scoped_matches:
-            declared_family = _DAGBuilder._file_family(terminal_file)
-            scoped_matches = [
-                binding
-                for binding in matches
-                if _DAGBuilder._file_family(
-                    _DAGBuilder._binding_first_file(binding)
-                )
-                == declared_family
-            ]
         if not scoped_matches:
             return TerminalValidation(
                 terminal=canonical,
@@ -1186,18 +1298,6 @@ def validate_terminal(
             ),
             resolved_identity=(
                 resolved_identity.model_dump() if resolved_identity is not None else None
-            ),
-        )
-    if logged:
-        # An exact observed logged output is resolvable through the
-        # catalogue alone; multiple publisher sites are legitimate.
-        return TerminalValidation(
-            terminal=canonical,
-            status="valid",
-            logged=True,
-            write_files=write_files,
-            resolved_identity=(
-                requested_identity.model_dump() if requested_identity else None
             ),
         )
     return TerminalValidation(
@@ -1465,12 +1565,30 @@ def discover_mechanism_dag(
     validation: Optional[TerminalValidation] = None
     visited: set[tuple[Any, ...]] = set()
 
-    def writes_terminal(facts: SourceFileFacts) -> bool:
+    def bindings_write_terminal(bindings: Iterable[dict[str, Any]]) -> bool:
         canonical = exact_symbol(terminal)
         return any(
-            symbol_produces_reference(exact_symbol(item.target), canonical)
-            for item in facts.source_assignments
+            source_storage_produces_reference(
+                exact_symbol(
+                    str(binding.get("target_symbol") or binding.get("target") or "")
+                ),
+                canonical,
+            )
+            for binding in bindings
         )
+
+    def candidate_bundle(file_path: str) -> tuple[list[str], DAGInputs]:
+        """Load one candidate and its source companions for proof only."""
+        files = dedupe_keep_order(
+            [file_path, *resolver.companion_files(file_path)]
+        )
+        return files, dag_inputs_from_facts(
+            resolver.facts_for(candidate) for candidate in files
+        )
+
+    def admit_terminal_candidate(file_path: str) -> list[str]:
+        files, candidate_inputs = candidate_bundle(file_path)
+        return files if bindings_write_terminal(candidate_inputs.bindings) else []
 
     explicit_files = [str(terminal_file)] if terminal_file else []
     explicit_companions = [
@@ -1478,7 +1596,15 @@ def discover_mechanism_dag(
         for file_path in explicit_files
         for companion in resolver.companion_files(file_path)
     ]
-    terminal_queries = _definition_queries(terminal) or [terminal]
+    terminal_queries = _definition_queries(terminal)
+    parsed_terminal = parse_signal_reference(exact_symbol(terminal))
+    if parsed_terminal is not None:
+        topic = parsed_terminal[0]
+        terminal_queries.extend(
+            [f"ORB_ID({topic})", f"ORB_ID::{topic}"]
+        )
+    if not terminal_queries:
+        terminal_queries.append(terminal)
     candidate_files = dedupe_keep_order(
         [
             *explicit_files,
@@ -1492,10 +1618,12 @@ def discover_mechanism_dag(
     pending: list[str] = []
     explicit_set = set(explicit_files) | set(explicit_companions)
     for file_path in candidate_files:
-        facts = resolver.facts_for(file_path)
-        if file_path in explicit_set or writes_terminal(facts):
+        admitted = admit_terminal_candidate(file_path)
+        if file_path in explicit_set:
             pending.append(file_path)
             pending.extend(resolver.companion_files(file_path))
+        elif admitted:
+            pending.extend(admitted)
     if not terminal_file or (
         requested_terminal_identity is not None
         and requested_terminal_identity.kind in {"member", "global"}
@@ -1508,10 +1636,7 @@ def discover_mechanism_dag(
             max_files=None,
             expand_query_tokens=False,
         ):
-            facts = resolver.facts_for(hit.file)
-            if writes_terminal(facts):
-                pending.append(hit.file)
-                pending.extend(resolver.companion_files(hit.file))
+            pending.extend(admit_terminal_candidate(hit.file))
     pending = dedupe_keep_order(pending)
 
     index = 0
@@ -1535,7 +1660,7 @@ def discover_mechanism_dag(
         locked = (
             validation is not None
             and validation.status == "valid"
-            and bool(validation.resolved_file or terminal_file or validation.logged)
+            and bool(validation.resolved_file or terminal_file)
         )
         if not locked:
             validation = validate_terminal(
@@ -1577,7 +1702,7 @@ def discover_mechanism_dag(
             parameter_predicates=inputs.parameter_predicates,
             parameter_values=parameter_values,
             parameter_names=inputs.parameter_names,
-            parameter_aliases=inputs.parameter_aliases,
+            parameter_bindings=inputs.parameter_bindings,
             terminal_file=validation.resolved_file or terminal_file,
             terminal_identity=validation.resolved_identity,
             call_statements=inputs.call_statements,

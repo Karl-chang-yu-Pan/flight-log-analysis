@@ -41,6 +41,7 @@ from flight_log_agent.expression_math import (
     normalize_expression_function_names,
 )
 from flight_log_agent.px4.source_snapshot import SourceHandle, SourceInput, source_handle
+from flight_log_agent.symbols import exact_symbol
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +108,11 @@ class SourceCallResultRef(BaseModel):
 class SourceExpressionRef(BaseModel):
     """Structured dependencies for one source expression.
 
-    ``text`` preserves the source spelling while ``lowered_text`` carries the
-    source-derived alias substitution used by the DAG. ``input_symbols``
+    ``text`` preserves the source spelling while ``lowered_text`` carries a
+    syntax-normalized spelling for the local numeric evaluator. It must not
+    substitute one source storage location for another. DAG construction uses
+    the structured operands below, never substituted text.
+    ``input_symbols``
     contains storage reads and source-resolved parameter accessor leaves;
     parameter accessors are values but do not receive storage identities.
     Call results are represented separately so a projection such as
@@ -122,7 +126,24 @@ class SourceExpressionRef(BaseModel):
     input_symbols: List[str] = Field(default_factory=list)
     input_identities: Dict[str, SourceStorageRef] = Field(default_factory=dict)
     call_results: List[SourceCallResultRef] = Field(default_factory=list)
+    direct_storage: Optional[str] = None
+    direct_call_result: Optional[SourceCallResultRef] = None
     exact: bool = False
+
+
+class SourceReturnRef(BaseModel):
+    """One source return and the exact control path reaching it."""
+
+    expression: str
+    file: str
+    line: int
+    source_site_id: str
+    expression_ref: Optional[SourceExpressionRef] = None
+    control_predicates: List[str] = Field(default_factory=list)
+    control_predicate_lines: List[int] = Field(default_factory=list)
+    control_predicate_site_ids: List[str] = Field(default_factory=list)
+    control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
+    reachability_exact: bool = True
 
 
 class TopicRef(BaseModel):
@@ -147,7 +168,13 @@ class TopicRef(BaseModel):
     endpoint_kind: Optional[str] = None
     variable_identity: Optional[SourceStorageRef] = None
     source_site_id: Optional[str] = None
+    # True only when this fact is the source statement that transfers the
+    # payload. Wrapper declarations and constructor initializers identify an
+    # endpoint but do not themselves read or write the message object.
+    transfer: bool = False
     control_predicates: List[str] = Field(default_factory=list)
+    control_predicate_lines: List[int] = Field(default_factory=list)
+    control_predicate_site_ids: List[str] = Field(default_factory=list)
     control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
     reachability_exact: bool = True
 
@@ -159,6 +186,8 @@ class ParameterRef(BaseModel):
     evidence: str
     access_pattern: str
     member: Optional[str] = None
+    owner: Optional[str] = None
+    source_site_id: Optional[str] = None
     confidence: str = "high"
 
 
@@ -240,9 +269,8 @@ class SourceAssignmentRef(BaseModel):
     reachability_exact: bool = True
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
     # Struct-typed variable → C++ struct type in scope at this assignment's
-    # site. Lets the DAG derive ``var.field → topic.field`` bindings
-    # graph-natively via :func:`_derive_topic_from_return_type` instead of
-    # depending on the pre-baked ``symbol_bindings`` dict.
+    # site. Retained as source type evidence for consumers and compatibility;
+    # it does not by itself prove a runtime source-to-log data-flow edge.
     struct_variables: Dict[str, str] = Field(default_factory=dict)
     source_site_id: Optional[str] = None
     expression_ref: Optional[SourceExpressionRef] = None
@@ -271,6 +299,7 @@ class HelperExpressionRef(BaseModel):
     assignment_sites: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     return_expression: Optional[str] = None
     return_expression_ref: Optional[SourceExpressionRef] = None
+    return_sites: List[SourceReturnRef] = Field(default_factory=list)
     lowered_return_expression: Optional[str] = None
     branches: List[Dict[str, Any]] = Field(default_factory=list)
     symbol_bindings: Dict[str, str] = Field(default_factory=dict)
@@ -283,16 +312,15 @@ class HelperExpressionRef(BaseModel):
     # The historical field name is retained for schema compatibility; entries
     # may be proven through pointer or reference parameters.
     pointer_output_writes: List[Dict[str, str]] = Field(default_factory=list)
-    # Raw C++ return type extracted from the function signature so the DAG
-    # can derive source→logged bindings without the flat ``symbol_bindings``
-    # table. Preserves pointer/reference qualifiers (``vehicle_status_s *``)
-    # so downstream can distinguish struct-return helpers from scalar ones.
+    # Raw C++ return type extracted from the function signature. Preserves
+    # pointer/reference qualifiers (``vehicle_status_s *``) for source type
+    # reasoning, but does not by itself prove runtime boundary provenance.
     return_type: Optional[str] = None
     # Struct-typed variable name → C++ struct type in scope of this helper
     # (both local variables declared in the body and class-member fields
-    # visible via ``this->``). Lets the DAG derive ``var.field →
-    # topic.field`` bindings graph-natively using the same
-    # :func:`_derive_topic_from_return_type` utility as helper return types.
+    # visible via ``this->``). Retained as source type evidence for consumers
+    # and retirement comparisons; graph value flow comes from explicit source
+    # assignments, call arguments, returns, and boundary writes.
     struct_variables: Dict[str, str] = Field(default_factory=dict)
     unresolved_reason: Optional[str] = None
 
@@ -316,6 +344,7 @@ class ParameterPredicateRef(BaseModel):
     member: Optional[str] = None
     operator: Optional[str] = None
     compared_value: Optional[str] = None
+    source_site_id: Optional[str] = None
 
 
 class SourceClassRef(BaseModel):
@@ -869,9 +898,26 @@ class MechanismSourceProfiler:
                             api=f"uORB::{api}",
                             instance=int(instance) if instance is not None else None,
                             variable_owner=owner,
+                            endpoint_kind=(
+                                "local"
+                                if definition
+                                else "member"
+                                if owner
+                                else "global"
+                            ),
                             file=rel_file,
                             line=line_no,
                             evidence=line.strip(),
+                            function=(
+                                str(definition.get("name") or "")
+                                if definition
+                                else None
+                            ),
+                            callable_id=self._callable_id(definition),
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start()}:"
+                                "legacy_uorb_endpoint"
+                            ),
                         )
                     )
                 for direction, api, pattern in self._UORB_DECL_PATTERNS:
@@ -884,6 +930,12 @@ class MechanismSourceProfiler:
                             for declaration in object_declarations
                         ):
                             continue
+                        definition = self._function_definition_for_line(
+                            definitions, line_no
+                        )
+                        owner = None if definition else self._class_owner_for_line(
+                            class_definitions, line_no
+                        )
                         refs.append(
                             TopicRef(
                                 topic=topic,
@@ -891,9 +943,27 @@ class MechanismSourceProfiler:
                                 variable=variable,
                                 direction=direction,
                                 api=api,
+                                variable_owner=owner,
+                                endpoint_kind=(
+                                    "local"
+                                    if definition
+                                    else "member"
+                                    if owner
+                                    else "global"
+                                ),
                                 file=rel_file,
                                 line=line_no,
                                 evidence=line.strip(),
+                                function=(
+                                    str(definition.get("name") or "")
+                                    if definition
+                                    else None
+                                ),
+                                callable_id=self._callable_id(definition),
+                                source_site_id=(
+                                    f"{rel_file}:{line_no}:{match.start()}:"
+                                    "legacy_uorb_typed_endpoint"
+                                ),
                             )
                         )
 
@@ -915,6 +985,10 @@ class MechanismSourceProfiler:
                                 file=rel_file,
                                 line=line_no,
                                 evidence=line.strip(),
+                                source_site_id=(
+                                    f"{rel_file}:{line_no}:{match.start()}:"
+                                    "legacy_uorb_call"
+                                ),
                             )
                         )
 
@@ -935,6 +1009,10 @@ class MechanismSourceProfiler:
                                 file=rel_file,
                                 line=line_no,
                                 evidence=line.strip(),
+                                source_site_id=(
+                                    f"{rel_file}:{line_no}:{match.start()}:"
+                                    "legacy_orb_reference"
+                                ),
                             )
                         )
 
@@ -959,6 +1037,17 @@ class MechanismSourceProfiler:
             if not topic or not source_symbol:
                 continue
             root = source_symbol.replace("->", ".").split(".", 1)[0]
+            argument_ref = (
+                call.argument_expressions[data_arg]
+                if data_arg < len(call.argument_expressions)
+                else None
+            )
+            variable_identity = None
+            if argument_ref is not None:
+                variable_identity = (
+                    argument_ref.input_identities.get(exact_symbol(source_symbol))
+                    or argument_ref.input_identities.get(exact_symbol(root))
+                )
             refs.append(
                 TopicRef(
                     topic=topic,
@@ -972,6 +1061,16 @@ class MechanismSourceProfiler:
                     function=call.function,
                     callable_id=call.callable_id,
                     variable_owner=call.argument_owners.get(root),
+                    variable_identity=variable_identity,
+                    source_site_id=call.source_site_id,
+                    transfer=True,
+                    control_predicates=list(call.control_predicates),
+                    control_predicate_lines=list(call.control_predicate_lines),
+                    control_predicate_site_ids=list(
+                        call.control_predicate_site_ids
+                    ),
+                    control_expression_refs=list(call.control_expression_refs),
+                    reachability_exact=call.reachability_exact,
                 )
             )
 
@@ -1023,7 +1122,19 @@ class MechanismSourceProfiler:
                 continue
 
             rel_file = self._rel(path)
+            definitions = self._extract_function_definitions(text, rel_file)
+            class_definitions = self._extract_class_definitions(text)
             for line_no, line in self._iter_code_lines(text):
+                definition = self._function_definition_for_line(
+                    definitions, line_no
+                )
+                owner = (
+                    str(definition.get("name") or "").rpartition("::")[0]
+                    if definition and "::" in str(definition.get("name") or "")
+                    else self._class_owner_for_line(
+                        class_definitions, line_no
+                    )
+                )
                 for match in self._PARAM_DECL_PATTERN.finditer(line):
                     refs.append(
                         ParameterRef(
@@ -1033,6 +1144,11 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=line.strip(),
+                            owner=owner or None,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start()}:"
+                                "legacy_parameter_declaration"
+                            ),
                             confidence="high",
                         )
                     )
@@ -1045,6 +1161,11 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=line.strip(),
+                            owner=owner or None,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start()}:"
+                                "legacy_parameter_reference"
+                            ),
                             confidence="high",
                         )
                     )
@@ -1057,6 +1178,11 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=line.strip(),
+                            owner=owner or None,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start()}:"
+                                "legacy_parameter_find"
+                            ),
                             confidence="high",
                         )
                     )
@@ -1079,6 +1205,11 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=line.strip(),
+                            owner=owner or None,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start()}:"
+                                "legacy_parameter_get"
+                            ),
                             confidence="high" if name else "low",
                         )
                     )
@@ -1288,8 +1419,15 @@ class MechanismSourceProfiler:
                                 file=rel_file,
                                 line=line_no,
                                 evidence=stripped,
+                                source_site_id=(
+                                    f"{rel_file}:{line_no}:{ctor.start('target')}:legacy_assignment"
+                                ),
                                 control_predicates=predicates,
                                 control_predicate_lines=predicate_lines,
+                                control_predicate_site_ids=[
+                                    f"{rel_file}:{site}:0:legacy_control"
+                                    for site in predicate_lines
+                                ],
                                 reachability_exact=reachability_exact,
                                 struct_variables=dict(var_to_struct),
                             )
@@ -1335,14 +1473,24 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start('target')}:legacy_assignment"
+                            ),
                             control_predicates=predicates,
                             control_predicate_lines=predicate_lines,
+                            control_predicate_site_ids=[
+                                f"{rel_file}:{site}:0:legacy_control"
+                                for site in predicate_lines
+                            ],
                             reachability_exact=reachability_exact,
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([target, expression, *predicates]),
                                 var_to_struct,
                             ),
                             struct_variables=dict(var_to_struct),
+                            expression_ref=self._legacy_direct_expression_ref(
+                                expression
+                            ),
                         )
                     )
                 for match in self._SOURCE_COMPOUND_ASSIGNMENT_PATTERN.finditer(line):
@@ -1370,8 +1518,15 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start('target')}:legacy_assignment"
+                            ),
                             control_predicates=predicates,
                             control_predicate_lines=predicate_lines,
+                            control_predicate_site_ids=[
+                                f"{rel_file}:{site}:0:legacy_control"
+                                for site in predicate_lines
+                            ],
                             reachability_exact=reachability_exact,
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([target, expression, *predicates]),
@@ -1443,10 +1598,19 @@ class MechanismSourceProfiler:
                         file=call.file,
                         line=call.line,
                         evidence=call.evidence,
+                        source_site_id=(
+                            f"{call.source_site_id}:{substituted['target']}:legacy_pointer_output"
+                        ),
                         control_predicates=list(call.control_predicates or []),
                         control_predicate_lines=list(call.control_predicate_lines or []),
+                        control_predicate_site_ids=list(
+                            call.control_predicate_site_ids or []
+                        ),
                         reachability_exact=call.reachability_exact,
                         symbol_bindings={},
+                        expression_ref=self._legacy_direct_expression_ref(
+                            substituted["expression"]
+                        ),
                     )
                 )
         return refs
@@ -1593,6 +1757,9 @@ class MechanismSourceProfiler:
                         file=rel_file,
                         line=line_no,
                         evidence=f"{name} = {value}",
+                        source_site_id=(
+                            f"{rel_file}:{line_no}:{body_start + entry_offset}:legacy_enum"
+                        ),
                         control_predicates=[],
                         symbol_bindings={},
                     )
@@ -1618,6 +1785,9 @@ class MechanismSourceProfiler:
                     file=rel_file,
                     line=line_no,
                     evidence=match.group(0).strip(),
+                    source_site_id=(
+                        f"{rel_file}:{line_no}:{match.start()}:legacy_define"
+                    ),
                     control_predicates=[],
                     symbol_bindings={},
                 )
@@ -2011,6 +2181,10 @@ class MechanismSourceProfiler:
                             evidence=stripped,
                             control_predicates=predicates,
                             control_predicate_lines=[s for _, s in predicate_entries],
+                            control_predicate_site_ids=[
+                                f"{rel_file}:{site}:0:legacy_control"
+                                for _, site in predicate_entries
+                            ],
                             reachability_exact=line_no not in unresolved_reach,
                             symbol_bindings=self._source_symbol_bindings(
                                 " ".join([stripped, *predicates]),
@@ -2019,6 +2193,13 @@ class MechanismSourceProfiler:
                             argument_owners=argument_owners,
                             function=function_name,
                             callable_id=self._callable_id(definition),
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start()}:legacy_call"
+                            ),
+                            argument_expressions=[
+                                self._legacy_direct_expression_ref(argument)
+                                for argument in args
+                            ],
                         )
                     )
 
@@ -2051,6 +2232,7 @@ class MechanismSourceProfiler:
                     name=name,
                     file=rel_file,
                     line=definition["line"],
+                    body_line=definition["body_line"],
                     params=definition["params"],
                     body=definition["body"],
                     evidence=definition["evidence"],
@@ -2176,6 +2358,10 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start()}:"
+                                "legacy_branch"
+                            ),
                         )
                     )
 
@@ -2187,6 +2373,10 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{match.start()}:"
+                                "legacy_case"
+                            ),
                         )
                     )
 
@@ -2238,6 +2428,10 @@ class MechanismSourceProfiler:
                             file=rel_file,
                             line=line_no,
                             evidence=stripped,
+                            source_site_id=(
+                                f"{rel_file}:{line_no}:{comparison.start()}:"
+                                "legacy_parameter_predicate"
+                            ),
                         )
                     )
 
@@ -2252,6 +2446,11 @@ class MechanismSourceProfiler:
                                     file=rel_file,
                                     line=line_no,
                                     evidence=stripped,
+                                    source_site_id=(
+                                        f"{rel_file}:{line_no}:"
+                                        f"{max(stripped.find(member), 0)}:"
+                                        "legacy_parameter_predicate"
+                                    ),
                                 )
                             )
                             break
@@ -3023,6 +3222,7 @@ class MechanismSourceProfiler:
                 {
                     "name": name,
                     "line": line_no,
+                    "body_line": text.count("\n", 0, open_brace) + 1,
                     "end_line": text.count("\n", 0, close_brace) + 1,
                     "start_index": match.start(),
                     "end_index": close_brace,
@@ -3155,6 +3355,7 @@ class MechanismSourceProfiler:
         name: str,
         file: str,
         line: int,
+        body_line: int,
         params: List[str],
         body: str,
         evidence: str,
@@ -3167,6 +3368,11 @@ class MechanismSourceProfiler:
         statements = self._helper_statements(cleaned_body)
         assignments = self._helper_assignments(cleaned_body)
         branches = self._helper_return_branches(cleaned_body)
+        return_sites = self._helper_return_sites(
+            cleaned_body,
+            file=file,
+            body_line=body_line,
+        )
         return_expression = self._helper_return_expression(cleaned_body)
         lowered_return_expression: Optional[str] = None
         if unresolved is None:
@@ -3204,6 +3410,7 @@ class MechanismSourceProfiler:
             statements=statements if unresolved is None else [],
             assignments=assignments if unresolved is None else {},
             return_expression=return_expression if unresolved is None else None,
+            return_sites=return_sites,
             lowered_return_expression=lowered_return_expression if unresolved is None else None,
             branches=branches if unresolved is None else [],
             symbol_bindings=symbol_bindings if unresolved is None else {},
@@ -4040,6 +4247,52 @@ class MechanismSourceProfiler:
             return None
         return self._normalize_helper_expression(matches[0])
 
+    def _helper_return_sites(
+        self,
+        body: str,
+        *,
+        file: str,
+        body_line: int,
+    ) -> List[SourceReturnRef]:
+        """Extract conservative return-site facts for the retiring scanner."""
+        predicates_by_line, unresolved_lines = self._control_predicates_by_line(
+            body
+        )
+        sites: List[SourceReturnRef] = []
+        for match in re.finditer(
+            r"\breturn\s+(?P<expr>.*?)\s*;", body, flags=re.DOTALL
+        ):
+            expression = self._normalize_helper_expression(match.group("expr"))
+            if not expression:
+                continue
+            relative_line = body[: match.start()].count("\n") + 1
+            absolute_line = body_line + relative_line - 1
+            predicate_entries = predicates_by_line.get(relative_line, [])
+            sites.append(
+                SourceReturnRef(
+                    expression=expression,
+                    expression_ref=self._legacy_direct_expression_ref(expression),
+                    file=file,
+                    line=absolute_line,
+                    source_site_id=(
+                        f"{file}:{absolute_line}:{match.start()}:legacy_return"
+                    ),
+                    control_predicates=[
+                        predicate for predicate, _site in predicate_entries
+                    ],
+                    control_predicate_lines=[
+                        body_line + site - 1
+                        for _predicate, site in predicate_entries
+                    ],
+                    control_predicate_site_ids=[
+                        f"{file}:{body_line + site - 1}:legacy_control"
+                        for _predicate, site in predicate_entries
+                    ],
+                    reachability_exact=relative_line not in unresolved_lines,
+                )
+            )
+        return sites
+
     def _helper_return_branches(self, body: str) -> List[Dict[str, str]]:
         branches: List[Dict[str, str]] = []
         pattern = re.compile(
@@ -4330,7 +4583,15 @@ class MechanismSourceProfiler:
         seen = set()
         out: List[TopicRef] = []
         for ref in refs:
-            key = (ref.topic, ref.direction, ref.file, ref.line, ref.api, ref.variable)
+            key = (
+                ref.source_site_id,
+                ref.topic,
+                ref.direction,
+                ref.file,
+                ref.line,
+                ref.api,
+                ref.variable,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -4342,7 +4603,15 @@ class MechanismSourceProfiler:
         seen = set()
         out: List[ParameterRef] = []
         for ref in refs:
-            key = (ref.name, ref.member, ref.file, ref.line, ref.access_pattern)
+            key = (
+                ref.source_site_id,
+                ref.owner,
+                ref.name,
+                ref.member,
+                ref.file,
+                ref.line,
+                ref.access_pattern,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -4366,7 +4635,15 @@ class MechanismSourceProfiler:
         seen = set()
         out: List[SourceAssignmentRef] = []
         for ref in refs:
-            key = (ref.target, ref.expression, ref.function, ref.file, ref.line)
+            key = (
+                ref.source_site_id,
+                ref.callable_id,
+                ref.target,
+                ref.expression,
+                ref.function,
+                ref.file,
+                ref.line,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -4378,7 +4655,16 @@ class MechanismSourceProfiler:
         seen = set()
         out: List[FunctionCallRef] = []
         for ref in refs:
-            key = (ref.name, ref.receiver, ref.file, ref.line, tuple(ref.control_predicates))
+            key = (
+                ref.source_site_id,
+                ref.callable_id,
+                ref.name,
+                ref.receiver,
+                tuple(ref.args),
+                ref.file,
+                ref.line,
+                tuple(ref.control_predicates),
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -4390,7 +4676,7 @@ class MechanismSourceProfiler:
         seen = set()
         out: List[HelperExpressionRef] = []
         for ref in refs:
-            key = (ref.name, ref.file, ref.line)
+            key = (ref.callable_id, ref.name, ref.file, ref.line)
             if key in seen:
                 continue
             seen.add(key)
@@ -4402,7 +4688,13 @@ class MechanismSourceProfiler:
         seen = set()
         out: List[BranchConditionRef] = []
         for ref in refs:
-            key = (ref.kind, ref.condition, ref.file, ref.line)
+            key = (
+                ref.source_site_id,
+                ref.kind,
+                ref.condition,
+                ref.file,
+                ref.line,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -4414,12 +4706,53 @@ class MechanismSourceProfiler:
         seen = set()
         out: List[ParameterPredicateRef] = []
         for ref in refs:
-            key = (ref.name, ref.member, ref.predicate, ref.file, ref.line)
+            key = (
+                ref.source_site_id,
+                ref.name,
+                ref.member,
+                ref.predicate,
+                ref.file,
+                ref.line,
+            )
             if key in seen:
                 continue
             seen.add(key)
             out.append(ref)
         return out
+
+    def _legacy_direct_expression_ref(
+        self, expression: str
+    ) -> SourceExpressionRef:
+        """Describe a scanner-proven whole-storage copy.
+
+        The retiring backend cannot provide a complete AST operand inventory,
+        so compound expressions stay inexact. A full-match storage reference is
+        nevertheless structurally sufficient for aggregate projection and is
+        emitted through the same contract as tree-sitter.
+        """
+        lowered = self._normalize_source_expression(expression)
+        direct = ""
+        candidate = str(expression or "").strip()
+        while (
+            len(candidate) >= 2
+            and candidate.startswith("(")
+            and candidate.endswith(")")
+        ):
+            candidate = candidate[1:-1].strip()
+        candidate = candidate.lstrip("&*").strip()
+        if re.fullmatch(
+            r"(?:this(?:->|\.))?[A-Za-z_][A-Za-z0-9_]*"
+            r"(?:(?:->|\.)[A-Za-z_][A-Za-z0-9_]*|\[[^\[\]]+\])*",
+            candidate,
+        ):
+            direct = self._clean_field_path(candidate)
+        return SourceExpressionRef(
+            text=str(expression or ""),
+            lowered_text=lowered,
+            input_symbols=[direct] if direct else [],
+            direct_storage=direct or None,
+            exact=bool(direct),
+        )
 
 
 def split_source_field(value: str) -> Tuple[str, str]:

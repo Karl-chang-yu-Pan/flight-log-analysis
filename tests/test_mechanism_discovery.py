@@ -126,7 +126,10 @@ def test_dag_inputs_from_facts_aggregates_and_dedupes():
     targets = [b["target_symbol"] for b in inputs.bindings]
     assert targets.count("_rtl_alt") == 1, "identical assignment must dedupe"
     assert "_destination_alt" in targets
-    assert inputs.parameter_aliases == {"_param_rtl_return_alt": "RTL_RETURN_ALT"}
+    assert {
+        (item["member"], item["name"])
+        for item in inputs.parameter_bindings
+    } == {("_param_rtl_return_alt", "RTL_RETURN_ALT")}
     assert inputs.parameter_names == {"RTL_RETURN_ALT", "RTL_TYPE"}
 
 
@@ -231,7 +234,7 @@ class Rtl
         helper_expressions=inputs.helper_expressions,
         parameter_predicates=inputs.parameter_predicates,
         parameter_names=inputs.parameter_names,
-        parameter_aliases=inputs.parameter_aliases,
+        parameter_bindings=inputs.parameter_bindings,
         logged_signals={"gpos_alt"},
         source_structure=inputs.structure,
     )
@@ -367,7 +370,7 @@ void Reader::calculate()
     assert "status.nav_state" in dag.unresolved_symbols
 
 
-def test_class_owned_payload_published_from_sibling_method_is_observed(
+def test_class_owned_payload_publication_is_an_explicit_operation(
     tmp_path, source_backend
 ):
     profiler = _mini_tree(
@@ -405,10 +408,86 @@ class Publisher {
         for item in inputs.bindings
         if item["target_symbol"] == "_status.value"
     )
-    assert write["logged_signal"] == "status.value"
+    assert write["logged_signal"] == ""
+    publication = next(
+        item
+        for item in inputs.bindings
+        if item.get("synthetic_boundary_transfer")
+        and item.get("boundary_direction") == "publish"
+    )
+    assert publication["target_symbol"] == "status"
+    assert publication["source_symbol"] == "_status"
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "status.value",
+        terminal_file="src/modules/example/publisher.cpp",
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+    targets = {
+        vertex.variable for vertex in dag.vertices if vertex.kind == "operation"
+    }
+    assert {"status.value", "_status.value"} <= targets
 
 
-def test_conditional_publication_candidates_remain_explicit(tmp_path):
+def test_boundary_call_in_predicate_is_not_a_helper_gap(tmp_path, source_backend):
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/reader.cpp": """
+struct status_s { float value; };
+
+class Reader {
+    uORB::Subscription _status_sub{ORB_ID(status)};
+    status_s _status{};
+    float output{};
+
+    void Run()
+    {
+        if (_status_sub.update(&_status)) {
+            output = _status.value;
+        }
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(
+            profiler,
+            tmp_path / "cache",
+            ["src/modules/example/reader.cpp"],
+            "hash",
+        )
+    )
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/example/reader.cpp",
+        logged_signals={"status.value"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+
+    assert any(
+        vertex.kind == "operation"
+        and (vertex.metadata or {}).get("synthetic_boundary_transfer")
+        for vertex in dag.vertices
+    )
+    assert not any(
+        reference.kind == "callable"
+        and reference.symbol.rsplit(".", 1)[-1] == "update"
+        for reference in dag.unresolved_references
+    )
+
+
+def test_conditional_publication_operations_remain_explicit(tmp_path):
     profiler = _mini_tree(
         tmp_path,
         {
@@ -456,10 +535,15 @@ public:
         if item["target_symbol"] == "_status.value"
     )
     assert write["logged_signal"] == ""
-    candidates = write["logged_signal_candidates"]
+    publications = [
+        item
+        for item in inputs.bindings
+        if item.get("synthetic_boundary_transfer")
+        and item.get("boundary_direction") == "publish"
+    ]
     assert {
-        (item["topic"], tuple(item["control_predicates"]))
-        for item in candidates
+        (item["target_symbol"], tuple(item["control_predicates"]))
+        for item in publications
     } == {
         ("status", ("primary",)),
         ("virtual_status", ("!(primary)",)),
@@ -467,42 +551,38 @@ public:
 
     selected = build_mechanism_dag(
         inputs.bindings,
-        "output",
+        "status.value",
         terminal_file="src/modules/example/publisher.cpp",
-        logged_signals={"status.value"},
         helper_expressions=inputs.helper_expressions,
         call_statements=inputs.call_statements,
         boundary_bindings=inputs.boundary_bindings,
         source_structure=inputs.structure,
     )
-    selected_checkpoints = [
+    selected_operations = [
         vertex
         for vertex in selected.vertices
-        if vertex.kind == "evidence"
-        and (vertex.metadata or {}).get("derivation")
-        == "published_storage_checkpoint"
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("synthetic_boundary_transfer")
     ]
-    assert [vertex.signal_name for vertex in selected_checkpoints] == [
-        "status.value"
-    ]
+    assert [vertex.variable for vertex in selected_operations] == ["status.value"]
+    assert any(
+        branch.kind == "branch" and branch.predicate_raw == "primary"
+        for branch in selected.vertices
+    )
 
-    ambiguous = build_mechanism_dag(
+    alternate = build_mechanism_dag(
         inputs.bindings,
-        "output",
+        "virtual_status.value",
         terminal_file="src/modules/example/publisher.cpp",
-        logged_signals={"status.value", "virtual_status.value"},
         helper_expressions=inputs.helper_expressions,
         call_statements=inputs.call_statements,
         boundary_bindings=inputs.boundary_bindings,
         source_structure=inputs.structure,
     )
-    assert not [
-        vertex
-        for vertex in ambiguous.vertices
-        if vertex.kind == "evidence"
-        and (vertex.metadata or {}).get("derivation")
-        == "published_storage_checkpoint"
-    ]
+    assert any(
+        branch.kind == "branch" and branch.predicate_raw == "!(primary)"
+        for branch in alternate.vertices
+    )
 
 
 def _mini_tree(tmp_path, files: dict[str, str], *, backend: str = "legacy"):
@@ -1119,7 +1199,7 @@ void Base::fill(const mission_item_s &item, position_setpoint_s *sp)
 
     dag = build_mechanism_dag(
         inputs.bindings,
-        "get_triplet().current.alt",
+        "triplet.current.alt",
         terminal_file="src/modules/mode/mode.cpp",
         helper_expressions=inputs.helper_expressions,
         call_statements=inputs.call_statements,
@@ -1131,7 +1211,7 @@ void Base::fill(const mission_item_s &item, position_setpoint_s *sp)
         vertex
         for vertex in operations
         if exact_symbol(vertex.variable or "")
-        == exact_symbol("get_triplet().current.alt")
+        == exact_symbol("triplet.current.alt")
         and vertex.expression == "sp.alt"
     )
     helper_writers = [
@@ -1638,12 +1718,6 @@ void run()
         if str(vertex.provenance or "").startswith("helper_return:inner@")
     ]
     assert len(outer_returns) == 1
-    if source_backend == "legacy":
-        # The retiring parser lowers the nested call into the outer formula.
-        assert "value * 2.0" in str(outer_returns[0].expression or "")
-        assert inner_returns == []
-        return
-
     assert len(inner_returns) == 1
     assert any(
         edge.source_id == inner_returns[0].id
@@ -1677,6 +1751,7 @@ struct controller_status_s {
 };
 
 class Control {
+    uORB::Subscription _vehicle_status_sub{ORB_ID(status)};
     status_s vehicle_status{};
     controller_status_s controller_status{};
     float destination{};
@@ -1688,8 +1763,14 @@ class Control {
 
     float default_radius();
     float acceptance_radius();
+    void poll();
     void run();
 };
+
+void Control::poll()
+{
+    _vehicle_status_sub.copy(&vehicle_status);
+}
 
 float Control::default_radius()
 {
@@ -1726,8 +1807,8 @@ void Control::run()
         helper_expressions=inputs.helper_expressions,
         call_statements=inputs.call_statements,
         parameter_names=inputs.parameter_names,
-        parameter_aliases=inputs.parameter_aliases,
-        logged_signals={"destination", "vehicle_status.vehicle_type"},
+        parameter_bindings=inputs.parameter_bindings,
+        logged_signals={"destination", "status.vehicle_type"},
         enum_registry={"status": {"ROTARY": 1}},
         source_structure=inputs.structure,
     )
@@ -1737,11 +1818,11 @@ void Control::run()
         parameter_values={"ACCEPT_RADIUS": 10.0},
         signal_samples={
             "destination": [(0.0, 100.0), (1.0, 100.0)],
-            "vehicle_status.vehicle_type": [(0.0, 1), (1.0, 1)],
+            "status.vehicle_type": [(0.0, 1), (1.0, 1)],
         },
         signal_policies={
             "destination": {"method": "linear"},
-            "vehicle_status.vehicle_type": {"method": "discrete_hold"},
+            "status.vehicle_type": {"method": "discrete_hold"},
         },
         prune_dead=False,
     )
@@ -1775,11 +1856,11 @@ void Control::run()
         parameter_values={"ACCEPT_RADIUS": 10.0},
         signal_samples={
             "destination": [(0.0, 100.0), (1.0, 100.0)],
-            "vehicle_status.vehicle_type": [(0.0, 1), (1.0, 1)],
+            "status.vehicle_type": [(0.0, 1), (1.0, 1)],
         },
         signal_policies={
             "destination": {"method": "linear"},
-            "vehicle_status.vehicle_type": {"method": "discrete_hold"},
+            "status.vehicle_type": {"method": "discrete_hold"},
         },
         timestamps=[0.0, 1.0],
         evaluation_windows=[(0.0, 1.0)],
@@ -1787,7 +1868,7 @@ void Control::run()
     assert reconstructed.complete is True
     assert set(reconstructed.referenced_signals) == {
         "destination",
-        "vehicle_status.vehicle_type",
+        "status.vehicle_type",
     }
     assert [value for _timestamp, value in reconstructed.samples] == [120.0, 120.0]
 
@@ -2069,6 +2150,166 @@ void Mode::run()
     assert "global_position.alt" not in dag.unresolved_symbols
 
 
+def test_helper_return_consumes_aliased_call_result_without_flattening(tmp_path):
+    source_file = "src/modules/mode/mode.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+struct vehicle_global_position_s { float alt; };
+
+class Navigator {
+public:
+    void update();
+    const vehicle_global_position_s *get_global_position() const;
+private:
+    uORB::Subscription _global_position_sub{ORB_ID(vehicle_global_position)};
+    vehicle_global_position_s _global_position{};
+};
+
+void Navigator::update()
+{
+    _global_position_sub.copy(&_global_position);
+}
+
+const vehicle_global_position_s *Navigator::get_global_position() const
+{
+    return &_global_position;
+}
+
+class Mode {
+public:
+    float calculate() const;
+    void run();
+private:
+    Navigator *_navigator;
+    float output;
+};
+
+float Mode::calculate() const
+{
+    const vehicle_global_position_s &gpos =
+        *_navigator->get_global_position();
+    const float floor = 100.0f;
+    return max(floor, gpos.alt);
+}
+
+void Mode::run()
+{
+    output = calculate();
+}
+""",
+        },
+        backend="tree_sitter",
+    )
+    facts = load_facts(profiler, tmp_path / "cache", [source_file], "hash")
+    inputs = dag_inputs_from_facts(facts)
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        inventory={
+            "topic_fields": {"vehicle_global_position": ["alt"]},
+            "available_topics": ["vehicle_global_position"],
+        },
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+
+    helper_return = next(
+        vertex
+        for vertex in dag.vertices
+        if str(vertex.provenance or "").startswith("helper_return:calculate@")
+    )
+    assert helper_return.expression == "max(floor, gpos.alt)"
+    assert not any(
+        str(vertex.provenance or "").startswith("helper_body")
+        for vertex in dag.vertices
+    )
+    logged_alt = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "vehicle_global_position.alt"
+    )
+    getter_projection = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and vertex.variable == "__return__.alt"
+        and str(vertex.provenance or "").startswith(
+            "helper_return:get_global_position@"
+        )
+    )
+    boundary_transfer = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and vertex.variable == "_global_position.alt"
+        and (vertex.metadata or {}).get("synthetic_boundary_transfer")
+        and (vertex.metadata or {}).get("boundary_direction") == "subscribe"
+    )
+    alias_projection = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.variable == "gpos.alt"
+    )
+    assert any(
+        edge.source_id == logged_alt.id
+        and edge.target_id == boundary_transfer.id
+        and edge.kind == "data"
+        for edge in dag.edges
+    )
+    assert any(
+        edge.source_id == boundary_transfer.id
+        and edge.target_id == getter_projection.id
+        and edge.kind == "data"
+        for edge in dag.edges
+    )
+    assert any(
+        edge.source_id == getter_projection.id
+        and edge.target_id == alias_projection.id
+        and edge.kind == "data"
+        for edge in dag.edges
+    )
+    assert any(
+        edge.source_id == alias_projection.id
+        and edge.target_id == helper_return.id
+        and edge.kind == "data"
+        for edge in dag.edges
+    )
+    assert not any(
+        edge.source_id == logged_alt.id
+        and edge.target_id == helper_return.id
+        for edge in dag.edges
+    )
+    assert "gpos.alt" not in dag.unresolved_symbols
+    terminal = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+    )
+    reconstructed = evaluate_dag_vertex_series(
+        dag,
+        terminal.id,
+        signal_samples={
+            "vehicle_global_position.alt": [(0.0, 125.0)],
+        },
+        signal_policies={
+            "vehicle_global_position.alt": {"method": "linear"},
+        },
+        timestamps=[0.0],
+        evaluation_windows=[(0.0, 0.0)],
+    )
+    assert reconstructed.complete is True
+    assert reconstructed.samples == ((0.0, 125.0),)
+
+
 def test_split_file_call_result_discovers_class_owned_runtime_writer(tmp_path):
     from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
 
@@ -2282,12 +2523,116 @@ def test_validate_terminal_statuses():
     assert absent.status == "absent" and "no write target" in absent.reason
 
     observed = validate_terminal("topic_a.alt", [], ["topic_a.alt"])
-    assert observed.status == "valid" and observed.logged is True
+    assert observed.status == "absent" and observed.logged is True
+    assert "no source writer" in observed.reason
+
+    ambiguous_publishers = validate_terminal(
+        "topic_a.alt",
+        [
+            _vt_binding("topic_a", "src/modules/aaa/publisher.cpp"),
+            _vt_binding("topic_a", "src/modules/bbb/publisher.cpp"),
+        ],
+        ["topic_a.alt"],
+    )
+    assert ambiguous_publishers.status == "ambiguous"
+
+
+def test_discovery_finds_logged_terminal_through_publish_operation(
+    tmp_path, source_backend
+):
+    """ULog membership locates candidates but never replaces source flow."""
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/publisher.cpp": """
+struct status_s { float value; };
+
+class Publisher {
+    uORB::Publication<status_s> _status_pub{ORB_ID(status)};
+    status_s _status{};
+    void run(float input);
+};
+
+void Publisher::run(float input)
+{
+    _status.value = input;
+    _status_pub.publish(_status);
+}
+""",
+        },
+        backend=source_backend,
+    )
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=[],
+        terminal="status.value",
+        source_hash="hash",
+        logged_signals={"status.value"},
+    )
+
+    assert result.dag is not None
+    assert result.terminal_validation.status == "valid"
+    transfers = [
+        vertex
+        for vertex in result.dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("synthetic_boundary_transfer")
+    ]
+    assert transfers
+    terminal_transfer = next(
+        vertex for vertex in transfers if vertex.variable == "status.value"
+    )
+    status_write = next(
+        vertex
+        for vertex in result.dag.vertices
+        if vertex.kind == "operation"
+        and vertex.variable == "_status.value"
+        and vertex.expression == "input"
+    )
+    assert any(
+        edge.source_id == status_write.id
+        and edge.target_id == terminal_transfer.id
+        and edge.kind == "data"
+        for edge in result.dag.edges
+    )
+
+
+def test_discovery_rejects_ambiguous_logged_publishers(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    files = {
+        f"src/modules/{owner.lower()}/publisher.cpp": f"""
+struct status_s {{ float value; }};
+class {owner} {{
+    uORB::Publication<status_s> pub{{ORB_ID(status)}};
+    status_s payload{{}};
+    void run(float input) {{ payload.value = input; pub.publish(payload); }}
+}};
+"""
+        for owner in ("Alpha", "Beta")
+    }
+    profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
+
+    result = discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=[],
+        terminal="status.value",
+        source_hash="hash",
+        logged_signals={"status.value"},
+    )
+
+    assert result.dag is None
+    assert result.terminal_validation.status == "ambiguous"
 
 
 def test_validate_terminal_scoping_rules():
     """Without ownership metadata, same names in different files remain
-    ambiguous; an explicit file or its companion can scope the terminal."""
+    ambiguous; an explicit file or source-proven include can scope it."""
     from flight_log_agent.analysis.mechanism_discovery import validate_terminal
 
     cross = [
@@ -2306,6 +2651,21 @@ def test_validate_terminal_scoping_rules():
 
     twin = validate_terminal(
         "dist", cross, [], terminal_file="src/modules/aaa/alpha.hpp"
+    )
+    assert twin.status == "absent_in_scope"
+
+    twin = validate_terminal(
+        "dist",
+        cross,
+        [],
+        terminal_file="src/modules/aaa/alpha.hpp",
+        source_structure=SourceStructureIndex(
+            includes={
+                "src/modules/aaa/alpha.cpp": {
+                    "src/modules/aaa/alpha.hpp"
+                }
+            }
+        ),
     )
     assert twin.status == "valid"
     assert twin.resolved_file == "src/modules/aaa/alpha.cpp"
@@ -2783,8 +3143,34 @@ void Example::calculate_only()
     by_expression = {
         binding["source_symbol"]: binding for binding in inputs.bindings
     }
-    assert by_expression["input_value"]["logged_signal"] == "alpha.value"
+    assert by_expression["input_value"]["logged_signal"] == ""
     assert by_expression["unrelated_value"]["logged_signal"] == ""
+    publications = [
+        binding
+        for binding in inputs.bindings
+        if binding.get("synthetic_boundary_transfer")
+        and binding.get("boundary_direction") == "publish"
+    ]
+    assert len(publications) == 1
+    assert publications[0]["target_symbol"] == "alpha"
+    assert publications[0]["source_symbol"] == "msg"
+    assert "Example::publish_value" in str(publications[0]["callable_id"])
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "alpha.value",
+        terminal_file="src/modules/example/example.cpp",
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+    expressions = {
+        vertex.expression
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+    }
+    assert "input_value" in expressions
+    assert "unrelated_value" not in expressions
 
 
 def test_survey_anchors_on_declared_parameter_and_selects_its_writes(tmp_path):
@@ -2939,7 +3325,7 @@ void Ctrl::update()
     target = next(t for t in entry["write_targets"] if t["symbol"] == "status.speed_sp")
     assert target["reaches_anchor_in_hops"] == 0
     assert "_param_exa_trim_spd" in target["expression"]
-    assert target["published_signal"] == "status.speed_sp"
+    assert "published_signal" not in target
 
 
 def test_survey_preserves_same_named_locals_in_distinct_callables(tmp_path):

@@ -22,7 +22,10 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     callable_parameter_count,
 )
 from flight_log_agent.px4.source_facts_cache import SourceFileFacts, extract_facts_for_file
-from flight_log_agent.symbols import exact_symbol, symbol_produces_reference
+from flight_log_agent.symbols import (
+    exact_symbol,
+    source_storage_produces_reference,
+)
 from flight_log_agent.utils import dedupe_keep_order
 
 
@@ -116,6 +119,7 @@ class UnresolvedSourceReference(BaseModel):
     resolved_callable_owner: str = ""
     argument_count: Optional[int] = None
     source_expression: str = ""
+    source_site_id: str = ""
     identity: Optional[SourceSymbolIdentity] = None
 
     def visit_key(self) -> tuple[Any, ...]:
@@ -131,6 +135,7 @@ class UnresolvedSourceReference(BaseModel):
             self.resolved_callable_file,
             self.resolved_callable_owner,
             self.argument_count,
+            self.source_site_id,
             self.identity.key() if self.identity is not None else None,
         )
 
@@ -497,7 +502,13 @@ class SourceStructureIndex:
         reference: SourceSymbolIdentity,
         producer: SourceSymbolIdentity,
     ) -> bool:
-        if not symbol_produces_reference(producer.symbol, reference.symbol):
+        if not source_storage_produces_reference(
+            producer.symbol, reference.symbol
+        ):
+            return False
+        if self.authoritative_declarations and not (
+            reference.declaration_proven and producer.declaration_proven
+        ):
             return False
         if reference.kind == "local" or producer.kind == "local":
             same_callable = (
@@ -542,7 +553,9 @@ class SourceStructureIndex:
         producer: SourceSymbolIdentity,
     ) -> bool:
         """Whether ``producer`` writes the requested storage location."""
-        if not symbol_produces_reference(producer.symbol, reference.symbol):
+        if not source_storage_produces_reference(
+            producer.symbol, reference.symbol
+        ):
             return False
         if reference.kind != producer.kind:
             return False
@@ -603,10 +616,13 @@ class SourceStructureIndex:
             parameters = [str(value) for value in binding.get("function_parameters") or []]
             target = str(binding.get("target_symbol") or binding.get("target") or "")
             raw_target_identity = binding.get("target_identity") or {}
-            if raw_target_identity:
+            if binding.get("external_target_signal"):
+                binding.pop("target_identity", None)
+            elif raw_target_identity:
                 target_identity = SourceSymbolIdentity.model_validate(
                     raw_target_identity
                 ).model_copy(update={"symbol": exact_symbol(target)})
+                binding["target_identity"] = target_identity.model_dump()
             else:
                 target_identity = self.symbol_identity(
                     target,
@@ -616,7 +632,7 @@ class SourceStructureIndex:
                     function_parameters=parameters,
                     class_owner_hint=str(binding.get("function_owner") or ""),
                 )
-            binding["target_identity"] = target_identity.model_dump()
+                binding["target_identity"] = target_identity.model_dump()
             reference_identities: dict[str, dict[str, Any]] = {}
             expression_refs = [
                 binding.get("expression_ref")
@@ -651,6 +667,8 @@ class SourceStructureIndex:
                 provided = dict(expression_ref.get("input_identities") or {})
                 for symbol in symbols:
                     canonical = exact_symbol(symbol)
+                    if binding.get("external_source_signal"):
+                        continue
                     raw_identity = provided.get(canonical) or provided.get(symbol)
                     if raw_identity:
                         identity = SourceSymbolIdentity.model_validate(
@@ -774,41 +792,14 @@ def reference_receiver_is_source_boundary(
     boundary_bindings: Sequence[dict[str, Any]],
     structure: SourceStructureIndex,
 ) -> bool:
-    """Whether a callable receiver is one exact source-proven I/O endpoint."""
-    if reference.kind != "callable" or not reference.receiver:
+    """Whether this exact call site is a source-proven I/O transfer."""
+    if reference.kind != "callable":
         return False
-    receiver = exact_symbol(reference.receiver)
-    if receiver.startswith("this."):
-        receiver = receiver[5:]
-    caller = str(reference.callable_id or "").split("::@call:", 1)[0]
-    lineage = set(structure.lineage(reference.class_owner))
-    candidates: list[dict[str, Any]] = []
-    for item in boundary_bindings:
-        source_symbol = exact_symbol(str(item.get("source_symbol") or ""))
-        if source_symbol != receiver or not item.get("topic"):
-            continue
-        endpoint_kind = str(item.get("endpoint_kind") or "")
-        item_owner = str(item.get("source_owner") or "")
-        item_callable = str(item.get("callable_id") or "")
-        item_file = str(item.get("file") or "")
-        if not endpoint_kind:
-            endpoint_kind = (
-                "member" if item_owner else "local" if item_callable else "global"
-            )
-        if endpoint_kind in {"member", "base"}:
-            if item_owner and item_owner in lineage:
-                candidates.append(item)
-        elif endpoint_kind == "local":
-            if caller and item_callable == caller:
-                candidates.append(item)
-        elif endpoint_kind == "global":
-            if reference.file and item_file == reference.file:
-                candidates.append(item)
-    placements = {
-        (str(item.get("topic") or ""), item.get("instance"))
-        for item in candidates
-    }
-    return len(placements) == 1
+    return bool(reference.source_site_id) and any(
+        item.get("transfer")
+        and str(item.get("source_site_id") or "") == reference.source_site_id
+        for item in boundary_bindings
+    )
 
 
 @dataclass
@@ -1264,7 +1255,7 @@ class SourceExpansionResolver:
             return bare in admission.classes
         symbol = exact_symbol(reference.symbol)
         return any(
-            symbol_produces_reference(item.target, symbol)
+            source_storage_produces_reference(item.target, symbol)
             and (
                 reference.kind != "constant"
                 or item.declaration_kind in {"enum", "define", "constexpr"}
@@ -1344,7 +1335,7 @@ class SourceExpansionResolver:
         owner = identity.class_owner or identity.declaring_class
         owners = set(structure.lineage(owner)) or ({owner} if owner else set())
         for assignment in admission.assignments:
-            if assignment.owner in owners and symbol_produces_reference(
+            if assignment.owner in owners and source_storage_produces_reference(
                 assignment.target, symbol
             ):
                 return assignment.source_site_id
@@ -1353,7 +1344,7 @@ class SourceExpansionResolver:
                 continue
             for argument in call.arguments:
                 storage = _argument_storage(argument)
-                if storage and symbol_produces_reference(storage, symbol):
+                if storage and source_storage_produces_reference(storage, symbol):
                     return call.source_site_id
         return ""
 
@@ -1479,7 +1470,9 @@ class SourceExpansionResolver:
                 "constexpr",
             }:
                 continue
-            if symbol_produces_reference(exact_symbol(assignment.target), symbol):
+            if source_storage_produces_reference(
+                exact_symbol(assignment.target), symbol
+            ):
                 return True
         return False
 
@@ -1647,7 +1640,7 @@ class SourceExpansionResolver:
         bindings = []
         for assignment in facts.source_assignments:
             target = exact_symbol(assignment.target)
-            if symbol_produces_reference(target, symbol):
+            if source_storage_produces_reference(target, symbol):
                 bindings.append(assignment)
         if reference.kind == "constant":
             bindings = [

@@ -1550,6 +1550,39 @@ int helper_with_local_counter(int n)
     assert helpers[0].unresolved_reason is None
 
 
+def test_helper_return_sites_are_backend_interchangeable(
+    tmp_path, source_backend
+):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "navigator"
+    module_dir.mkdir(parents=True)
+    (module_dir / "helpers.cpp").write_text(
+        """
+float choose(int value)
+{
+    if (value > 0) return 1.0f;
+    if (value < 0) return -1.0f;
+    return 0.0f;
+}
+""",
+        encoding="utf-8",
+    )
+
+    profiler = _SourceExtractorContract(source_path, source_backend)
+    helper = profiler.extract_helper_expressions_from_source(
+        ["src/modules/navigator/helpers.cpp"],
+        helper_names=["choose"],
+    )[0]
+
+    assert [site.expression for site in helper.return_sites] == [
+        "1.0",
+        "-1.0",
+        "0.0",
+    ]
+    assert len({site.source_site_id for site in helper.return_sites}) == 3
+    assert all(site.expression_ref is not None for site in helper.return_sites)
+
+
 def test_switch_helper_lowers_to_nested_ternary(tmp_path, source_backend):
     source_path = tmp_path / "PX4-Autopilot"
     module_dir = source_path / "src" / "modules" / "navigator"

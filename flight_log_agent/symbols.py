@@ -119,6 +119,23 @@ def symbol_produces_reference(producer: str, reference: str) -> bool:
     return True
 
 
+def source_storage_produces_reference(producer: str, reference: str) -> bool:
+    """Whether a source assignment supplies a requested subobject.
+
+    Source object assignment is directional: a writer of ``state`` supplies
+    reads of ``state.position.x``, while a writer of ``state.position.x``
+    cannot prove the aggregate ``state`` or a sibling field. Logged-signal
+    identity remains stricter and continues to use
+    :func:`symbol_produces_reference` directly.
+    """
+    producer_parts = exact_symbol(producer).split(".")
+    reference_parts = exact_symbol(reference).split(".")
+    if not producer_parts or len(producer_parts) > len(reference_parts):
+        return False
+    reference_prefix = ".".join(reference_parts[: len(producer_parts)])
+    return symbol_produces_reference(producer, reference_prefix)
+
+
 def _topic_is_struct_type(reference: str) -> bool:
     """PX4 struct type names end in ``_s``; topic names do not.
 

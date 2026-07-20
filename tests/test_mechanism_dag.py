@@ -76,6 +76,53 @@ def _boundary(
     }
 
 
+def _boundary_transfer(
+    source_symbol: str,
+    topic: str,
+    *,
+    file: str = "",
+    line: int = 1,
+    direction: str = "subscribe",
+    instance: int | None = None,
+    function: str = "",
+    callable_id: str = "",
+    target_identity: dict | None = None,
+) -> dict:
+    """One source-proven message transfer in the DAG binding contract."""
+    topic_symbol = f"{topic}[{instance}]" if instance is not None else topic
+    if direction == "subscribe":
+        target, source = source_symbol, topic_symbol
+    else:
+        target, source = topic_symbol, source_symbol
+    return {
+        "target_symbol": target,
+        "source_symbol": source,
+        "logged_signal": "",
+        "assignment_operator": "=",
+        "assignment_path": [
+            {"file": file, "line": line, "expression": source}
+        ],
+        "source_site_id": f"{file}:{line}:test_boundary_transfer",
+        "function": function,
+        "callable_id": callable_id,
+        "target_identity": target_identity or {},
+        "expression_ref": {
+            "text": source,
+            "lowered_text": source,
+            "input_symbols": [source],
+            "input_identities": {},
+            "call_results": [],
+            "direct_storage": source,
+            "exact": True,
+        },
+        "control_predicates": [],
+        "synthetic_boundary_transfer": True,
+        "boundary_direction": direction,
+        "external_source_signal": direction == "subscribe",
+        "provenance": "test source transfer",
+    }
+
+
 def _fake_helper(
     *,
     name: str,
@@ -86,6 +133,70 @@ def _fake_helper(
     return_expression: str,
     branches: list[dict] | None = None,
 ) -> dict:
+    branch_records = list(branches or [])
+    return_sites = [
+        {
+            "expression": str(branch.get("expression") or ""),
+            "expression_ref": branch.get("expression_ref"),
+            "file": str(branch.get("file") or file),
+            "line": int(branch.get("line") or line),
+            "source_site_id": str(
+                branch.get("source_site_id")
+                or f"{file}:{line}:{position}:test_return"
+            ),
+            "control_predicates": [str(branch.get("condition") or "")],
+            "control_predicate_lines": [
+                int(branch.get("condition_line") or branch.get("line") or line)
+            ],
+            "control_predicate_site_ids": [
+                str(
+                    branch.get("condition_source_site_id")
+                    or branch.get("source_site_id")
+                    or f"{file}:{line}:{position}:test_control"
+                )
+            ],
+            "control_expression_refs": (
+                [branch["condition_ref"]]
+                if branch.get("condition_ref")
+                else []
+            ),
+            "reachability_exact": bool(
+                branch.get("reachability_exact", True)
+            ),
+        }
+        for position, branch in enumerate(branch_records)
+        if str(branch.get("expression") or "")
+        and str(branch.get("condition") or "")
+    ]
+    if return_expression:
+        return_sites.append(
+            {
+                "expression": return_expression,
+                "file": file,
+                "line": line,
+                "source_site_id": f"{file}:{line}:fallback:test_return",
+                "control_predicates": [
+                    f"!({str(branch.get('condition') or '')})"
+                    for branch in branch_records
+                    if str(branch.get("condition") or "")
+                ],
+                "control_predicate_lines": [
+                    int(branch.get("condition_line") or branch.get("line") or line)
+                    for branch in branch_records
+                    if str(branch.get("condition") or "")
+                ],
+                "control_predicate_site_ids": [
+                    str(
+                        branch.get("condition_source_site_id")
+                        or branch.get("source_site_id")
+                        or f"{file}:{line}:{position}:test_control"
+                    )
+                    for position, branch in enumerate(branch_records)
+                    if str(branch.get("condition") or "")
+                ],
+                "reachability_exact": True,
+            }
+        )
     return {
         "name": name,
         "file": file,
@@ -93,13 +204,36 @@ def _fake_helper(
         "evidence": evidence,
         "assignments": assignments,
         "return_expression": return_expression,
-        "lowered_return_expression": return_expression,
-        "branches": branches or [],
+        "branches": branch_records,
+        "return_sites": return_sites,
         "helper_calls": [],
         "call_resolutions": [],
         "statements": [],
         "symbol_bindings": {},
         "parameters": [],
+    }
+
+
+def _fake_call(
+    name: str,
+    args: list[str],
+    *,
+    file: str,
+    line: int,
+    function: str = "",
+    callable_id: str = "",
+    receiver: str = "",
+    site_offset: int = 0,
+) -> dict:
+    return {
+        "name": name,
+        "receiver": receiver,
+        "args": list(args),
+        "file": file,
+        "line": line,
+        "function": function,
+        "callable_id": callable_id or function,
+        "source_site_id": f"{file}:{line}:{site_offset}:test_call",
     }
 
 
@@ -233,6 +367,13 @@ def test_evidence_leaf_classification_covers_logged_and_parameter():
         "_rtl_alt",
         logged_signals={"gpos_alt"},
         parameter_names={"RTL_RETURN_ALT"},
+        parameter_bindings=[
+            {
+                "member": "_param_rtl_return_alt",
+                "name": "RTL_RETURN_ALT",
+                "file": "src/modules/navigator/rtl.cpp",
+            }
+        ],
     )
 
     evidence_by_kind = {v.sub_kind: v for v in dag.vertices if v.kind == "evidence"}
@@ -260,7 +401,7 @@ def test_unresolved_symbol_becomes_opaque_evidence():
     assert "some_unresolved_thing" in dag.unresolved_symbols
 
 
-def test_helper_body_preserves_intermediates_per_call_site():
+def test_helper_returns_are_private_without_duplicate_body_operations():
     helper = _fake_helper(
         name="RTL::calc_cone_alt",
         file="src/modules/navigator/rtl.cpp",
@@ -301,16 +442,22 @@ def test_helper_body_preserves_intermediates_per_call_site():
         bindings,
         "combined_alt",
         helper_expressions=[helper],
+        call_statements=[
+            _fake_call(
+                "calc_cone_alt",
+                ["_param_rtl_cone_half_angle_deg.get()"],
+                file="src/modules/navigator/rtl.cpp",
+                line=line,
+            )
+            for line in (245, 311)
+        ],
         parameter_names={"RTL_CONE_HALF_ANGLE_DEG", "RTL_RETURN_ALT"},
     )
 
-    intermediates = {
-        v.variable: v
-        for v in dag.vertices
-        if v.kind == "operation" and v.provenance and v.provenance.startswith("helper_body")
-    }
-    assert "destination_dist" in intermediates
-    assert "return_altitude_amsl" in intermediates
+    assert not any(
+        str(vertex.provenance or "").startswith("helper_body")
+        for vertex in dag.vertices
+    )
 
     helper_terminals = [
         v
@@ -621,7 +768,9 @@ def test_signal_samples_compute_active_windows_for_partial_true_predicate():
             control_predicates=[predicate],
         ),
     ]
-    dag = build_mechanism_dag(bindings, "_rtl_alt")
+    dag = build_mechanism_dag(
+        bindings, "_rtl_alt", logged_signals={"nav_state"}
+    )
 
     reduced = evaluate_feasibility(
         dag,
@@ -653,7 +802,9 @@ def test_signal_samples_mark_always_true_when_predicate_covers_whole_span():
             control_predicates=[predicate],
         ),
     ]
-    dag = build_mechanism_dag(bindings, "_rtl_alt")
+    dag = build_mechanism_dag(
+        bindings, "_rtl_alt", logged_signals={"vehicle_type"}
+    )
 
     reduced = evaluate_feasibility(
         dag,
@@ -686,7 +837,9 @@ def test_signal_samples_prune_branch_when_predicate_never_true():
             line=248,
         ),
     ]
-    dag = build_mechanism_dag(bindings, "_rtl_alt")
+    dag = build_mechanism_dag(
+        bindings, "_rtl_alt", logged_signals={"vehicle_type"}
+    )
 
     reduced = evaluate_feasibility(
         dag,
@@ -714,7 +867,9 @@ def test_signal_samples_combine_with_parameter_substitution():
             control_predicates=[predicate],
         ),
     ]
-    dag = build_mechanism_dag(bindings, "_rtl_alt")
+    dag = build_mechanism_dag(
+        bindings, "_rtl_alt", logged_signals={"vehicle_type"}
+    )
 
     reduced = evaluate_feasibility(
         dag,
@@ -859,6 +1014,16 @@ def test_helper_chain_source_form_resolves_to_logged_evidence():
     ``_navigator.get_vstatus().vehicle_type`` should emit
     ``evidence:logged_signal`` with the canonical logged name — resolved
     graph-natively via the helper's ``return_type`` and the PX4 msg schema."""
+    member_identity = {
+        "kind": "member",
+        "symbol": "_vehicle_status",
+        "root": "_vehicle_status",
+        "file": "navigator.h",
+        "class_owner": "Navigator",
+        "declaring_class": "Navigator",
+        "declaration_id": "navigator-vehicle-status-member",
+        "declaration_proven": True,
+    }
     helper = _fake_helper(
         name="Navigator::get_vstatus",
         file="navigator.cpp",
@@ -868,6 +1033,28 @@ def test_helper_chain_source_form_resolves_to_logged_evidence():
         return_expression="_vehicle_status",
     )
     helper["return_type"] = "vehicle_status_s *"
+    helper["owner"] = "Navigator"
+    helper["callable_id"] = "navigator-vstatus-callable"
+    helper["return_sites"] = [
+        {
+            "expression": "_vehicle_status",
+            "file": "navigator.cpp",
+            "line": 100,
+            "source_site_id": "navigator-return",
+            "expression_ref": {
+                "text": "_vehicle_status",
+                "lowered_text": "_vehicle_status",
+                "input_symbols": ["_vehicle_status"],
+                "input_identities": {
+                    "_vehicle_status": member_identity,
+                },
+                "call_results": [],
+                "direct_storage": "_vehicle_status",
+                "exact": True,
+            },
+            "reachability_exact": True,
+        }
+    ]
     predicate = "_navigator.get_vstatus().vehicle_type == 1"
     bindings = [
         _fake_binding(
@@ -878,6 +1065,31 @@ def test_helper_chain_source_form_resolves_to_logged_evidence():
             line=245,
             control_predicates=[predicate],
         ),
+        _boundary_transfer(
+            "_vehicle_status",
+            "vehicle_status",
+            file="navigator.cpp",
+            line=90,
+            function="Navigator::update",
+            callable_id="navigator-update-callable",
+            target_identity=member_identity,
+        ),
+    ]
+    bindings[0]["control_expression_refs"] = [
+        {
+            "text": predicate,
+            "lowered_text": predicate,
+            "input_symbols": [],
+            "input_identities": {},
+            "call_results": [
+                {
+                    "call_source_site_id": "vstatus-call",
+                    "result_path": "vehicle_type",
+                    "text": "_navigator.get_vstatus().vehicle_type",
+                }
+            ],
+            "exact": True,
+        }
     ]
     dag = build_mechanism_dag(
         bindings,
@@ -887,6 +1099,30 @@ def test_helper_chain_source_form_resolves_to_logged_evidence():
         boundary_bindings=[
             _boundary("_vehicle_status", "vehicle_status", file="navigator.cpp")
         ],
+        call_statements=[
+            {
+                "name": "get_vstatus",
+                "receiver": "_navigator",
+                "args": [],
+                "file": "rtl.cpp",
+                "line": 245,
+                "source_site_id": "vstatus-call",
+                "resolved_callable_file": "navigator.cpp",
+                "resolved_callable_owner": "Navigator",
+                "resolved_callable_id": "navigator-vstatus-callable",
+                }
+            ],
+        source_structure=SourceStructureIndex(
+            direct_bases={"Navigator": set()},
+            declared_classes={"Navigator"},
+            members={
+                ("Navigator", "_vehicle_status"): {
+                    "name": "_vehicle_status",
+                    "owner": "Navigator",
+                    "type": "vehicle_status_s",
+                }
+            },
+        ),
     )
 
     logged = next(
@@ -896,8 +1132,19 @@ def test_helper_chain_source_form_resolves_to_logged_evidence():
         None,
     )
     assert logged is not None
-    assert logged.metadata.get("source_form")
-    assert logged.metadata.get("derivation") == "source_boundary"
+    transfer = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and vertex.variable == "_vehicle_status.vehicle_type"
+        and (vertex.metadata or {}).get("synthetic_boundary_transfer")
+    )
+    assert any(
+        edge.source_id == logged.id
+        and edge.target_id == transfer.id
+        and edge.kind == "data"
+        for edge in dag.edges
+    )
 
 
 def test_source_enum_resolution_stores_value_on_constant_vertex():
@@ -1045,10 +1292,7 @@ def test_cxx_stdlib_constant_stored_on_constant_vertex():
     assert const_vertex.metadata.get("source") == "cxx_stdlib"
 
 
-def test_helper_call_arguments_wire_into_formal_parameter_vertices():
-    """Caller's actual argument should be connected to the helper's
-    formal-parameter vertex — the graph flows through parameter ports
-    instead of leaving the formal name unresolved."""
+def test_helper_call_arguments_wire_through_call_scoped_formal_operations():
     helper = _fake_helper(
         name="scale_alt",
         file="rtl.cpp",
@@ -1079,21 +1323,32 @@ def test_helper_call_arguments_wire_into_formal_parameter_vertices():
         bindings,
         "_rtl_alt",
         helper_expressions=[helper],
+        call_statements=[
+            _fake_call(
+                "scale_alt",
+                ["_destination.alt"],
+                file="rtl.cpp",
+                line=500,
+            )
+        ],
     )
 
-    # Formal-parameter vertex emitted?
     formal = next(
-        (v for v in dag.vertices if v.kind == "evidence" and v.sub_kind == "helper_parameter"),
+        (
+            vertex
+            for vertex in dag.vertices
+            if vertex.kind == "operation"
+            and vertex.variable == "base"
+            and (vertex.metadata or {}).get("synthetic_call_binding")
+        ),
         None,
     )
-    assert formal is not None, "helper_parameter vertex missing"
-    assert formal.signal_name == "base"
+    assert formal is not None
+    assert formal.expression == "_destination.alt"
 
-    # A data edge should feed the argument into the formal-parameter vertex.
     incoming = [e for e in dag.edges if e.target_id == formal.id and e.kind == "data"]
-    assert incoming, "no data edge feeding the helper formal parameter"
-    # The role should reference the formal name so LLM presentation stays useful.
-    assert any(e.role == "arg:base" for e in incoming)
+    assert incoming
+    assert any(e.role == "_destination.alt" for e in incoming)
 
 
 def test_struct_root_does_not_guess_which_fields_a_helper_reads():
@@ -1177,10 +1432,7 @@ def test_dag_without_source_root_omits_snippets():
     assert all(v.snippet is None for v in dag.vertices)
 
 
-def test_helper_pointer_output_writes_emit_ops_at_call_site():
-    """When a helper record carries ``pointer_output_writes``, the DAG
-    builder should emit an operation vertex per write at the call site,
-    with the caller's actual arg substituted for the pointer formal."""
+def test_unrelated_helper_pointer_effect_is_not_eagerly_emitted():
     helper = _fake_helper(
         name="RTL::compute_setpoint",
         file="rtl.cpp",
@@ -1194,9 +1446,6 @@ def test_helper_pointer_output_writes_emit_ops_at_call_site():
     helper["pointer_output_writes"] = [
         {"param": "sp", "field": "alt", "expression": "_rtl_alt"},
     ]
-    # Caller writes _navigator.get_position_setpoint_triplet().current via
-    # the helper call; the DAG should emit an op targeting
-    # <arg>.alt = _rtl_alt at the caller site.
     bindings = [
         _fake_binding(
             binding_id="caller",
@@ -1206,18 +1455,15 @@ def test_helper_pointer_output_writes_emit_ops_at_call_site():
             line=500,
         ),
     ]
-    dag = build_mechanism_dag(bindings, "_rtl_alt", helper_expressions=[helper])
+    dag = build_mechanism_dag(
+        bindings,
+        "_rtl_alt",
+        helper_expressions=[helper],
+    )
 
-    ops = [v for v in dag.vertices if v.kind == "operation"]
-    variables = {v.variable for v in ops}
-    assert "_pos_sp.alt" in variables
-    pointer_op = next(v for v in ops if v.variable == "_pos_sp.alt")
-    assert pointer_op.expression == "sp.alt"
-    assert (pointer_op.provenance or "").startswith("pointer_output:")
-    helper_write = next(v for v in ops if v.variable == "sp.alt")
-    assert any(
-        edge.source_id == helper_write.id and edge.target_id == pointer_op.id
-        for edge in dag.edges
+    assert not any(
+        vertex.kind == "operation" and vertex.variable == "_pos_sp.alt"
+        for vertex in dag.vertices
     )
 
 
@@ -1457,6 +1703,15 @@ def test_statement_call_rebinds_structured_formal_to_caller_storage():
     )
     writer["callable_id"] = helper_callable
     writer["function_parameters"] = ["item", "sp"]
+    writer["expression_ref"] = {
+        "text": "item.altitude",
+        "lowered_text": "item.altitude",
+        "input_symbols": ["item.altitude"],
+        "input_identities": {},
+        "call_results": [],
+        "direct_storage": "item.altitude",
+        "exact": True,
+    }
     call = {
         "name": "fill",
         "args": ["source_item", "&out"],
@@ -1464,6 +1719,27 @@ def test_statement_call_rebinds_structured_formal_to_caller_storage():
         "line": 20,
         "function": "run",
         "callable_id": "caller.cpp:1:run:",
+        "source_site_id": "caller.cpp:20:fill",
+        "argument_expressions": [
+            {
+                "text": "source_item",
+                "lowered_text": "source_item",
+                "input_symbols": ["source_item"],
+                "input_identities": {},
+                "call_results": [],
+                "direct_storage": "source_item",
+                "exact": True,
+            },
+            {
+                "text": "&out",
+                "lowered_text": "out",
+                "input_symbols": ["out"],
+                "input_identities": {},
+                "call_results": [],
+                "direct_storage": "out",
+                "exact": True,
+            },
+        ],
     }
 
     dag = build_mechanism_dag(
@@ -1589,6 +1865,17 @@ def test_expression_call_instances_have_private_formals_and_returns():
         "output",
         terminal_file="caller.cpp",
         helper_expressions=[helper],
+        call_statements=[
+            _fake_call(
+                "scale",
+                [actual],
+                file="caller.cpp",
+                line=line,
+                function="run",
+                callable_id="caller.cpp:1:run:",
+            )
+            for actual, line in (("first", 20), ("second", 30))
+        ],
     )
 
     returns = [
@@ -1599,27 +1886,23 @@ def test_expression_call_instances_have_private_formals_and_returns():
     formals = [
         vertex
         for vertex in dag.vertices
-        if vertex.kind == "evidence" and vertex.sub_kind == "helper_parameter"
+        if vertex.kind == "operation"
+        and vertex.variable == "value"
+        and (vertex.metadata or {}).get("synthetic_call_binding")
     ]
     assert len(returns) == 2
     assert len(formals) == 2
     assert len({vertex.metadata["call_site_id"] for vertex in returns}) == 2
-    incoming = {
-        formal.id: {
-            edge.source_id for edge in dag.edges if edge.target_id == formal.id
-        }
-        for formal in formals
+    assert {formal.expression for formal in formals} == {"first", "second"}
+    return_scopes = {
+        str((vertex.metadata or {}).get("call_instance_scope") or "")
+        for vertex in returns
     }
-    evidence = {
-        vertex.signal_name: vertex.id
-        for vertex in dag.vertices
-        if vertex.kind == "evidence" and vertex.sub_kind == "opaque_symbol"
+    formal_scopes = {
+        str((vertex.metadata or {}).get("call_instance_scope") or "")
+        for vertex in formals
     }
-    assert sorted(
-        source in predecessors
-        for source in (evidence["first"], evidence["second"])
-        for predecessors in incoming.values()
-    ) == [False, False, True, True]
+    assert return_scopes == formal_scopes
 
 
 def test_unrelated_call_does_not_probe_helper_provider():
@@ -1807,7 +2090,7 @@ def test_receiver_call_result_does_not_admit_other_receiver_methods():
     )
 
 
-def test_source_boundary_receiver_does_not_expand_framework_method():
+def test_only_exact_source_boundary_transfer_call_skips_helper_expansion():
     probes: list[str] = []
 
     def provider(name, reference=None):
@@ -1823,6 +2106,7 @@ def test_source_boundary_receiver_does_not_expand_framework_method():
         logged_signal="",
         function="Controller::run",
     )
+    binding["callable_id"] = "main.cpp:1:Controller::run:"
     structure = SourceStructureIndex(
         direct_bases={"Controller": set(), "Channel": set()},
         declared_classes={"Controller", "Channel"},
@@ -1847,6 +2131,7 @@ def test_source_boundary_receiver_does_not_expand_framework_method():
                     "args": ["&sample"],
                     "file": "main.cpp",
                     "line": 10,
+                    "source_site_id": "main.cpp:10:update",
                     "function": "Controller::run",
                     "callable_id": "main.cpp:1:Controller::run:",
                 }
@@ -1860,6 +2145,8 @@ def test_source_boundary_receiver_does_not_expand_framework_method():
                 "source_owner": "Controller",
                 "endpoint_kind": "member",
                 "file": "main.hpp",
+                "source_site_id": "main.cpp:10:update",
+                "transfer": True,
             }
         ],
         source_structure=structure,
@@ -1867,12 +2154,46 @@ def test_source_boundary_receiver_does_not_expand_framework_method():
     )
 
     assert probes == []
-    assert any(
+    assert not any(
         item.kind == "callable"
-        and item.symbol == "_channel.update"
-        and item.receiver == "_channel"
+        and item.symbol.rsplit(".", 1)[-1] == "update"
         for item in dag.unresolved_references
     )
+
+    probes.clear()
+    build_mechanism_dag(
+        [binding],
+        "answer",
+        terminal_file="main.cpp",
+        call_statements=structure.enrich_calls(
+            [
+                {
+                    "name": "update",
+                    "receiver": "_channel",
+                    "args": ["&sample"],
+                    "file": "main.cpp",
+                    "line": 10,
+                    "source_site_id": "main.cpp:10:update",
+                    "function": "Controller::run",
+                    "callable_id": "main.cpp:1:Controller::run:",
+                }
+            ]
+        ),
+        boundary_bindings=[
+            {
+                "source_symbol": "_channel",
+                "topic": "sample_stream",
+                "direction": "subscribe",
+                "source_owner": "Controller",
+                "endpoint_kind": "member",
+                "file": "main.hpp",
+                "transfer": False,
+            }
+        ],
+        source_structure=structure,
+        helper_body_provider=provider,
+    )
+    assert probes == ["update"]
 
 
 def test_unresolved_receiver_calls_share_one_provider_lookup_identity():
@@ -1891,6 +2212,7 @@ def test_unresolved_receiver_calls_share_one_provider_lookup_identity():
         logged_signal="",
         function="Controller::run",
     )
+    binding["callable_id"] = "main.cpp:1:Controller::run:"
     structure = SourceStructureIndex(
         direct_bases={"Controller": set(), "Client": set()},
         declared_classes={"Controller", "Client"},
@@ -1909,6 +2231,19 @@ def test_unresolved_receiver_calls_share_one_provider_lookup_identity():
         terminal_file="main.cpp",
         source_structure=structure,
         helper_body_provider=provider,
+        call_statements=[
+            _fake_call(
+                "compute",
+                [argument],
+                receiver="client",
+                file="main.cpp",
+                line=10,
+                function="Controller::run",
+                callable_id="main.cpp:1:Controller::run:",
+                site_offset=offset,
+            )
+            for offset, argument in enumerate(("left", "right"))
+        ],
     )
 
     assert probes == ["compute"]
@@ -1948,6 +2283,14 @@ def test_helper_body_provider_lazily_supplies_missing_helper():
         "dist_squared",
         helper_expressions=[],
         helper_body_provider=provider,
+        call_statements=[
+            _fake_call(
+                "haversine_distance",
+                ["a", "b"],
+                file="rtl.cpp",
+                line=300,
+            )
+        ],
     )
 
     assert "haversine_distance" in fetches
@@ -1974,7 +2317,21 @@ def test_helper_body_provider_probes_each_name_at_most_once():
             line=10,
         ),
     ]
-    build_mechanism_dag(bindings, "x", helper_body_provider=provider)
+    build_mechanism_dag(
+        bindings,
+        "x",
+        helper_body_provider=provider,
+        call_statements=[
+            _fake_call(
+                "mystery",
+                [argument],
+                file="rtl.cpp",
+                line=10,
+                site_offset=offset,
+            )
+            for offset, argument in enumerate(("a", "b", "c"))
+        ],
+    )
     assert calls.count("mystery") == 1
 
 
@@ -2072,10 +2429,8 @@ def test_symbol_bindings_flat_dict_no_longer_consumed():
     assert not phantom, "flat symbol_bindings should no longer produce evidence vertices"
 
 
-def test_predicate_lowering_substitutes_enum_and_helper_chain_derivation():
-    """Branch ``predicate_lowered`` should reflect enum resolution AND
-    graph-native helper-chain substitution — no flat symbol_bindings
-    entry required."""
+def test_predicate_lowering_preserves_source_symbols_and_constant_edge():
+    """Predicate values stay on edges instead of being text-substituted."""
     helper = _fake_helper(
         name="Navigator::get_vstatus",
         file="navigator.cpp",
@@ -2119,12 +2474,17 @@ def test_predicate_lowering_substitutes_enum_and_helper_chain_derivation():
     )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
-    assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
-    assert "VEHICLE_TYPE_ROTARY_WING" not in (branch.predicate_lowered or "")
-    variables = branch.metadata.get("variables") or {}
+    assert branch.predicate_lowered == predicate
+    enum_vertex = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "evidence"
+        and vertex.sub_kind == "constant"
+        and vertex.signal_name == "VEHICLE_TYPE_ROTARY_WING"
+    )
     assert any(
-        "get_vstatus" in key and value == "vehicle_status.vehicle_type"
-        for key, value in variables.items()
+        edge.source_id == enum_vertex.id and edge.target_id == branch.id
+        for edge in dag.edges
     )
 
 
@@ -2157,11 +2517,8 @@ def test_derive_pointer_output_bindings_skips_missing_arg_position():
     assert derive_pointer_output_bindings(pointer_writes, pointer_params, call_args) == []
 
 
-def test_helper_chain_resolves_via_return_type_and_schema():
-    """A chain like ``_navigator.get_vstatus().vehicle_type`` should
-    resolve to ``vehicle_status.vehicle_type`` purely from the helper's
-    return_type + PX4 msg schema — without any entry in the flat
-    symbol_bindings dict."""
+def test_helper_return_type_does_not_bypass_source_graph():
+    """A compatible return type alone is not runtime boundary provenance."""
     helper = _fake_helper(
         name="Navigator::get_vstatus",
         file="navigator.cpp",
@@ -2182,8 +2539,6 @@ def test_helper_chain_resolves_via_return_type_and_schema():
             control_predicates=[predicate],
         ),
     ]
-    # The chain resolves purely from graph derivation (helper return_type
-    # + schema lookup); the DAG has no flat symbol_bindings table at all.
     dag = build_mechanism_dag(
         bindings,
         "_rtl_alt",
@@ -2195,12 +2550,12 @@ def test_helper_chain_resolves_via_return_type_and_schema():
     )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
-    assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
-    variables = branch.metadata.get("variables") or {}
-    # Each substitution keys on the original chain-with-field text.
-    assert any(
-        "get_vstatus" in key and value == "vehicle_status.vehicle_type"
-        for key, value in variables.items()
+    assert branch.predicate_lowered == predicate
+    assert not any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "vehicle_status.vehicle_type"
+        for vertex in dag.vertices
     )
 
 
@@ -2266,20 +2621,6 @@ def test_helper_chain_skipped_when_topic_not_in_schema():
     assert "get_thing" in (branch.predicate_lowered or "")
 
 
-def test_derive_topic_from_return_type_variants():
-    """The topic derivation should handle pointer, reference, namespaced,
-    and bare-struct return types — and return None for scalars."""
-    from flight_log_agent.analysis.mechanism_dag import _derive_topic_from_return_type
-
-    assert _derive_topic_from_return_type("vehicle_status_s *") == "vehicle_status"
-    assert _derive_topic_from_return_type("vehicle_status_s&") == "vehicle_status"
-    assert _derive_topic_from_return_type("vehicle_status_s") == "vehicle_status"
-    assert _derive_topic_from_return_type("px4::vehicle_status_s *") == "vehicle_status"
-    assert _derive_topic_from_return_type("float") is None
-    assert _derive_topic_from_return_type("") is None
-    assert _derive_topic_from_return_type(None) is None
-
-
 def test_struct_var_field_resolves_via_source_boundary():
     """A copied local resolves only through its source-proven subscription."""
     helper = _fake_helper(
@@ -2301,6 +2642,12 @@ def test_struct_var_field_resolves_via_source_boundary():
             line=1,
             control_predicates=[predicate],
         ),
+        _boundary_transfer(
+            "vstatus",
+            "vehicle_status",
+            file="rtl.cpp",
+            line=0,
+        ),
     ]
     dag = build_mechanism_dag(
         bindings,
@@ -2313,7 +2660,29 @@ def test_struct_var_field_resolves_via_source_boundary():
     )
 
     branch = next(v for v in dag.vertices if v.kind == "branch")
-    assert "vehicle_status.vehicle_type" in (branch.predicate_lowered or "")
+    assert branch.predicate_lowered == predicate
+    logged = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "vehicle_status.vehicle_type"
+    )
+    transfer = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and vertex.variable == "vstatus.vehicle_type"
+        and (vertex.metadata or {}).get("synthetic_boundary_transfer")
+    )
+    assert any(
+        edge.source_id == logged.id and edge.target_id == transfer.id
+        for edge in dag.edges
+    )
+    assert any(
+        edge.source_id == transfer.id and edge.target_id == branch.id
+        for edge in dag.edges
+    )
 
 
 def test_struct_type_without_source_boundary_does_not_become_evidence():
@@ -2374,11 +2743,10 @@ def test_struct_var_field_skipped_when_topic_unknown():
     assert "mystery" in (branch.predicate_lowered or "")
 
 
-def test_parameter_alias_resolves_member_differing_from_param_name():
+def test_source_scoped_parameter_binding_resolves_member_differing_from_name():
     """A PX4 param whose member name differs from the param name
     (`_param_rtl_cone_half_angle_deg` ↔ RTL_CONE_ANG) resolves only via the
-    parameter_aliases map (the DEFINE_PARAMETERS member→name mapping), not
-    the `_param_<snake>→UPPER` heuristic."""
+    source declaration retained by the DAG, not a spelling heuristic."""
     bindings = [
         _fake_binding(
             binding_id="b1",
@@ -2392,7 +2760,13 @@ def test_parameter_alias_resolves_member_differing_from_param_name():
         bindings,
         "_rtl_alt",
         parameter_names={"RTL_CONE_ANG"},
-        parameter_aliases={"_param_rtl_cone_half_angle_deg": "RTL_CONE_ANG"},
+        parameter_bindings=[
+            {
+                "member": "_param_rtl_cone_half_angle_deg",
+                "name": "RTL_CONE_ANG",
+                "file": "rtl.cpp",
+            }
+        ],
     )
     params = {
         v.signal_name for v in dag.vertices
@@ -2401,9 +2775,8 @@ def test_parameter_alias_resolves_member_differing_from_param_name():
     assert "RTL_CONE_ANG" in params
 
 
-def test_parameter_alias_not_resolved_without_map():
-    """Without the alias map, the same member is NOT resolvable (the
-    heuristic would produce RTL_CONE_HALF_ANGLE_DEG, which isn't the param)."""
+def test_parameter_member_not_resolved_without_source_binding():
+    """Inventory membership alone cannot identify a source member."""
     bindings = [
         _fake_binding(
             binding_id="b1",
@@ -2440,6 +2813,26 @@ def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
         return_expression="_vstatus",
     )
     helper["return_type"] = "vehicle_status_s"
+    helper["owner"] = "Navigator"
+    helper["callable_id"] = "navigator-vstatus-callable"
+    helper["return_sites"] = [
+        {
+            "expression": "_vstatus",
+            "file": "navigator.h",
+            "line": 10,
+            "source_site_id": "navigator-vstatus-return",
+            "expression_ref": {
+                "text": "_vstatus",
+                "lowered_text": "_vstatus",
+                "input_symbols": ["_vstatus"],
+                "input_identities": {},
+                "call_results": [],
+                "direct_storage": "_vstatus",
+                "exact": True,
+            },
+            "reachability_exact": True,
+        }
+    ]
     bindings = [
         _fake_binding(
             binding_id="b1",
@@ -2449,6 +2842,33 @@ def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
             line=245,
             control_predicates=[predicate],
         ),
+        _boundary_transfer(
+            "_vstatus",
+            "vehicle_status",
+            file="navigator.h",
+            line=9,
+            function="Navigator::get_vstatus",
+            callable_id="navigator-vstatus-callable",
+        ),
+    ]
+    bindings[0]["control_expression_refs"] = [
+        {
+            "text": predicate,
+            "lowered_text": predicate.replace("->", ".").replace("::", "."),
+            "input_symbols": [
+                "_param_rtl_cone_half_angle_deg.get()",
+                "vehicle_status_s.VEHICLE_TYPE_ROTARY_WING",
+            ],
+            "input_identities": {},
+            "call_results": [
+                {
+                    "call_source_site_id": "navigator-vstatus-call",
+                    "result_path": "vehicle_type",
+                    "text": "_navigator.get_vstatus().vehicle_type",
+                }
+            ],
+            "exact": True,
+        }
     ]
     dag = build_mechanism_dag(
         bindings,
@@ -2456,9 +2876,28 @@ def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
         inventory=_fake_inventory({"vehicle_status": ["vehicle_type"]}),
         helper_expressions=[helper],
         parameter_names={"RTL_CONE_ANG"},
-        parameter_aliases={"_param_rtl_cone_half_angle_deg": "RTL_CONE_ANG"},
+        parameter_bindings=[
+            {
+                "member": "_param_rtl_cone_half_angle_deg",
+                "name": "RTL_CONE_ANG",
+                "file": "rtl.cpp",
+            }
+        ],
         boundary_bindings=[
             _boundary("_vstatus", "vehicle_status", file="navigator.h")
+        ],
+        call_statements=[
+            {
+                "name": "get_vstatus",
+                "receiver": "_navigator",
+                "args": [],
+                "file": "rtl.cpp",
+                "line": 245,
+                "source_site_id": "navigator-vstatus-call",
+                "resolved_callable_file": "navigator.h",
+                "resolved_callable_owner": "Navigator",
+                "resolved_callable_id": "navigator-vstatus-callable",
+            }
         ],
     )
     params = {v.signal_name for v in dag.vertices
@@ -2469,8 +2908,7 @@ def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
     assert "vehicle_status.vehicle_type" in logged
 
 
-def test_helper_branch_selects_value_without_gating_return_reachability():
-    """Alternative helper return values are selection, not conjunction."""
+def test_helper_return_writers_carry_piecewise_reachability():
     helper = _fake_helper(
         name="RTL::calc",
         file="rtl.cpp",
@@ -2494,24 +2932,40 @@ def test_helper_branch_selects_value_without_gating_return_reachability():
         _fake_binding(binding_id="ea", target="early_alt", expression="mission.alt",
                       file="rtl.cpp", line=3),
     ]
-    dag = build_mechanism_dag(bindings, "_rtl_alt", helper_expressions=[helper])
+    dag = build_mechanism_dag(
+        bindings,
+        "_rtl_alt",
+        helper_expressions=[helper],
+        call_statements=[
+            _fake_call("calc", [], file="rtl.cpp", line=1)
+        ],
+    )
 
-    branch = next((v for v in dag.vertices if v.kind == "branch"), None)
-    assert branch is not None, "no branch vertex emitted from helper.branches"
-    selection_out = [
-        e for e in dag.edges if e.source_id == branch.id and e.kind == "selection"
-    ]
-    assert selection_out
-    assert not [
-        edge
+    returns = {
+        vertex.expression: vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.variable == "__return__"
+    }
+    assert set(returns) == {"early_alt", "fallback_alt"}
+    controls = {
+        vertex.id: str(vertex.predicate_raw or "")
+        for vertex in dag.vertices
+        if vertex.kind == "branch"
+    }
+    early_controls = {
+        controls[edge.source_id]
         for edge in dag.edges
-        if edge.source_id == branch.id and edge.kind == "control"
-    ]
-
-    # the branch's alternate return value's producer feeds the return op
-    return_op = next(v for v in dag.vertices if v.kind == "operation"
-                     and "__return__" in str(v.variable))
-    assert any(e.target_id == return_op.id for e in selection_out)
+        if edge.kind == "control" and edge.target_id == returns["early_alt"].id
+    }
+    fallback_controls = {
+        controls[edge.source_id]
+        for edge in dag.edges
+        if edge.kind == "control"
+        and edge.target_id == returns["fallback_alt"].id
+    }
+    assert any("cond_flag > 0" in predicate for predicate in early_controls)
+    assert any("!(cond_flag > 0)" in predicate for predicate in fallback_controls)
+    assert not any(edge.kind == "selection" for edge in dag.edges)
 
 
 def test_helper_branches_on_same_line_keep_parser_source_identity():
@@ -2521,7 +2975,7 @@ def test_helper_branches_on_same_line_keep_parser_source_identity():
         line=10,
         evidence="float Control::select()",
         assignments={},
-        return_expression="fallback",
+        return_expression="",
         branches=[
             {
                 "condition": "valid",
@@ -2551,6 +3005,9 @@ def test_helper_branches_on_same_line_keep_parser_source_identity():
         ],
         "output",
         helper_expressions=[helper],
+        call_statements=[
+            _fake_call("select", [], file="control.cpp", line=1)
+        ],
     )
 
     branches = [vertex for vertex in dag.vertices if vertex.kind == "branch"]
@@ -2641,8 +3098,7 @@ def test_member_and_local_spellings_are_distinct_identities():
 
 def test_terminal_file_scopes_writers_to_named_module():
     """Two modules writing the SAME spelling: ``terminal_file`` keeps
-    only that file's writers; a hint naming a writer-less file falls
-    back instead of emptying the slice."""
+    only that file's writers; a mismatched validated file fails closed."""
     bindings = [
         _fake_binding(binding_id="l1", target="_lateral_accel",
                       expression="_K_L1 * ground_speed", file="l1.cpp", line=10),
@@ -2655,9 +3111,10 @@ def test_terminal_file_scopes_writers_to_named_module():
                     and v.variable == "_lateral_accel"]
     assert {v.file for v in terminal_ops} == {"l1.cpp"}
 
-    # Hint naming a file with no writers must fall back, not empty the slice.
-    fallback = build_mechanism_dag(bindings, "_lateral_accel", terminal_file="other.cpp")
-    assert any(v.kind == "operation" for v in fallback.vertices)
+    mismatch = build_mechanism_dag(
+        bindings, "_lateral_accel", terminal_file="other.cpp"
+    )
+    assert not any(v.kind == "operation" for v in mismatch.vertices)
 
 
 def test_symbol_producer_prefers_same_file_writer():
@@ -2701,7 +3158,11 @@ def test_short_helper_names_do_not_claim_calls():
                       expression="_param_thing.get() + max(a_value, b_value)",
                       file="rtl.cpp", line=1),
     ]
-    dag = build_mechanism_dag(bindings, "_out", helper_expressions=[helper])
+    dag = build_mechanism_dag(
+        bindings,
+        "_out",
+        helper_expressions=[helper],
+    )
 
     assert not [v for v in dag.vertices
                 if v.provenance and v.provenance.startswith("helper_return")], \
@@ -2723,7 +3184,14 @@ def test_bare_short_helper_still_expands():
         _fake_binding(binding_id="b1", target="_out", expression="gen() + 1.0",
                       file="rtl.cpp", line=1),
     ]
-    dag = build_mechanism_dag(bindings, "_out", helper_expressions=[helper])
+    dag = build_mechanism_dag(
+        bindings,
+        "_out",
+        helper_expressions=[helper],
+        call_statements=[
+            _fake_call("gen", [], file="rtl.cpp", line=1)
+        ],
+    )
 
     assert [v for v in dag.vertices
             if v.provenance and v.provenance.startswith("helper_return")], \
@@ -2919,21 +3387,36 @@ def test_logged_inputs_are_leaves_not_publisher_tunnels():
     its PUBLISHER (another module across the uORB boundary) must not be
     walked. Only the terminal enters source through its publishers."""
     bindings = [
-        # terminal enters source via its publisher (logged_signal set)
-        # mechanism reads a logged input topic field
+        # The mechanism reads a logged input topic field.
         _fake_binding(binding_id="g", target="gate_state",
                       expression="vehicle_status.vehicle_type",
                       file="fw.cpp", line=1, function="Fw::run",
                       logged_signal=""),
-        _fake_binding(binding_id="t", target="out_field",
+        _fake_binding(binding_id="t", target="fw_status_msg.out_field",
                       expression="gate_state + 1.0",
                       file="fw.cpp", line=2, function="Fw::run",
-                      logged_signal="fw_status.out_field"),
+                      logged_signal=""),
+        _boundary_transfer(
+            "fw_status_msg",
+            "fw_status",
+            file="fw.cpp",
+            line=3,
+            direction="publish",
+            function="Fw::run",
+        ),
         # the FOREIGN publisher of that input topic — must stay out
-        _fake_binding(binding_id="pub", target="vehicle_status.vehicle_type",
+        _fake_binding(binding_id="pub", target="vehicle_status_msg.vehicle_type",
                       expression="commander_internal_state",
                       file="commander.cpp", line=3, function="Commander::run",
-                      logged_signal="vehicle_status.vehicle_type"),
+                      logged_signal=""),
+        _boundary_transfer(
+            "vehicle_status_msg",
+            "vehicle_status",
+            file="commander.cpp",
+            line=4,
+            direction="publish",
+            function="Commander::run",
+        ),
     ]
     dag = build_mechanism_dag(
         bindings, "fw_status.out_field",
@@ -2981,6 +3464,16 @@ def test_helper_pick_prefers_caller_module_and_skips_foreign_ambiguity():
         "_out",
         helper_expressions=[foreign, ours],
         source_structure=structure,
+        call_statements=[
+            _fake_call(
+                "set_index",
+                ["2"],
+                file="src/modules/navigator/rtl.cpp",
+                line=1,
+                function="RTL::run",
+                callable_id="RTL::run",
+            )
+        ],
     )
 
     bodies = {v.file for v in dag.vertices
@@ -2993,8 +3486,21 @@ def test_helper_pick_prefers_caller_module_and_skips_foreign_ambiguity():
                       file="src/modules/commander/Commander.cpp", line=1,
                       function="Commander::run"),
     ]
-    dag2 = build_mechanism_dag(bindings2, "_out",
-                               helper_expressions=[foreign, ours])
+    dag2 = build_mechanism_dag(
+        bindings2,
+        "_out",
+        helper_expressions=[foreign, ours],
+        call_statements=[
+            _fake_call(
+                "set_index",
+                ["2"],
+                file="src/modules/commander/Commander.cpp",
+                line=1,
+                function="Commander::run",
+                callable_id="Commander::run",
+            )
+        ],
+    )
     assert not [v for v in dag2.vertices
                 if v.provenance and v.provenance.startswith("helper_return")]
 
@@ -3037,12 +3543,6 @@ def test_helper_pick_qualifies_nested_receiver_type_from_lexical_owner():
     )
 
     assert structure.member_receiver_type("RTL", "_destination") == "RTL::RTLPosition"
-    assert any(
-        vertex.kind == "operation"
-        and vertex.variable == "alt"
-        and vertex.file == "src/modules/navigator/rtl.h"
-        for vertex in dag.vertices
-    )
     assert not any(
         reference.kind == "callable" and reference.symbol == "set"
         for reference in dag.unresolved_references
@@ -3115,9 +3615,9 @@ def test_px4_macro_predicates_evaluate():
     assert branch.active_windows == [(10.0, 20.0)]
 
 
-def test_dotted_formal_rebinds_to_actual_nested_placement():
-    """``formal.field`` follows the formal's unique simple rebinding to
-    the actual's logged placement instead of degrading to the nested
+def test_dotted_local_copy_projects_to_actual_nested_placement():
+    """``local.field`` follows a source-proven whole-storage copy to
+    the copied value's logged placement instead of degrading to the nested
     message name (position_setpoint.type vs the logged
     position_setpoint_triplet.current.type)."""
     bindings = [
@@ -3132,6 +3632,24 @@ def test_dotted_formal_rebinds_to_actual_nested_placement():
     bindings[1]["struct_variables"] = {
         "_pos_sp_triplet": "position_setpoint_triplet_s"
     }
+    bindings[0]["expression_ref"] = {
+        "text": "_pos_sp_triplet.current",
+        "lowered_text": "_pos_sp_triplet.current",
+        "input_symbols": ["_pos_sp_triplet.current"],
+        "input_identities": {},
+        "call_results": [],
+        "direct_storage": "_pos_sp_triplet.current",
+        "exact": True,
+    }
+    bindings.append(
+        _boundary_transfer(
+            "_pos_sp_triplet",
+            "position_setpoint_triplet",
+            file="fw.cpp",
+            line=0,
+            function="Fw::run",
+        )
+    )
     dag = build_mechanism_dag(
         bindings, "_out",
         logged_signals={"position_setpoint_triplet.current.type"},
@@ -3144,9 +3662,9 @@ def test_dotted_formal_rebinds_to_actual_nested_placement():
     assert "position_setpoint_triplet.current.type" in leaves
 
 
-def test_rebinding_survives_passthrough_and_cycles():
-    """Pass-through forwarding (formal bound to a same-named actual) is
-    ignored as identity, and alias cycles must not recurse forever."""
+def test_source_projection_respects_scope_and_terminates_cycles():
+    """A same-named copy in another callable is not storage identity, and
+    exact source-copy cycles must not recurse forever."""
     bindings = [
         # identity pass-through from a forwarding call
         _fake_binding(binding_id="fwd", target="pos_sp_curr",
@@ -3173,6 +3691,26 @@ def test_rebinding_survives_passthrough_and_cycles():
                       file="fw.cpp", line=6, function="Fw::run"),
     ]
     bindings[2]["struct_variables"] = {"_trip": "position_setpoint_triplet_s"}
+    for binding in (bindings[0], bindings[1], bindings[3], bindings[4]):
+        source = binding["source_symbol"]
+        binding["expression_ref"] = {
+            "text": source,
+            "lowered_text": source,
+            "input_symbols": [source],
+            "input_identities": {},
+            "call_results": [],
+            "direct_storage": source,
+            "exact": True,
+        }
+    bindings.append(
+        _boundary_transfer(
+            "_trip",
+            "position_setpoint_triplet",
+            file="fw.cpp",
+            line=0,
+            function="Fw::run",
+        )
+    )
     dag = build_mechanism_dag(
         bindings, "_out",
         logged_signals={"position_setpoint_triplet.current.type"},
@@ -3227,6 +3765,9 @@ def test_member_copy_grounds_only_through_source_boundary():
         _fake_binding(binding_id="b", target="out",
                       expression="_vehicle_status.nav_state + 1",
                       file="mod.cpp", line=4, logged_signal=""),
+        _boundary_transfer(
+            "_vehicle_status", "vehicle_status", file="mod.cpp", line=3
+        ),
     ]
     dag = build_mechanism_dag(
         bindings, "out", terminal_file="mod.cpp",
@@ -3306,9 +3847,16 @@ def test_logged_signal_leaves_carry_observation_status():
         "control_predicates": [],
         "struct_variables": {"data": "gate_status_s"},
     }
+    transfer = _boundary_transfer(
+        "data",
+        "gate_status",
+        file="mod.cpp",
+        line=3,
+        function="Gate::update",
+    )
 
     declared_only = build_mechanism_dag(
-        [dict(binding)], "out", terminal_file="mod.cpp",
+        [dict(binding), dict(transfer)], "out", terminal_file="mod.cpp",
         schema_signals={"gate_status.field_x"},
         boundary_bindings=[_boundary("data", "gate_status", file="mod.cpp")],
     )
@@ -3322,7 +3870,7 @@ def test_logged_signal_leaves_carry_observation_status():
     assert leaf.metadata.get("boundary_status") == "source_proven"
 
     observed = build_mechanism_dag(
-        [dict(binding)], "out", terminal_file="mod.cpp",
+        [dict(binding), dict(transfer)], "out", terminal_file="mod.cpp",
         schema_signals={"gate_status.field_x"},
         logged_signals={"gate_status.field_x"},
         boundary_bindings=[_boundary("data", "gate_status", file="mod.cpp")],
@@ -3467,11 +4015,9 @@ def test_wiring_respects_callable_scope_for_locals():
     assert linked_lines == {5}, "consumer wired to another function's local"
 
 
-def test_failed_rebinding_falls_back_to_original_resolution():
-    """A unique simple rebinder whose rewritten form resolves to nothing
-    must not hijack resolution: the ORIGINAL dotted symbol continues its
-    own sequence (here: struct-variable derivation to a schema-proven
-    placement)."""
+def test_exact_copy_projection_does_not_fallback_to_unrelated_boundary():
+    """A source-proven copy is the reaching definition even when its input
+    is unresolved; the DAG must not invent a topic path from struct shape."""
     bindings = [
         {
             "target_symbol": "out",
@@ -3496,7 +4042,23 @@ def test_failed_rebinding_falls_back_to_original_resolution():
             "logged_signal": "",
             "control_predicates": [],
             "struct_variables": {},
+            "expression_ref": {
+                "text": "other_thing",
+                "lowered_text": "other_thing",
+                "input_symbols": ["other_thing"],
+                "input_identities": {},
+                "call_results": [],
+                "direct_storage": "other_thing",
+                "exact": True,
+            },
         },
+        _boundary_transfer(
+            "data",
+            "gate_status",
+            file="mod.cpp",
+            line=3,
+            function="C::run",
+        ),
     ]
     dag = build_mechanism_dag(
         bindings, "out", terminal_file="mod.cpp",
@@ -3507,11 +4069,11 @@ def test_failed_rebinding_falls_back_to_original_resolution():
         v.signal_name for v in dag.vertices
         if v.kind == "evidence" and v.sub_kind == "logged_signal"
     }
-    assert "gate_status.alt" in leaves, "failed rewrite hijacked resolution"
-    assert "other_thing.alt" not in dag.unresolved_symbols
+    assert "gate_status.alt" not in leaves
+    assert "other_thing.alt" in dag.unresolved_symbols
 
 
-def test_aggregate_writer_can_reach_indexed_read_directionally():
+def test_aggregate_copy_projects_an_indexed_read_directionally():
     bindings = [
         _fake_binding(
             binding_id="aggregate", target="state.q", expression="source_q",
@@ -3522,17 +4084,27 @@ def test_aggregate_writer_can_reach_indexed_read_directionally():
             file="att.cpp", line=2, logged_signal="", function="Att::run",
         ),
     ]
+    bindings[0]["expression_ref"] = {
+        "text": "source_q",
+        "lowered_text": "source_q",
+        "input_symbols": ["source_q"],
+        "input_identities": {},
+        "call_results": [],
+        "direct_storage": "source_q",
+        "exact": True,
+    }
     dag = build_mechanism_dag(bindings, "out", terminal_file="att.cpp")
-    aggregate = next(
+    projected = next(
         vertex for vertex in dag.vertices
-        if vertex.kind == "operation" and vertex.variable == "state.q"
+        if vertex.kind == "operation" and vertex.variable == "state.q[0]"
     )
+    assert projected.expression == "source_q[0]"
     consumer = next(
         vertex for vertex in dag.vertices
         if vertex.kind == "operation" and vertex.variable == "out"
     )
     assert any(
-        edge.source_id == aggregate.id and edge.target_id == consumer.id
+        edge.source_id == projected.id and edge.target_id == consumer.id
         for edge in dag.edges
     )
 
@@ -3610,7 +4182,9 @@ def test_unrelated_signal_span_does_not_change_branch_classification():
         binding_id="gated", target="out", expression="1",
         file="gate.cpp", line=3, control_predicates=["mode == 1"],
     )
-    dag = build_mechanism_dag([binding], "out")
+    dag = build_mechanism_dag(
+        [binding], "out", logged_signals={"mode"}
+    )
     reduced = evaluate_feasibility(
         dag,
         signal_samples={
@@ -3633,7 +4207,9 @@ def test_missing_signal_policy_keeps_dynamic_verdict_unknown():
         binding_id="gated", target="out", expression="1",
         file="gate.cpp", line=3, control_predicates=["value > 0"],
     )
-    dag = build_mechanism_dag([binding], "out")
+    dag = build_mechanism_dag(
+        [binding], "out", logged_signals={"value"}
+    )
     reduced = evaluate_feasibility(
         dag,
         signal_samples={"value": [(0.0, 1.0), (10.0, 1.0)]},
@@ -3949,8 +4525,10 @@ def test_static_unevaluable_branch_schedules_no_timestamps(monkeypatch):
     monkeypatch.setattr(DAGValueSession, "evaluate_many", counted)
     annotated = evaluate_feasibility(
         dag,
-        signal_samples={"unrelated": [(0.0, 1), (1.0, 2)]},
-        signal_policies={"unrelated": {"method": "linear"}},
+        # A same-spelled sample must not turn opaque source storage into a
+        # logged value without a source boundary edge.
+        signal_samples={"unknown_value": [(0.0, 1), (1.0, 2)]},
+        signal_policies={"unknown_value": {"method": "linear"}},
         prune_dead=False,
     )
 

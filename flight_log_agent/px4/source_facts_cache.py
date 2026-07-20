@@ -5,9 +5,10 @@ re-parse the same PX4 file for every question or every flight. Keyed on
 ``(source_hash, file_path)`` where ``source_hash`` is the git commit
 SHA of the source tree at extraction time.
 
-Cross-file joins — pointer-output routing, recursive helper resolution —
-are NOT part of Layer 1; they are re-run by the discovery loop after
-loading each involved file's Layer 1 entry.
+Cross-file joins are NOT part of Layer 1. In particular, call-site
+pointer-output flattening is disabled here: the DAG reconstructs calls,
+formal storage, and callee writes as explicit operations after all involved
+files have been loaded.
 
 **Cross-hash reuse**: entries under different git hashes coexist. On a
 cache miss for the current ``source_hash``, :func:`get_source_facts_for_file`
@@ -309,12 +310,10 @@ def get_or_extract_facts(
     writes the result to Layer 1 for next time.
 
     **Cross-file joins are NOT covered.** ``SourceFileFacts.source_assignments``
-    contains only what falls out of ``extract_source_assignments_from_source([file])``
-    for a single-file input — pointer-output routing across caller/callee
-    files, recursive helper resolution across files, and any other
-    cross-file pass must be reapplied by the caller on the union of loaded
-    Layer 1 entries. The discovery loop is the intended owner of that
-    reassembly.
+    contains only direct writes extracted from this source file. Pointer and
+    reference output effects are intentionally not flattened at call sites;
+    the DAG materializes their call/formal/write relationships after loading
+    the caller and callee facts.
     """
     _prune_stale_fingerprints(Path(cache_root), extractor_fingerprint())
     facts = get_source_facts_for_file(
@@ -347,12 +346,9 @@ def extract_facts_for_file(
     deliberately never unions facts: a DAG is always built from one parser's
     output so missing or extra extraction remains measurable.
 
-    The legacy path invokes each ``extract_*_from_source`` method with the single-file
-    list ``[file_path]``. The profiler's cross-file join steps
-    (pointer-output routing, recursive helper resolution) may still fire
-    but only against the single input file, so they collapse to the
-    trivial single-file case — cross-file joins are the discovery
-    loop's responsibility to reassemble across Layer 1 entries.
+    The legacy path invokes each ``extract_*_from_source`` method with the
+    single-file list ``[file_path]``. Call-site pointer-output flattening is
+    explicitly disabled because it bypasses the DAG's source-call topology.
     """
     backend = str(getattr(profiler, "source_parser_backend", "legacy"))
     if backend in {"tree_sitter", "compare"}:
@@ -403,10 +399,20 @@ def _extract_legacy_facts(
         files, expand_companions=False
     )
 
-    def expression_ref(text: Any) -> SourceExpressionRef:
+    def expression_ref(
+        text: Any, provided: Any = None
+    ) -> SourceExpressionRef:
+        if provided is not None:
+            candidate = SourceExpressionRef.model_validate(provided)
+            if candidate.exact:
+                return candidate
+        direct = profiler._legacy_direct_expression_ref(str(text or ""))
+        if direct.exact:
+            return direct
         normalized = profiler._normalize_source_expression(str(text or ""))
         return SourceExpressionRef(
             text=str(text or ""),
+            lowered_text=normalized,
             input_symbols=source_expression_names(normalized),
             # The scanner does not prove that its textual rewrite retained
             # every C++ value reference. Consumers must therefore preserve
@@ -417,7 +423,9 @@ def _extract_legacy_facts(
     source_assignments = [
         item.model_copy(
             update={
-                "expression_ref": expression_ref(item.expression),
+                "expression_ref": expression_ref(
+                    item.expression, item.expression_ref
+                ),
                 "control_expression_refs": [
                     expression_ref(predicate)
                     for predicate in item.control_predicates
@@ -425,14 +433,23 @@ def _extract_legacy_facts(
             }
         )
         for item in from_exact_file(
-            profiler.extract_source_assignments_from_source(files)
+            profiler.extract_source_assignments_from_source(
+                files,
+                include_pointer_outputs=False,
+            )
         )
     ]
     function_calls = [
         item.model_copy(
             update={
                 "argument_expressions": [
-                    expression_ref(arg) for arg in item.args
+                    expression_ref(
+                        arg,
+                        item.argument_expressions[index]
+                        if index < len(item.argument_expressions)
+                        else None,
+                    )
+                    for index, arg in enumerate(item.args)
                 ],
                 "control_expression_refs": [
                     expression_ref(predicate)
@@ -448,18 +465,35 @@ def _extract_legacy_facts(
         item.model_copy(
             update={
                 "assignment_expression_refs": {
-                    target: expression_ref(value)
+                    target: expression_ref(
+                        value, item.assignment_expression_refs.get(target)
+                    )
                     for target, value in item.assignments.items()
                 },
                 "return_expression_ref": (
                     expression_ref(
                         item.return_expression
                         or item.lowered_return_expression
-                        or ""
+                        or "",
+                        item.return_expression_ref,
                     )
                     if item.return_expression or item.lowered_return_expression
                     else None
                 ),
+                "return_sites": [
+                    site.model_copy(
+                        update={
+                            "expression_ref": expression_ref(
+                                site.expression, site.expression_ref
+                            ),
+                            "control_expression_refs": [
+                                expression_ref(predicate)
+                                for predicate in site.control_predicates
+                            ],
+                        }
+                    )
+                    for site in item.return_sites
+                ],
             }
         )
         for item in from_exact_file(

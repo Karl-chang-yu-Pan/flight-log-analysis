@@ -619,12 +619,16 @@ def test_complete_replay_distinguishes_match_mismatch_and_missing_policy(monkeyp
     monkeypatch.setattr(dag_pipeline, "ULogEvidenceIndex", _StubIndex)
 
     dag = build_mechanism_dag(
-        [{"target_symbol": "_x", "source_symbol": "topic_in.value",
+        [{"target_symbol": "topic_out.value", "source_symbol": "topic_in.value",
           "assignment_path": [{"file": "a.cpp", "line": 1,
                                "expression": "topic_in.value"}],
-          "logged_signal": "topic_out.value", "control_predicates": [],
+          "external_target_signal": True,
+          "synthetic_boundary_transfer": True,
+          "boundary_direction": "publish",
+          "control_predicates": [],
           "function": "A::run"}],
-        "_x", logged_signals={"topic_in.value", "topic_out.value"},
+        "topic_out.value",
+        logged_signals={"topic_in.value", "topic_out.value"},
     )
     policies = {
         "topic_in.value": {"method": "linear"},
@@ -673,18 +677,20 @@ def test_replay_reuses_supplied_dag_signal_data(monkeypatch):
 
     dag = build_mechanism_dag(
         [{
-            "target_symbol": "output",
+            "target_symbol": "topic_out.value",
             "source_symbol": "topic_in.value",
             "assignment_path": [{
                 "file": "a.cpp",
                 "line": 1,
                 "expression": "topic_in.value",
             }],
-            "logged_signal": "topic_out.value",
+            "external_target_signal": True,
+            "synthetic_boundary_transfer": True,
+            "boundary_direction": "publish",
             "control_predicates": [],
             "function": "A::run",
         }],
-        "output",
+        "topic_out.value",
         logged_signals={"topic_in.value", "topic_out.value"},
     )
     samples = {
@@ -768,29 +774,35 @@ def test_replay_combines_mutually_exclusive_writers_piecewise(monkeypatch):
     }
     bindings = [
         {
-            "target_symbol": "_out",
+            "target_symbol": "output.value",
             "source_symbol": "input.first",
             "assignment_path": [
                 {"file": "a.cpp", "line": 10, "expression": "input.first"}
             ],
-            "logged_signal": "output.value",
+            "external_target_signal": True,
+            "synthetic_boundary_transfer": True,
+            "boundary_direction": "publish",
             "control_predicates": ["mode.state == 0"],
             "control_predicate_lines": [9],
             "function": "A::run",
         },
         {
-            "target_symbol": "_out",
+            "target_symbol": "output.value",
             "source_symbol": "input.second",
             "assignment_path": [
                 {"file": "a.cpp", "line": 12, "expression": "input.second"}
             ],
-            "logged_signal": "output.value",
+            "external_target_signal": True,
+            "synthetic_boundary_transfer": True,
+            "boundary_direction": "publish",
             "control_predicates": ["mode.state == 1"],
             "control_predicate_lines": [11],
             "function": "A::run",
         },
     ]
-    dag = build_mechanism_dag(bindings, "_out", logged_signals=logged)
+    dag = build_mechanism_dag(
+        bindings, "output.value", logged_signals=logged
+    )
     samples = {
         name: [(sample.time_s, sample.value) for sample in values]
         for name, values in _StubIndex.table.items()
@@ -831,12 +843,14 @@ def test_replay_reconstructs_nested_internal_flow_from_dag_edges():
             "function": "A::run",
         },
         {
-            "target_symbol": "output",
+            "target_symbol": "output.value",
             "source_symbol": "max(internal, 3.0)",
             "assignment_path": [
                 {"file": "a.cpp", "line": 20, "expression": "max(internal, 3.0)"}
             ],
-            "logged_signal": "output.value",
+            "external_target_signal": True,
+            "synthetic_boundary_transfer": True,
+            "boundary_direction": "publish",
             "control_predicates": [],
             "function": "A::run",
         },
@@ -851,7 +865,7 @@ def test_replay_reconstructs_nested_internal_flow_from_dag_edges():
     }
     dag = build_mechanism_dag(
         bindings,
-        "output",
+        "output.value",
         logged_signals=set(samples),
     )
 
@@ -878,17 +892,25 @@ def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges():
     )
 
     def binding(target, expression, line, *, controls=None, logged_signal=""):
-        return {
-            "target_symbol": target,
+        binding = {
+            "target_symbol": logged_signal or target,
             "source_symbol": expression,
             "assignment_path": [
                 {"file": "a.cpp", "line": line, "expression": expression}
             ],
-            "logged_signal": logged_signal,
             "control_predicates": controls or [],
             "control_predicate_lines": [line - 1 for _ in controls or []],
             "function": "A::run",
         }
+        if logged_signal:
+            binding.update(
+                {
+                    "external_target_signal": True,
+                    "synthetic_boundary_transfer": True,
+                    "boundary_direction": "publish",
+                }
+            )
+        return binding
 
     bindings = [
         binding("selected", "input.first", 10, controls=["mode.state == 0"]),
@@ -909,7 +931,7 @@ def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges():
     }
     dag = build_mechanism_dag(
         bindings,
-        "output",
+        "output.value",
         logged_signals=set(samples),
     )
     annotated = evaluate_feasibility(

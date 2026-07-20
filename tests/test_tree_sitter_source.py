@@ -57,7 +57,7 @@ def test_admission_parses_one_file_without_retaining_rejected_ast(tmp_path):
     assert profiler._text_cache == {}
 
 
-def test_call_result_alias_preserves_projection_and_resolved_callee(tmp_path):
+def test_reference_alias_preserves_source_variable_and_resolved_callee(tmp_path):
     root = tmp_path / "PX4-Autopilot"
     module = root / "src" / "modules" / "example"
     module.mkdir(parents=True)
@@ -109,12 +109,35 @@ void Mode::run()
     assert getter_call.resolved_callable_id
     assert getter_call.resolved_callable_file == "src/modules/example/navigator.h"
     assert output.expression_ref is not None
-    assert output.expression_ref.lowered_text == "_navigator.get_position().alt"
-    assert output.expression_ref.input_symbols == []
-    assert [item.call_source_site_id for item in output.expression_ref.call_results] == [
-        getter_call.source_site_id
-    ]
-    assert [item.result_path for item in output.expression_ref.call_results] == ["alt"]
+    assert output.expression_ref.lowered_text == "position.alt"
+    assert output.expression_ref.input_symbols == ["position.alt"]
+    assert output.expression_ref.call_results == []
+
+
+def test_branch_condition_ref_preserves_projected_call_result(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+struct Position { float alt; };
+class Control {
+    Position *get_position();
+    float output;
+    void run();
+};
+void Control::run()
+{
+    if (get_position()->alt > 0.0f) {
+        output = 1.0f;
+    }
+}
+""",
+    )
+
+    branch = next(item for item in facts.branch_conditions if "get_position" in item.condition)
+    assert branch.condition_ref is not None
+    assert branch.condition_ref.input_symbols == []
+    assert len(branch.condition_ref.call_results) == 1
+    assert branch.condition_ref.call_results[0].result_path == "alt"
 
 
 def test_untyped_receiver_does_not_resolve_unrelated_bare_method(tmp_path):
@@ -773,6 +796,12 @@ float choose(int value)
     helper = next(item for item in facts.helper_expressions if item.name == "choose")
     assert helper.unresolved_reason is None
     assert len(helper.branches) == 3
+    assert [site.expression for site in helper.return_sites] == [
+        "1.f",
+        "-1.f",
+        "0.f",
+    ]
+    assert all(site.expression_ref is not None for site in helper.return_sites)
     assert len({item["source_site_id"] for item in helper.branches}) == 3
     assert len({item["line"] for item in helper.branches}) == 3
 
@@ -929,7 +958,7 @@ void Control::run(float input, float alternate, float yaw)
         for item in facts.source_assignments
     }
     assert ("input", "get_triplet().current.alt") in writes
-    assert ("get_triplet().current.alt", "observed_altitude") in writes
+    assert ("snapshot.current.alt", "observed_altitude") in writes
     assert ("alternate", "get_triplet().next.alt") in writes
     assert ("input", "get_triplet().next.alt") in writes
     assert ("yaw", "get_triplet().current.yaw") in writes
