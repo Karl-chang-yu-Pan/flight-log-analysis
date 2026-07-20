@@ -573,22 +573,12 @@ def replay_terminal_expressions(
     if not terminal_ops:
         return not_attempted("no terminal writes in the graph")
     published = {
-        str(
-            (op.metadata or {}).get("external_target_signal")
-            or (op.metadata or {}).get("logged_signal")
-            or ""
-        )
+        str((op.metadata or {}).get("external_target_signal") or "")
         for op in terminal_ops
-        if (
-            (op.metadata or {}).get("external_target_signal")
-            or (op.metadata or {}).get("logged_signal")
-        )
+        if (op.metadata or {}).get("external_target_signal")
     }
-    terminal = str(annotated.terminal or "")
     if len(published) == 1:
         observed = next(iter(published))
-    elif terminal in logged_set:
-        observed = terminal
     elif observed_hint and observed_hint in published:
         observed = observed_hint
     else:

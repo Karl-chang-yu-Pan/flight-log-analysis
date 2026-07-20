@@ -36,7 +36,6 @@ from flight_log_agent.analysis.dag_value import (
 )
 from flight_log_agent.analysis.parameter_lookup import (
     CXX_STDLIB_CONSTANTS,
-    is_px4_parameter_name,
 )
 from flight_log_agent.analysis.source_expression import (
     alias_dotted_names,
@@ -49,7 +48,6 @@ from flight_log_agent.analysis.source_expansion import (
     reference_receiver_is_source_boundary,
     source_reference_resolution_key,
 )
-from flight_log_agent.expression_math import is_safe_math_function_name
 from flight_log_agent.px4.mechanism_source_profiler import (
     callable_accepts_argument_count,
     callable_arguments_with_defaults,
@@ -115,13 +113,25 @@ def _callable_instance_scope(
 
 
 def _source_site_order(source_site_id: str) -> Optional[int]:
-    """Recover parser byte order from a stable source-site identifier."""
+    """Compatibility fallback for source facts predating ``source_order``."""
     parts = str(source_site_id or "").rsplit(":", 3)
     if len(parts) != 4:
         return None
     if parts[-1].startswith("legacy_"):
         return int(parts[-2]) if parts[-2].isdigit() else None
     return int(parts[-3]) if parts[-3].isdigit() else None
+
+
+def _record_source_order(
+    record: dict[str, Any],
+    *,
+    order_key: str = "source_order",
+    site_key: str = "source_site_id",
+) -> Optional[int]:
+    raw = record.get(order_key)
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    return _source_site_order(str(record.get(site_key) or ""))
 
 # Fixed language/evaluator grammar, not domain semantics. These tokens can be
 # followed by parentheses in lowered source but never identify source helpers.
@@ -281,6 +291,43 @@ def _logged_signals_from_inventory(inventory: Optional[dict[str, Any]]) -> set[s
     has no dependency on that module.
     """
     return observed_signals_from_inventory(inventory)
+
+
+def observed_signal_placements(
+    reference: str, observed_signals: Iterable[str]
+) -> tuple[str, ...]:
+    """Return exact observed placements compatible with one reference."""
+    observed = {exact_symbol(value) for value in observed_signals if value}
+    symbol = exact_symbol(reference)
+    if symbol in observed:
+        return (symbol,)
+    parsed = parse_signal_reference(symbol)
+    if parsed is None:
+        return ()
+    topic, requested_instance, field = parsed
+    candidates: list[str] = []
+    for candidate in observed:
+        candidate_parts = parse_signal_reference(candidate)
+        if candidate_parts is None:
+            continue
+        candidate_topic, candidate_instance, candidate_field = candidate_parts
+        if candidate_topic != topic or candidate_field != field:
+            continue
+        if (
+            requested_instance is not None
+            and candidate_instance != requested_instance
+        ):
+            continue
+        candidates.append(candidate)
+    return tuple(sorted(candidates))
+
+
+def resolve_observed_signal_placement(
+    reference: str, observed_signals: Iterable[str]
+) -> Optional[str]:
+    """Resolve one reference only when its observed placement is unique."""
+    candidates = observed_signal_placements(reference, observed_signals)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _parse_numeric_literal(
@@ -560,6 +607,7 @@ class _DAGBuilder:
         # Replaces the old dependency on ``BindingIndex.assignment_resolutions``
         # (which stored SliceResult objects the DAG mis-typed).
         self._source_constants: dict[str, Any] = {}
+        self._source_constants_by_entity: dict[str, Any] = {}
         constant_values_by_alias: dict[str, dict[str, Any]] = defaultdict(dict)
         constant_bindings: list[
             tuple[str, dict[str, Any], tuple[str, ...], str]
@@ -607,8 +655,14 @@ class _DAGBuilder:
         def register_constant(
             target: str, scopes: tuple[str, ...], entity: str, value: Any
         ) -> None:
+            self._source_constants_by_entity[entity] = value
             leaf = target.rsplit(".", 1)[-1]
-            aliases = {target, *(f"{scope}.{leaf}" for scope in scopes)}
+            aliases = {
+                *(f"{scope}.{leaf}" for scope in scopes),
+                *([target] if "." in target else []),
+            }
+            if not self._source_structure.authoritative_declarations:
+                aliases.add(target)
             for alias in aliases:
                 candidates = constant_values_by_alias[alias]
                 candidates[entity] = value
@@ -625,6 +679,26 @@ class _DAGBuilder:
             progress = False
             for target, binding, scopes, entity in pending_constants:
                 known_constants = dict(self._source_constants)
+                expression_ref = binding.get("expression_ref") or {}
+                if hasattr(expression_ref, "model_dump"):
+                    expression_ref = expression_ref.model_dump(
+                        exclude_none=True
+                    )
+                if isinstance(expression_ref, dict):
+                    for symbol, raw_identity in (
+                        expression_ref.get("input_identities") or {}
+                    ).items():
+                        try:
+                            input_identity = SourceSymbolIdentity.model_validate(
+                                raw_identity
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        input_value = self._source_constants_by_entity.get(
+                            input_identity.declaration_id
+                        )
+                        if input_value is not None:
+                            known_constants[exact_symbol(str(symbol))] = input_value
                 for scope in scopes:
                     prefix = f"{scope}."
                     for alias, alias_value in self._source_constants.items():
@@ -771,38 +845,28 @@ class _DAGBuilder:
         may resolve only when the current log has one compatible instance;
         multiple instances remain ambiguous.
         """
-        symbol = exact_symbol(reference)
-        if symbol in self.logged_signals:
-            return symbol
-        parsed = parse_signal_reference(symbol)
-        if parsed is None:
-            return None
-        topic, requested_instance, field = parsed
-        candidates: list[str] = []
-        for candidate in self.logged_signals:
-            candidate_parts = parse_signal_reference(candidate)
-            if candidate_parts is None:
-                continue
-            candidate_topic, candidate_instance, candidate_field = candidate_parts
-            if candidate_topic != topic or candidate_field != field:
-                continue
-            if requested_instance is not None and candidate_instance != requested_instance:
-                continue
-            candidates.append(candidate)
-        return candidates[0] if len(candidates) == 1 else None
+        return resolve_observed_signal_placement(reference, self.logged_signals)
 
     def _source_constant_value(
-        self, symbol: str, scope_function: str = ""
+        self,
+        symbol: str,
+        identity: SourceSymbolIdentity,
+        scope_function: str = "",
     ) -> Optional[Any]:
         """Resolve a source constant under its declaration-derived scope.
 
-        Fully qualified spellings resolve directly. An unqualified spelling
-        first uses a globally unambiguous alias, then the lexical callable's
-        class lineage. This mirrors C++ lookup without maintaining enum-name
-        knowledge outside the extracted declarations.
+        A parser-proven declaration identity is authoritative. Qualified names
+        and lexical class lineage are structural fallbacks. A globally unique
+        spelling is accepted only for non-authoritative legacy facts.
         """
         canonical = exact_symbol(symbol)
-        if canonical in self._source_constants:
+        if identity.declaration_proven and identity.declaration_id:
+            entity_value = self._source_constants_by_entity.get(
+                identity.declaration_id
+            )
+            if entity_value is not None:
+                return entity_value
+        if "." in canonical and canonical in self._source_constants:
             return self._source_constants[canonical]
         owner = self._source_structure.callable_owner(
             _base_callable_scope(scope_function)
@@ -811,6 +875,11 @@ class _DAGBuilder:
             qualified = f"{exact_symbol(candidate_owner)}.{canonical}"
             if qualified in self._source_constants:
                 return self._source_constants[qualified]
+        if (
+            not self._source_structure.authoritative_declarations
+            and canonical in self._source_constants
+        ):
+            return self._source_constants[canonical]
         return None
 
     # ------------------------------------------------------------
@@ -914,26 +983,18 @@ class _DAGBuilder:
                 walked.add(walk_key)
                 if (
                     norm != self.terminal
-                    and self._source_constant_value(norm, scope[1]) is not None
+                    and self._source_constant_value(
+                        norm,
+                        self._reference_identity(
+                            raw, scope[0], scope[1], scope[2]
+                        ),
+                        scope[1],
+                    )
+                    is not None
                 ):
                     # Source-defined constants resolve as value-carrying
                     # evidence leaves at wiring time; walking their single
                     # literal write would demote them to bare operations.
-                    continue
-                if (
-                    norm != self.terminal
-                    and self._observed_signal_placement(norm) is not None
-                    and (
-                        "." not in norm
-                        or not self._reference_identity(
-                            raw, scope[0], scope[1], scope[2]
-                        ).declaration_proven
-                    )
-                ):
-                    # Known ground: the log records this exact field at one
-                    # unambiguous topic-instance placement, so it is an
-                    # evidence leaf — walking its
-                    # publisher would widen into another module.
                     continue
                 if is_terminal_root:
                     writers = self._writers_of(norm)
@@ -1267,13 +1328,12 @@ class _DAGBuilder:
     ) -> list[dict[str, Any]]:
         """Instantiate terminal writers through every source-proven caller path.
 
-        A member writer that depends only on class state represents the same
-        storage at every call and stays at its source definition. A writer
-        whose value or control predicate reads a formal needs the caller's
-        actual argument, so each source-proven invocation path gets private
-        callable scopes from the outermost loaded caller to the terminal.
-        Recursive source call paths stop at the repeated callable identity;
-        no depth or call-count budget affects which acyclic paths are kept.
+        Every source-proven invocation path receives a private callable scope,
+        even when the writer does not read a formal. Arguments determine value
+        aliases, but the call site itself determines whether the callee ran and
+        therefore contributes caller reachability. Recursive source call paths
+        stop at the repeated callable identity; no depth or call-count budget
+        affects which acyclic paths are kept.
         """
         contextualized: list[dict[str, Any]] = []
         for writer in writers:
@@ -1282,7 +1342,6 @@ class _DAGBuilder:
             if (
                 _CALL_SCOPE_MARKER in writer_callable
                 or not base_callable
-                or not self._binding_reads_formal(writer)
             ):
                 contextualized.append(writer)
                 continue
@@ -1527,7 +1586,7 @@ class _DAGBuilder:
             if source_callable and caller != source_callable:
                 continue
             call_line = int(call.get("line") or 0) or None
-            call_order = _source_site_order(str(call.get("source_site_id") or ""))
+            call_order = _record_source_order(call)
             if (
                 scope_line is not None
                 and call_file == scope_file
@@ -1587,9 +1646,7 @@ class _DAGBuilder:
             if source_callable and caller != source_callable:
                 continue
             call_line = int(source_call.get("line") or 0) or None
-            call_order = _source_site_order(
-                str(source_call.get("source_site_id") or "")
-            )
+            call_order = _record_source_order(source_call)
             if (
                 scope_line is not None
                 and call_file == scope_file
@@ -1606,7 +1663,7 @@ class _DAGBuilder:
             ):
                 continue
             name = str(source_call.get("name") or "")
-            if not name or is_safe_math_function_name(name):
+            if not name or source_call.get("evaluation_intrinsic"):
                 continue
             receiver = exact_symbol(str(source_call.get("receiver") or ""))
             if receiver and self._match_parameter(
@@ -1881,6 +1938,9 @@ class _DAGBuilder:
         caller_predicate_sites = list(
             call.get("control_predicate_site_ids") or []
         )
+        caller_predicate_orders = list(
+            call.get("control_predicate_orders") or []
+        )
         caller_predicate_refs = list(
             call.get("control_expression_refs") or []
         )
@@ -1905,6 +1965,9 @@ class _DAGBuilder:
             callee_sites = list(
                 original.get("control_predicate_site_ids") or []
             )
+            callee_orders = list(
+                original.get("control_predicate_orders") or []
+            )
             callee_refs = list(original.get("control_expression_refs") or [])
             clone.update(
                 {
@@ -1925,6 +1988,10 @@ class _DAGBuilder:
                     "control_predicate_site_ids": [
                         *caller_predicate_sites,
                         *callee_sites,
+                    ],
+                    "control_predicate_orders": [
+                        *caller_predicate_orders,
+                        *callee_orders,
                     ],
                     "control_expression_refs": [
                         *caller_predicate_refs,
@@ -2028,6 +2095,7 @@ class _DAGBuilder:
                     "control_predicates": caller_predicates,
                     "control_predicate_lines": caller_predicate_lines,
                     "control_predicate_site_ids": caller_predicate_sites,
+                    "control_predicate_orders": caller_predicate_orders,
                     "control_expression_refs": caller_predicate_refs,
                     "reachability_exact": bool(
                         call.get("reachability_exact", True)
@@ -2039,8 +2107,14 @@ class _DAGBuilder:
                     "scope_file": helper_file,
                     "scope_function": call_scope,
                     "scope_line": int(helper.get("line") or 0),
+                    "scope_source_order": 0,
                     "expression_scope_file": expression_file,
                     "expression_scope_function": expression_callable,
+                    "expression_scope_source_order": (
+                        _record_source_order(call)
+                        if not uses_default
+                        else _record_source_order(helper)
+                    ),
                     "control_scope_file": caller_file,
                     "control_scope_function": caller_callable,
                     "function": str(call.get("function") or ""),
@@ -2100,6 +2174,7 @@ class _DAGBuilder:
         ]
         caller_lines = list(call.get("control_predicate_lines") or [])
         caller_sites = list(call.get("control_predicate_site_ids") or [])
+        caller_orders = list(call.get("control_predicate_orders") or [])
         caller_refs = list(call.get("control_expression_refs") or [])
         return_identity = SourceSymbolIdentity(
             kind="local",
@@ -2129,6 +2204,7 @@ class _DAGBuilder:
             ]
             return_lines = list(site.get("control_predicate_lines") or [])
             return_sites = list(site.get("control_predicate_site_ids") or [])
+            return_orders = list(site.get("control_predicate_orders") or [])
             return_refs = [
                 self._expression_ref_in_call_scope(
                     value,
@@ -2171,6 +2247,10 @@ class _DAGBuilder:
                         *caller_sites,
                         *return_sites,
                     ],
+                    "control_predicate_orders": [
+                        *caller_orders,
+                        *return_orders,
+                    ],
                     "control_expression_refs": [
                         *caller_refs,
                         *return_refs,
@@ -2190,9 +2270,11 @@ class _DAGBuilder:
                     "scope_file": helper_file,
                     "scope_function": call_scope,
                     "scope_line": return_line,
+                    "scope_source_order": _record_source_order(site),
                     "expression_scope_file": return_file,
                     "expression_scope_function": call_scope,
                     "expression_scope_line": return_line,
+                    "expression_scope_source_order": _record_source_order(site),
                     "control_scope_file": return_file,
                     "control_scope_function": call_scope,
                     "function": str(helper.get("name") or ""),
@@ -2206,6 +2288,7 @@ class _DAGBuilder:
                     else {},
                     "synthetic_helper_return_binding": True,
                     "source_site_id": str(site.get("source_site_id") or ""),
+                    "source_order": _record_source_order(site),
                     "call_site_id": self._call_site_id(call),
                     "call_instance_scope": call_scope,
                     "provenance": (
@@ -2331,6 +2414,9 @@ class _DAGBuilder:
                     "control_predicate_site_ids": list(
                         call.get("control_predicate_site_ids") or []
                     ),
+                    "control_predicate_orders": list(
+                        call.get("control_predicate_orders") or []
+                    ),
                     "reachability_exact": bool(
                         call.get("reachability_exact", True)
                     ),
@@ -2340,6 +2426,9 @@ class _DAGBuilder:
                     "expression_scope_file": call_file,
                     "expression_scope_function": caller_callable,
                     "expression_scope_line": call_line,
+                    "expression_scope_source_order": _record_source_order(call),
+                    "source_site_id": self._call_site_id(call),
+                    "source_order": _record_source_order(call),
                     "target_identity": identity.model_dump(),
                     "expression_ref": expression_ref,
                     "reference_identities": {
@@ -2488,6 +2577,9 @@ class _DAGBuilder:
                     "control_predicate_site_ids": list(
                         call.get("control_predicate_site_ids") or []
                     ),
+                    "control_predicate_orders": list(
+                        call.get("control_predicate_orders") or []
+                    ),
                     "reachability_exact": bool(
                         call.get("reachability_exact", True)
                     ),
@@ -2495,6 +2587,7 @@ class _DAGBuilder:
                     "scope_file": call_file,
                     "scope_function": caller_callable,
                     "scope_line": call_line,
+                    "scope_source_order": _record_source_order(call),
                     "expression_scope_file": helper_file,
                     "expression_scope_function": call_scope,
                     "expression_scope_unordered": True,
@@ -2507,6 +2600,8 @@ class _DAGBuilder:
                     "reference_identities": {target: identity.model_dump()},
                     "synthetic_member_output_binding": True,
                     "call_site_id": self._call_site_id(call),
+                    "source_site_id": self._call_site_id(call),
+                    "source_order": _record_source_order(call),
                     "call_instance_scope": call_scope,
                 }
             )
@@ -2791,6 +2886,9 @@ class _DAGBuilder:
             predicate_sites = list(
                 call.get("control_predicate_site_ids") or []
             )
+            predicate_orders = list(
+                call.get("control_predicate_orders") or []
+            )
             target_identity = self._source_structure.symbol_identity(
                 entry["target"],
                 file=call_file,
@@ -2815,6 +2913,7 @@ class _DAGBuilder:
                     "control_predicates": predicates,
                     "control_predicate_lines": predicate_lines,
                     "control_predicate_site_ids": predicate_sites,
+                    "control_predicate_orders": predicate_orders,
                     "reachability_exact": bool(
                         call.get("reachability_exact", True)
                     ),
@@ -2822,6 +2921,7 @@ class _DAGBuilder:
                     "scope_file": call_file,
                     "scope_function": caller_callable,
                     "scope_line": call_line,
+                    "scope_source_order": _record_source_order(call),
                     "expression_scope_file": helper_file,
                     "expression_scope_function": call_scope,
                     "expression_scope_unordered": True,
@@ -2832,6 +2932,8 @@ class _DAGBuilder:
                     "target_identity": target_identity.model_dump(),
                     "synthetic_pointer_output_binding": True,
                     "call_site_id": self._call_site_id(call),
+                    "source_site_id": self._call_site_id(call),
+                    "source_order": _record_source_order(call),
                     "call_instance_scope": call_scope,
                 }
             )
@@ -3002,6 +3104,8 @@ class _DAGBuilder:
         resolved_callable_owner: str = "",
         argument_count: Optional[int] = None,
         source_site_id: str = "",
+        origin_vertex_id: str = "",
+        origin_operand: str = "",
     ) -> None:
         identity = (
             self._reference_identity(symbol, file, scope_function, line)
@@ -3027,6 +3131,10 @@ class _DAGBuilder:
             source_expression=source_expression,
             source_site_id=source_site_id,
             identity=identity,
+            origin_vertex_ids=(
+                [origin_vertex_id] if origin_vertex_id else []
+            ),
+            origin_operands=([origin_operand] if origin_operand else []),
         )
         reference_key: tuple[Any, ...] = reference.visit_key()
         if (
@@ -3039,7 +3147,30 @@ class _DAGBuilder:
                 identity.kind,
                 identity.declaration_id,
             )
-        self._unresolved_references.setdefault(reference_key, reference)
+        existing = self._unresolved_references.get(reference_key)
+        if existing is None:
+            self._unresolved_references[reference_key] = reference
+        elif origin_vertex_id or origin_operand:
+            self._unresolved_references[reference_key] = existing.model_copy(
+                update={
+                    "origin_vertex_ids": dedupe_keep_order(
+                        value
+                        for value in [
+                            *existing.origin_vertex_ids,
+                            origin_vertex_id,
+                        ]
+                        if value
+                    ),
+                    "origin_operands": dedupe_keep_order(
+                        value
+                        for value in [
+                            *existing.origin_operands,
+                            origin_operand,
+                        ]
+                        if value
+                    ),
+                }
+            )
         if kind not in {"member_writers", "storage_writers"}:
             self.unresolved_symbols.add(symbol)
 
@@ -3077,6 +3208,7 @@ class _DAGBuilder:
         callables = list(binding.get("control_predicate_callables") or [])
         lines = list(binding.get("control_predicate_lines") or [])
         site_ids = list(binding.get("control_predicate_site_ids") or [])
+        orders = list(binding.get("control_predicate_orders") or [])
         default_file, default_callable = self._binding_control_scope(binding)
         return (
             str(files[position]) if position < len(files) else default_file,
@@ -3091,8 +3223,13 @@ class _DAGBuilder:
                 and isinstance(lines[position], (int, float))
                 else None
             ),
-            _source_site_order(
-                str(site_ids[position]) if position < len(site_ids) else ""
+            (
+                int(orders[position])
+                if position < len(orders)
+                and isinstance(orders[position], (int, float))
+                else _source_site_order(
+                    str(site_ids[position]) if position < len(site_ids) else ""
+                )
             ),
         )
 
@@ -3102,12 +3239,11 @@ class _DAGBuilder:
         file, callable_id = self._binding_site_scope(binding)
         if binding.get("expression_scope_unordered"):
             return file, callable_id, None, None
-        source_order = _source_site_order(
-            str(
-                binding.get("expression_scope_source_site_id")
-                or binding.get("source_site_id")
-                or ""
-            )
+        raw_source_order = binding.get("expression_scope_source_order")
+        source_order = (
+            int(raw_source_order)
+            if isinstance(raw_source_order, (int, float))
+            else _record_source_order(binding)
         )
         raw_expression_line = binding.get("expression_scope_line")
         if isinstance(raw_expression_line, (int, float)):
@@ -3136,7 +3272,7 @@ class _DAGBuilder:
         raw = binding.get("scope_source_order")
         if isinstance(raw, (int, float)):
             return int(raw)
-        return _source_site_order(str(binding.get("source_site_id") or ""))
+        return _record_source_order(binding)
 
     def _scoped_writers(
         self,
@@ -3424,7 +3560,7 @@ class _DAGBuilder:
             source_site_id = str(binding.get("source_site_id") or "")
             if source_site_id:
                 metadata["source_site_id"] = source_site_id
-                source_order = _source_site_order(source_site_id)
+                source_order = _record_source_order(binding)
                 if source_order is not None:
                     metadata["source_order"] = source_order
             metadata.update(
@@ -3449,9 +3585,7 @@ class _DAGBuilder:
             metadata["site_scope"] = {
                 "file": site_file,
                 "callable": site_callable,
-                "source_order": _source_site_order(
-                    str(binding.get("source_site_id") or "")
-                ),
+                "source_order": _record_source_order(binding),
             }
             metadata["control_scope"] = {
                 "file": control_file,
@@ -3481,7 +3615,9 @@ class _DAGBuilder:
                     binding.get("boundary_direction") or ""
                 )
             if binding.get("external_target_signal"):
-                metadata["external_target_signal"] = target_norm
+                metadata["external_target_signal"] = (
+                    self._observed_signal_placement(target_norm) or target_norm
+                )
                 metadata["external_target_observation"] = (
                     "observed"
                     if self._observed_signal_placement(target_norm) is not None
@@ -3514,6 +3650,7 @@ class _DAGBuilder:
         # not where the gated assignment does.
         predicate_sites = binding.get("control_predicate_lines") or []
         predicate_site_ids = binding.get("control_predicate_site_ids") or []
+        predicate_orders = binding.get("control_predicate_orders") or []
         predicate_files = binding.get("control_predicate_files") or []
         predicate_callables = binding.get("control_predicate_callables") or []
         control_file, control_callable = self._binding_control_scope(binding)
@@ -3544,6 +3681,12 @@ class _DAGBuilder:
                     str(predicate_site_ids[position])
                     if position < len(predicate_site_ids)
                     else ""
+                ),
+                source_order=(
+                    int(predicate_orders[position])
+                    if position < len(predicate_orders)
+                    and isinstance(predicate_orders[position], (int, float))
+                    else None
                 ),
                 condition_ref=condition_ref,
             )
@@ -3609,6 +3752,8 @@ class _DAGBuilder:
                     scope_function=scope_function,
                     source_order=resolution_order,
                     excluded_call_effect_site=excluded_call_effect_site,
+                    origin_vertex_id=op_id,
+                    origin_operand=symbol,
                 )
             if binding.get("synthetic_pointer_output_binding"):
                 producer_ids = [
@@ -3649,6 +3794,7 @@ class _DAGBuilder:
             scope_function=scope_function,
             line=line,
             expression_ref=expression_ref,
+            origin_vertex_id=target_id,
         ):
             helper_key = self._helper_key_for_invocation(
                 invocation,
@@ -3675,6 +3821,12 @@ class _DAGBuilder:
                 str(helper.get("file") or ""),
                 None,
                 scope_function=invocation.call_scope,
+                origin_vertex_id=target_id,
+                origin_operand=(
+                    f"call-result:{invocation.result_path}"
+                    if invocation.result_path
+                    else f"call:{invocation.name}"
+                ),
             )
             for helper_return_id in return_producers:
                 self._add_edge(
@@ -3917,6 +4069,8 @@ class _DAGBuilder:
         source_order: Optional[int] = None,
         emit_opaque: bool = True,
         excluded_call_effect_site: str = "",
+        origin_vertex_id: str = "",
+        origin_operand: str = "",
     ) -> list[str]:
         """Resolve a source-expression symbol to all reaching producers.
 
@@ -3929,10 +4083,8 @@ class _DAGBuilder:
         2. Source enum resolution — the symbol is defined in source as a
            numeric constant; emit ``constant`` with ``metadata['value']``.
         3. C stdlib constant (``CXX_STDLIB_CONSTANTS``) — same shape.
-        4. Direct logged-signal set membership (fallback for canonical
-           references that don't need a binding).
-        5. Parameter accessor resolved through source-scoped declarations.
-        6. Otherwise: typed unresolved source symbol.
+        4. Parameter accessor resolved through source-scoped declarations.
+        5. Otherwise: typed unresolved source symbol.
 
         No flat ``symbol_bindings`` table is consulted anywhere — every
         source→logged mapping is derived from graph structure.
@@ -3948,6 +4100,8 @@ class _DAGBuilder:
                 line=line,
                 scope_function=scope_function,
                 source_expression=source_expression,
+                origin_vertex_id=origin_vertex_id,
+                origin_operand=origin_operand,
             )
         producers = self._visible_reaching_producers(
             self._producers_matching(symbol_norm),
@@ -3962,7 +4116,9 @@ class _DAGBuilder:
             return producers
 
         # 2. Source enum / #define resolution.
-        enum_value = self._source_constant_value(symbol_norm, scope_function)
+        enum_value = self._source_constant_value(
+            symbol_norm, identity, scope_function
+        )
         if enum_value is not None:
             return [self._emit_evidence(
                 "constant",
@@ -3972,7 +4128,10 @@ class _DAGBuilder:
                 metadata={
                     "value": enum_value,
                     "source": "enum",
-                    "source_scope": _base_callable_scope(scope_function),
+                    "source_scope": (
+                        identity.declaration_id
+                        or _base_callable_scope(scope_function)
+                    ),
                 },
             )]
 
@@ -4003,19 +4162,7 @@ class _DAGBuilder:
                 metadata={"value": cxx_value, "source": "cxx_stdlib"},
             )]
 
-        # 4. Canonical logged signal at one exact observed placement.
-        observed_placement = self._observed_signal_placement(symbol_norm)
-        if observed_placement is not None and (
-            "." not in symbol_norm or not identity.declaration_proven
-        ):
-            return [
-                self._emit_evidence(
-                    "logged_signal", observed_placement, file=None, line=None
-                )
-            ]
-
-        # 5. Parameter accessor resolved from source-scoped declarations or an
-        # exact inventory name.
+        # 4. Parameter accessor resolved from source-scoped declarations.
         parameter_alias = self._match_parameter(
             symbol_raw,
             file=file,
@@ -4025,19 +4172,7 @@ class _DAGBuilder:
         if parameter_alias is not None:
             return [self._emit_evidence("parameter", parameter_alias, file=None, line=None)]
 
-        # 6a. Bare PX4-parameter-shaped name resolved through the ULog
-        # parameter inventory. Handles source RHSes like ``FW_AIRSPD_TRIM``.
-        parameter_value = self._parameter_values.get(symbol_raw.upper())
-        if parameter_value is not None and is_px4_parameter_name(symbol_raw.upper()):
-            return [self._emit_evidence(
-                "constant",
-                symbol_raw,
-                file=None,
-                line=None,
-                metadata={"value": parameter_value, "source": "parameter"},
-            )]
-
-        # 7. Unclassified. Preserve source identity and fail closed.
+        # 5. Unclassified. Preserve source identity and fail closed.
         if not emit_opaque:
             return []
         if self._symbol_is_receiver_call_result(
@@ -4072,6 +4207,8 @@ class _DAGBuilder:
                 line=line,
                 scope_function=scope_function,
                 source_expression=source_expression,
+                origin_vertex_id=origin_vertex_id,
+                origin_operand=origin_operand,
             )
         return [
             self._emit_evidence(
@@ -4226,6 +4363,7 @@ class _DAGBuilder:
         line: Optional[int],
         scope_function: str = "",
         source_site_id: str = "",
+        source_order: Optional[int] = None,
         condition_ref: Any = None,
     ) -> str:
         canonical = _canonical_predicate(predicate)
@@ -4251,6 +4389,8 @@ class _DAGBuilder:
             source_site_id=source_site_id,
         )
         metadata.update(_source_expression_metadata(condition_ref, predicate))
+        if source_order is not None:
+            metadata["source_order"] = int(source_order)
         lowered, variables = self._lower_predicate(canonical)
         if variables:
             metadata["variables"] = variables
@@ -4284,7 +4424,13 @@ class _DAGBuilder:
                 file,
                 line,
                 scope_function=scope_function,
-                source_order=_source_site_order(source_site_id),
+                source_order=(
+                    source_order
+                    if source_order is not None
+                    else _source_site_order(source_site_id)
+                ),
+                origin_vertex_id=vertex_id,
+                origin_operand=symbol,
             )
             for producer_id in producer_ids:
                 self._add_edge(producer_id, vertex_id, kind="data", role=symbol)
@@ -4316,6 +4462,7 @@ class _DAGBuilder:
         scope_function: str = "",
         line: Optional[int] = None,
         expression_ref: Optional[dict[str, Any]] = None,
+        origin_vertex_id: str = "",
     ) -> list[_ExpressionCall]:
         """Return each source-resolved call occurrence in ``expression``.
 
@@ -4351,6 +4498,10 @@ class _DAGBuilder:
                         line=line,
                         scope_function=scope_function,
                         source_expression=expression,
+                        origin_vertex_id=origin_vertex_id,
+                        origin_operand=str(
+                            result.get("text") or source_site_id or "call"
+                        ),
                     )
                     continue
                 structured_call = self._call_from_structured_result(
@@ -4360,6 +4511,7 @@ class _DAGBuilder:
                     scope_file=scope_file,
                     scope_function=scope_function,
                     line=line,
+                    origin_vertex_id=origin_vertex_id,
                 )
                 if structured_call is not None:
                     matches.append(structured_call)
@@ -4392,7 +4544,7 @@ class _DAGBuilder:
             )
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression):
             candidate = match.group(1)
-            if candidate in _NON_CALL_SYNTAX or is_safe_math_function_name(candidate):
+            if candidate in _NON_CALL_SYNTAX:
                 continue
             prefix = expression[: match.start()]
             receiver_match = re.search(
@@ -4450,6 +4602,10 @@ class _DAGBuilder:
                 ]
                 if len(location_candidates) == 1:
                     source_record = location_candidates[0]
+            if source_record is not None and source_record.get(
+                "evaluation_intrinsic"
+            ):
+                continue
             source_site_id = (
                 self._call_site_id(source_record)
                 if source_record is not None
@@ -4481,6 +4637,10 @@ class _DAGBuilder:
                     receiver=receiver,
                     argument_count=len(args),
                     source_site_id=source_site_id,
+                    origin_vertex_id=origin_vertex_id,
+                    origin_operand=(
+                        f"{receiver}.{candidate}" if receiver else candidate
+                    ),
                 )
                 continue
             # A source site nested under two different parent invocations is
@@ -4556,6 +4716,10 @@ class _DAGBuilder:
                     ),
                     argument_count=len(args),
                     source_site_id=source_site_id,
+                    origin_vertex_id=origin_vertex_id,
+                    origin_operand=(
+                        f"{receiver}.{candidate}" if receiver else candidate
+                    ),
                 )
                 continue
             helper = self.helper_index.get(helper_key) or {}
@@ -4618,6 +4782,7 @@ class _DAGBuilder:
                     scope_file=scope_file,
                     scope_function=scope_function,
                     line=line,
+                    origin_vertex_id=origin_vertex_id,
                 )
                 if structured_call is not None:
                     matches.append(structured_call)
@@ -4632,6 +4797,7 @@ class _DAGBuilder:
         scope_file: Optional[str],
         scope_function: str,
         line: Optional[int],
+        origin_vertex_id: str = "",
     ) -> Optional[_ExpressionCall]:
         """Recover an aliased call result without searching expression text."""
         candidate = str(source_record.get("name") or "").rsplit("::", 1)[-1]
@@ -4642,7 +4808,7 @@ class _DAGBuilder:
         if (
             not candidate
             or candidate in _NON_CALL_SYNTAX
-            or is_safe_math_function_name(candidate)
+            or source_record.get("evaluation_intrinsic")
         ):
             return None
         call_file = str(source_record.get("file") or scope_file or "")
@@ -4714,6 +4880,10 @@ class _DAGBuilder:
                 ),
                 argument_count=len(args),
                 source_site_id=source_site_id,
+                origin_vertex_id=origin_vertex_id,
+                origin_operand=(
+                    f"{receiver}.{candidate}" if receiver else candidate
+                ),
             )
             return None
         helper = self.helper_index.get(helper_key) or {}
@@ -5007,12 +5177,6 @@ class _DAGBuilder:
         )
         if raw.startswith("this."):
             raw = raw[5:]
-        if raw in self.parameter_names:
-            return raw
-        upper = raw.upper()
-        if raw == upper and upper in self.parameter_names:
-            return upper
-
         root = raw.replace("->", ".").split(".", 1)[0]
         candidates = list(self._parameter_bindings_by_member.get(root, ()))
         if not candidates:

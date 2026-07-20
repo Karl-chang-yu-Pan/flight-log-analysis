@@ -60,6 +60,7 @@ class _ControlTerm:
     expression: str
     line: int
     site_id: str
+    source_order: int
     input_symbols: tuple[str, ...] = ()
     input_identities: tuple[tuple[str, SourceStorageRef], ...] = ()
     call_results: tuple[SourceCallResultRef, ...] = ()
@@ -521,35 +522,29 @@ class TreeSitterSourceExtractor:
         self.parser = Parser(_CPP_LANGUAGE)
         self._units: dict[str, Optional[_ParsedUnit]] = {}
         self._fully_structured_units: set[str] = set()
-        self._paths_by_file: dict[str, list[Path]] = {}
-
-    def _source_family_paths(self, file_path: str) -> list[Path]:
-        cached = self._paths_by_file.get(file_path)
-        if cached is not None:
-            return list(cached)
-        primary_path = self.profiler._resolve_file(file_path)
-        paths = self.profiler._expand_companion_files([primary_path])
-        if all(self.profiler._rel(path) != file_path for path in paths):
-            paths.insert(0, primary_path)
-        self._paths_by_file[file_path] = list(paths)
-        return paths
 
     def extract(self, file_path: str, source_hash: str):
         # Imported lazily to keep the legacy profiler usable when the optional
         # parser dependency has not been installed yet.
         from flight_log_agent.px4.source_facts_cache import SourceFileFacts
 
-        paths = self._source_family_paths(file_path)
-        units = [unit for path in paths if (unit := self._parse(path)) is not None]
-        primary = next((unit for unit in units if unit.file == file_path), None)
+        primary = self._parse(self.profiler._resolve_file(file_path))
         if primary is None:
-            self._release_units(units)
             return SourceFileFacts(
                 file=file_path,
                 source_hash=source_hash,
                 parser_backend="tree_sitter",
                 parse_diagnostics={"error": "source file could not be read"},
             )
+        units = [primary]
+        for include in primary.includes:
+            included = self._parse(
+                self.profiler._resolve_file(include.included_file)
+            )
+            if included is not None and included.file not in {
+                unit.file for unit in units
+            }:
+                units.append(included)
 
         self._resolve_class_bases(units)
         self._merge_callable_defaults(units)
@@ -826,6 +821,7 @@ class TreeSitterSourceExtractor:
                     ),
                     function_parameters=list(callable_item.parameters),
                     source_site_id=unit.site_id(node),
+                    source_order=node.start_byte,
                 )
             )
         return assignments
@@ -871,6 +867,7 @@ class TreeSitterSourceExtractor:
                     line=unit.line(node),
                     evidence=unit.evidence(node),
                     source_site_id=unit.site_id(node),
+                    source_order=node.start_byte,
                 )
             )
         return calls
@@ -1960,6 +1957,7 @@ class TreeSitterSourceExtractor:
                         expression=_not(termination),
                         line=state.unit.line(statement),
                         site_id=state.unit.site_id(statement),
+                        source_order=statement.start_byte,
                     ),
                 ]
                 active_exact = active_exact and termination_exact
@@ -2011,6 +2009,7 @@ class TreeSitterSourceExtractor:
                 expression=condition,
                 line=unit.line(node),
                 site_id=unit.site_id(node),
+                source_order=node.start_byte,
                 input_symbols=tuple(condition_ref.input_symbols),
                 input_identities=tuple(condition_ref.input_identities.items()),
                 call_results=tuple(condition_ref.call_results),
@@ -2042,6 +2041,7 @@ class TreeSitterSourceExtractor:
                             expression=_not(condition),
                             line=unit.line(alternative),
                             site_id=unit.site_id(alternative),
+                            source_order=alternative.start_byte,
                             input_symbols=tuple(condition_ref.input_symbols),
                             input_identities=tuple(
                                 condition_ref.input_identities.items()
@@ -2070,6 +2070,7 @@ class TreeSitterSourceExtractor:
                 expression=condition,
                 line=unit.line(node),
                 site_id=unit.site_id(node),
+                source_order=node.start_byte,
                 input_symbols=tuple(condition_ref.input_symbols),
                 input_identities=tuple(condition_ref.input_identities.items()),
                 call_results=tuple(condition_ref.call_results),
@@ -2140,6 +2141,7 @@ class TreeSitterSourceExtractor:
                         file=unit.file,
                         line=unit.line(node),
                         source_site_id=unit.site_id(node),
+                        source_order=node.start_byte,
                         control_predicates=[
                             self.profiler._normalize_source_expression(
                                 item.expression
@@ -2151,6 +2153,9 @@ class TreeSitterSourceExtractor:
                         ],
                         control_predicate_site_ids=[
                             item.site_id for item in controls
+                        ],
+                        control_predicate_orders=[
+                            item.source_order for item in controls
                         ],
                         control_expression_refs=control_refs,
                         reachability_exact=exact,
@@ -2275,6 +2280,7 @@ class TreeSitterSourceExtractor:
                 expression=active,
                 line=unit.line(site),
                 site_id=unit.site_id(site),
+                source_order=site.start_byte,
                 input_symbols=tuple(discriminant_ref.input_symbols),
                 input_identities=tuple(
                     discriminant_ref.input_identities.items()
@@ -2368,6 +2374,7 @@ class TreeSitterSourceExtractor:
                 line=term.line,
                 evidence=state.unit.evidence(node),
                 source_site_id=term.site_id,
+                source_order=term.source_order,
                 condition_ref=SourceExpressionRef(
                     text=term.expression,
                     lowered_text=self.profiler._normalize_source_expression(
@@ -2588,6 +2595,17 @@ class TreeSitterSourceExtractor:
             text=unit.text(right),
             extra_inputs=(target,) if operator != "=" else (),
         )
+        if operator != "=":
+            expression_ref = expression_ref.model_copy(
+                update={
+                    "text": expression,
+                    "lowered_text": self.profiler._normalize_source_expression(
+                        expression
+                    ),
+                    "direct_storage": None,
+                    "direct_call_result": None,
+                }
+            )
         return self._make_assignment(
             state,
             node,
@@ -2623,6 +2641,16 @@ class TreeSitterSourceExtractor:
             argument,
             text=target,
             extra_inputs=(target,),
+        )
+        expression_ref = expression_ref.model_copy(
+            update={
+                "text": expression,
+                "lowered_text": self.profiler._normalize_source_expression(
+                    expression
+                ),
+                "direct_storage": None,
+                "direct_call_result": None,
+            }
         )
         return self._make_assignment(
             state,
@@ -2712,12 +2740,14 @@ class TreeSitterSourceExtractor:
             control_predicates=predicates,
             control_predicate_lines=[item.line for item in controls],
             control_predicate_site_ids=[item.site_id for item in controls],
+            control_predicate_orders=[item.source_order for item in controls],
             reachability_exact=exact and not node.has_error,
             symbol_bindings=self.profiler._source_symbol_bindings(
                 combined, state.struct_variables
             ),
             struct_variables=state.struct_variables,
             source_site_id=state.unit.site_id(node),
+            source_order=node.start_byte,
             expression_ref=expression_ref,
             control_expression_refs=[
                 SourceExpressionRef(
@@ -2839,6 +2869,15 @@ class TreeSitterSourceExtractor:
             if receiver is None or receiver_type
             else None
         )
+        evaluation_intrinsic = (
+            canonical_math_function_name(name)
+            if (
+                resolved_callable is None
+                and receiver is None
+                and is_safe_math_function_name(name)
+            )
+            else None
+        )
         predicates = [item.expression for item in controls]
         return FunctionCallRef(
             name=name,
@@ -2855,11 +2894,13 @@ class TreeSitterSourceExtractor:
             resolved_callable_owner=(
                 resolved_callable.owner if resolved_callable else None
             ),
+            evaluation_intrinsic=evaluation_intrinsic,
             args=args,
             argument_topics=argument_topics,
             control_predicates=predicates,
             control_predicate_lines=[item.line for item in controls],
             control_predicate_site_ids=[item.site_id for item in controls],
+            control_predicate_orders=[item.source_order for item in controls],
             reachability_exact=exact and not node.has_error,
             symbol_bindings=self.profiler._source_symbol_bindings(
                 " ".join([receiver or "", *args, *predicates]),
@@ -2872,6 +2913,7 @@ class TreeSitterSourceExtractor:
             line=unit.line(node),
             evidence=unit.evidence(node),
             source_site_id=unit.site_id(node),
+            source_order=node.start_byte,
             argument_expressions=argument_expressions,
             control_expression_refs=[
                 SourceExpressionRef(
@@ -2940,6 +2982,7 @@ class TreeSitterSourceExtractor:
                         assignment_operator="=",
                         declaration_kind="global",
                         source_site_id=unit.site_id(initializer),
+                        source_order=initializer.start_byte,
                         expression_ref=self._expression_ref(
                             None,
                             value_node,
@@ -3003,6 +3046,7 @@ class TreeSitterSourceExtractor:
                             assignment_operator="=",
                             declaration_kind="constexpr",
                             source_site_id=unit.site_id(declarator),
+                            source_order=declarator.start_byte,
                             expression_ref=self._expression_ref(
                                 None,
                                 value_node,
@@ -3093,6 +3137,7 @@ class TreeSitterSourceExtractor:
                         declaration_kind="enum",
                         constant_scopes=constant_scopes,
                         source_site_id=unit.site_id(node),
+                        source_order=node.start_byte,
                         expression_ref=expression_ref,
                     )
                 )
@@ -3121,6 +3166,7 @@ class TreeSitterSourceExtractor:
                         assignment_operator="=",
                         declaration_kind="define",
                         source_site_id=unit.site_id(node),
+                        source_order=node.start_byte,
                         expression_ref=self._expression_ref(
                             None,
                             value_node,
@@ -3171,6 +3217,7 @@ class TreeSitterSourceExtractor:
                         else "member_initializer"
                     ),
                     source_site_id=unit.site_id(node),
+                    source_order=node.start_byte,
                     expression_ref=self._expression_ref(
                         None,
                         value_node,
@@ -3225,6 +3272,7 @@ class TreeSitterSourceExtractor:
                         control_refs,
                         control_lines,
                         control_site_ids,
+                        control_orders,
                     ) = self._endpoint_controls(
                         unit,
                         orb_node,
@@ -3265,9 +3313,12 @@ class TreeSitterSourceExtractor:
                                 ),
                             ),
                             source_site_id=unit.site_id(declarator),
+                            source_order=declarator.start_byte,
+                            metadata_call_site_ids=[unit.site_id(orb_node)],
                             control_predicates=control_predicates,
                             control_predicate_lines=control_lines,
                             control_predicate_site_ids=control_site_ids,
+                            control_predicate_orders=control_orders,
                             control_expression_refs=control_refs,
                         )
                     )
@@ -3295,6 +3346,7 @@ class TreeSitterSourceExtractor:
                     control_refs,
                     control_lines,
                     control_site_ids,
+                    control_orders,
                 ) = self._endpoint_controls(
                     unit, orb_node, right, state
                 )
@@ -3326,9 +3378,12 @@ class TreeSitterSourceExtractor:
                             force_global=callable is None,
                         ),
                         source_site_id=unit.site_id(node),
+                        source_order=node.start_byte,
+                        metadata_call_site_ids=[unit.site_id(orb_node)],
                         control_predicates=control_predicates,
                         control_predicate_lines=control_lines,
                         control_predicate_site_ids=control_site_ids,
+                        control_predicate_orders=control_orders,
                         control_expression_refs=control_refs,
                     )
                 )
@@ -3357,6 +3412,7 @@ class TreeSitterSourceExtractor:
                     control_refs,
                     control_lines,
                     control_site_ids,
+                    control_orders,
                 ) = self._endpoint_controls(
                     unit, orb_node, node, state
                 )
@@ -3397,9 +3453,12 @@ class TreeSitterSourceExtractor:
                             )
                         ),
                         source_site_id=unit.site_id(node),
+                        source_order=node.start_byte,
+                        metadata_call_site_ids=[unit.site_id(orb_node)],
                         control_predicates=control_predicates,
                         control_predicate_lines=control_lines,
                         control_predicate_site_ids=control_site_ids,
+                        control_predicate_orders=control_orders,
                         control_expression_refs=control_refs,
                     )
                 )
@@ -3438,6 +3497,7 @@ class TreeSitterSourceExtractor:
                     control_refs,
                     control_lines,
                     control_site_ids,
+                    control_orders,
                 ) = self._endpoint_controls(
                     unit, orb_node, node, state
                 )
@@ -3472,10 +3532,13 @@ class TreeSitterSourceExtractor:
                             else None
                         ),
                         source_site_id=unit.site_id(node),
+                        source_order=node.start_byte,
+                        metadata_call_site_ids=[unit.site_id(orb_node)],
                         transfer=True,
                         control_predicates=control_predicates,
                         control_predicate_lines=control_lines,
                         control_predicate_site_ids=control_site_ids,
+                        control_predicate_orders=control_orders,
                         control_expression_refs=control_refs,
                         reachability_exact=not node.has_error,
                     )
@@ -3498,6 +3561,7 @@ class TreeSitterSourceExtractor:
                     function=callable.name if callable else None,
                     callable_id=callable.callable_id if callable else None,
                     source_site_id=unit.site_id(orb_node),
+                    source_order=orb_node.start_byte,
                 )
             )
         return refs
@@ -3508,7 +3572,9 @@ class TreeSitterSourceExtractor:
         endpoint_node: Node,
         root: Node,
         state: Optional[_ExtractionState],
-    ) -> tuple[list[str], list[SourceExpressionRef], list[int], list[str]]:
+    ) -> tuple[
+        list[str], list[SourceExpressionRef], list[int], list[str], list[int]
+    ]:
         """Return source predicates selecting one conditional endpoint."""
         terms: list[tuple[str, SourceExpressionRef, Node]] = []
         current: Optional[Node] = endpoint_node
@@ -3558,6 +3624,7 @@ class TreeSitterSourceExtractor:
             [ref for _predicate, ref, _node in terms],
             [unit.line(node) for _predicate, _ref, node in terms],
             [unit.site_id(node) for _predicate, _ref, node in terms],
+            [node.start_byte for _predicate, _ref, node in terms],
         )
 
     def _orb_topics(
@@ -3694,6 +3761,7 @@ class TreeSitterSourceExtractor:
                     evidence=unit.evidence(template),
                     access_pattern="typed_parameter_declaration",
                     source_site_id=unit.site_id(template),
+                    source_order=template.start_byte,
                 )
             )
             covered.add((template.start_byte, template.end_byte))
@@ -3714,6 +3782,7 @@ class TreeSitterSourceExtractor:
                         evidence=unit.evidence(node),
                         access_pattern="px4_parameter_identifier",
                         source_site_id=unit.site_id(node),
+                        source_order=node.start_byte,
                     )
                 )
             elif node.type == "call_expression":
@@ -3732,6 +3801,7 @@ class TreeSitterSourceExtractor:
                                 evidence=unit.evidence(node),
                                 access_pattern="param_find",
                                 source_site_id=unit.site_id(node),
+                                source_order=node.start_byte,
                             )
                         )
                 if function_node is None or function_node.type != "field_expression":
@@ -3760,6 +3830,7 @@ class TreeSitterSourceExtractor:
                         evidence=unit.evidence(node),
                         access_pattern="typed_parameter_get",
                         source_site_id=unit.site_id(node),
+                        source_order=node.start_byte,
                         confidence="high" if parameter else "low",
                     )
                 )
@@ -3807,6 +3878,7 @@ class TreeSitterSourceExtractor:
                     line=unit.line(node),
                     evidence=unit.evidence(node),
                     source_site_id=unit.site_id(node),
+                    source_order=node.start_byte,
                 )
             )
         return refs
@@ -5021,11 +5093,11 @@ class TreeSitterSourceExtractor:
                     "call": f"{call_name}()",
                     "kind": "unresolved_runtime_call",
                 }
-            elif is_safe_math_function_name(call.name):
+            elif call.evaluation_intrinsic:
                 resolution = {
                     "call": f"{call.name}()",
                     "kind": "math_function",
-                    "canonical_name": canonical_math_function_name(call.name),
+                    "canonical_name": call.evaluation_intrinsic,
                 }
             else:
                 resolution = {

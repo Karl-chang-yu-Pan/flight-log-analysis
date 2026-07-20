@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from flight_log_agent.analysis.dag_value import DAGValueProgram
 from flight_log_agent.analysis.mechanism_dag import (
     build_mechanism_dag,
     evaluate_dag_vertex_series,
@@ -194,12 +195,16 @@ def test_facts_to_dag_end_to_end(tmp_path, source_backend):
     module_dir.mkdir(parents=True)
     (module_dir / "rtl.cpp").write_text(
         """
+#include "rtl.h"
+
 void Rtl::pick()
 {
+    gpos_s gpos_data{};
+    orb_copy(ORB_ID(gpos), subscription, &gpos_data);
     if (_param_rtl_type.get() == 1) {
         _rtl_alt = _destination_alt + 10.0f;
     }
-    _destination_alt = gpos_alt;
+    _destination_alt = gpos_data.alt;
 }
 """,
         encoding="utf-8",
@@ -227,6 +232,17 @@ class Rtl
         "hash",
     )
     inputs = dag_inputs_from_facts(facts)
+    assert all(
+        call["name"].rsplit("::", 1)[-1] != "ORB_ID"
+        for call in inputs.call_statements
+    )
+    destination_write = next(
+        binding
+        for binding in inputs.bindings
+        if binding["target_symbol"] == "_destination_alt"
+    )
+    assert destination_write["target_identity"]["kind"] == "member"
+    assert destination_write["target_identity"]["declaration_proven"] is True
 
     dag = build_mechanism_dag(
         inputs.bindings,
@@ -235,7 +251,7 @@ class Rtl
         parameter_predicates=inputs.parameter_predicates,
         parameter_names=inputs.parameter_names,
         parameter_bindings=inputs.parameter_bindings,
-        logged_signals={"gpos_alt"},
+        logged_signals={"gpos.alt"},
         source_structure=inputs.structure,
     )
 
@@ -251,7 +267,8 @@ class Rtl
         for v in dag.vertices
         if v.kind == "evidence" and v.sub_kind == "logged_signal"
     }
-    assert "gpos_alt" in logged
+    assert "gpos.alt" in logged
+    assert "ORB_ID" not in dag.unresolved_symbols
 
 
 @pytest.mark.parametrize(
@@ -598,6 +615,172 @@ def _mini_tree(tmp_path, files: dict[str, str], *, backend: str = "legacy"):
     )
 
 
+def test_tree_sitter_source_order_selects_prior_same_line_writer(tmp_path):
+    source_file = "src/modules/example/order.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: "float output; void run() { float value = 1; output = value; value = 2; }",
+        },
+        backend="tree_sitter",
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(profiler, tmp_path / "cache", [source_file], "hash")
+    )
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        source_structure=inputs.structure,
+    )
+    terminal = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+    )
+    value_writers = sorted(
+        (
+            vertex
+            for vertex in dag.vertices
+            if vertex.kind == "operation" and vertex.variable == "value"
+        ),
+        key=lambda vertex: int(
+            ((vertex.metadata or {}).get("target_scope") or {}).get(
+                "source_order"
+            )
+            or 0
+        ),
+    )
+
+    result = DAGValueProgram(dag).bind().evaluate(terminal.id, None)
+
+    assert len(value_writers) == 1
+    assert value_writers[0].expression == "1"
+    assert result.status == "value"
+    assert result.value == 1.0
+
+
+def test_source_defined_max_is_not_treated_as_evaluator_intrinsic(tmp_path):
+    source_file = "src/modules/example/source_max.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+float max(float left, float right) { return left - right; }
+float output;
+void run() { output = max(5.0f, 2.0f); }
+""",
+        },
+        backend="tree_sitter",
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(profiler, tmp_path / "cache", [source_file], "hash")
+    )
+    call = next(item for item in inputs.call_statements if item["name"] == "max")
+    assert call.get("resolved_callable_id")
+    assert not call.get("evaluation_intrinsic")
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+    )
+    terminal = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+    )
+    result = DAGValueProgram(dag).bind().evaluate(terminal.id, None)
+
+    assert result.status == "value"
+    assert result.value == 3.0
+
+
+def test_no_argument_callee_write_retains_caller_reachability(tmp_path):
+    source_file = "src/modules/example/caller_gate.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+class Control {
+    float output{};
+    void assign() { output = 2.0f; }
+    void run(bool enabled) { if (enabled) { assign(); } }
+};
+""",
+        },
+        backend="tree_sitter",
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(profiler, tmp_path / "cache", [source_file], "hash")
+    )
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        source_structure=inputs.structure,
+    )
+    terminal = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+        and vertex.expression == "2.0"
+    )
+    controls = [
+        edge.source_id
+        for edge in dag.edges
+        if edge.kind == "control" and edge.target_id == terminal.id
+    ]
+
+    assert controls
+    assert any(
+        vertex.id in controls and vertex.predicate_raw == "enabled"
+        for vertex in dag.vertices
+        if vertex.kind == "branch"
+    )
+
+
+def test_authoritative_constants_do_not_resolve_by_global_uniqueness(tmp_path):
+    source_file = "src/modules/example/constants.cpp"
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            source_file: """
+class First { enum Mode { ACTIVE = 1 }; };
+class Second { enum Mode { ACTIVE = 2 }; };
+float output;
+void run() { output = ACTIVE; }
+""",
+        },
+        backend="tree_sitter",
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(profiler, tmp_path / "cache", [source_file], "hash")
+    )
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file=source_file,
+        source_structure=inputs.structure,
+    )
+
+    assert not any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "constant"
+        and vertex.signal_name == "ACTIVE"
+        for vertex in dag.vertices
+    )
+    assert "ACTIVE" in dag.unresolved_symbols
+
+
 def test_fixpoint_resolves_symbol_across_files_in_second_round(tmp_path):
     """Round 0 loads only the seeded file and leaves ``_dest_val``
     unresolved; the gap's definition search pulls the second file in
@@ -606,6 +789,8 @@ def test_fixpoint_resolves_symbol_across_files_in_second_round(tmp_path):
 
     profiler = _mini_tree(tmp_path, {
         "src/modules/example/rtl.cpp": """
+#include "rtl.h"
+
 void Rtl::pick_altitude()
 {
     _final_out = _dest_val + 1.0f;
@@ -619,9 +804,13 @@ class Rtl
 };
 """,
         "src/modules/example/dest.cpp": """
+#include "rtl.h"
+
 void Rtl::update()
 {
-    _dest_val = gspeed;
+    speed_s speed_data{};
+    orb_copy(ORB_ID(speed), subscription, &speed_data);
+    _dest_val = speed_data.value;
 }
 """,
     })
@@ -632,7 +821,8 @@ void Rtl::update()
         seeds=["pick_altitude"],
         terminal="_final_out",
         source_hash="hash",
-        logged_signals={"gspeed"},
+        terminal_file="src/modules/example/rtl.cpp",
+        logged_signals={"speed.value"},
     )
 
     assert len(result.rounds) == 2
@@ -647,8 +837,101 @@ void Rtl::update()
     assert {"_final_out", "_dest_val"} <= op_targets
     logged = {v.signal_name for v in result.dag.vertices
               if v.kind == "evidence" and v.sub_kind == "logged_signal"}
-    assert "gspeed" in logged
+    assert "speed.value" in logged
     assert result.dag.unresolved_symbols == []
+
+
+def test_frontier_pruning_uses_vertex_origin_not_shared_source_line():
+    from flight_log_agent.analysis.mechanism_dag import (
+        DAGEdge,
+        DAGVertex,
+        MechanismDAG,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        _reachable_frontier_references,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+
+    terminal = DAGVertex(
+        id="terminal",
+        kind="operation",
+        variable="output",
+        metadata={"is_terminal": True},
+    )
+    dead = DAGVertex(
+        id="dead",
+        kind="operation",
+        file="same.cpp",
+        line=10,
+        variable="dead_value",
+    )
+    live = DAGVertex(
+        id="live",
+        kind="operation",
+        file="same.cpp",
+        line=10,
+        variable="live_value",
+    )
+    full = MechanismDAG(
+        dag_id="full",
+        terminal="output",
+        vertices=[terminal, dead, live],
+        edges=[
+            DAGEdge(
+                id="dead-edge",
+                source_id="dead",
+                target_id="terminal",
+                kind="data",
+            ),
+            DAGEdge(
+                id="live-edge",
+                source_id="live",
+                target_id="terminal",
+                kind="data",
+            ),
+        ],
+    )
+    feasible = MechanismDAG(
+        dag_id="feasible",
+        terminal="output",
+        vertices=[terminal, live],
+        edges=[
+            DAGEdge(
+                id="live-edge",
+                source_id="live",
+                target_id="terminal",
+                kind="data",
+            ),
+        ],
+    )
+    references = [
+        UnresolvedSourceReference(
+            symbol="dead_gap",
+            file="same.cpp",
+            line=10,
+            origin_vertex_ids=["dead"],
+        ),
+        UnresolvedSourceReference(
+            symbol="live_gap",
+            file="same.cpp",
+            line=10,
+            origin_vertex_ids=["live"],
+        ),
+        UnresolvedSourceReference(
+            symbol="unplaced_gap",
+            file="same.cpp",
+            line=10,
+        ),
+    ]
+
+    kept = _reachable_frontier_references(references, full, feasible)
+
+    assert [reference.symbol for reference in kept] == [
+        "live_gap",
+        "unplaced_gap",
+    ]
 
 
 def test_fixpoint_ignores_legacy_round_budget(tmp_path):
@@ -656,6 +939,8 @@ def test_fixpoint_ignores_legacy_round_budget(tmp_path):
 
     profiler = _mini_tree(tmp_path, {
         "src/modules/example/rtl.cpp": """
+#include "rtl.h"
+
 void Rtl::pick_altitude()
 {
     _final_out = _dest_val + 1.0f;
@@ -669,9 +954,13 @@ class Rtl
 };
 """,
         "src/modules/example/dest.cpp": """
+#include "rtl.h"
+
 void Rtl::update()
 {
-    _dest_val = gspeed;
+    speed_s speed_data{};
+    orb_copy(ORB_ID(speed), subscription, &speed_data);
+    _dest_val = speed_data.value;
 }
 """,
     })
@@ -683,7 +972,7 @@ void Rtl::update()
         terminal="_final_out",
         source_hash="hash",
         max_rounds=1,
-        logged_signals={"gspeed"},
+        logged_signals={"speed.value"},
     )
 
     assert len(result.rounds) == 2
@@ -1241,8 +1530,10 @@ static constexpr float B = 2.0f;
 
 void Example::update()
 {
+    vehicle_state_s vehicle_state{};
+    orb_copy(ORB_ID(vehicle_state), subscription, &vehicle_state);
     float var = B;
-    var *= max(static_cast<float>(B), vehicle_state.mut);
+    var *= std::max(static_cast<float>(B), vehicle_state.mut);
     output = var;
 }
 """,
@@ -1752,9 +2043,10 @@ struct controller_status_s {
 
 class Control {
     uORB::Subscription _vehicle_status_sub{ORB_ID(status)};
+    uORB::Subscription _destination_sub{ORB_ID(destination)};
     status_s vehicle_status{};
+    destination_s destination_state{};
     controller_status_s controller_status{};
-    float destination{};
     float floor{};
 
     DEFINE_PARAMETERS(
@@ -1770,6 +2062,7 @@ class Control {
 void Control::poll()
 {
     _vehicle_status_sub.copy(&vehicle_status);
+    _destination_sub.copy(&destination_state);
 }
 
 float Control::default_radius()
@@ -1783,7 +2076,7 @@ float Control::acceptance_radius()
 
     if (vehicle_status.vehicle_type != status_s::ROTARY
         && controller_status.valid) {
-        selected = max(selected, controller_status.radius);
+        selected = std::max(selected, controller_status.radius);
     }
 
     return selected;
@@ -1791,7 +2084,7 @@ float Control::acceptance_radius()
 
 void Control::run()
 {
-    floor = destination + 2.0f * acceptance_radius();
+    floor = destination_state.value + 2.0f * acceptance_radius();
 }
 """,
         },
@@ -1808,7 +2101,7 @@ void Control::run()
         call_statements=inputs.call_statements,
         parameter_names=inputs.parameter_names,
         parameter_bindings=inputs.parameter_bindings,
-        logged_signals={"destination", "status.vehicle_type"},
+        logged_signals={"destination.value", "status.vehicle_type"},
         enum_registry={"status": {"ROTARY": 1}},
         source_structure=inputs.structure,
     )
@@ -1817,11 +2110,11 @@ void Control::run()
         dag,
         parameter_values={"ACCEPT_RADIUS": 10.0},
         signal_samples={
-            "destination": [(0.0, 100.0), (1.0, 100.0)],
+            "destination.value": [(0.0, 100.0), (1.0, 100.0)],
             "status.vehicle_type": [(0.0, 1), (1.0, 1)],
         },
         signal_policies={
-            "destination": {"method": "linear"},
+            "destination.value": {"method": "linear"},
             "status.vehicle_type": {"method": "discrete_hold"},
         },
         prune_dead=False,
@@ -1838,10 +2131,10 @@ void Control::run()
         # this selection in its flattened helper expression. The shared
         # numerical contract below remains identical for both backends.
         assert override_branches
-    assert all(
-        vertex.feasibility_verdict == "always_false"
-        for vertex in override_branches
-    )
+        assert all(
+            vertex.feasibility_verdict == "always_false"
+            for vertex in override_branches
+        )
 
     terminal = next(
         vertex
@@ -1855,19 +2148,26 @@ void Control::run()
         terminal.id,
         parameter_values={"ACCEPT_RADIUS": 10.0},
         signal_samples={
-            "destination": [(0.0, 100.0), (1.0, 100.0)],
+            "destination.value": [(0.0, 100.0), (1.0, 100.0)],
             "status.vehicle_type": [(0.0, 1), (1.0, 1)],
         },
         signal_policies={
-            "destination": {"method": "linear"},
+            "destination.value": {"method": "linear"},
             "status.vehicle_type": {"method": "discrete_hold"},
         },
         timestamps=[0.0, 1.0],
         evaluation_windows=[(0.0, 1.0)],
     )
+    if source_backend == "legacy":
+        # The shared consumer now rejects non-parser-exact dependencies. This
+        # pins the explicit retirement gap instead of letting the legacy
+        # backend numerically guess through its flattened helper expression.
+        assert reconstructed.complete is False
+        assert "not parser-exact" in reconstructed.reason
+        return
     assert reconstructed.complete is True
     assert set(reconstructed.referenced_signals) == {
-        "destination",
+        "destination.value",
         "status.vehicle_type",
     }
     assert [value for _timestamp, value in reconstructed.samples] == [120.0, 120.0]
@@ -2004,7 +2304,9 @@ def test_tree_sitter_default_argument_expands_and_binds_in_dag(tmp_path):
     profiler = _mini_tree(
         tmp_path,
         {
-            "src/modules/caller.cpp": """
+                "src/modules/caller.cpp": """
+#include <src/lib/numeric.hpp>
+
 float input;
 float output;
 void run()
@@ -2015,7 +2317,9 @@ void run()
             "src/lib/numeric.hpp": """
 float adjust(float value, bool enabled = false);
 """,
-            "src/lib/numeric.cpp": """
+                "src/lib/numeric.cpp": """
+#include "numeric.hpp"
+
 float adjust(float value, bool enabled)
 {
     return enabled ? value * 2.0f : value;
@@ -2191,7 +2495,7 @@ float Mode::calculate() const
     const vehicle_global_position_s &gpos =
         *_navigator->get_global_position();
     const float floor = 100.0f;
-    return max(floor, gpos.alt);
+    return std::max(floor, gpos.alt);
 }
 
 void Mode::run()
@@ -2492,6 +2796,7 @@ def _vt_binding(
     file: str,
     logged: str = "",
     function: str = "C::f",
+    published: bool = False,
 ) -> dict:
     return {
         "target_symbol": target,
@@ -2499,6 +2804,7 @@ def _vt_binding(
         "function": function,
         "assignment_path": [{"file": file, "line": 1, "expression": "input_val + 1.0f"}],
         "logged_signal": logged,
+        "external_target_signal": published,
         "control_predicates": [],
         "struct_variables": {},
     }
@@ -2526,11 +2832,31 @@ def test_validate_terminal_statuses():
     assert observed.status == "absent" and observed.logged is True
     assert "no source writer" in observed.reason
 
+    unique_instance = validate_terminal(
+        "topic_a.alt",
+        [_vt_binding("topic_a", "src/modules/aaa/publisher.cpp", published=True)],
+        ["topic_a[0].alt"],
+    )
+    assert unique_instance.status == "valid"
+    assert unique_instance.logged is True
+
+    ambiguous_instance = validate_terminal(
+        "topic_a.alt",
+        [_vt_binding("topic_a", "src/modules/aaa/publisher.cpp", published=True)],
+        ["topic_a[0].alt", "topic_a[1].alt"],
+    )
+    assert ambiguous_instance.status == "ambiguous"
+    assert "multiple observed placements" in ambiguous_instance.reason
+
     ambiguous_publishers = validate_terminal(
         "topic_a.alt",
         [
-            _vt_binding("topic_a", "src/modules/aaa/publisher.cpp"),
-            _vt_binding("topic_a", "src/modules/bbb/publisher.cpp"),
+            _vt_binding(
+                "topic_a", "src/modules/aaa/publisher.cpp", published=True
+            ),
+            _vt_binding(
+                "topic_a", "src/modules/bbb/publisher.cpp", published=True
+            ),
         ],
         ["topic_a.alt"],
     )
@@ -3445,7 +3771,9 @@ def test_discovery_accepts_preranked_files(tmp_path):
         "src/modules/example/ctrl.cpp": """
 void Ctrl::run()
 {
-    speed_sp = gspeed + 1.0f;
+    speed_s speed_data{};
+    orb_copy(ORB_ID(speed), subscription, &speed_data);
+    speed_sp = speed_data.value + 1.0f;
 }
 """,
     })
@@ -3457,13 +3785,15 @@ void Ctrl::run()
 
     result = discover_mechanism_dag(
         profiler, tmp_path / "cache", seeds=[], terminal="speed_sp",
-        source_hash="hash", logged_signals={"gspeed"},
+        source_hash="hash", logged_signals={"speed.value"},
         preranked_files=["src/modules/example/ctrl.cpp"],
         terminal_file="src/modules/example/ctrl.cpp",
     )
 
     assert result.terminal_validation.status == "valid"
-    assert {v.variable for v in result.dag.vertices if v.kind == "operation"} == {"speed_sp"}
+    assert {
+        v.variable for v in result.dag.vertices if v.kind == "operation"
+    } == {"speed_sp", "speed_data.value"}
 
 
 def test_internal_global_gap_never_falls_back_to_repository_search(tmp_path):

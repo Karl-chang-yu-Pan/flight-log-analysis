@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 import flight_log_agent.analysis.dag_value as dag_value_module
@@ -18,6 +20,11 @@ from flight_log_agent.analysis.mechanism_dag import (
     write_dag_to_cache,
 )
 from flight_log_agent.analysis.source_expansion import SourceStructureIndex
+from flight_log_agent.analysis.source_expression import (
+    normalize_source_expression,
+    source_expression_names,
+)
+from flight_log_agent.expression_math import is_safe_math_function_name
 from flight_log_agent.ulog.inventory import observed_signals_from_inventory
 
 
@@ -37,13 +44,38 @@ def _fake_binding(
     BindingIndex backward walk starts from ``logged_signal``, so tests
     seed it explicitly. Pass ``logged_signal=""`` to exercise the scoped
     target-writer path (logged-output writers bypass visibility)."""
+    predicates = control_predicates or []
+
+    def expression_ref(value: str) -> dict:
+        lowered = normalize_source_expression(value).replace("::", ".").replace(
+            "->", "."
+        )
+        call_names = re.findall(
+            r"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+            value,
+        )
+        exact = all(
+            name == "get" or is_safe_math_function_name(name)
+            for name in call_names
+        )
+        return {
+            "text": value,
+            "lowered_text": lowered,
+            "input_symbols": source_expression_names(lowered),
+            "input_identities": {},
+            "call_results": [],
+            "exact": exact,
+        }
+
     return {
         "binding_id": binding_id,
         "source_symbol": expression,
         "target_symbol": target,
         "logged_signal": target if logged_signal is None else logged_signal,
         "assignment_path": [{"file": file, "line": line, "expression": expression}],
-        "control_predicates": control_predicates or [],
+        "expression_ref": expression_ref(expression),
+        "control_predicates": predicates,
+        "control_expression_refs": [expression_ref(value) for value in predicates],
         "function": function or "",
         "declaration_kind": declaration_kind or "",
     }
@@ -119,6 +151,7 @@ def _boundary_transfer(
         "synthetic_boundary_transfer": True,
         "boundary_direction": direction,
         "external_source_signal": direction == "subscribe",
+        "external_target_signal": direction == "publish",
         "provenance": "test source transfer",
     }
 
@@ -360,6 +393,12 @@ def test_evidence_leaf_classification_covers_logged_and_parameter():
             expression="max(gpos_alt, _destination_alt + _param_rtl_return_alt.get())",
             file="src/modules/navigator/rtl.cpp",
             line=248,
+        ),
+        _boundary_transfer(
+            "gpos_alt",
+            "gpos_alt",
+            file="src/modules/navigator/rtl.cpp",
+            line=200,
         ),
     ]
     dag = build_mechanism_dag(
@@ -606,6 +645,13 @@ def test_feasibility_evaluates_internal_predicate_from_dag_edges():
             logged_signal="",
             function="Control::run",
         ),
+        _boundary_transfer(
+            "topic",
+            "topic",
+            file="src/modules/example/ctrl.cpp",
+            line=5,
+            function="Control::run",
+        ),
         _fake_binding(
             binding_id="terminal",
             target="output",
@@ -767,6 +813,12 @@ def test_signal_samples_compute_active_windows_for_partial_true_predicate():
             line=245,
             control_predicates=[predicate],
         ),
+        _boundary_transfer(
+            "nav_state",
+            "nav_state",
+            file="src/modules/navigator/rtl.cpp",
+            line=200,
+        ),
     ]
     dag = build_mechanism_dag(
         bindings, "_rtl_alt", logged_signals={"nav_state"}
@@ -800,6 +852,12 @@ def test_signal_samples_mark_always_true_when_predicate_covers_whole_span():
             file="src/modules/navigator/rtl.cpp",
             line=245,
             control_predicates=[predicate],
+        ),
+        _boundary_transfer(
+            "vehicle_type",
+            "vehicle_type",
+            file="src/modules/navigator/rtl.cpp",
+            line=200,
         ),
     ]
     dag = build_mechanism_dag(
@@ -836,6 +894,12 @@ def test_signal_samples_prune_branch_when_predicate_never_true():
             file="src/modules/navigator/rtl.cpp",
             line=248,
         ),
+        _boundary_transfer(
+            "vehicle_type",
+            "vehicle_type",
+            file="src/modules/navigator/rtl.cpp",
+            line=200,
+        ),
     ]
     dag = build_mechanism_dag(
         bindings, "_rtl_alt", logged_signals={"vehicle_type"}
@@ -865,6 +929,12 @@ def test_signal_samples_combine_with_parameter_substitution():
             file="src/modules/navigator/rtl.cpp",
             line=245,
             control_predicates=[predicate],
+        ),
+        _boundary_transfer(
+            "vehicle_type",
+            "vehicle_type",
+            file="src/modules/navigator/rtl.cpp",
+            line=200,
         ),
     ]
     dag = build_mechanism_dag(
@@ -2370,10 +2440,8 @@ def test_parameter_predicate_metadata_surfaces_on_branch_vertex():
     assert branch.metadata.get("compared_value") == "RTL_TYPE_HOME_OR_RALLY"
 
 
-def test_parameter_values_populate_resolved_value_on_evidence_constant():
-    """A bare PX4-parameter-shaped name mentioned in source should carry
-    the runtime value on the constant vertex metadata when the parameter
-    is present in ``parameter_values``."""
+def test_parameter_inventory_does_not_resolve_bare_source_token():
+    """Runtime inventory cannot prove that a bare source token is a parameter."""
     predicate = "cruising_speed > FW_AIRSPD_TRIM"
     bindings = [
         _fake_binding(
@@ -2390,13 +2458,48 @@ def test_parameter_values_populate_resolved_value_on_evidence_constant():
         "_rtl_alt",
         parameter_values={"FW_AIRSPD_TRIM": 15.0},
     )
-    const_vertex = next(
-        v for v in dag.vertices
-        if v.kind == "evidence" and v.sub_kind == "constant"
-        and v.signal_name == "FW_AIRSPD_TRIM"
+    assert not any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind in {"constant", "parameter"}
+        and vertex.signal_name == "FW_AIRSPD_TRIM"
+        for vertex in dag.vertices
     )
-    assert const_vertex.metadata.get("value") == 15.0
-    assert const_vertex.metadata.get("source") == "parameter"
+
+
+def test_source_bound_parameter_accessor_uses_runtime_value():
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="output",
+            expression="_param_trim.get()",
+            file="controller.cpp",
+            line=1,
+        ),
+    ]
+    dag = build_mechanism_dag(
+        bindings,
+        "output",
+        parameter_values={"TRIM": 15.0},
+        parameter_bindings=[
+            {
+                "member": "_param_trim",
+                "name": "TRIM",
+                "file": "controller.cpp",
+            }
+        ],
+    )
+    operation = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation" and vertex.variable == "output"
+    )
+
+    result = DAGValueProgram(dag).bind(parameter_values={"TRIM": 15.0}).evaluate(
+        operation.id, None
+    )
+
+    assert result.status == "value"
+    assert result.value == 15.0
 
 
 def test_symbol_bindings_flat_dict_no_longer_consumed():
@@ -3060,6 +3163,12 @@ def test_cpp_qualified_expression_wires_inner_logged_signal_not_dropped():
             file="wv.cpp",
             line=1,
         ),
+        _boundary_transfer(
+            "vehicle_local_position",
+            "vehicle_local_position",
+            file="wv.cpp",
+            line=1,
+        ),
     ]
     dag = build_mechanism_dag(
         bindings, "R_yaw", logged_signals={"vehicle_local_position.heading"}
@@ -3073,9 +3182,20 @@ def test_cpp_qualified_expression_wires_inner_logged_signal_not_dropped():
     ]
     assert ev, "logged signal inside a :: expression was dropped from wiring"
     ryaw = next(v for v in dag.vertices if v.variable == "R_yaw")
+    boundary = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and vertex.variable == "vehicle_local_position.heading"
+    )
     assert any(
-        e.source_id == ev[0].id and e.target_id == ryaw.id for e in dag.edges
-    ), "logged signal not connected to the operation that references it"
+        edge.source_id == ev[0].id and edge.target_id == boundary.id
+        for edge in dag.edges
+    ), "logged signal not connected to its source boundary"
+    assert any(
+        edge.source_id == boundary.id and edge.target_id == ryaw.id
+        for edge in dag.edges
+    ), "source boundary not connected to the operation that references it"
 
 
 def test_member_and_local_spellings_are_distinct_identities():
@@ -3320,6 +3440,13 @@ def test_internal_state_branch_grounds_through_graph_and_gets_windows():
                       expression="vehicle_land_detected.flaring_flag",
                       file="a.cpp", line=2, function="A::poll",
                       logged_signal=""),
+        _boundary_transfer(
+            "vehicle_land_detected",
+            "vehicle_land_detected",
+            file="a.cpp",
+            line=1,
+            function="A::poll",
+        ),
     ]
     bindings, structure = _owned_bindings(
         bindings,
@@ -3356,6 +3483,13 @@ def test_grounding_substitutes_constant_values():
                       expression="vehicle_status.nav_mode",
                       file="a.cpp", line=2, function="A::poll",
                       logged_signal=""),
+        _boundary_transfer(
+            "vehicle_status",
+            "vehicle_status",
+            file="a.cpp",
+            line=1,
+            function="A::poll",
+        ),
         _fake_binding(binding_id="c", target="MODE_ON", expression="3",
                       file="a.cpp", line=3, function="",
                       logged_signal="", declaration_kind="enum"),
@@ -3387,20 +3521,27 @@ def test_logged_inputs_are_leaves_not_publisher_tunnels():
     its PUBLISHER (another module across the uORB boundary) must not be
     walked. Only the terminal enters source through its publishers."""
     bindings = [
+        _boundary_transfer(
+            "vehicle_status",
+            "vehicle_status",
+            file="fw.cpp",
+            line=1,
+            function="Fw::run",
+        ),
         # The mechanism reads a logged input topic field.
         _fake_binding(binding_id="g", target="gate_state",
-                      expression="vehicle_status.vehicle_type",
-                      file="fw.cpp", line=1, function="Fw::run",
-                      logged_signal=""),
-        _fake_binding(binding_id="t", target="fw_status_msg.out_field",
-                      expression="gate_state + 1.0",
+                          expression="vehicle_status.vehicle_type",
                       file="fw.cpp", line=2, function="Fw::run",
-                      logged_signal=""),
+                          logged_signal=""),
+        _fake_binding(binding_id="t", target="fw_status_msg.out_field",
+                          expression="gate_state + 1.0",
+                      file="fw.cpp", line=3, function="Fw::run",
+                          logged_signal=""),
         _boundary_transfer(
             "fw_status_msg",
             "fw_status",
             file="fw.cpp",
-            line=3,
+            line=4,
             direction="publish",
             function="Fw::run",
         ),
@@ -3561,6 +3702,13 @@ def test_schema_enum_resolves_scoped_constant_and_evaluates():
                       expression="position_setpoint.type",
                       file="a.cpp", line=2, function="A::poll",
                       logged_signal=""),
+        _boundary_transfer(
+            "position_setpoint",
+            "position_setpoint",
+            file="a.cpp",
+            line=1,
+            function="A::poll",
+        ),
     ]
     bindings, structure = _owned_bindings(
         bindings,
@@ -3597,8 +3745,15 @@ def test_px4_macro_predicates_evaluate():
     poison predicate evaluation — the interval evaluator routes through
     the centralized expression lowering."""
     bindings = [
+        _boundary_transfer(
+            "wind_speed",
+            "wind_speed",
+            file="a.cpp",
+            line=1,
+            function="A::run",
+        ),
         _fake_binding(binding_id="t", target="_out", expression="v + 1.0",
-                      file="a.cpp", line=1, function="A::run",
+                      file="a.cpp", line=2, function="A::run",
                       control_predicates=[
                           "PX4_ISFINITE(wind_speed.value) && wind_speed.value > 0.5f"]),
     ]
@@ -3660,6 +3815,92 @@ def test_dotted_local_copy_projects_to_actual_nested_placement():
     leaves = {v.signal_name for v in dag.vertices
               if v.kind == "evidence" and v.sub_kind == "logged_signal"}
     assert "position_setpoint_triplet.current.type" in leaves
+
+
+def test_boundary_and_conditional_source_writer_both_reach_nested_read():
+    bindings = [
+        _boundary_transfer(
+            "_state",
+            "state_topic",
+            file="ctrl.cpp",
+            line=1,
+            function="Ctrl::run",
+        ),
+        _fake_binding(
+            binding_id="override",
+            target="_state.current.value",
+            expression="7.0",
+            file="ctrl.cpp",
+            line=2,
+            function="Ctrl::run",
+            logged_signal="",
+            control_predicates=["override_enabled"],
+        ),
+        _fake_binding(
+            binding_id="terminal",
+            target="_out",
+            expression="_state.current.value",
+            file="ctrl.cpp",
+            line=3,
+            function="Ctrl::run",
+        ),
+    ]
+
+    dag = build_mechanism_dag(
+        bindings,
+        "_out",
+        logged_signals={"state_topic.current.value"},
+    )
+
+    terminal = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+    )
+    incoming = {
+        edge.source_id
+        for edge in dag.edges
+        if edge.kind == "data" and edge.target_id == terminal.id
+    }
+    assert any(
+        vertex.id in incoming
+        and vertex.kind == "operation"
+        and vertex.expression == "7.0"
+        for vertex in dag.vertices
+    )
+    assert any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "state_topic.current.value"
+        for vertex in dag.vertices
+    )
+
+
+def test_published_terminal_records_unique_observed_instance_placement():
+    dag = build_mechanism_dag(
+        [
+            _boundary_transfer(
+                "payload",
+                "output_topic",
+                file="publisher.cpp",
+                line=4,
+                direction="publish",
+                function="Publisher::run",
+            )
+        ],
+        "output_topic.value",
+        logged_signals={"output_topic[0].value"},
+    )
+
+    terminal = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and (vertex.metadata or {}).get("is_terminal")
+    )
+    assert terminal.metadata["external_target_signal"] == "output_topic[0].value"
+    assert terminal.metadata["external_target_observation"] == "observed"
 
 
 def test_source_projection_respects_scope_and_terminates_cycles():
@@ -3894,10 +4135,19 @@ def test_inventory_observation_preserves_multi_instance_identity():
         },
     }
     dag = build_mechanism_dag(
-        [_fake_binding(
-            binding_id="b", target="out", expression="sensor[0].value",
-            file="mod.cpp", line=1,
-        )],
+        [
+            _boundary_transfer(
+                "sensor_data",
+                "sensor",
+                instance=0,
+                file="mod.cpp",
+                line=1,
+            ),
+            _fake_binding(
+                binding_id="b", target="out", expression="sensor_data.value",
+                file="mod.cpp", line=2,
+            ),
+        ],
         "out",
         inventory=inventory,
     )
@@ -3923,17 +4173,25 @@ def test_observed_inventory_preserves_a_lone_nonzero_instance():
     assert observed == {"sensor[3].value"}
 
 
-def test_unqualified_signal_resolves_only_one_observed_instance():
-    binding = _fake_binding(
-        binding_id="b",
-        target="out",
-        expression="sensor.value",
-        file="mod.cpp",
-        line=1,
-        logged_signal="",
-    )
+def test_unqualified_boundary_resolves_only_one_observed_instance():
+    bindings = [
+        _boundary_transfer(
+            "sensor_data",
+            "sensor",
+            file="mod.cpp",
+            line=1,
+        ),
+        _fake_binding(
+            binding_id="b",
+            target="out",
+            expression="sensor_data.value",
+            file="mod.cpp",
+            line=2,
+            logged_signal="",
+        ),
+    ]
     unique = build_mechanism_dag(
-        [binding], "out", logged_signals={"sensor[3].value"}
+        bindings, "out", logged_signals={"sensor[3].value"}
     )
     assert any(
         vertex.kind == "evidence"
@@ -3943,11 +4201,18 @@ def test_unqualified_signal_resolves_only_one_observed_instance():
     )
 
     ambiguous = build_mechanism_dag(
-        [binding],
+        bindings,
         "out",
         logged_signals={"sensor[0].value", "sensor[3].value"},
     )
-    assert "sensor.value" in ambiguous.unresolved_symbols
+    ambiguous_leaf = next(
+        vertex
+        for vertex in ambiguous.vertices
+        if vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "sensor.value"
+    )
+    assert ambiguous_leaf.metadata.get("observation") == "unobserved"
 
 
 def test_explicit_sibling_index_is_not_observed_by_shape():
@@ -4180,10 +4445,17 @@ def test_false_conjunct_prunes_operation_even_when_other_gate_is_true():
 def test_unrelated_signal_span_does_not_change_branch_classification():
     binding = _fake_binding(
         binding_id="gated", target="out", expression="1",
-        file="gate.cpp", line=3, control_predicates=["mode == 1"],
+        file="gate.cpp", line=3, control_predicates=["mode_state == 1"],
     )
     dag = build_mechanism_dag(
-        [binding], "out", logged_signals={"mode"}
+        [
+            _boundary_transfer(
+                "mode_state", "mode", file="gate.cpp", line=1
+            ),
+            binding,
+        ],
+        "out",
+        logged_signals={"mode"},
     )
     reduced = evaluate_feasibility(
         dag,
@@ -4205,10 +4477,17 @@ def test_unrelated_signal_span_does_not_change_branch_classification():
 def test_missing_signal_policy_keeps_dynamic_verdict_unknown():
     binding = _fake_binding(
         binding_id="gated", target="out", expression="1",
-        file="gate.cpp", line=3, control_predicates=["value > 0"],
+        file="gate.cpp", line=3, control_predicates=["value_state > 0"],
     )
     dag = build_mechanism_dag(
-        [binding], "out", logged_signals={"value"}
+        [
+            _boundary_transfer(
+                "value_state", "value", file="gate.cpp", line=1
+            ),
+            binding,
+        ],
+        "out",
+        logged_signals={"value"},
     )
     reduced = evaluate_feasibility(
         dag,
@@ -4222,6 +4501,21 @@ def test_missing_signal_policy_keeps_dynamic_verdict_unknown():
 
 
 def _shared_value_program_dag() -> MechanismDAG:
+    def expression_metadata(text: str, inputs: list[str]) -> dict:
+        return {
+            "source_expression": text,
+            "source_expression_ref": {
+                "text": text,
+                "lowered_text": text,
+                "input_symbols": inputs,
+                "input_identities": {},
+                "call_results": [],
+                "exact": True,
+            },
+            "expression_inputs_exact": True,
+            "reachability": {"exact": True},
+        }
+
     vertices = [
         DAGVertex(
             id="signal",
@@ -4241,6 +4535,7 @@ def _shared_value_program_dag() -> MechanismDAG:
             kind="branch",
             predicate_raw="ENABLED",
             feasibility_verdict="unknown",
+            metadata=expression_metadata("ENABLED", ["ENABLED"]),
         ),
         DAGVertex(
             id="shared",
@@ -4249,19 +4544,24 @@ def _shared_value_program_dag() -> MechanismDAG:
             expression="sensor.value + 1",
             file="value.cpp",
             line=2,
-            metadata={"target_scope": {"file": "value.cpp", "callable": "run"}},
+            metadata={
+                **expression_metadata("sensor.value + 1", ["sensor.value"]),
+                "target_scope": {"file": "value.cpp", "callable": "run"},
+            },
         ),
         DAGVertex(
             id="positive",
             kind="branch",
             predicate_raw="shared > 0",
             feasibility_verdict="unknown",
+            metadata=expression_metadata("shared > 0", ["shared"]),
         ),
         DAGVertex(
             id="bounded",
             kind="branch",
             predicate_raw="shared < 10",
             feasibility_verdict="unknown",
+            metadata=expression_metadata("shared < 10", ["shared"]),
         ),
     ]
     edges = [
@@ -4298,9 +4598,9 @@ def test_dag_value_program_compiles_each_expression_once(monkeypatch):
     compile_calls = []
     original = dag_value_module.compile_source_expression
 
-    def counted_compile(expression, operand_names):
+    def counted_compile(expression, operand_names, **kwargs):
         compile_calls.append(expression)
-        return original(expression, operand_names)
+        return original(expression, operand_names, **kwargs)
 
     monkeypatch.setattr(
         dag_value_module, "compile_source_expression", counted_compile
@@ -4405,6 +4705,23 @@ def test_dag_value_program_preserves_call_result_operand_identity():
                 id="output", kind="operation", variable="output",
                 expression="reader().value + 1",
                 metadata={
+                    "source_expression": "reader().value + 1",
+                    "source_expression_ref": {
+                        "text": "reader().value + 1",
+                        "lowered_text": "reader().value + 1",
+                        "input_symbols": [],
+                        "input_identities": {},
+                        "call_results": [
+                            {
+                                "call_source_site_id": "call-site",
+                                "result_path": "value",
+                                "text": "reader().value",
+                            }
+                        ],
+                        "exact": True,
+                    },
+                    "expression_inputs_exact": True,
+                    "reachability": {"exact": True},
                     "source_call_roles": {
                         "call-site": {
                             "call": "reader()",
@@ -4426,6 +4743,90 @@ def test_dag_value_program_preserves_call_result_operand_identity():
 
     assert result.status == "value"
     assert result.value == 5.0
+
+
+def test_dag_value_program_keeps_repeated_call_sites_distinct():
+    dag = MechanismDAG(
+        dag_id="repeated-call-results",
+        terminal="output",
+        vertices=[
+            DAGVertex(
+                id="first",
+                kind="evidence",
+                sub_kind="constant",
+                signal_name="first result",
+                metadata={"value": 2.0},
+            ),
+            DAGVertex(
+                id="second",
+                kind="evidence",
+                sub_kind="constant",
+                signal_name="second result",
+                metadata={"value": 5.0},
+            ),
+            DAGVertex(
+                id="output",
+                kind="operation",
+                variable="output",
+                expression="reader() + reader()",
+                metadata={
+                    "source_expression": "reader() + reader()",
+                    "source_expression_ref": {
+                        "text": "reader() + reader()",
+                        "lowered_text": "reader() + reader()",
+                        "input_symbols": [],
+                        "input_identities": {},
+                        "call_results": [
+                            {
+                                "call_source_site_id": "first-site",
+                                "text": "reader()",
+                            },
+                            {
+                                "call_source_site_id": "second-site",
+                                "text": "reader()",
+                            },
+                        ],
+                        "exact": True,
+                    },
+                    "expression_inputs_exact": True,
+                    "reachability": {"exact": True},
+                    "source_call_roles": {
+                        "first-site": {
+                            "call": "reader()",
+                            "result": "reader()",
+                        },
+                        "second-site": {
+                            "call": "reader()",
+                            "result": "reader()",
+                        },
+                    },
+                },
+            ),
+        ],
+        edges=[
+            DAGEdge(
+                id="first-edge",
+                source_id="first",
+                target_id="output",
+                kind="data",
+                role="call:reader",
+                via="first-site",
+            ),
+            DAGEdge(
+                id="second-edge",
+                source_id="second",
+                target_id="output",
+                kind="data",
+                role="call:reader",
+                via="second-site",
+            ),
+        ],
+    )
+
+    result = DAGValueProgram(dag).bind().evaluate("output", None)
+
+    assert result.status == "value"
+    assert result.value == 7.0
 
 
 def test_implicit_enum_chain_is_available_to_static_feasibility():
@@ -4470,11 +4871,23 @@ def test_static_short_circuit_does_not_request_dynamic_operand():
                 id="signal", kind="evidence", sub_kind="logged_signal",
                 signal_name="sensor.value",
             ),
-            DAGVertex(
-                id="gate", kind="branch",
-                predicate_raw="DISABLED && sensor.value > 0",
-                feasibility_verdict="unknown",
-            ),
+                DAGVertex(
+                    id="gate", kind="branch",
+                    predicate_raw="DISABLED && sensor.value > 0",
+                    feasibility_verdict="unknown",
+                    metadata={
+                        "source_expression": "DISABLED && sensor.value > 0",
+                        "source_expression_ref": {
+                            "text": "DISABLED && sensor.value > 0",
+                            "lowered_text": "DISABLED and sensor.value > 0",
+                            "input_symbols": ["DISABLED", "sensor.value"],
+                            "input_identities": {},
+                            "call_results": [],
+                            "exact": True,
+                        },
+                        "expression_inputs_exact": True,
+                    },
+                ),
         ],
         edges=[
             DAGEdge(

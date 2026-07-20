@@ -138,10 +138,12 @@ class SourceReturnRef(BaseModel):
     file: str
     line: int
     source_site_id: str
+    source_order: Optional[int] = None
     expression_ref: Optional[SourceExpressionRef] = None
     control_predicates: List[str] = Field(default_factory=list)
     control_predicate_lines: List[int] = Field(default_factory=list)
     control_predicate_site_ids: List[str] = Field(default_factory=list)
+    control_predicate_orders: List[int] = Field(default_factory=list)
     control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
     reachability_exact: bool = True
 
@@ -168,6 +170,11 @@ class TopicRef(BaseModel):
     endpoint_kind: Optional[str] = None
     variable_identity: Optional[SourceStorageRef] = None
     source_site_id: Optional[str] = None
+    source_order: Optional[int] = None
+    # Exact nested call occurrences consumed as topic/endpoint metadata. They
+    # are syntax inside the boundary declaration/transfer, not value-flow
+    # helper calls.
+    metadata_call_site_ids: List[str] = Field(default_factory=list)
     # True only when this fact is the source statement that transfers the
     # payload. Wrapper declarations and constructor initializers identify an
     # endpoint but do not themselves read or write the message object.
@@ -175,6 +182,7 @@ class TopicRef(BaseModel):
     control_predicates: List[str] = Field(default_factory=list)
     control_predicate_lines: List[int] = Field(default_factory=list)
     control_predicate_site_ids: List[str] = Field(default_factory=list)
+    control_predicate_orders: List[int] = Field(default_factory=list)
     control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
     reachability_exact: bool = True
 
@@ -188,6 +196,7 @@ class ParameterRef(BaseModel):
     member: Optional[str] = None
     owner: Optional[str] = None
     source_site_id: Optional[str] = None
+    source_order: Optional[int] = None
     confidence: str = "high"
 
 
@@ -214,6 +223,10 @@ class FunctionCallRef(BaseModel):
     resolved_callable_id: Optional[str] = None
     resolved_callable_file: Optional[str] = None
     resolved_callable_owner: Optional[str] = None
+    # Canonical evaluator capability, set only when source syntax proves that
+    # the call names a supported runtime intrinsic rather than a source
+    # callable with the same spelling.
+    evaluation_intrinsic: Optional[str] = None
     args: List[str] = Field(default_factory=list)
     argument_topics: Dict[str, str] = Field(default_factory=dict)
     control_predicates: List[str] = Field(default_factory=list)
@@ -222,6 +235,7 @@ class FunctionCallRef(BaseModel):
     # from this ref's ``line`` (the gated statement).
     control_predicate_lines: List[int] = Field(default_factory=list)
     control_predicate_site_ids: List[str] = Field(default_factory=list)
+    control_predicate_orders: List[int] = Field(default_factory=list)
     # False when a governing construct the extractor does not model
     # (switch, loops) makes ``control_predicates`` incomplete — the
     # reachability is then explicitly unresolved, never silently partial.
@@ -233,6 +247,7 @@ class FunctionCallRef(BaseModel):
     function: Optional[str] = None
     callable_id: Optional[str] = None
     source_site_id: Optional[str] = None
+    source_order: Optional[int] = None
     argument_expressions: List[SourceExpressionRef] = Field(default_factory=list)
     control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
 
@@ -263,6 +278,7 @@ class SourceAssignmentRef(BaseModel):
     # from this ref's ``line`` (the gated statement).
     control_predicate_lines: List[int] = Field(default_factory=list)
     control_predicate_site_ids: List[str] = Field(default_factory=list)
+    control_predicate_orders: List[int] = Field(default_factory=list)
     # False when a governing construct the extractor does not model
     # (switch, loops) makes ``control_predicates`` incomplete — the
     # reachability is then explicitly unresolved, never silently partial.
@@ -273,6 +289,7 @@ class SourceAssignmentRef(BaseModel):
     # it does not by itself prove a runtime source-to-log data-flow edge.
     struct_variables: Dict[str, str] = Field(default_factory=dict)
     source_site_id: Optional[str] = None
+    source_order: Optional[int] = None
     expression_ref: Optional[SourceExpressionRef] = None
     control_expression_refs: List[SourceExpressionRef] = Field(default_factory=list)
 
@@ -332,6 +349,7 @@ class BranchConditionRef(BaseModel):
     line: int
     evidence: str
     source_site_id: Optional[str] = None
+    source_order: Optional[int] = None
     condition_ref: Optional[SourceExpressionRef] = None
 
 
@@ -345,6 +363,7 @@ class ParameterPredicateRef(BaseModel):
     operator: Optional[str] = None
     compared_value: Optional[str] = None
     source_site_id: Optional[str] = None
+    source_order: Optional[int] = None
 
 
 class SourceClassRef(BaseModel):
@@ -1019,7 +1038,8 @@ class MechanismSourceProfiler:
         # C uORB APIs carry the message object in the call arguments instead
         # of a wrapper declaration. Reuse the token-aware call extraction so
         # multi-line calls and callable identity stay consistent.
-        for call in self.extract_function_calls_from_source(files):
+        source_calls = self.extract_function_calls_from_source(files)
+        for call in source_calls:
             short_name = call.name.rsplit("::", 1)[-1]
             topic_arg: Optional[int] = None
             data_arg: Optional[int] = None
@@ -1073,6 +1093,24 @@ class MechanismSourceProfiler:
                     reachability_exact=call.reachability_exact,
                 )
             )
+
+        for index, ref in enumerate(refs):
+            metadata_sites = [
+                str(call.source_site_id)
+                for call in source_calls
+                if call.source_site_id
+                and call.source_site_id != ref.source_site_id
+                and call.file == ref.file
+                and call.line == ref.line
+                and self._topic_from_orb_reference(
+                    f"{call.name}({', '.join(call.args)})"
+                )
+                == ref.topic
+            ]
+            if metadata_sites:
+                refs[index] = ref.model_copy(
+                    update={"metadata_call_site_ids": metadata_sites}
+                )
 
         refs = self._dedupe_topic_refs(refs)
         return {
@@ -2170,10 +2208,23 @@ class MechanismSourceProfiler:
                     )
                     predicate_entries = control_predicates.get(line_no, [])
                     predicates = [p for p, _ in predicate_entries]
+                    intrinsic_owner, intrinsic_separator, _intrinsic_name = (
+                        name.rpartition("::")
+                    )
+                    evaluation_intrinsic = (
+                        canonical_math_function_name(name)
+                        if (
+                            intrinsic_separator
+                            and intrinsic_owner == "std"
+                            and is_safe_math_function_name(name)
+                        )
+                        else None
+                    )
                     refs.append(
                         FunctionCallRef(
                             name=name,
                             receiver=receiver,
+                            evaluation_intrinsic=evaluation_intrinsic,
                             args=args,
                             argument_topics=argument_topics,
                             file=rel_file,
@@ -3347,7 +3398,9 @@ class MechanismSourceProfiler:
     @staticmethod
     def _normalize_source_expression(expr: str) -> str:
         expr = MechanismSourceProfiler._clean_field_path(expr.strip())
-        return MechanismSourceProfiler._normalize_helper_expression(expr)
+        return MechanismSourceProfiler._normalize_helper_expression(expr).replace(
+            "::", "."
+        )
 
     def _translate_helper_body(
         self,

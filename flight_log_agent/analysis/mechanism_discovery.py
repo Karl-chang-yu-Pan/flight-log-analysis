@@ -35,6 +35,7 @@ from flight_log_agent.analysis.mechanism_dag import (
     _DAGBuilder,
     build_mechanism_dag,
     evaluate_feasibility,
+    observed_signal_placements,
 )
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
 from flight_log_agent.px4.source_facts_cache import (
@@ -85,6 +86,7 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         ],
         "assignment_operator": str(ref.get("assignment_operator") or "="),
         "source_site_id": str(ref.get("source_site_id") or ""),
+        "source_order": ref.get("source_order"),
         "expression_ref": expression_ref,
         "reference_identities": {
             exact_symbol(str(symbol)): dict(identity)
@@ -111,6 +113,9 @@ def binding_from_assignment(assignment: Any) -> dict[str, Any]:
         "control_predicate_lines": list(ref.get("control_predicate_lines") or []),
         "control_predicate_site_ids": list(
             ref.get("control_predicate_site_ids") or []
+        ),
+        "control_predicate_orders": list(
+            ref.get("control_predicate_orders") or []
         ),
         "reachability_exact": bool(ref.get("reachability_exact", True)),
         "struct_variables": dict(ref.get("struct_variables") or {}),
@@ -157,6 +162,18 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
         for entry in entries
         for raw_call in entry.get("function_calls") or []
         if (call := _as_dict(raw_call)).get("source_site_id")
+    }
+    boundary_metadata_call_sites = {
+        str(site_id)
+        for entry in entries
+        for direction_key in (
+            "subscribed_topics",
+            "published_topics",
+            "unknown_direction_topics",
+        )
+        for raw_ref in entry.get(direction_key) or []
+        for site_id in (_as_dict(raw_ref).get("metadata_call_site_ids") or [])
+        if site_id
     }
 
     class_bases: dict[str, list[str]] = {}
@@ -214,6 +231,10 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                         ),
                         "endpoint_kind": str(ref.get("endpoint_kind") or ""),
                         "source_site_id": str(ref.get("source_site_id") or ""),
+                        "source_order": ref.get("source_order"),
+                        "metadata_call_site_ids": list(
+                            ref.get("metadata_call_site_ids") or []
+                        ),
                         "transfer": bool(ref.get("transfer", False)),
                         "provenance": str(ref.get("api") or direction_key),
                         "control_predicates": [
@@ -237,6 +258,14 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
                             for value in (
                                 transfer_call.get("control_predicate_site_ids")
                                 or ref.get("control_predicate_site_ids")
+                                or []
+                            )
+                        ],
+                        "control_predicate_orders": [
+                            int(value)
+                            for value in (
+                                transfer_call.get("control_predicate_orders")
+                                or ref.get("control_predicate_orders")
                                 or []
                             )
                         ],
@@ -489,6 +518,7 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             "target_identity": target_identity,
             "assignment_operator": "=",
             "source_site_id": source_site_id,
+            "source_order": item.get("source_order"),
             "expression_ref": {
                 "text": source,
                 "lowered_text": source,
@@ -510,6 +540,9 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
             ),
             "control_predicate_site_ids": list(
                 item.get("control_predicate_site_ids") or []
+            ),
+            "control_predicate_orders": list(
+                item.get("control_predicate_orders") or []
             ),
             "control_expression_refs": list(
                 item.get("control_expression_refs") or []
@@ -600,6 +633,10 @@ def dag_inputs_from_facts(facts: Iterable[Any]) -> DAGInputs:
 
         for call in entry.get("function_calls") or []:
             call_dict = _as_dict(call)
+            if str(call_dict.get("source_site_id") or "") in (
+                boundary_metadata_call_sites
+            ):
+                continue
             key = (
                 str(call_dict.get("source_site_id") or ""),
                 str(call_dict.get("callable_id") or ""),
@@ -1156,14 +1193,31 @@ def validate_terminal(
             terminal=canonical, status="absent", reason="empty terminal"
         )
 
-    logged = norm in {exact_symbol(str(s)) for s in logged_signals if s}
+    observed_placements = observed_signal_placements(norm, logged_signals)
+    if len(observed_placements) > 1:
+        return TerminalValidation(
+            terminal=canonical,
+            status="ambiguous",
+            logged=True,
+            reason=(
+                "terminal omits an instance and matches multiple observed placements: "
+                + ", ".join(observed_placements)
+            ),
+        )
+    logged = bool(observed_placements)
 
     matches: list[dict[str, Any]] = []
     for binding in bindings:
         target = exact_symbol(
             str(binding.get("target_symbol") or binding.get("target") or "")
         )
-        if source_storage_produces_reference(target, norm):
+        if not source_storage_produces_reference(target, norm):
+            continue
+        if logged and not bool(binding.get("external_target_signal")):
+            continue
+        if not logged and bool(binding.get("external_target_signal")):
+            continue
+        if target:
             matches.append(binding)
 
     all_matches = list(matches)
@@ -1444,9 +1498,8 @@ class DiscoveryResult:
     terminal_validation: Optional[TerminalValidation] = None
 
 
-def _reachable_source_sites(dag: MechanismDAG) -> set[tuple[str, int]]:
-    """Return source sites on backward paths from surviving terminal writes."""
-    vertices = {vertex.id: vertex for vertex in dag.vertices}
+def _reachable_vertex_ids(dag: MechanismDAG) -> set[str]:
+    """Return graph vertices on backward paths from terminal writes."""
     terminal_ids = {
         vertex.id
         for vertex in dag.vertices
@@ -1464,11 +1517,7 @@ def _reachable_source_sites(dag: MechanismDAG) -> set[tuple[str, int]]:
             if predecessor not in reachable:
                 reachable.add(predecessor)
                 pending.append(predecessor)
-    return {
-        (str(vertex.file or ""), int(vertex.line))
-        for vertex_id, vertex in vertices.items()
-        if vertex_id in reachable and vertex.file and vertex.line is not None
-    }
+    return reachable
 
 
 def _reachable_frontier_references(
@@ -1476,16 +1525,19 @@ def _reachable_frontier_references(
     full_dag: MechanismDAG,
     feasible_dag: MechanismDAG,
 ) -> list[UnresolvedSourceReference]:
-    """Drop only references proven to originate solely on removed paths."""
-    full_sites = _reachable_source_sites(full_dag)
-    feasible_sites = _reachable_source_sites(feasible_dag)
+    """Drop references whose exact origin vertices were all pruned.
+
+    File and line equality is not graph provenance: several operations and
+    branches can share one source line. References without an attached DAG
+    origin are retained conservatively.
+    """
+    full_vertices = _reachable_vertex_ids(full_dag)
+    feasible_vertices = _reachable_vertex_ids(feasible_dag)
     kept: list[UnresolvedSourceReference] = []
     for reference in references:
-        site = (
-            str(reference.file or ""),
-            int(reference.line) if reference.line is not None else 0,
-        )
-        if site[0] and site[1] and site in full_sites and site not in feasible_sites:
+        origins = set(reference.origin_vertex_ids)
+        reachable_origins = origins & full_vertices
+        if reachable_origins and not (reachable_origins & feasible_vertices):
             continue
         kept.append(reference)
     return kept
@@ -1578,24 +1630,30 @@ def discover_mechanism_dag(
         )
 
     def candidate_bundle(file_path: str) -> tuple[list[str], DAGInputs]:
-        """Load one candidate and its source companions for proof only."""
+        """Load one candidate and its source-declared direct includes."""
+        primary_facts = resolver.facts_for(file_path)
         files = dedupe_keep_order(
-            [file_path, *resolver.companion_files(file_path)]
+            [
+                file_path,
+                *(
+                    str(_as_dict(include).get("included_file") or "")
+                    for include in primary_facts.includes
+                ),
+            ]
         )
         return files, dag_inputs_from_facts(
             resolver.facts_for(candidate) for candidate in files
         )
+
+    def declared_source_files(file_path: str) -> list[str]:
+        files, _inputs = candidate_bundle(file_path)
+        return files
 
     def admit_terminal_candidate(file_path: str) -> list[str]:
         files, candidate_inputs = candidate_bundle(file_path)
         return files if bindings_write_terminal(candidate_inputs.bindings) else []
 
     explicit_files = [str(terminal_file)] if terminal_file else []
-    explicit_companions = [
-        companion
-        for file_path in explicit_files
-        for companion in resolver.companion_files(file_path)
-    ]
     terminal_queries = _definition_queries(terminal)
     parsed_terminal = parse_signal_reference(exact_symbol(terminal))
     if parsed_terminal is not None:
@@ -1608,7 +1666,6 @@ def discover_mechanism_dag(
     candidate_files = dedupe_keep_order(
         [
             *explicit_files,
-            *explicit_companions,
             *(str(file_path) for file_path in (preranked_files or ()) if file_path),
         ]
     )
@@ -1616,21 +1673,19 @@ def discover_mechanism_dag(
     # graph provenance and therefore cannot admit round-zero files.
     _ = seeds
     pending: list[str] = []
-    explicit_set = set(explicit_files) | set(explicit_companions)
+    explicit_set = set(explicit_files)
+    explicit_terminal_proven = False
     for file_path in candidate_files:
         admitted = admit_terminal_candidate(file_path)
         if file_path in explicit_set:
-            pending.append(file_path)
-            pending.extend(resolver.companion_files(file_path))
+            explicit_terminal_proven = explicit_terminal_proven or bool(admitted)
+            pending.extend(admitted or [file_path])
         elif admitted:
             pending.extend(admitted)
-    if not terminal_file or (
-        requested_terminal_identity is not None
-        and requested_terminal_identity.kind in {"member", "global"}
-    ):
-        # A ranked survey is not an exhaustive declaration index. Unscoped
-        # terminals must inspect every exact writer so ambiguity cannot depend
-        # on ranking order. A declared terminal file already supplies scope.
+    # A ranked survey or filename relation is not an exhaustive declaration
+    # index. Inspect every exact writer candidate so terminal admission cannot
+    # depend on ranking or same-stem files.
+    if not (terminal_file and explicit_terminal_proven):
         for hit in profiler.search_related_source_files(
             terminal_queries,
             max_files=None,
@@ -1770,11 +1825,9 @@ def discover_mechanism_dag(
                 continue
             visited.add(key)
             for candidate in resolver.resolve(reference, inputs.structure):
-                next_files.append(candidate.file)
-                next_files.extend(resolver.companion_files(candidate.file))
+                next_files.extend(declared_source_files(candidate.file))
         for file_path in fetched_files:
-            next_files.append(file_path)
-            next_files.extend(resolver.companion_files(file_path))
+            next_files.extend(declared_source_files(file_path))
         pending = [
             file_path
             for file_path in dedupe_keep_order(next_files)

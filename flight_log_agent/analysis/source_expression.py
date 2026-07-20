@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from functools import cache
 import math
@@ -233,19 +234,62 @@ class _LazyOperandEnvironment(Mapping[str, Any]):
 def compile_source_expression(
     expression: str,
     operand_names: Iterable[str],
+    *,
+    occurrence_operands: Iterable[tuple[str, str]] = (),
 ) -> CompiledSourceExpression:
     """Compile one source expression against parser/DAG-proven operands."""
     normalized = normalize_source_expression(expression)
-    rewritten, alias_to_name = alias_dotted_names(normalized, operand_names)
+    try:
+        source_tree = ast.parse(normalized, mode="eval")
+    except SyntaxError as exc:
+        raise SourceExpressionError("invalid expression syntax") from exc
+
+    occurrence_queues: dict[str, deque[tuple[str, str]]] = defaultdict(deque)
+    for index, (operand_id, operand_expression) in enumerate(
+        occurrence_operands
+    ):
+        try:
+            operand_tree = ast.parse(
+                normalize_source_expression(operand_expression), mode="eval"
+            )
+        except SyntaxError as exc:
+            raise SourceExpressionError(
+                "invalid parser-proven call operand"
+            ) from exc
+        token = f"__source_call_operand_{index}"
+        occurrence_queues[
+            ast.dump(operand_tree.body, include_attributes=False)
+        ].append((token, operand_id))
+
+    occurrence_aliases: dict[str, str] = {}
+
+    class ReplaceOccurrenceOperands(ast.NodeTransformer):
+        def visit(self, node: ast.AST) -> ast.AST:
+            queue = occurrence_queues.get(
+                ast.dump(node, include_attributes=False)
+            )
+            if queue:
+                token, operand_id = queue.popleft()
+                occurrence_aliases[token] = operand_id
+                return ast.copy_location(ast.Name(id=token, ctx=ast.Load()), node)
+            return super().visit(node)
+
+    transformed = ReplaceOccurrenceOperands().visit(source_tree)
+    ast.fix_missing_locations(transformed)
+    transformed_text = ast.unparse(transformed)
+    rewritten, alias_to_name = alias_dotted_names(
+        transformed_text, operand_names
+    )
     try:
         tree = ast.parse(rewritten, mode="eval")
     except SyntaxError as exc:
         raise SourceExpressionError("invalid expression syntax") from exc
+    aliases = {**occurrence_aliases, **alias_to_name}
     return CompiledSourceExpression(
         source=str(expression or ""),
         normalized=normalized,
         tree=tree,
-        alias_to_operand=tuple(alias_to_name.items()),
+        alias_to_operand=tuple(aliases.items()),
     )
 
 

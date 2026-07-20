@@ -27,6 +27,7 @@ TREE = {
     "src/modules/example/rtl.cpp": """
 void Rtl::pick_altitude()
 {
+    orb_copy(ORB_ID(gspeed), _gspeed_sub, &gspeed);
     _dest_val = gspeed;
     if (_param_rtl_type.get() == 1) {
         _final_out = _dest_val + 1.0f;
@@ -34,6 +35,34 @@ void Rtl::pick_altitude()
 }
 """,
 }
+
+
+def _exact_expression(text: str, *inputs: str) -> dict:
+    return {
+        "text": text,
+        "lowered_text": text,
+        "input_symbols": list(inputs),
+        "input_identities": {},
+        "call_results": [],
+        "direct_storage": inputs[0] if len(inputs) == 1 and text == inputs[0] else "",
+        "exact": True,
+    }
+
+
+def _logged_input(local: str, signal: str, line: int) -> dict:
+    return {
+        "target_symbol": local,
+        "source_symbol": signal,
+        "assignment_path": [
+            {"file": "a.cpp", "line": line, "expression": signal}
+        ],
+        "expression_ref": _exact_expression(signal, signal),
+        "external_source_signal": True,
+        "synthetic_boundary_transfer": True,
+        "boundary_direction": "subscribe",
+        "control_predicates": [],
+        "function": "A::run",
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -420,10 +449,27 @@ def test_questioned_signal_resolves_via_slice_not_string_fuzz(tmp_path):
     logged = {"tecs_status.true_airspeed_sp", "tecs_status.height_rate",
               "vehicle_status.nav_state"}
     dag = build_mechanism_dag(
-        [{"target_symbol": "_x", "source_symbol": "tecs_status.true_airspeed_sp",
-          "assignment_path": [{"file": "a.cpp", "line": 1,
-                               "expression": "tecs_status.true_airspeed_sp"}],
-          "logged_signal": "", "control_predicates": [], "function": "A::run"}],
+        [
+            {
+                "target_symbol": "airspeed_sp",
+                "source_symbol": "tecs_status.true_airspeed_sp",
+                "assignment_path": [{"file": "a.cpp", "line": 1,
+                                     "expression": "tecs_status.true_airspeed_sp"}],
+                "control_predicates": [],
+                "function": "A::run",
+                "external_source_signal": True,
+                "synthetic_boundary_transfer": True,
+                "boundary_direction": "subscribe",
+            },
+            {
+                "target_symbol": "_x",
+                "source_symbol": "airspeed_sp",
+                "assignment_path": [{"file": "a.cpp", "line": 2,
+                                     "expression": "airspeed_sp"}],
+                "control_predicates": [],
+                "function": "A::run",
+            },
+        ],
         "_x", logged_signals=logged,
     )
 
@@ -619,14 +665,21 @@ def test_complete_replay_distinguishes_match_mismatch_and_missing_policy(monkeyp
     monkeypatch.setattr(dag_pipeline, "ULogEvidenceIndex", _StubIndex)
 
     dag = build_mechanism_dag(
-        [{"target_symbol": "topic_out.value", "source_symbol": "topic_in.value",
-          "assignment_path": [{"file": "a.cpp", "line": 1,
-                               "expression": "topic_in.value"}],
-          "external_target_signal": True,
-          "synthetic_boundary_transfer": True,
-          "boundary_direction": "publish",
-          "control_predicates": [],
-          "function": "A::run"}],
+        [
+            _logged_input("input_value", "topic_in.value", 1),
+            {
+                "target_symbol": "topic_out.value",
+                "source_symbol": "input_value",
+                "assignment_path": [{"file": "a.cpp", "line": 2,
+                                     "expression": "input_value"}],
+                "expression_ref": _exact_expression("input_value", "input_value"),
+                "external_target_signal": True,
+                "synthetic_boundary_transfer": True,
+                "boundary_direction": "publish",
+                "control_predicates": [],
+                "function": "A::run",
+            },
+        ],
         "topic_out.value",
         logged_signals={"topic_in.value", "topic_out.value"},
     )
@@ -676,20 +729,24 @@ def test_replay_reuses_supplied_dag_signal_data(monkeypatch):
     )
 
     dag = build_mechanism_dag(
-        [{
-            "target_symbol": "topic_out.value",
-            "source_symbol": "topic_in.value",
-            "assignment_path": [{
-                "file": "a.cpp",
-                "line": 1,
-                "expression": "topic_in.value",
-            }],
-            "external_target_signal": True,
-            "synthetic_boundary_transfer": True,
-            "boundary_direction": "publish",
-            "control_predicates": [],
-            "function": "A::run",
-        }],
+        [
+            _logged_input("input_value", "topic_in.value", 1),
+            {
+                "target_symbol": "topic_out.value",
+                "source_symbol": "input_value",
+                "assignment_path": [{
+                    "file": "a.cpp",
+                    "line": 2,
+                    "expression": "input_value",
+                }],
+                "expression_ref": _exact_expression("input_value", "input_value"),
+                "external_target_signal": True,
+                "synthetic_boundary_transfer": True,
+                "boundary_direction": "publish",
+                "control_predicates": [],
+                "function": "A::run",
+            },
+        ],
         "topic_out.value",
         logged_signals={"topic_in.value", "topic_out.value"},
     )
@@ -773,29 +830,40 @@ def test_replay_combines_mutually_exclusive_writers_piecewise(monkeypatch):
         "output.value": {"method": "linear"},
     }
     bindings = [
+        _logged_input("mode_state", "mode.state", 1),
+        _logged_input("first_value", "input.first", 2),
+        _logged_input("second_value", "input.second", 3),
         {
             "target_symbol": "output.value",
-            "source_symbol": "input.first",
+            "source_symbol": "first_value",
             "assignment_path": [
-                {"file": "a.cpp", "line": 10, "expression": "input.first"}
+                {"file": "a.cpp", "line": 10, "expression": "first_value"}
             ],
+            "expression_ref": _exact_expression("first_value", "first_value"),
             "external_target_signal": True,
             "synthetic_boundary_transfer": True,
             "boundary_direction": "publish",
-            "control_predicates": ["mode.state == 0"],
+            "control_predicates": ["mode_state == 0"],
+            "control_expression_refs": [
+                _exact_expression("mode_state == 0", "mode_state")
+            ],
             "control_predicate_lines": [9],
             "function": "A::run",
         },
         {
             "target_symbol": "output.value",
-            "source_symbol": "input.second",
+            "source_symbol": "second_value",
             "assignment_path": [
-                {"file": "a.cpp", "line": 12, "expression": "input.second"}
+                {"file": "a.cpp", "line": 12, "expression": "second_value"}
             ],
+            "expression_ref": _exact_expression("second_value", "second_value"),
             "external_target_signal": True,
             "synthetic_boundary_transfer": True,
             "boundary_direction": "publish",
-            "control_predicates": ["mode.state == 1"],
+            "control_predicates": ["mode_state == 1"],
+            "control_expression_refs": [
+                _exact_expression("mode_state == 1", "mode_state")
+            ],
             "control_predicate_lines": [11],
             "function": "A::run",
         },
@@ -833,12 +901,16 @@ def test_replay_reconstructs_nested_internal_flow_from_dag_edges():
     from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
 
     bindings = [
+        _logged_input("input_value", "input.value", 1),
         {
             "target_symbol": "internal",
-            "source_symbol": "input.value * 2.0",
+            "source_symbol": "input_value * 2.0",
             "assignment_path": [
-                {"file": "a.cpp", "line": 10, "expression": "input.value * 2.0"}
+                {"file": "a.cpp", "line": 10, "expression": "input_value * 2.0"}
             ],
+            "expression_ref": _exact_expression(
+                "input_value * 2.0", "input_value"
+            ),
             "control_predicates": [],
             "function": "A::run",
         },
@@ -848,6 +920,9 @@ def test_replay_reconstructs_nested_internal_flow_from_dag_edges():
             "assignment_path": [
                 {"file": "a.cpp", "line": 20, "expression": "max(internal, 3.0)"}
             ],
+            "expression_ref": _exact_expression(
+                "max(internal, 3.0)", "internal"
+            ),
             "external_target_signal": True,
             "synthetic_boundary_transfer": True,
             "boundary_direction": "publish",
@@ -900,6 +975,11 @@ def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges():
             ],
             "control_predicates": controls or [],
             "control_predicate_lines": [line - 1 for _ in controls or []],
+            "control_expression_refs": [
+                _exact_expression(predicate, "mode_state")
+                for predicate in controls or []
+            ],
+            "expression_ref": _exact_expression(expression, expression),
             "function": "A::run",
         }
         if logged_signal:
@@ -913,8 +993,11 @@ def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges():
         return binding
 
     bindings = [
-        binding("selected", "input.first", 10, controls=["mode.state == 0"]),
-        binding("selected", "input.second", 12, controls=["mode.state == 1"]),
+        _logged_input("mode_state", "mode.state", 1),
+        _logged_input("first_value", "input.first", 2),
+        _logged_input("second_value", "input.second", 3),
+        binding("selected", "first_value", 10, controls=["mode_state == 0"]),
+        binding("selected", "second_value", 12, controls=["mode_state == 1"]),
         binding("output", "selected", 20, logged_signal="output.value"),
     ]
     samples = {

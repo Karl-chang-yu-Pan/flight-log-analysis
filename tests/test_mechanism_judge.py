@@ -23,6 +23,8 @@ class Rtl
 };
 """,
     "src/modules/example/rtl.cpp": """
+#include "rtl.h"
+
 void Rtl::pick_altitude()
 {
     if (_param_rtl_type.get() == 1) {
@@ -31,8 +33,11 @@ void Rtl::pick_altitude()
 }
 """,
     "src/modules/example/dest.cpp": """
+#include "rtl.h"
+
 void Rtl::update()
 {
+    orb_copy(ORB_ID(gspeed), _gspeed_sub, &gspeed);
     _dest_val = gspeed;
 }
 """,
@@ -421,6 +426,7 @@ AIRSPEED_SHAPED_TREE = {
     "src/modules/ctrl/Controller.cpp": """
 void Controller::update()
 {
+    orb_copy(ORB_ID(base_in), _base_in_sub, &base_in);
     real_out = base_in + 1.0f;
     _member_out = real_out * 2.0f;
 }

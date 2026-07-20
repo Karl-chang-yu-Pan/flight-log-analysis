@@ -41,6 +41,7 @@ class _CompiledVertex:
     expression: Optional[CompiledSourceExpression]
     compile_error: str
     producers_by_operand: tuple[tuple[str, tuple[str, ...]], ...]
+    exact: bool
 
 
 class DAGValueProgram:
@@ -88,7 +89,33 @@ class DAGValueProgram:
                 continue
             expression = self._vertex_expression(vertex)
             by_operand: dict[str, list[str]] = defaultdict(list)
+            call_occurrences: list[tuple[str, str]] = []
+            call_roles = dict(
+                (vertex.metadata or {}).get("source_call_roles") or {}
+            )
             for edge in self.data_by_target.get(vertex.id, ()):
+                if edge.via and edge.via in call_roles and edge.role.startswith(
+                    ("call:", "call-result:")
+                ):
+                    operand_id = f"call-site:{edge.via}"
+                    call_role = call_roles[edge.via] or {}
+                    call_expression = str(
+                        call_role.get("result")
+                        or call_role.get("call")
+                        or ""
+                    )
+                    call_expression = self._expression_spelling(
+                        call_expression
+                    )
+                    if call_expression and not any(
+                        existing_id == operand_id
+                        for existing_id, _expression in call_occurrences
+                    ):
+                        call_occurrences.append(
+                            (operand_id, call_expression)
+                        )
+                    by_operand[operand_id].append(edge.source_id)
+                    continue
                 role = self._source_role(vertex, edge)
                 if role:
                     spelling = self._expression_spelling(role)
@@ -99,9 +126,22 @@ class DAGValueProgram:
                 (role, tuple(dict.fromkeys(producer_ids)))
                 for role, producer_ids in by_operand.items()
             )
+            expression_exact = bool(
+                (vertex.metadata or {}).get("expression_inputs_exact", False)
+            )
             try:
+                if not expression_exact:
+                    raise SourceExpressionError(
+                        "source expression dependencies are not parser-exact"
+                    )
                 local_expression = compile_source_expression(
-                    expression, (role for role, _producer_ids in operands)
+                    expression,
+                    (
+                        role
+                        for role, _producer_ids in operands
+                        if not role.startswith("call-site:")
+                    ),
+                    occurrence_operands=call_occurrences,
                 )
                 compile_error = ""
             except SourceExpressionError as exc:
@@ -111,6 +151,7 @@ class DAGValueProgram:
                 expression=local_expression,
                 compile_error=compile_error,
                 producers_by_operand=operands,
+                exact=expression_exact,
             )
         self.compiled_vertices = MappingProxyType(compiled)
 
@@ -352,7 +393,11 @@ class DAGValueSession:
         timestamp: Optional[float],
         active: frozenset[str],
     ) -> ActivityStatus:
-        unknown = False
+        unknown = not bool(
+            ((self.program.vertices[vertex_id].metadata or {}).get("reachability") or {}).get(
+                "exact", False
+            )
+        )
         for branch_id in self.program.controls_by_target.get(vertex_id, ()):
             result = self._evaluate_vertex(branch_id, timestamp, active)
             if result.status != "value":
@@ -368,7 +413,7 @@ class DAGValueSession:
         active: frozenset[str],
     ) -> DAGValueResult:
         local = self.program.compiled_vertices.get(vertex.id)
-        if local is None or local.expression is None:
+        if local is None or local.expression is None or not local.exact:
             return DAGValueResult(
                 "unresolved",
                 reason=(local.compile_error if local is not None else "vertex has no expression"),
@@ -453,15 +498,24 @@ class DAGValueSession:
             return None
         latest_active = max(
             active_values,
-            key=lambda item: int(self.program.vertices[item[0]].line or 0),
+            key=lambda item: self._producer_order(item[0]),
         )
-        latest_line = int(self.program.vertices[latest_active[0]].line or 0)
+        latest_order = self._producer_order(latest_active[0])
         if any(
-            int(self.program.vertices[vertex_id].line or 0) > latest_line
+            self._producer_order(vertex_id) > latest_order
             for vertex_id in unknown_ids
         ):
             return None
         return latest_active[1]
+
+    def _producer_order(self, vertex_id: str) -> tuple[int, int]:
+        vertex = self.program.vertices[vertex_id]
+        metadata = vertex.metadata or {}
+        target_scope = metadata.get("target_scope") or {}
+        return (
+            int(target_scope.get("line") or vertex.line or 0),
+            int(target_scope.get("source_order") or metadata.get("source_order") or 0),
+        )
 
 
 class DAGValuePlan:

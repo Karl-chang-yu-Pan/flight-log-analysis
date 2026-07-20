@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.px4.mechanism_source_profiler import (
@@ -121,6 +121,11 @@ class UnresolvedSourceReference(BaseModel):
     source_expression: str = ""
     source_site_id: str = ""
     identity: Optional[SourceSymbolIdentity] = None
+    # DAG vertices and operand roles that require this source entity. These
+    # are graph provenance for feasibility-aware expansion; source locations
+    # remain descriptive and are never used to infer reachability.
+    origin_vertex_ids: list[str] = Field(default_factory=list)
+    origin_operands: list[str] = Field(default_factory=list)
 
     def visit_key(self) -> tuple[Any, ...]:
         return (
@@ -619,9 +624,21 @@ class SourceStructureIndex:
             if binding.get("external_target_signal"):
                 binding.pop("target_identity", None)
             elif raw_target_identity:
-                target_identity = SourceSymbolIdentity.model_validate(
+                provisional = SourceSymbolIdentity.model_validate(
                     raw_target_identity
                 ).model_copy(update={"symbol": exact_symbol(target)})
+                target_identity = (
+                    provisional
+                    if provisional.declaration_proven
+                    else self.symbol_identity(
+                        target,
+                        file=file,
+                        callable_id=callable_id,
+                        function_name=function,
+                        function_parameters=parameters,
+                        class_owner_hint=str(binding.get("function_owner") or ""),
+                    )
+                )
                 binding["target_identity"] = target_identity.model_dump()
             else:
                 target_identity = self.symbol_identity(
@@ -671,9 +688,23 @@ class SourceStructureIndex:
                         continue
                     raw_identity = provided.get(canonical) or provided.get(symbol)
                     if raw_identity:
-                        identity = SourceSymbolIdentity.model_validate(
+                        provisional = SourceSymbolIdentity.model_validate(
                             raw_identity
                         ).model_copy(update={"symbol": canonical})
+                        identity = (
+                            provisional
+                            if provisional.declaration_proven
+                            else self.symbol_identity(
+                                symbol,
+                                file=file,
+                                callable_id=callable_id,
+                                function_name=function,
+                                function_parameters=parameters,
+                                class_owner_hint=str(
+                                    binding.get("function_owner") or ""
+                                ),
+                            )
+                        )
                     else:
                         identity = self.symbol_identity(
                             symbol,
@@ -700,24 +731,115 @@ class SourceStructureIndex:
             callable_id = str(call.get("callable_id") or call.get("function") or "")
             function = str(call.get("function") or "")
             owner = self.callable_owner(callable_id, function)
+            file = str(call.get("file") or "")
+            record = self.callables_by_id.get(callable_id) or {}
+            parameters = [
+                str(value) for value in (record.get("parameters") or [])
+            ]
+
+            def enrich_expression_ref(raw_ref: Any) -> dict[str, Any]:
+                if hasattr(raw_ref, "model_dump"):
+                    raw_ref = raw_ref.model_dump(exclude_none=True)
+                expression_ref = dict(raw_ref or {})
+                expression = str(expression_ref.get("text") or "")
+                symbols = [
+                    str(value)
+                    for value in (expression_ref.get("input_symbols") or [])
+                    if str(value)
+                ]
+                if not bool(expression_ref.get("exact", False)):
+                    symbols = list(
+                        dict.fromkeys(
+                            [*symbols, *source_expression_names(expression)]
+                        )
+                    )
+                provided = dict(expression_ref.get("input_identities") or {})
+                identities: dict[str, dict[str, Any]] = {}
+                for symbol in symbols:
+                    canonical = exact_symbol(symbol)
+                    raw_identity = provided.get(canonical) or provided.get(symbol)
+                    provisional = (
+                        SourceSymbolIdentity.model_validate(raw_identity).model_copy(
+                            update={"symbol": canonical}
+                        )
+                        if raw_identity
+                        else None
+                    )
+                    identity = (
+                        provisional
+                        if provisional is not None
+                        and provisional.declaration_proven
+                        else self.symbol_identity(
+                            symbol,
+                            file=file,
+                            callable_id=callable_id,
+                            function_name=function,
+                            function_parameters=parameters,
+                            class_owner_hint=owner,
+                        )
+                    )
+                    identities[canonical] = identity.model_dump()
+                expression_ref["input_identities"] = identities
+                return expression_ref
+
             receiver = str(call.get("receiver") or "").replace("->", ".")
             root = receiver.split(".", 1)[0].lstrip("&*")
             receiver_type = self.member_receiver_type(owner, root) if owner and root else ""
             call["caller_owner"] = owner
             call["receiver_type"] = str(call.get("receiver_type") or receiver_type)
-            if receiver and not call.get("receiver_identity"):
-                record = self.callables_by_id.get(callable_id) or {}
-                call["receiver_identity"] = self.symbol_identity(
-                    receiver,
-                    file=str(call.get("file") or ""),
-                    callable_id=callable_id,
-                    function_name=function,
-                    function_parameters=[
-                        str(value)
-                        for value in (record.get("parameters") or [])
-                    ],
-                    class_owner_hint=owner,
-                ).model_dump()
+            if receiver:
+                raw_identity = call.get("receiver_identity") or {}
+                provisional = (
+                    SourceSymbolIdentity.model_validate(raw_identity).model_copy(
+                        update={"symbol": exact_symbol(receiver)}
+                    )
+                    if raw_identity
+                    else None
+                )
+                receiver_identity = (
+                    provisional
+                    if provisional is not None and provisional.declaration_proven
+                    else self.symbol_identity(
+                        receiver,
+                        file=file,
+                        callable_id=callable_id,
+                        function_name=function,
+                        function_parameters=parameters,
+                        class_owner_hint=owner,
+                    )
+                )
+                call["receiver_identity"] = receiver_identity.model_dump()
+                if not call["receiver_type"]:
+                    declaration = self.declaration_for_identity(receiver_identity)
+                    declared_type = str((declaration or {}).get("type") or "")
+                    if declared_type:
+                        call["receiver_type"] = self.resolve_class_name(
+                            declared_type,
+                            lexical_owner=(
+                                receiver_identity.declaring_class or owner
+                            ),
+                        )
+            argument_refs = [
+                enrich_expression_ref(value)
+                for value in (call.get("argument_expressions") or [])
+            ]
+            control_refs = [
+                enrich_expression_ref(value)
+                for value in (call.get("control_expression_refs") or [])
+            ]
+            call["argument_expressions"] = argument_refs
+            call["control_expression_refs"] = control_refs
+            argument_owners = dict(call.get("argument_owners") or {})
+            for expression_ref in argument_refs:
+                for symbol, raw_identity in (
+                    expression_ref.get("input_identities") or {}
+                ).items():
+                    identity = SourceSymbolIdentity.model_validate(raw_identity)
+                    if identity.kind == "member":
+                        argument_owners.setdefault(
+                            exact_symbol(symbol), identity.declaring_class
+                        )
+            call["argument_owners"] = argument_owners
             enriched.append(call)
         return enriched
 
@@ -1020,15 +1142,6 @@ class SourceExpansionResolver:
                 expand_query_tokens=False,
             )
             hit_files = dedupe_keep_order(hit.file for hit in hits)
-            if reference.kind == "callable" and query_group and all(
-                query.startswith(("class ", "struct ", "namespace "))
-                for query in query_group
-            ):
-                hit_files = dedupe_keep_order(
-                    file_path
-                    for hit_file in hit_files
-                    for file_path in [hit_file, *self.companion_files(hit_file)]
-                )
             candidates = self._admit_files(reference, structure, hit_files)
             if candidates:
                 return self._unique_entity(reference, candidates)
@@ -1052,13 +1165,9 @@ class SourceExpansionResolver:
             direct_files = [
                 file_path
                 for candidate_owner in owners
-                for declared_file in sorted(
+                for file_path in sorted(
                     structure.class_files.get(candidate_owner, ())
                 )
-                for file_path in [
-                    declared_file,
-                    *self.companion_files(declared_file),
-                ]
             ]
             hits = self.profiler.search_related_source_files(
                 [f"{candidate_owner}::" for candidate_owner in owners],
@@ -1080,15 +1189,11 @@ class SourceExpansionResolver:
         direct_files = [
             candidate
             for item in declarations
-            for declared_file in [str(item.get("file") or "")]
-            if declared_file
-            for candidate in [
-                declared_file,
-                *self.companion_files(declared_file),
-            ]
+            for candidate in [str(item.get("file") or "")]
+            if candidate
         ]
         if not direct_files and identity.file:
-            direct_files = [identity.file, *self.companion_files(identity.file)]
+            direct_files = [identity.file]
         internal = bool(
             (declaration and declaration.get("linkage") == "internal")
             or identity.declaration_id.startswith("global:internal:")
@@ -1137,11 +1242,7 @@ class SourceExpansionResolver:
                 *(
                     file_path
                     for owner in owners
-                    for declared_file in sorted(structure.class_files.get(owner, ()))
-                    for file_path in [
-                        declared_file,
-                        *self.companion_files(declared_file),
-                    ]
+                    for file_path in sorted(structure.class_files.get(owner, ()))
                 ),
             ]
         )

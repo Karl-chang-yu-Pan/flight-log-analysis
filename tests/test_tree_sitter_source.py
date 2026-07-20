@@ -964,7 +964,7 @@ void Control::run(float input, float alternate, float yaw)
     assert ("yaw", "get_triplet().current.yaw") in writes
 
 
-def test_companion_declaration_defaults_and_call_comments_are_structural(tmp_path):
+def test_included_declaration_defaults_and_call_comments_are_structural(tmp_path):
     root = tmp_path / "PX4-Autopilot"
     source_file = root / "src" / "modules" / "example" / "control.cpp"
     header_file = source_file.with_suffix(".hpp")
@@ -981,6 +981,8 @@ public:
     )
     source_file.write_text(
         """
+#include "control.hpp"
+
 float Control::adapt(float value, bool enabled)
 {
     return enabled ? value * 2.0f : value;
