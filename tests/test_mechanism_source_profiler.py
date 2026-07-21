@@ -2027,6 +2027,42 @@ def test_define_macros_extracted_as_source_assignments(tmp_path, source_backend)
     assert "MAX_MACRO" not in by_target
 
 
+def test_source_defined_parameter_member_macro_is_backend_interchangeable(
+    tmp_path, source_backend
+):
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "framework.h").write_text(
+        "#define DECLARE_FIELDS(...) MAP_FIELDS(__VA_ARGS__)\n",
+        encoding="utf-8",
+    )
+    (module_dir / "settings.hpp").write_text(
+        """#include "framework.h"
+class Settings {
+    DECLARE_FIELDS(
+        (ParamFloat<px4::params::FIRST_VALUE>) first_value,
+        (ParamInt<px4::params::SECOND_VALUE>) second_value
+    )
+};
+""",
+        encoding="utf-8",
+    )
+    profiler = _SourceExtractorContract(source_path, source_backend)
+
+    parameters = profiler.extract_params_from_source(
+        ["src/modules/example/settings.hpp"]
+    )
+
+    aliases = {
+        item.member: item.name
+        for item in parameters
+        if item.member and item.name
+    }
+    assert aliases["first_value"] == "FIRST_VALUE"
+    assert aliases["second_value"] == "SECOND_VALUE"
+
+
 def test_pointer_output_writes_populate_helper_expression_ref(
     tmp_path, source_backend
 ):

@@ -1187,6 +1187,138 @@ void fill(float value, output_s &out, float &direct)
     ]
 
 
+def test_source_defined_attribute_macro_is_projected_without_moving_sites(
+    tmp_path,
+):
+    root = tmp_path / "PX4-Autopilot"
+    module = root / "src" / "modules" / "example"
+    module.mkdir(parents=True)
+    (module / "attributes.h").write_text(
+        '#define PUBLIC_ENTRY __attribute__((visibility("default")))\n',
+        encoding="utf-8",
+    )
+    source = """#include "attributes.h"
+extern "C" PUBLIC_ENTRY int example_main(int input)
+{
+    output = input;
+    return output;
+}
+"""
+    (module / "example.cpp").write_text(source, encoding="utf-8")
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+
+    facts = extract_facts_for_file(
+        profiler,
+        "src/modules/example/example.cpp",
+        "source-hash",
+    )
+
+    assert facts.parse_diagnostics == {"has_error": False, "error_nodes": []}
+    assert any(item.name == "example_main" for item in facts.callables)
+    assignment = next(
+        item for item in facts.source_assignments if item.target == "output"
+    )
+    assert assignment.line == 4
+    assert f":{source.encode().index(b'output')}:" in str(
+        assignment.source_site_id
+    )
+
+
+def test_source_defined_declaration_macro_projects_parameter_members(tmp_path):
+    root = tmp_path / "PX4-Autopilot"
+    module = root / "src" / "modules" / "example"
+    module.mkdir(parents=True)
+    (module / "members.h").write_text(
+        "#define DECLARE_GROUP(...) FOR_EACH_FIELD(__VA_ARGS__)\n",
+        encoding="utf-8",
+    )
+    (module / "example.cpp").write_text(
+        """#include "members.h"
+class Controller {
+    DECLARE_GROUP(
+        (ParamFloat<px4::params::GAIN_VALUE>) gain_value,
+        // Comments inside the invocation are parser trivia, not arguments.
+        (ParamInt<px4::params::SELECT_MODE>) select_mode
+    )
+};
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+
+    facts = extract_facts_for_file(
+        profiler,
+        "src/modules/example/example.cpp",
+        "source-hash",
+    )
+
+    assert facts.parse_diagnostics == {"has_error": False, "error_nodes": []}
+    assert {(item.owner, item.name) for item in facts.members} >= {
+        ("Controller", "gain_value"),
+        ("Controller", "select_mode"),
+    }
+    assert {(item.name, item.member) for item in facts.referenced_parameters} >= {
+        ("GAIN_VALUE", "gain_value"),
+        ("SELECT_MODE", "select_mode"),
+    }
+
+
+def test_undefined_declaration_shaped_macro_remains_a_parse_error(tmp_path):
+    facts = _facts(
+        tmp_path,
+        """
+class Controller {
+    UNKNOWN_GROUP((SomeType) value)
+};
+""",
+    )
+
+    assert facts.parse_diagnostics["has_error"] is True
+    assert facts.parse_diagnostics["error_nodes"]
+
+
+def test_macro_that_discards_declaration_arguments_remains_a_parse_error(
+    tmp_path,
+):
+    root = tmp_path / "PX4-Autopilot"
+    module = root / "src" / "modules" / "example"
+    module.mkdir(parents=True)
+    (module / "macros.h").write_text(
+        "#define IGNORE_GROUP(...) unrelated_token\n",
+        encoding="utf-8",
+    )
+    (module / "example.cpp").write_text(
+        """#include "macros.h"
+class Controller {
+    IGNORE_GROUP((SomeType) value)
+};
+""",
+        encoding="utf-8",
+    )
+    profiler = MechanismSourceProfiler(
+        root,
+        rg_path="missing-rg",
+        source_parser_backend="tree_sitter",
+    )
+
+    facts = extract_facts_for_file(
+        profiler,
+        "src/modules/example/example.cpp",
+        "source-hash",
+    )
+
+    assert facts.parse_diagnostics["has_error"] is True
+    assert facts.parse_diagnostics["error_nodes"]
+
+
 def test_parse_errors_are_reported_without_legacy_fallback(tmp_path):
     facts = _facts(
         tmp_path,

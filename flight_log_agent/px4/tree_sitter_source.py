@@ -20,6 +20,11 @@ from flight_log_agent.expression_math import (
     canonical_math_function_name,
     is_safe_math_function_name,
 )
+from flight_log_agent.px4.cpp_macro_projection import (
+    CppMacroProjector,
+    MacroDefinition,
+    extract_macro_definitions,
+)
 from flight_log_agent.px4.mechanism_source_profiler import (
     BranchConditionRef,
     FieldRef,
@@ -520,6 +525,12 @@ class TreeSitterSourceExtractor:
     def __init__(self, profiler: MechanismSourceProfiler) -> None:
         self.profiler = profiler
         self.parser = Parser(_CPP_LANGUAGE)
+        self._macro_definition_cache: dict[
+            str, tuple[MacroDefinition, ...]
+        ] = {}
+        self._macro_projector = CppMacroProjector(
+            self.parser, self._macro_definitions
+        )
         self._units: dict[str, Optional[_ParsedUnit]] = {}
         self._fully_structured_units: set[str] = set()
 
@@ -751,7 +762,7 @@ class TreeSitterSourceExtractor:
         unit = _ParsedUnit(
             file=file,
             source=source,
-            tree=self.parser.parse(source),
+            tree=self._macro_projector.project(source).tree,
         )
         self._extract_structure(
             unit,
@@ -900,7 +911,9 @@ class TreeSitterSourceExtractor:
                 return None
             source = text.encode("utf-8")
             unit = _ParsedUnit(
-                file=file, source=source, tree=self.parser.parse(source)
+                file=file,
+                source=source,
+                tree=self._macro_projector.project(source).tree,
             )
             self._units[file] = unit
             self._extract_structure(
@@ -920,6 +933,29 @@ class TreeSitterSourceExtractor:
             self._extract_structure(unit, path, include_lambdas=True)
             self._fully_structured_units.add(file)
         return unit
+
+    def _macro_definitions(self, name: str) -> tuple[MacroDefinition, ...]:
+        cached = self._macro_definition_cache.get(name)
+        if cached is not None:
+            return cached
+        definition_line = re.compile(
+            rf"^[ \t]*#[ \t]*define[ \t]+{re.escape(name)}(?=[ \t(]|$)"
+        )
+        files = {
+            match.file
+            for match in self.profiler._ripgrep_or_python_search(name)
+            if definition_line.match(match.text)
+        }
+        definitions: list[MacroDefinition] = []
+        for file in sorted(files):
+            try:
+                text = self.profiler.source.read_text(file, errors="ignore")
+            except Exception:
+                continue
+            definitions.extend(extract_macro_definitions(text, name))
+        unique = tuple(dict.fromkeys(definitions))
+        self._macro_definition_cache[name] = unique
+        return unique
 
     def _extract_structure(
         self,
