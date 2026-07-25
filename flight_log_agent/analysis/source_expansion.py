@@ -1120,6 +1120,17 @@ class SourceExpansionResolver:
             candidates = self._admit_files(reference, structure, direct_files)
             if candidates:
                 return self._unique_entity(reference, candidates)
+            _dispatch, bare, _owners = callable_dispatch_context(
+                reference, structure
+            )
+            definition_files = self.profiler.search_callable_definition_files(
+                bare
+            )
+            candidates = self._admit_files(
+                reference, structure, definition_files
+            )
+            if candidates:
+                return self._unique_entity(reference, candidates)
             query_groups = self._callable_query_groups(reference, structure)
         else:
             queries = self._queries(reference)

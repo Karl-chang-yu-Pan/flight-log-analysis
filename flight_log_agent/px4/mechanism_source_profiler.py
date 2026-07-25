@@ -2720,6 +2720,56 @@ class MechanismSourceProfiler:
             }
         )
 
+    def search_callable_definition_files(self, name: str) -> List[str]:
+        """Files where ``name`` begins a definition declarator.
+
+        A callable definition starts a declarator at file or class scope: the
+        name follows a return type at column zero (``Type name(`` or
+        ``Type Class::name(``). Call sites place the name in a value position
+        (after ``.``, ``->``, ``=``, ``(``, ``return``, operators) and sit
+        indented inside a function body. Anchoring to the declarator returns the
+        few files that define the callable instead of every file that calls it,
+        so ``_admit_files`` parses definitions rather than call sites. The
+        anchor never widens the result beyond real definitions, so an empty
+        result falls through to the unanchored bare-name search that keeps
+        completeness for unusual formatting.
+        """
+        pattern = rf"^[A-Za-z_][A-Za-z0-9_:<>,&*\t ]*\b{re.escape(name)}[\t ]*\("
+        local_root = getattr(self.source, "root", None)
+        if local_root is None:
+            return []
+        command = [
+            self.rg_path,
+            "--files-with-matches",
+            "--color=never",
+        ]
+        for source_glob in self.SOURCE_GLOBS:
+            command.extend(["--glob", source_glob])
+        for excluded in self.excludes:
+            command.extend(["--glob", f"!{excluded.rstrip('/')}/*"])
+            command.extend(["--glob", f"!{excluded.rstrip('/')}*/**"])
+        command.extend(["--regexp", pattern, "--", "."])
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=Path(local_root),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            return []
+        if completed.returncode not in {0, 1}:
+            return []
+        files = [
+            line.removeprefix("./")
+            for line in completed.stdout.splitlines()
+            if line
+        ]
+        # ripgrep's parallel walker does not order its output; sort so
+        # downstream admission is deterministic across runs.
+        return sorted(file for file in files if not self._is_excluded(file))
+
     def _python_search(self, query: str) -> List[SourceMatch]:
         matches: List[SourceMatch] = []
         query_l = query.lower()
