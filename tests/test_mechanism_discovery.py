@@ -504,6 +504,111 @@ class Reader {
     )
 
 
+def test_c_api_copy_field_grounds_branch_and_feasibility(
+    tmp_path, source_backend
+):
+    """A copied field used only by a branch remains flight-grounded."""
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/reader.cpp": """
+struct topic_a_s { float value; };
+
+class Reader {
+    int _subscription{};
+    float output{};
+
+    void Run()
+    {
+        topic_a_s sample{};
+        orb_copy(ORB_ID(topic_a), _subscription, &sample);
+
+        if (sample.value > 0.5f) {
+            output = 1.0f;
+        }
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(
+            profiler,
+            tmp_path / "cache",
+            ["src/modules/example/reader.cpp"],
+            "hash",
+        )
+    )
+
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/example/reader.cpp",
+        logged_signals={"topic_a.value"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+
+    branch = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "branch"
+        and "sample.value" in str(vertex.predicate_raw or "")
+    )
+    logged = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "evidence"
+        and vertex.sub_kind == "logged_signal"
+        and vertex.signal_name == "topic_a.value"
+    )
+    transfer = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and vertex.variable == "sample.value"
+        and (vertex.metadata or {}).get("synthetic_boundary_transfer")
+    )
+    assert any(
+        edge.source_id == logged.id and edge.target_id == transfer.id
+        for edge in dag.edges
+    )
+    assert any(
+        edge.source_id == transfer.id and edge.target_id == branch.id
+        for edge in dag.edges
+    )
+    assert not any(
+        vertex.kind == "evidence"
+        and vertex.sub_kind == "opaque_symbol"
+        and vertex.signal_name == "sample.value"
+        for vertex in dag.vertices
+    )
+
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples={
+            "topic_a.value": [(0.0, 0.0), (10.0, 1.0), (20.0, 0.0)]
+        },
+        signal_policies={"topic_a.value": {"method": "discrete_hold"}},
+        prune_dead=False,
+    )
+    evaluated_branch = next(
+        vertex for vertex in annotated.vertices if vertex.id == branch.id
+    )
+    assert evaluated_branch.feasibility_verdict == "unknown"
+    if source_backend == "legacy":
+        assert evaluated_branch.active_windows == []
+        assert evaluated_branch.metadata["static_evaluation"] == {
+            "status": "unresolved",
+            "reason": "source expression dependencies are not parser-exact",
+        }
+        return
+    assert evaluated_branch.active_windows == [(10.0, 20.0)]
+
+
 def test_conditional_publication_operations_remain_explicit(tmp_path):
     profiler = _mini_tree(
         tmp_path,
