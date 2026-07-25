@@ -2662,6 +2662,64 @@ class MechanismSourceProfiler:
             if not self._is_excluded(match.file)
         ]
 
+    def search_macro_definition_files(self, name: str) -> List[str]:
+        """Files that contain a ``#define name`` line.
+
+        The match is anchored to the definition (``^\\s*#\\s*define name``), so
+        the search returns only definition sites instead of every occurrence of
+        the token. A bare-name search returns thousands of use sites for common
+        identifiers, and materialising and caching those matches dominates
+        macro projection cost; the definition anchor keeps it to the few files
+        that actually declare the macro.
+        """
+        pattern = rf"^[ \t]*#[ \t]*define[ \t]+{re.escape(name)}\b"
+        local_root = getattr(self.source, "root", None)
+        if local_root is not None:
+            command = [
+                self.rg_path,
+                "--files-with-matches",
+                "--color=never",
+            ]
+            for source_glob in self.SOURCE_GLOBS:
+                command.extend(["--glob", source_glob])
+            for excluded in self.excludes:
+                command.extend(["--glob", f"!{excluded.rstrip('/')}/*"])
+                command.extend(["--glob", f"!{excluded.rstrip('/')}*/**"])
+            command.extend(["--regexp", pattern, "--", "."])
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=Path(local_root),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                completed = None
+            if completed is not None and completed.returncode in {0, 1}:
+                files = [
+                    line.removeprefix("./")
+                    for line in completed.stdout.splitlines()
+                    if line
+                ]
+                # ripgrep's parallel walker does not order its output; sort so
+                # downstream admission is deterministic across runs.
+                return sorted(
+                    file for file in files if not self._is_excluded(file)
+                )
+        # Fallback (no local ripgrep root): filter a bare-name search to the
+        # anchored definition lines, preserving the original result set.
+        definition_line = re.compile(
+            rf"^[ \t]*#[ \t]*define[ \t]+{re.escape(name)}(?=[ \t(]|$)"
+        )
+        return sorted(
+            {
+                match.file
+                for match in self._ripgrep_or_python_search(name)
+                if definition_line.match(match.text)
+            }
+        )
+
     def _python_search(self, query: str) -> List[SourceMatch]:
         matches: List[SourceMatch] = []
         query_l = query.lower()

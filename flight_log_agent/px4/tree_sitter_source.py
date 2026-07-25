@@ -938,14 +938,7 @@ class TreeSitterSourceExtractor:
         cached = self._macro_definition_cache.get(name)
         if cached is not None:
             return cached
-        definition_line = re.compile(
-            rf"^[ \t]*#[ \t]*define[ \t]+{re.escape(name)}(?=[ \t(]|$)"
-        )
-        files = {
-            match.file
-            for match in self.profiler._ripgrep_or_python_search(name)
-            if definition_line.match(match.text)
-        }
+        files = self.profiler.search_macro_definition_files(name)
         definitions: list[MacroDefinition] = []
         for file in sorted(files):
             try:
