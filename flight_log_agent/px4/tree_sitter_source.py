@@ -115,6 +115,9 @@ class _ParsedUnit:
     declarations: list[SourceDeclarationRef] = field(default_factory=list)
     class_ranges: list[tuple[int, int, str]] = field(default_factory=list)
     namespace_ranges: list[tuple[int, int, str]] = field(default_factory=list)
+    _param_declarations: Optional[
+        list[tuple[str, Optional[str], Optional[str], Node]]
+    ] = field(default=None, compare=False, repr=False)
 
     def text(self, node: Optional[Node]) -> str:
         if node is None:
@@ -1822,6 +1825,11 @@ class TreeSitterSourceExtractor:
     def _parameter_declarations(
         self, unit: _ParsedUnit
     ) -> list[tuple[str, Optional[str], Optional[str], Node]]:
+        # Parameter declarations are a property of the unit's tree, but
+        # admission builds a fresh extraction state per callable; memoize per
+        # unit so a large file's whole AST is not re-walked once per method.
+        if unit._param_declarations is not None:
+            return unit._param_declarations
         templates = [
             node
             for node in _walk(unit.tree.root_node)
@@ -1857,6 +1865,7 @@ class TreeSitterSourceExtractor:
             ]
             member = unit.text(min(identifiers, key=lambda item: item.start_byte)).strip() if identifiers else None
             refs.append((parameter, member, unit.class_owner(template), template))
+        unit._param_declarations = refs
         return refs
 
     def _extract_callable(
