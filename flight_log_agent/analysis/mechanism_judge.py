@@ -20,7 +20,16 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, Optional, Sequence, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Iterable,
+    Literal,
+    Optional,
+    Sequence,
+    Union,
+)
 
 from agents import Agent
 from pydantic import BaseModel, Field
@@ -59,14 +68,80 @@ def _capped(items: list[Any], cap: int) -> list[Any]:
     return items[:cap] + [f"… +{len(items) - cap} more"]
 
 
+def _render_site_key(vertex: Any) -> tuple[Any, ...]:
+    """Identity of the SOURCE SITE a vertex stands for.
+
+    The DAG keeps one vertex per call instance, so a single source site becomes
+    many vertices (a helper body is instantiated per call site). The judge
+    reasons about source mechanism, not call instances, and must name one
+    stable branch id — so the rendering projects instances onto their site.
+    Deliberately excludes the per-instance scope that distinguishes them.
+    """
+    if vertex.kind == "operation":
+        return (
+            "op",
+            str(vertex.file or ""),
+            int(vertex.line or 0),
+            str(vertex.variable or ""),
+            str(vertex.expression or ""),
+        )
+    if vertex.kind == "branch":
+        predicate = str(vertex.predicate_raw or vertex.predicate_lowered or "")
+        return (
+            "br",
+            str(vertex.file or ""),
+            int(vertex.line or 0),
+            " ".join(predicate.split()),
+        )
+    return ("ev", str(vertex.sub_kind or ""), str(vertex.signal_name or ""))
+
+
+def _merge_windows(
+    windows: Iterable[Sequence[float]],
+) -> list[list[float]]:
+    """Union of active intervals across the instances of one source site."""
+    ordered = sorted(
+        (float(window[0]), float(window[1]))
+        for window in windows
+        if window is not None and len(tuple(window)) == 2
+    )
+    merged: list[list[float]] = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def _join_verdicts(verdicts: Sequence[str]) -> str:
+    """Feasibility of a source site across its instances.
+
+    Dead only when EVERY instance is dead, always-true only when every instance
+    is — otherwise the site fired on some path and stays ``unknown``. This keeps
+    the report's cross-check honest: a site is never presented as dead while one
+    of its instances was alive.
+    """
+    present = {str(value or "unknown") for value in verdicts} or {"unknown"}
+    if present == {"always_false"}:
+        return "always_false"
+    if present == {"always_true"}:
+        return "always_true"
+    return "unknown"
+
+
 def render_discovery_compact(
     result: DiscoveryResult,
     *,
     dag: Optional[Any] = None,
-    max_operations: int = 400,
-    max_branches: int = 400,
-    max_evidence: int = 400,
-    max_unresolved: int = 400,
+    # Site grouping makes the rendering the size of the mechanism, so these
+    # valves no longer fire on a real slice (a measured real-source mechanism
+    # renders ~440 operation sites). They stay as a guard against a
+    # pathological graph, well above any legitimate slice.
+    max_operations: int = 4000,
+    max_branches: int = 4000,
+    max_evidence: int = 4000,
+    max_unresolved: int = 4000,
 ) -> dict[str, Any]:
     """JSON-able compact view of one discovery result.
 
@@ -81,9 +156,81 @@ def render_discovery_compact(
     not curation — the judge must see the whole slice (a starved render
     measurably produced wrong-shaped verdicts). Truncation is always
     marked with an explicit ``… +N more`` tail.
+
+    Two projections keep the rendering the size of the MECHANISM rather than
+    of the traversal, without dropping anything the judge is asked to name:
+
+    * vertices are grouped by SOURCE SITE (:func:`_render_site_key`) — the DAG
+      instantiates a helper body once per call site, so one source branch
+      otherwise arrives as many ids and the judge cannot name "the" explaining
+      branch. Each entry keeps a real DAG vertex id (so the report's
+      cross-check still resolves it) and lists its sibling ``instances``.
+    * adjacency is serialized once, in the direction the judge reasons
+      (``inputs``/``controls``); the forward ``feeds`` of an operation is the
+      exact inverse of its consumers' ``inputs`` and is therefore redundant.
+
+    The DAG itself keeps full per-instance fidelity — this is a projection for
+    the judge, not a change to the graph the value engine evaluates.
     """
     dag = dag if dag is not None else result.dag
     validation = getattr(result, "terminal_validation", None)
+    scoped = {vertex.id for vertex in dag.vertices} if dag is not None else set()
+    site_groups: dict[tuple[Any, ...], list[Any]] = {}
+    for vertex in dag.vertices if dag else []:
+        if vertex.id in scoped:
+            site_groups.setdefault(_render_site_key(vertex), []).append(vertex)
+    representative: dict[tuple[Any, ...], Any] = {}
+    for key, members in site_groups.items():
+        if key[0] == "br":
+            # A site is only dead when every instance is: prefer a live
+            # instance so the report's feasibility cross-check is not
+            # downgraded by an arbitrary dead sibling.
+            representative[key] = min(
+                members,
+                key=lambda item: (
+                    item.feasibility_verdict == "always_false",
+                    -len(item.active_windows or ()),
+                    item.id,
+                ),
+            )
+        else:
+            representative[key] = min(members, key=lambda item: item.id)
+    rep_id: dict[str, str] = {}
+    for key, members in site_groups.items():
+        for member in members:
+            rep_id[member.id] = representative[key].id
+    rendered_ids = {vertex.id for vertex in representative.values()}
+
+    # Branch ids stay the real DAG ids: the judge copies them into
+    # explaining_branches and the report resolves them against the graph.
+    # Operations and evidence are referenced only from adjacency, so they carry
+    # short render-local ids — the same graph, a cheaper spelling.
+    render_id: dict[str, str] = {}
+    operation_index = evidence_index = 0
+    for vertex in dag.vertices if dag else []:
+        if vertex.id not in rendered_ids:
+            continue
+        if vertex.kind == "branch":
+            render_id[vertex.id] = vertex.id
+        elif vertex.kind == "operation":
+            operation_index += 1
+            render_id[vertex.id] = f"o{operation_index}"
+        else:
+            evidence_index += 1
+            render_id[vertex.id] = f"e{evidence_index}"
+
+    def _ref(vertex_id: str) -> str:
+        target = rep_id.get(vertex_id, vertex_id)
+        return render_id.get(target, target)
+
+    def _instances(key: tuple[Any, ...]) -> dict[str, Any]:
+        members = site_groups.get(key, [])
+        if len(members) <= 1:
+            return {}
+        # The count discloses that the site is instantiated per call site; the
+        # instance ids themselves are recoverable from the graph by site and are
+        # never named by the judge.
+        return {"instances": len(members)}
     operations: list[dict[str, Any]] = []
     branches: list[dict[str, Any]] = []
     helper_returns: list[str] = []
@@ -92,38 +239,52 @@ def render_discovery_compact(
     incoming_data: dict[str, list[dict[str, str]]] = {}
     incoming_controls: dict[str, list[str]] = {}
     incoming_selections: dict[str, list[str]] = {}
-    outgoing: dict[str, list[str]] = {}
     control_outgoing: dict[str, list[str]] = {}
     selection_outgoing: dict[str, list[str]] = {}
+    seen_edges: set[tuple[str, str, str, str]] = set()
     for edge in dag.edges if dag else []:
-        outgoing.setdefault(edge.source_id, []).append(edge.target_id)
+        if edge.source_id not in rep_id or edge.target_id not in rep_id:
+            continue
+        source = _ref(edge.source_id)
+        target = _ref(edge.target_id)
+        role = str(edge.role or "")
+        signature = (source, target, edge.kind, role)
+        if signature in seen_edges:
+            continue
+        seen_edges.add(signature)
         if edge.kind == "data":
-            incoming_data.setdefault(edge.target_id, []).append(
-                {
-                    "source_id": edge.source_id,
-                    "role": str(edge.role or ""),
-                }
+            incoming_data.setdefault(target, []).append(
+                {"source_id": source, "role": role}
             )
         elif edge.kind == "control":
-            incoming_controls.setdefault(edge.target_id, []).append(edge.source_id)
-            control_outgoing.setdefault(edge.source_id, []).append(edge.target_id)
+            incoming_controls.setdefault(target, []).append(source)
+            control_outgoing.setdefault(source, []).append(target)
         elif edge.kind == "selection":
-            incoming_selections.setdefault(edge.target_id, []).append(edge.source_id)
-            selection_outgoing.setdefault(edge.source_id, []).append(edge.target_id)
+            incoming_selections.setdefault(target, []).append(source)
+            selection_outgoing.setdefault(source, []).append(target)
 
     for vertex in dag.vertices if dag else []:
+        if vertex.id not in rendered_ids:
+            continue
         if vertex.kind == "operation":
+            local_id = render_id[vertex.id]
             entry = {
-                "id": vertex.id,
+                "id": local_id,
                 "target": str(vertex.variable or ""),
                 "expression": _truncate(vertex.expression or ""),
                 "file": vertex.file,
                 "line": vertex.line,
-                "inputs": incoming_data.get(vertex.id, []),
-                "controls": incoming_controls.get(vertex.id, []),
-                "value_selectors": incoming_selections.get(vertex.id, []),
-                "feeds": sorted(set(outgoing.get(vertex.id, []))),
-                "reachability": (vertex.metadata or {}).get("reachability"),
+                "inputs": incoming_data.get(local_id, []),
+                "controls": incoming_controls.get(local_id, []),
+                "value_selectors": incoming_selections.get(local_id, []),
+                # Only whether the write's reachability is fully known; the
+                # gating predicates themselves are the `controls` edges.
+                "reachability_exact": bool(
+                    ((vertex.metadata or {}).get("reachability") or {}).get(
+                        "exact", False
+                    )
+                ),
+                **_instances(_render_site_key(vertex)),
             }
             if vertex.provenance and vertex.provenance.startswith("helper_return"):
                 helper_returns.append(str(vertex.variable))
@@ -135,18 +296,30 @@ def render_discovery_compact(
             operations.append(entry)
         elif vertex.kind == "branch":
             predicate = vertex.predicate_lowered or vertex.predicate_raw or ""
+            site_key = _render_site_key(vertex)
+            members = site_groups.get(site_key, [vertex])
             branches.append(
                 {
                     "id": vertex.id,
                     "predicate": _truncate(predicate),
-                    "feasibility": vertex.feasibility_verdict or "unknown",
-                    "active_windows": [list(window) for window in vertex.active_windows],
+                    # Aggregated over the site's instances: dead only when every
+                    # instance is dead, windows are the union of when any
+                    # instance was active.
+                    "feasibility": _join_verdicts(
+                        [item.feasibility_verdict for item in members]
+                    ),
+                    "active_windows": _merge_windows(
+                        window
+                        for item in members
+                        for window in (item.active_windows or ())
+                    ),
                     "evaluation_domain": (vertex.metadata or {}).get("evaluation_domain"),
                     "gates": sorted(set(control_outgoing.get(vertex.id, []))),
                     "selects_values_for": sorted(
                         set(selection_outgoing.get(vertex.id, []))
                     ),
                     "inputs": incoming_data.get(vertex.id, []),
+                    **_instances(site_key),
                 }
             )
         elif vertex.kind == "evidence":
@@ -154,12 +327,12 @@ def render_discovery_compact(
             metadata = vertex.metadata or {}
             evidence.setdefault(kind, []).append(
                 {
-                    "id": vertex.id,
+                    "id": render_id[vertex.id],
                     "signal": str(vertex.signal_name or ""),
                     "value": metadata.get("value"),
                     "observation": metadata.get("observation"),
                     "boundary": metadata.get("boundary"),
-                    "feeds": sorted(set(outgoing.get(vertex.id, []))),
+                    **_instances(_render_site_key(vertex)),
                 }
             )
 
