@@ -130,14 +130,45 @@ def _join_verdicts(verdicts: Sequence[str]) -> str:
     return "unknown"
 
 
+def _terminal_scoped_ids(dag: Any) -> set[str]:
+    """Vertices on a backward path from a terminal write.
+
+    A vertex that cannot reach the terminal cannot explain it, so it is not
+    part of the mechanism the judge is asked to judge. Falls back to the whole
+    graph when no terminal write is marked, so nothing is ever hidden by a
+    missing annotation.
+    """
+    vertex_ids = {vertex.id for vertex in dag.vertices}
+    terminals = {
+        vertex.id
+        for vertex in dag.vertices
+        if vertex.kind == "operation"
+        and bool((vertex.metadata or {}).get("is_terminal"))
+    }
+    if not terminals:
+        return vertex_ids
+    incoming: dict[str, list[str]] = {}
+    for edge in dag.edges:
+        incoming.setdefault(edge.target_id, []).append(edge.source_id)
+    reached = set(terminals)
+    pending = list(terminals)
+    while pending:
+        current = pending.pop()
+        for source in incoming.get(current, ()):
+            if source not in reached and source in vertex_ids:
+                reached.add(source)
+                pending.append(source)
+    return reached
+
+
 def render_discovery_compact(
     result: DiscoveryResult,
     *,
     dag: Optional[Any] = None,
-    # Site grouping makes the rendering the size of the mechanism, so these
-    # valves no longer fire on a real slice (a measured real-source mechanism
-    # renders ~440 operation sites). They stay as a guard against a
-    # pathological graph, well above any legitimate slice.
+    # Site grouping and terminal scoping make the rendering the size of the
+    # mechanism, so these valves no longer fire on a real slice (a measured
+    # real-source mechanism renders ~440 operation sites). They stay as a guard
+    # against a pathological graph, well above any legitimate slice.
     max_operations: int = 4000,
     max_branches: int = 4000,
     max_evidence: int = 4000,
@@ -157,7 +188,7 @@ def render_discovery_compact(
     measurably produced wrong-shaped verdicts). Truncation is always
     marked with an explicit ``… +N more`` tail.
 
-    Two projections keep the rendering the size of the MECHANISM rather than
+    Three projections keep the rendering the size of the MECHANISM rather than
     of the traversal, without dropping anything the judge is asked to name:
 
     * vertices are grouped by SOURCE SITE (:func:`_render_site_key`) — the DAG
@@ -165,6 +196,11 @@ def render_discovery_compact(
       otherwise arrives as many ids and the judge cannot name "the" explaining
       branch. Each entry keeps a real DAG vertex id (so the report's
       cross-check still resolves it) and lists its sibling ``instances``.
+    * only vertices on a backward path from a terminal write are rendered — a
+      vertex that cannot reach the terminal cannot explain it; such writes stay
+      visible as identity only under
+      ``other_writes_not_reaching_terminal`` so a replacement terminal can
+      still be proposed.
     * adjacency is serialized once, in the direction the judge reasons
       (``inputs``/``controls``); the forward ``feeds`` of an operation is the
       exact inverse of its consumers' ``inputs`` and is therefore redundant.
@@ -174,7 +210,7 @@ def render_discovery_compact(
     """
     dag = dag if dag is not None else result.dag
     validation = getattr(result, "terminal_validation", None)
-    scoped = {vertex.id for vertex in dag.vertices} if dag is not None else set()
+    scoped = _terminal_scoped_ids(dag) if dag is not None else set()
     site_groups: dict[tuple[Any, ...], list[Any]] = {}
     for vertex in dag.vertices if dag else []:
         if vertex.id in scoped:
@@ -336,6 +372,29 @@ def render_discovery_compact(
                 }
             )
 
+    # A write that cannot reach the terminal is not part of THIS mechanism, but
+    # the judge may still need it to propose a replacement terminal. Keep those
+    # writes visible as identity only — no adjacency, since their connectivity
+    # is not what is being judged.
+    off_mechanism: list[dict[str, Any]] = []
+    seen_off: set[tuple[Any, ...]] = set()
+    for vertex in dag.vertices if dag else []:
+        if vertex.kind != "operation" or vertex.id in scoped:
+            continue
+        key = _render_site_key(vertex)
+        if key in seen_off:
+            continue
+        seen_off.add(key)
+        off_mechanism.append(
+            {
+                "target": str(vertex.variable or ""),
+                "expression": _truncate(vertex.expression or "", 120),
+                "file": vertex.file,
+                "line": vertex.line,
+                "reaches_terminal": False,
+            }
+        )
+
     return {
         "terminal": dag.terminal if dag else None,
         **(
@@ -351,6 +410,9 @@ def render_discovery_compact(
         "vertices": len(dag.vertices) if dag else 0,
         "edges": len(dag.edges) if dag else 0,
         "operations": _capped(operations, max_operations),
+        "other_writes_not_reaching_terminal": _capped(
+            off_mechanism, max_operations
+        ),
         "branches": _capped(branches, max_branches),
         "helper_subgraphs": sorted(set(helper_returns)),
         # Call heads in operation expressions with no expanded subgraph —
