@@ -1018,7 +1018,7 @@ def build_report_from_dag(
                     + str(replay.get("observed"))
                     + ": "
                     + "; ".join(
-                        f"{r.get('grounded', '')[:60]} match={r.get('match_fraction')}"
+                        f"{str(r.get('grounded') or '')[:60]} match={r.get('match_fraction')}"
                         for r in replay.get("results", [])
                         if r.get("evaluable")
                     )
