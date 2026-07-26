@@ -1,4 +1,5 @@
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
@@ -98,6 +99,12 @@ def test_analysis_event_message_maps_run_progress_events():
         "event": "agent.final_report.retrying",
     })["message"] == "Retrying writing final report"
     assert analysis_event_message({
+        "event": "agent.shell_analysis.started",
+    })["message"] == "Analyzing log and source"
+    assert analysis_event_message({
+        "event": "agent.shell_analysis.finished",
+    })["message"] == "Analyzed log and source"
+    assert analysis_event_message({
         "event": "source.started",
         "name": "bounded_source_search",
     })["message"] == "Searching PX4 source"
@@ -148,6 +155,105 @@ def test_build_analysis_progress_uses_latest_progress_message():
         "Normalizing question intent",
         "Searching PX4 source",
     ]
+
+
+def test_analysis_job_uses_shell_analyzer_and_preserves_run_contract(
+    tmp_path,
+    monkeypatch,
+):
+    import flight_log_agent.analysis.analyzer as shell_analyzer
+
+    run_id = "shell_web_run"
+    output_dir = tmp_path / "outputs" / f"web_{run_id}"
+    report = {
+        "airframe_summary": "unknown",
+        "question_intent_summary": "question",
+        "ranked_hypotheses": [],
+        "excluded_mechanisms": [],
+        "confirmed": [],
+        "unconfirmed": [],
+        "final_summary": "done",
+    }
+    captured = {}
+
+    async def fake_analyze_flight_log(**kwargs):
+        captured.update(kwargs)
+        return report
+
+    monkeypatch.setattr(shell_analyzer, "analyze_flight_log", fake_analyze_flight_log)
+    monkeypatch.setattr(web_app, "WEB_DEV_LOG_ROOT", tmp_path / "dev_logs")
+    with web_app.ANALYSIS_RUNS_LOCK:
+        web_app.ANALYSIS_RUNS[run_id] = {
+            "run_id": run_id,
+            "status": "queued",
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+            "traceback": None,
+            "log_path": str(tmp_path / "uploads" / "flight.ulg"),
+            "mission_path": None,
+            "source_path": str(tmp_path / "PX4-Autopilot"),
+            "output_dir": str(output_dir),
+            "report_path": str(output_dir / "report.json"),
+            "dev_log_dir": str(web_app.WEB_DEV_LOG_ROOT / run_id),
+            "report": None,
+        }
+
+    try:
+        web_app._run_analysis_job(run_id, "What happened?")
+        snapshot = web_app.analysis_run_snapshot(run_id)
+    finally:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS.pop(run_id, None)
+
+    assert snapshot["status"] == "completed"
+    assert snapshot["report"] == report
+    assert captured == {
+        "log_path": str(tmp_path / "uploads" / "flight.ulg"),
+        "user_question": "What happened?",
+        "mission_path": None,
+        "source_path": str(tmp_path / "PX4-Autopilot"),
+        "output_dir": str(output_dir),
+        "dev_log_root": str(web_app.WEB_DEV_LOG_ROOT),
+        "dev_run_id": run_id,
+    }
+
+
+def test_analysis_runs_keep_distinct_work_and_report_directories(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(web_app, "OUTPUT_ROOT", tmp_path / "outputs")
+    monkeypatch.setattr(web_app.threading, "Thread", FakeThread)
+    first = web_app.start_analysis_run({
+        "log_path": str(tmp_path / "uploads" / "upload_1" / "flight.ulg"),
+        "user_question": "First question",
+    })
+    second = web_app.start_analysis_run({
+        "log_path": str(tmp_path / "uploads" / "upload_1" / "flight.ulg"),
+        "user_question": "Second question",
+    })
+
+    try:
+        assert first["run_id"] != second["run_id"]
+        assert first["output_dir"] != second["output_dir"]
+        assert first["report_path"] == str(
+            Path(first["output_dir"]) / "report.json"
+        )
+        assert second["report_path"] == str(
+            Path(second["output_dir"]) / "report.json"
+        )
+    finally:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS.pop(first["run_id"], None)
+            web_app.ANALYSIS_RUNS.pop(second["run_id"], None)
 
 
 def test_resolve_artifact_path_allows_outputs_and_rejects_other_paths(tmp_path, monkeypatch):

@@ -778,6 +778,7 @@ def agent_progress_message(event_name: str) -> str | None:
         ("build_signature_", "Building log signature checks", "Built log signature checks"),
         ("final_report", "Writing final report", "Wrote final report"),
         ("repair_report", "Repairing report", "Repaired report"),
+        ("shell_analysis", "Analyzing log and source", "Analyzed log and source"),
     ]
     for prefix, started_message, finished_message in stage_messages:
         if stage == prefix or stage.startswith(prefix):
@@ -939,7 +940,7 @@ def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
 def _run_analysis_job(run_id: str, user_question: str) -> None:
     _update_analysis_run(run_id, status="running", started_at=time.time())
     try:
-        from runner import analyze_flight_log
+        from flight_log_agent.analysis.analyzer import analyze_flight_log
 
         with ANALYSIS_RUNS_LOCK:
             run = dict(ANALYSIS_RUNS[run_id])

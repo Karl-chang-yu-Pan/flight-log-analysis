@@ -1623,7 +1623,10 @@ def _sample_report(runner, candidate, applicability, plots=None):
     )
 
 
-def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
+def test_analyze_flight_log_runs_v3_mechanism_first_workflow(
+    tmp_path,
+    assert_analysis_engine_contract,
+):
     runner = load_runner(tmp_path)
     log_path = tmp_path / "flight.ulg"
     mission_path = tmp_path / "mission.plan"
@@ -1853,6 +1856,12 @@ def test_analyze_flight_log_runs_v3_mechanism_first_workflow(tmp_path):
     metadata = json.loads((run_dir / "metadata.json").read_text())
     assert metadata["runner_version"] == "v3_mechanism_first"
     assert metadata["report_path"] == str(output_dir / "report.json")
+    assert_analysis_engine_contract(
+        final_report,
+        output_dir,
+        dev_log_root,
+        "web_run_001",
+    )
 
 
 def test_signal_canonicalizer_requires_exact_binding_alias(tmp_path):
