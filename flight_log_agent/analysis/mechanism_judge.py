@@ -657,6 +657,55 @@ async def discover_with_judge(
                 valid += 1
         return valid
 
+    # The questioned quantity's LOGGED signal (topic.field) is the terminal
+    # that ties a mechanism to the observation. The seeder may anchor on
+    # decision-site internals and demote it, so force an observable terminal to
+    # the front of the candidate list for the judge.
+    if seeds.questioned_condition and seeds.questioned_condition.signal_hint:
+        hint = str(seeds.questioned_condition.signal_hint)
+        existing_keys = {
+            _candidate_key(candidate) for candidate in seeds.candidate_terminals
+        }
+        added: list[TerminalCandidate] = []
+        # Precise: a surveyed write that publishes the questioned signal.
+        for target_file, target in survey.published_writes_for(hint):
+            candidate = TerminalCandidate(
+                terminal=target.symbol,
+                terminal_file=target_file,
+                source_target_id=target.source_target_id,
+                reason="write that publishes the questioned logged signal",
+            )
+            key = _candidate_key(candidate)
+            if key not in existing_keys:
+                existing_keys.add(key)
+                added.append(candidate)
+        # Fallback: the logged signal itself, anchored to a module the seeder
+        # already targeted; discover_mechanism_dag resolves the write site.
+        if not added and "." in hint:
+            hint_files = [
+                candidate.terminal_file
+                for candidate in seeds.candidate_terminals
+                if candidate.terminal_file
+            ] or [
+                str(value)
+                for value in (intent.get("likely_source_files") or [])
+                if value
+            ]
+            candidate = TerminalCandidate(
+                terminal=hint,
+                terminal_file=hint_files[0] if hint_files else "",
+                source_target_id="",
+                reason="logged signal of the questioned quantity",
+            )
+            if hint_files and _candidate_key(candidate) not in existing_keys:
+                added.append(candidate)
+        if added:
+            seeds = seeds.model_copy(
+                update={
+                    "candidate_terminals": [*added, *seeds.candidate_terminals]
+                }
+            )
+
     valid_count = _slice_candidates(seeds.candidate_terminals)
 
     # Rejection recovery: every proposal failed deterministic validation,

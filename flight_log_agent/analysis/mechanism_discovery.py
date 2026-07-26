@@ -800,6 +800,21 @@ class SourceSurvey:
             and (not file or entry.file == file)
         ]
 
+    def published_writes_for(
+        self, signal: str
+    ) -> list[tuple[str, SurveyedTarget]]:
+        """Surveyed writes whose value is published to ``signal`` (topic.field).
+
+        These are the source writes that PRODUCE a logged signal — the terminal
+        that ties a mechanism to the observation the question is about.
+        """
+        return [
+            (entry.file, target)
+            for entry in self.files
+            for target in entry.targets
+            if target.published_signal == signal
+        ]
+
     def as_payload(self) -> dict[str, Any]:
         return {
             "anchors": {
