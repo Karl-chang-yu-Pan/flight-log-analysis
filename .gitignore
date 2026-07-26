@@ -13,7 +13,8 @@ uploads/
 *.ulg
 
 # Local reference checkouts used by the analysis tools.
-ref/
+ref/*
+!ref/PX4-Autopilot/
 
 # Local Codex handoff/planning notes.
 docs/next_implementation_plan.md
