@@ -847,6 +847,46 @@ class _DAGBuilder:
         """
         return resolve_observed_signal_placement(reference, self.logged_signals)
 
+    def _member_observation_leaf(
+        self, symbol_norm: str, identity: SourceSymbolIdentity
+    ) -> Optional[str]:
+        """Ground a struct-member read from the flight observation.
+
+        A member whose DECLARED TYPE is a uORB topic struct (e.g.
+        ``vehicle_attitude_setpoint_s _att_sp`` -> topic
+        ``vehicle_attitude_setpoint``) is recorded in the log. The logged value
+        is the ground truth of what the member held, so when the member is READ
+        we prefer that observation over tracing its source writes, which for a
+        published output are one-per-flight-mode and cannot be disambiguated
+        without grounding every mode branch. The topic is derived from the
+        declared type, not the member name, so no spelling heuristic applies;
+        grounding only happens when the resulting ``topic.field`` is actually
+        logged, otherwise this returns ``None`` and source resolution proceeds.
+        """
+        if identity is None or identity.kind != "member":
+            return None
+        root, separator, field = symbol_norm.partition(".")
+        if not separator or not field:
+            return None
+        class_owner = identity.class_owner or identity.declaring_class or ""
+        member_type = self._source_structure.member_receiver_type(
+            class_owner, root
+        )
+        if not member_type or not member_type.endswith("_s"):
+            return None
+        placement = self._observed_signal_placement(
+            f"{member_type[:-2]}.{field}"
+        )
+        if placement is None:
+            return None
+        return self._emit_evidence(
+            "logged_signal",
+            placement,
+            file=None,
+            line=None,
+            metadata={"grounded_via": "declared_type"},
+        )
+
     def _source_constant_value(
         self,
         symbol: str,
@@ -4112,6 +4152,15 @@ class _DAGBuilder:
             source_order,
             excluded_call_effect_site=excluded_call_effect_site,
         )
+        if len(producers) == 1:
+            return producers
+        # A member whose declared type is a logged uORB topic, whose source
+        # writes are ambiguous (one-per-flight-mode, not disambiguable) or
+        # absent, reads as an observation: the recorded value is ground truth.
+        # A single unambiguous producer above stays a traced source edge.
+        observation = self._member_observation_leaf(symbol_norm, identity)
+        if observation is not None:
+            return [observation]
         if producers:
             return producers
 
