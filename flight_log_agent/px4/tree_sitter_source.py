@@ -1996,6 +1996,12 @@ class TreeSitterSourceExtractor:
                         line=state.unit.line(statement),
                         site_id=state.unit.site_id(statement),
                         source_order=statement.start_byte,
+                        # Negating an expression adds no inputs, so the
+                        # extractor's exactness verdict for the termination
+                        # carries over. Dropping it here left every
+                        # guard-clause remainder predicate inexact, which the
+                        # value engine fails closed on.
+                        inputs_exact=termination_exact,
                     ),
                 ]
                 active_exact = active_exact and termination_exact
