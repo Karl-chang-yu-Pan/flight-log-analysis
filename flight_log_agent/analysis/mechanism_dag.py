@@ -5490,6 +5490,42 @@ def ground_expression_via_edges(
     return grounded
 
 
+def _freshness_gate_verdict(predicate: str) -> Optional[bool]:
+    """TEMPORARY stopgap verdict for a standalone uORB freshness/timeout gate.
+
+    PX4 guards paths with ``hrt_elapsed_time(&_last) < TIMEOUT`` (recent) or
+    ``> TIMEOUT`` (stale). Both the elapsed time and the ``#define`` timeout are
+    not yet grounded, so such a gate is otherwise unresolved and drags its
+    guarded operation to unknown. As a permissive stand-in we assume the data
+    is fresh (elapsed time ~ 0): a ``<``/``<=`` check is satisfied and a
+    ``>``/``>=`` check is not, with a leading negation flipping the result so a
+    gate and its complement stay consistent. Only a *standalone* comparison is
+    resolved; a boolean combination keeps its real (unresolved) verdict.
+
+    Unlike a dataman read this value IS in the log; replace this with
+    log-derived freshness (a topic's last sample time vs the resolved timeout)
+    so a genuine data gap can make the gate false.
+    """
+    text = predicate.strip()
+    negated = False
+    while text.startswith("!"):
+        negated = not negated
+        text = text[1:].strip()
+        if text.startswith("(") and text.endswith(")"):
+            text = text[1:-1].strip()
+    if "hrt_elapsed_time" not in text and "hrt_absolute_time" not in text:
+        return None
+    if "&&" in text or "||" in text:
+        return None
+    if "<" in text:
+        fresh = True
+    elif ">" in text:
+        fresh = False
+    else:
+        return None
+    return (not fresh) if negated else fresh
+
+
 def evaluate_feasibility(
     dag: MechanismDAG,
     *,
@@ -5634,13 +5670,30 @@ def evaluate_feasibility(
                 elif _covers_span(windows, spans[vertex.id]):
                     verdict = "always_true"
 
+        # TEMPORARY stopgap: resolve a standalone uORB freshness/timeout gate
+        # under the "data is fresh" assumption (see _freshness_gate_verdict).
+        fresh_verdict: Optional[bool] = None
+        if verdict == "unknown" and not windows:
+            fresh_verdict = _freshness_gate_verdict(
+                vertex.predicate_raw or vertex.predicate_lowered or ""
+            )
+        if fresh_verdict is not None:
+            verdict = "always_true" if fresh_verdict else "always_false"
+
         verdicts[vertex.id] = verdict
         metadata = dict(vertex.metadata or {})
         metadata["evaluation_mode"] = "dag_value_plan"
-        metadata["static_evaluation"] = {
-            "status": static_result.status,
-            "reason": static_result.reason,
-        }
+        metadata["static_evaluation"] = (
+            {
+                "status": "value",
+                "reason": "temporary: uORB freshness gate assumed fresh",
+            }
+            if fresh_verdict is not None
+            else {
+                "status": static_result.status,
+                "reason": static_result.reason,
+            }
+        )
         if vertex.id in spans:
             metadata["evaluation_domain"] = list(spans[vertex.id])
             metadata["sampling_policies"] = policy_summaries.get(vertex.id, {})
