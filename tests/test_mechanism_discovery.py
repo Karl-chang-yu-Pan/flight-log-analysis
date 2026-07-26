@@ -609,6 +609,80 @@ class Reader {
     assert evaluated_branch.active_windows == [(10.0, 20.0)]
 
 
+def test_control_flow_governed_boundary_transfer_stays_grounded(
+    tmp_path, source_backend
+):
+    """A subscription copy inside control flow still grounds a gating branch.
+
+    The logged topic observes the member's value over the whole timeline, so
+    the source-code guard around the copy does not gate the observation.
+    """
+    profiler = _mini_tree(
+        tmp_path,
+        {
+            "src/modules/example/reader.cpp": """
+class Reader {
+    vehicle_status_s _status{};
+    uORB::Subscription _status_sub{ORB_ID(vehicle_status)};
+    bool _enabled{};
+    float output{};
+
+    void Run()
+    {
+        if (_enabled) {
+            _status_sub.update(&_status);
+        }
+
+        if (_status.nav_state > 0.5f) {
+            output = 1.0f;
+        }
+    }
+};
+""",
+        },
+        backend=source_backend,
+    )
+    inputs = dag_inputs_from_facts(
+        load_facts(
+            profiler,
+            tmp_path / "cache",
+            ["src/modules/example/reader.cpp"],
+            "hash",
+        )
+    )
+    dag = build_mechanism_dag(
+        inputs.bindings,
+        "output",
+        terminal_file="src/modules/example/reader.cpp",
+        logged_signals={"vehicle_status.nav_state"},
+        helper_expressions=inputs.helper_expressions,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+    branch = next(
+        vertex
+        for vertex in dag.vertices
+        if vertex.kind == "branch"
+        and "nav_state" in str(vertex.predicate_raw or "")
+    )
+    annotated = evaluate_feasibility(
+        dag,
+        signal_samples={
+            "vehicle_status.nav_state": [(0.0, 0.0), (10.0, 1.0), (20.0, 0.0)]
+        },
+        signal_policies={"vehicle_status.nav_state": {"method": "discrete_hold"}},
+        prune_dead=False,
+    )
+    evaluated = next(
+        vertex for vertex in annotated.vertices if vertex.id == branch.id
+    )
+    if source_backend == "legacy":
+        assert evaluated.active_windows == []
+        return
+    assert evaluated.active_windows == [(10.0, 20.0)]
+
+
 def test_conditional_publication_operations_remain_explicit(tmp_path):
     profiler = _mini_tree(
         tmp_path,

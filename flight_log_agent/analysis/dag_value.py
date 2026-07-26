@@ -393,10 +393,19 @@ class DAGValueSession:
         timestamp: Optional[float],
         active: frozenset[str],
     ) -> ActivityStatus:
+        metadata = self.program.vertices[vertex_id].metadata or {}
+        if (
+            metadata.get("synthetic_boundary_transfer")
+            and metadata.get("boundary_direction") == "subscribe"
+        ):
+            # An input boundary transfer reads the member's value from the
+            # logged topic. The logged signal already observes that value over
+            # the whole timeline (hold-last between samples), so the source-code
+            # control flow around the copy statement does not gate the
+            # observation — the log records what the member held regardless.
+            return "active"
         unknown = not bool(
-            ((self.program.vertices[vertex_id].metadata or {}).get("reachability") or {}).get(
-                "exact", False
-            )
+            (metadata.get("reachability") or {}).get("exact", False)
         )
         for branch_id in self.program.controls_by_target.get(vertex_id, ()):
             result = self._evaluate_vertex(branch_id, timestamp, active)
