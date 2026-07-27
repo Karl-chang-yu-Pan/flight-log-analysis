@@ -207,6 +207,11 @@ def render_discovery_compact(
 
     The DAG itself keeps full per-instance fidelity — this is a projection for
     the judge, not a change to the graph the value engine evaluates.
+
+    Grouping is path-INSENSITIVE and therefore a sound OVER-approximation: an
+    edge is never hidden, but a site reached by several writes lists all of them
+    even though one call instance sees one per role. Those entries declare it in
+    ``roles_with_alternative_producers`` rather than implying a single path.
     """
     dag = dag if dag is not None else result.dag
     validation = getattr(result, "terminal_validation", None)
@@ -267,6 +272,22 @@ def render_discovery_compact(
         # instance ids themselves are recoverable from the graph by site and are
         # never named by the judge.
         return {"instances": len(members)}
+
+    def _union_note(entry_inputs: list[dict[str, str]]) -> dict[str, Any]:
+        """Flag a role fed by several producers once instances are grouped.
+
+        Grouping by source site is path-INSENSITIVE: the site really is reached
+        by every listed write, but no single call instance sees more than one of
+        them per role. Saying so keeps the rendering a declared
+        over-approximation instead of implying a path that never runs.
+        """
+        roles: dict[str, int] = {}
+        for item in entry_inputs:
+            roles[item["role"]] = roles.get(item["role"], 0) + 1
+        unioned = sorted(role for role, count in roles.items() if count > 1)
+        if not unioned:
+            return {}
+        return {"roles_with_alternative_producers": unioned}
     operations: list[dict[str, Any]] = []
     branches: list[dict[str, Any]] = []
     helper_returns: list[str] = []
@@ -321,6 +342,7 @@ def render_discovery_compact(
                     )
                 ),
                 **_instances(_render_site_key(vertex)),
+                **_union_note(incoming_data.get(local_id, [])),
             }
             if vertex.provenance and vertex.provenance.startswith("helper_return"):
                 helper_returns.append(str(vertex.variable))
