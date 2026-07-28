@@ -1091,33 +1091,22 @@ async def run_dag_discovery_stage(
             dict[str, PreparedSignalSeries],
         ],
     ] = {}
-    dag_signal_data: dict[
-        int,
-        tuple[
-            dict[str, list[tuple[float, Any]]],
-            dict[str, PreparedSignalSeries],
-        ],
-    ] = {}
-    value_programs: dict[int, DAGValueProgram] = {}
-    dag_annotations: dict[int, MechanismDAG] = {}
+    # One live annotation, not one per round. ``annotate_dag`` is the fixpoint's
+    # round annotator, and every round hands it a NEW graph, so caching by graph
+    # retained a full annotated copy, a value program and a set of ULog sample
+    # series for EVERY round of EVERY candidate — while only the newest is ever
+    # read (a round's annotation is consumed to pick that round's frontier).
+    # The entry holds the graph object itself rather than its ``id()``: an id is
+    # reused once its object is freed, so an id-keyed cache could return another
+    # graph's feasibility.
+    annotation: dict[str, Any] = {}
 
     def annotate_dag(dag: MechanismDAG) -> MechanismDAG:
-        dag_key = id(dag)
-        cached = dag_annotations.get(dag_key)
-        if cached is not None:
-            return cached
-        prepared_data = dag_signal_data.get(dag_key)
-        if prepared_data is None:
-            samples = _signal_samples_for_dag(dag, log_path)
-            prepared_series = prepare_signal_series(samples, signal_policies)
-            prepared_data = (samples, prepared_series)
-            dag_signal_data[dag_key] = prepared_data
-        else:
-            samples, prepared_series = prepared_data
-        program = value_programs.get(dag_key)
-        if program is None:
-            program = DAGValueProgram(dag)
-            value_programs[dag_key] = program
+        if annotation.get("dag") is dag:
+            return annotation["annotated"]
+        samples = _signal_samples_for_dag(dag, log_path)
+        prepared_series = prepare_signal_series(samples, signal_policies)
+        program = DAGValueProgram(dag)
         annotated = evaluate_feasibility(
             dag,
             parameter_values=parameter_values,
@@ -1126,14 +1115,24 @@ async def run_dag_discovery_stage(
             prepared_signal_series=prepared_series,
             value_program=program,
         )
-        dag_annotations[dag_key] = annotated
+        annotation.clear()
+        annotation.update(
+            {
+                "dag": dag,
+                "annotated": annotated,
+                "samples": samples,
+                "prepared": prepared_series,
+            }
+        )
         return annotated
 
     def annotate(result: DiscoveryResult) -> Optional[MechanismDAG]:
         if result.dag is None:
             return None
         annotated = annotate_dag(result.dag)
-        signal_data[id(result)] = dag_signal_data[id(result.dag)]
+        # Retained per CANDIDATE (not per round) because replay needs the
+        # selected candidate's series after the verdict.
+        signal_data[id(result)] = (annotation["samples"], annotation["prepared"])
         return annotated
 
     logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
