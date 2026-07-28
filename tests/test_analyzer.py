@@ -51,20 +51,20 @@ def _empty_report() -> FlightLogReport:
     )
 
 
-def test_base_instructions_define_generic_causal_evidence_contract():
+def test_base_instructions_define_lean_single_agent_contract():
     instructions = " ".join(analyzer.BASE_INSTRUCTIONS.split())
 
-    assert "when available, its exact resolved" in instructions
-    assert "deterministic prepass" in instructions
-    assert "do not stop at the first plausible source match" in instructions
-    assert "relevant runtime conditions were active" in instructions
-    assert "aligned to the same time interval" in instructions
-    assert "compatible units or representations" in instructions
-    assert "independently computed extrema" in instructions
-    assert "actually evaluated during this run" in instructions
-    assert "merely restates the observed symptom" in instructions
-    assert "Choose commands, statistics, scripts, and plots" in instructions
-    assert "If a plot is useful" in instructions
+    assert "sole analyst" in instructions
+    assert "complete investigation in this one agent context" in instructions
+    assert "Write and run your own Python scripts" in instructions
+    assert "do not rely on a fixed mechanism catalog" in instructions
+    assert "commit-pinned Git commands" in instructions
+    assert "Actively try to falsify the leading explanation" in instructions
+    assert "plausible alternatives" in instructions
+    assert "use it only after the ULog and exact source" in instructions
+    assert "Web results cannot replace flight evidence" in instructions
+    assert "lower confidence rather than forcing an answer" in instructions
+    assert "source broker" not in instructions
 
 
 @pytest.mark.parametrize(
@@ -79,6 +79,8 @@ def test_base_instructions_define_generic_causal_evidence_contract():
         "Do not provide tuning, code changes, or flight-test suggestions",
         "previous ChatGPT sessions",
         "Run one command per shell-tool command",
+        "Complete only the assigned evidence stage",
+        "execution receipt",
     ],
 )
 def test_base_instructions_omit_prototype_behavior_rules(removed_instruction):
@@ -367,14 +369,9 @@ def test_python_sandbox_excludes_source_checkout_and_network(tmp_path):
         snapshot,
         input_paths={"flight.ulg": upload_path},
     )
-    broker_root = tmp_path / "broker"
-    broker_root.mkdir()
-    (broker_root / "requests").mkdir()
-    (broker_root / "responses").mkdir()
 
     command = executor._build_sandbox_command(
-        ["python", "-c", "print('ok')"],
-        broker_root=broker_root,
+        ["python", "-c", "print('ok')"]
     )
 
     assert "--unshare-net" in command
@@ -389,26 +386,10 @@ def test_python_sandbox_excludes_source_checkout_and_network(tmp_path):
     ] == command[
         command.index(str(upload_path)) - 1 : command.index(str(upload_path)) + 2
     ]
-    assert [
-        "--bind",
-        str(broker_root / "requests"),
-        "/broker/requests",
-    ] == command[
-        command.index(str(broker_root / "requests")) - 1 :
-        command.index(str(broker_root / "requests")) + 2
-    ]
-    assert [
-        "--ro-bind",
-        str(broker_root / "responses"),
-        "/broker/responses",
-    ] == command[
-        command.index(str(broker_root / "responses")) - 1 :
-        command.index(str(broker_root / "responses")) + 2
-    ]
-    assert "FLIGHT_LOG_PX4_REPOSITORY" in command
-    assert analyzer.SOURCE_ALIAS in command
-    assert "FLIGHT_LOG_PX4_COMMIT" in command
-    assert analyzer.SNAPSHOT_TOKEN in command
+    assert "/broker" not in command
+    assert "FLIGHT_LOG_SOURCE_BROKER" not in command
+    assert "FLIGHT_LOG_PX4_REPOSITORY" not in command
+    assert "FLIGHT_LOG_PX4_COMMIT" not in command
     assert "FLIGHT_LOG_ULOG" in command
     assert "/inputs/flight.ulg" in command
     assert command[-3:] == [
@@ -418,7 +399,7 @@ def test_python_sandbox_excludes_source_checkout_and_network(tmp_path):
     ]
 
 
-def test_preflight_exercises_input_mount_and_snapshot_proxy(
+def test_preflight_exercises_read_only_input_mounts(
     tmp_path,
     monkeypatch,
 ):
@@ -459,8 +440,8 @@ def test_preflight_exercises_input_mount_and_snapshot_proxy(
     assert captured["argv"][:2] == ["python", "-c"]
     assert "FLIGHT_LOG_ULOG" in captured["argv"][2]
     assert "FLIGHT_LOG_MISSION" in captured["argv"][2]
-    assert "FLIGHT_LOG_PX4_REPOSITORY" in captured["argv"][2]
-    assert "ls-tree" in captured["argv"][2]
+    assert "FLIGHT_LOG_PX4_REPOSITORY" not in captured["argv"][2]
+    assert "ls-tree" not in captured["argv"][2]
     assert captured["timeout_s"] == 10
 
 
@@ -468,7 +449,7 @@ def test_preflight_exercises_input_mount_and_snapshot_proxy(
     os.environ.get("FLIGHT_LOG_RUN_BWRAP_TESTS") != "1",
     reason="set FLIGHT_LOG_RUN_BWRAP_TESTS=1 for the real sandbox smoke",
 )
-def test_real_python_sandbox_reads_pinned_source_without_checkout_copy(
+def test_real_python_sandbox_scopes_inputs_and_output_without_source_copy(
     tmp_path,
 ):
     repository_path = tmp_path / "PX4-Autopilot"
@@ -497,7 +478,6 @@ def test_real_python_sandbox_reads_pinned_source_without_checkout_copy(
     script = f"""
 import json
 import os
-import subprocess
 from pathlib import Path
 
 input_path = Path(os.environ["FLIGHT_LOG_ULOG"])
@@ -508,25 +488,15 @@ except OSError:
 else:
     os.close(descriptor)
     input_is_read_only = False
-source_text = subprocess.run(
-    [
-        "git",
-        "-C",
-        os.environ["FLIGHT_LOG_PX4_REPOSITORY"],
-        "show",
-        os.environ["FLIGHT_LOG_PX4_COMMIT"] + ":src/module.cpp",
-    ],
-    check=True,
-    capture_output=True,
-    text=True,
-).stdout
 Path("/work/generated.txt").write_text("work", encoding="utf-8")
 Path("/plots/generated.txt").write_text("plot", encoding="utf-8")
 print(json.dumps({{
     "input": input_path.read_bytes().decode("ascii"),
     "input_is_read_only": input_is_read_only,
-    "source": source_text.strip(),
     "checkout_visible": Path({checkout_literal}).exists(),
+    "source_environment_visible": any(
+        name.startswith("FLIGHT_LOG_PX4_") for name in os.environ
+    ),
 }}))
 """
 
@@ -543,8 +513,8 @@ print(json.dumps({{
     assert result == {
         "input": "ULog",
         "input_is_read_only": True,
-        "source": "old",
         "checkout_visible": False,
+        "source_environment_visible": False,
     }
     assert source_file.read_text(encoding="utf-8") == "dirty\n"
     assert (work_dir / "generated.txt").read_text(encoding="utf-8") == "work"
@@ -563,208 +533,10 @@ def test_restricted_environment_does_not_expose_source_checkout(tmp_path):
     environment = executor._restricted_env()
 
     assert str(repository_path) not in environment.values()
-    assert environment["FLIGHT_LOG_PX4_REPOSITORY"] == analyzer.SOURCE_ALIAS
-    assert environment["FLIGHT_LOG_PX4_COMMIT"] == analyzer.SNAPSHOT_TOKEN
+    assert "FLIGHT_LOG_PX4_REPOSITORY" not in environment
+    assert "FLIGHT_LOG_PX4_COMMIT" not in environment
+    assert "FLIGHT_LOG_SOURCE_BROKER" not in environment
     assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
-
-
-def test_python_source_broker_enforces_resolved_snapshot(
-    tmp_path,
-    monkeypatch,
-):
-    repository_path = tmp_path / "PX4-Autopilot"
-    repository_path.mkdir()
-    _git(repository_path, "init")
-    (repository_path / "file.txt").write_text("value\n", encoding="utf-8")
-    commit_sha = _commit(repository_path, "snapshot")
-    snapshot = SourceRepository(repository_path).resolve_snapshot(commit_sha)
-    executor = analyzer.RestrictedShellExecutor(tmp_path, snapshot)
-    request_path = tmp_path / f"request-{'a' * 32}.json"
-    request_path.write_text(
-        json.dumps(
-            {
-                "argv": [
-                    "-C",
-                    analyzer.SOURCE_ALIAS,
-                    "show",
-                    f"{analyzer.SNAPSHOT_TOKEN}:file.txt",
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    captured = {}
-
-    async def fake_run_process(
-        argv,
-        *,
-        timeout_s,
-        cwd,
-        env,
-    ):
-        captured["argv"] = argv
-        captured["cwd"] = cwd
-        return b"value\n", b"", 0, False
-
-    monkeypatch.setattr(executor, "_run_process", fake_run_process)
-
-    response = asyncio.run(executor._snapshot_git_response(request_path))
-
-    assert response == {
-        "stdout": "value\n",
-        "stderr": "",
-        "returncode": 0,
-    }
-    assert captured["argv"] == [
-        "git",
-        "-C",
-        str(repository_path),
-        "show",
-        f"{commit_sha}:file.txt",
-    ]
-    assert captured["cwd"] == tmp_path.resolve()
-
-
-def test_python_source_broker_rejects_unpinned_revision(tmp_path):
-    repository_path = tmp_path / "PX4-Autopilot"
-    repository_path.mkdir()
-    _git(repository_path, "init")
-    (repository_path / "file.txt").write_text("value\n", encoding="utf-8")
-    commit_sha = _commit(repository_path, "snapshot")
-    snapshot = SourceRepository(repository_path).resolve_snapshot(commit_sha)
-    executor = analyzer.RestrictedShellExecutor(tmp_path, snapshot)
-    request_path = tmp_path / f"request-{'b' * 32}.json"
-    request_path.write_text(
-        json.dumps(
-            {
-                "argv": [
-                    "-C",
-                    analyzer.SOURCE_ALIAS,
-                    "show",
-                    "HEAD:file.txt",
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    response = asyncio.run(executor._snapshot_git_response(request_path))
-
-    assert response["returncode"] == 126
-    assert "SNAPSHOT" in response["stderr"]
-
-
-def test_python_source_broker_rejects_symlink_request(tmp_path):
-    executor = analyzer.RestrictedShellExecutor(tmp_path)
-    victim = tmp_path / "victim.json"
-    victim.write_text(
-        json.dumps({"argv": ["-C", analyzer.SOURCE_ALIAS, "show"]}),
-        encoding="utf-8",
-    )
-    request_path = tmp_path / f"request-{'c' * 32}.json"
-    request_path.symlink_to(victim)
-
-    response = asyncio.run(executor._snapshot_git_response(request_path))
-
-    assert response["returncode"] == 126
-    assert "Too many levels of symbolic links" in response["stderr"]
-    assert victim.read_text(encoding="utf-8").startswith('{"argv"')
-
-
-def test_python_source_broker_rejects_fifo_without_blocking(tmp_path):
-    executor = analyzer.RestrictedShellExecutor(tmp_path)
-    request_path = tmp_path / f"request-{'d' * 32}.json"
-    os.mkfifo(request_path)
-
-    response = asyncio.run(executor._snapshot_git_response(request_path))
-
-    assert response["returncode"] == 126
-    assert "regular file" in response["stderr"]
-
-
-def test_source_broker_writes_only_to_parent_response_directory(
-    tmp_path,
-    monkeypatch,
-):
-    broker_root = tmp_path / "broker"
-    request_dir = broker_root / "requests"
-    response_dir = broker_root / "responses"
-    request_dir.mkdir(parents=True)
-    response_dir.mkdir()
-    request_id = "e" * 32
-    request_path = request_dir / f"request-{request_id}.json"
-    request_path.write_text("{}", encoding="utf-8")
-    victim = tmp_path / "victim.txt"
-    victim.write_text("keep", encoding="utf-8")
-    malicious_temp = request_dir / f"response-{request_id}.tmp"
-    malicious_temp.symlink_to(victim)
-    executor = analyzer.RestrictedShellExecutor(tmp_path)
-
-    async def fake_response(_request_path, *, timeout_s):
-        assert timeout_s > 0
-        return {"stdout": "safe", "stderr": "", "returncode": 0}
-
-    monkeypatch.setattr(executor, "_snapshot_git_response", fake_response)
-
-    async def serve_once():
-        stop = asyncio.Event()
-        task = asyncio.create_task(
-            executor._serve_snapshot_git_requests(broker_root, stop)
-        )
-        for _ in range(100):
-            if (
-                response_dir / f"response-{request_id}.json"
-            ).is_file():
-                break
-            await asyncio.sleep(0.01)
-        stop.set()
-        await task
-
-    asyncio.run(serve_once())
-
-    assert victim.read_text(encoding="utf-8") == "keep"
-    response_path = response_dir / f"response-{request_id}.json"
-    assert json.loads(response_path.read_text(encoding="utf-8")) == {
-        "stdout": "safe",
-        "stderr": "",
-        "returncode": 0,
-    }
-
-
-def test_source_broker_cancels_an_active_request(tmp_path, monkeypatch):
-    broker_root = tmp_path / "broker"
-    request_dir = broker_root / "requests"
-    (broker_root / "responses").mkdir(parents=True)
-    request_dir.mkdir()
-    request_path = request_dir / f"request-{'f' * 32}.json"
-    request_path.write_text("{}", encoding="utf-8")
-    executor = analyzer.RestrictedShellExecutor(tmp_path)
-
-    async def exercise():
-        started = asyncio.Event()
-
-        async def blocking_response(_request_path, *, timeout_s):
-            assert timeout_s > 0
-            started.set()
-            await asyncio.Event().wait()
-
-        monkeypatch.setattr(
-            executor,
-            "_snapshot_git_response",
-            blocking_response,
-        )
-        task = asyncio.create_task(
-            executor._serve_snapshot_git_requests(
-                broker_root,
-                asyncio.Event(),
-            )
-        )
-        await asyncio.wait_for(started.wait(), timeout=1)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=1)
-
-    asyncio.run(exercise())
 
 
 def test_run_process_cancellation_kills_and_reaps_child(
@@ -818,6 +590,53 @@ def test_run_process_cancellation_kills_and_reaps_child(
             task.result()
 
     asyncio.run(exercise())
+    assert created["process"].killed is True
+    assert created["process"].returncode == -9
+
+
+def test_run_process_timeout_kills_and_reaps_child(
+    tmp_path,
+    monkeypatch,
+):
+    executor = analyzer.RestrictedShellExecutor(tmp_path)
+    created = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.killed = False
+            self.finished = asyncio.Event()
+
+        async def communicate(self):
+            await self.finished.wait()
+            return b"partial stdout", b"partial stderr"
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            self.finished.set()
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        process = FakeProcess()
+        created["process"] = process
+        return process
+
+    monkeypatch.setattr(
+        analyzer.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    result = asyncio.run(
+        executor._run_process(
+            ["fake-process"],
+            timeout_s=0.01,
+            cwd=tmp_path,
+            env=executor._restricted_env(),
+        )
+    )
+
+    assert result == (b"partial stdout", b"partial stderr", 124, True)
     assert created["process"].killed is True
     assert created["process"].returncode == -9
 
@@ -933,10 +752,39 @@ def test_prepare_workspace_refuses_to_replace_unmanaged_input(tmp_path):
     assert (work_dir / "flight.ulg").read_text(encoding="utf-8") == "keep me"
 
 
-def test_shell_analyzer_preserves_shared_report_and_run_contract(
+def test_report_plot_paths_map_only_to_produced_artifacts(tmp_path):
+    plots_dir = tmp_path / "outputs" / "web_run" / "plots"
+    plots_dir.mkdir(parents=True)
+    produced = plots_dir / "analysis.png"
+    produced.write_bytes(b"png")
+    kept = SimpleNamespace(path="/plots/analysis.png", warnings=[])
+    rejected = SimpleNamespace(path="/plots/not-created.png", warnings=[])
+    report = SimpleNamespace(
+        ranked_hypotheses=[
+            SimpleNamespace(plots=[kept, rejected]),
+        ]
+    )
+
+    result = analyzer._normalize_report_plot_paths(
+        report,
+        plots_dir=plots_dir,
+    )
+
+    assert result is report
+    assert kept.path == str(produced.resolve())
+    assert kept.warnings == []
+    assert rejected.path == ""
+    assert rejected.warnings == [
+        "The report referenced a plot that was not produced during this analysis."
+    ]
+
+
+@pytest.mark.parametrize("enable_web_fallback", [True, False])
+def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
     tmp_path,
     monkeypatch,
     assert_analysis_engine_contract,
+    enable_web_fallback,
 ):
     log_path = tmp_path / "uploads" / "upload_1" / "flight.ulg"
     log_path.parent.mkdir(parents=True)
@@ -961,23 +809,35 @@ def test_shell_analyzer_preserves_shared_report_and_run_contract(
     )
     captured = {}
 
-    async def fake_staged_analysis(**kwargs):
-        captured.update(kwargs)
-        captured["source_tool"] = kwargs["shell_tool_factory"](True)
-        captured["log_tool"] = kwargs["shell_tool_factory"](False)
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["agent_kwargs"] = kwargs
+
+    class FakeShellTool:
+        def __init__(self, **kwargs):
+            self.executor = kwargs["executor"]
+            captured["shell_tool"] = self
+
+    class FakeWebSearchTool:
+        def __init__(self, **kwargs):
+            captured.setdefault("web_tools", []).append(kwargs)
+
+    async def fake_run(agent, prompt, max_turns, hooks):
+        captured["agent"] = agent
+        captured["prompt"] = prompt
+        captured["max_turns"] = max_turns
+        captured["hooks"] = hooks
         return SimpleNamespace(
-            report=report,
-                usage=Usage(),
-                evidence_state=SimpleNamespace(
-                    status="sufficient",
-                    question_is_causal=False,
-                accepted_candidate_titles=[],
-                reason="Observational report.",
-            ),
+            final_output=report,
+            new_items=[],
+            context_wrapper=SimpleNamespace(usage=Usage()),
         )
 
     monkeypatch.setattr(analyzer, "parse_ulog_inventory", parse_inventory)
-    monkeypatch.setattr(analyzer, "run_staged_analysis", fake_staged_analysis)
+    monkeypatch.setattr(analyzer, "Agent", FakeAgent)
+    monkeypatch.setattr(analyzer, "ShellTool", FakeShellTool)
+    monkeypatch.setattr(analyzer, "WebSearchTool", FakeWebSearchTool)
+    monkeypatch.setattr(analyzer.Runner, "run", fake_run)
 
     async def fake_preflight(executor):
         captured["preflight_executor"] = executor
@@ -997,13 +857,17 @@ def test_shell_analyzer_preserves_shared_report_and_run_contract(
             dev_log_root=str(dev_log_root),
             dev_run_id="web_run_1",
             user_question="What happened?",
+            model="gpt-5.6",
+            max_turns=30,
+            max_total_requests=12,
+            project_instructions="Keep this project context.",
+            enable_web_fallback=enable_web_fallback,
         )
     )
 
     parse_inventory.assert_called_once_with(log_path, analyzer.SOURCE_UNAVAILABLE)
     assert result is report
-    source_executor = captured["source_tool"].executor
-    log_executor = captured["log_tool"].executor
+    source_executor = captured["shell_tool"].executor
     assert (
         captured["preflight_executor"].source_snapshot.commit_sha
         == logged_commit
@@ -1014,11 +878,28 @@ def test_shell_analyzer_preserves_shared_report_and_run_contract(
     assert source_executor.source_snapshot.commit_sha == logged_commit
     assert source_executor.cwd == (output_dir / "work").resolve()
     assert source_executor.input_paths == {"flight.ulg": log_path.resolve()}
-    assert log_executor.source_snapshot is None
-    assert captured["work_dir"] == (output_dir / "work").resolve()
-    assert captured["plots_dir"] == (output_dir / "plots").resolve()
-    assert captured["max_total_requests"] is None
-    assert "SNAPSHOT" in captured["base_instructions"]
+    assert captured["agent_kwargs"]["output_type"] is FlightLogReport
+    assert captured["agent_kwargs"]["model"] == "gpt-5.6"
+    assert (
+        captured["agent_kwargs"]["model_settings"].reasoning.effort
+        == "high"
+    )
+    assert "SNAPSHOT" in captured["agent_kwargs"]["instructions"]
+    assert "Keep this project context." in captured["agent_kwargs"]["instructions"]
+    assert captured["max_turns"] == 12
+    assert "What happened?" in captured["prompt"]
+    assert "try to falsify it" in captured["prompt"]
+    assert (
+        "Web search is available" in captured["prompt"]
+    ) is enable_web_fallback
+    assert len(captured.get("web_tools", [])) == int(enable_web_fallback)
+    if enable_web_fallback:
+        assert captured["web_tools"] == [
+            {
+                "search_context_size": "medium",
+                "external_web_access": True,
+            }
+        ]
     assert not (output_dir / "work" / "PX4-Autopilot").exists()
     metadata = json.loads(
         (dev_log_root / "web_run_1" / "metadata.json").read_text(
@@ -1026,8 +907,12 @@ def test_shell_analyzer_preserves_shared_report_and_run_contract(
         )
     )
     assert metadata["runner_version"] == "shell_snapshot_v1"
-    assert metadata["analysis_architecture"] == "staged_evidence_v1"
-    assert metadata["max_total_requests"] == 20
+    assert metadata["analysis_architecture"] == "single_agent_v1"
+    assert metadata["model"] == "gpt-5.6"
+    assert metadata["reasoning_effort"] == "high"
+    assert metadata["max_turns"] == 12
+    assert metadata["max_total_requests"] == 12
+    assert metadata["enable_web_fallback"] is enable_web_fallback
     assert_analysis_engine_contract(
         report,
         output_dir,

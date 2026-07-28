@@ -27,34 +27,34 @@ import os
 import re
 import shlex
 import shutil
-import stat
 import sys
-import tempfile
 import time
-from contextlib import suppress
-from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from agents import (
+    Agent,
+    ModelSettings,
+    Runner,
     ShellCallOutcome,
     ShellCommandOutput,
     ShellCommandRequest,
     ShellResult,
     ShellTool,
+    WebSearchTool,
 )
+from openai.types.shared.reasoning import Reasoning
 
 from flight_log_agent.analysis.report_validation import (
     enforce_validation_downgrades,
     validate_report,
 )
-from flight_log_agent.analysis.staged_workflow import (
-    reconcile_report_with_evidence_state,
-    run_staged_analysis,
-)
 from flight_log_agent.audit import (
+    AgentRunAuditHooks,
     DEFAULT_DEV_LOG_ROOT,
     DeveloperAuditLogger,
+    log_run_items,
+    make_json_safe,
 )
 from flight_log_agent.models import FlightLogReport
 from flight_log_agent.px4.source_snapshot import (
@@ -143,14 +143,9 @@ ALLOWED_SED_FLAGS = {
     "--silent",
 }
 SED_PRINT_EXPRESSION = re.compile(r"(?:[0-9]+|\$)(?:,(?:[0-9]+|\$))?p")
-SOURCE_BROKER_REQUEST_LIMIT = 64 * 1024
-SOURCE_BROKER_MAX_REQUESTS = 128
-SOURCE_BROKER_BATCH_SIZE = 16
 SOURCE_ALIAS_MAX_CHARS = 4096
 SOURCE_ALIAS_MAX_PARTS = 64
 SOURCE_ALIAS_MAX_RESOLUTION_ATTEMPTS = 128
-SOURCE_BROKER_REQUEST_NAME = re.compile(r"request-[0-9a-f]{32}\.json")
-SNAPSHOT_GIT_PROXY = Path(__file__).with_name("snapshot_git_proxy.py")
 
 
 class RestrictedShellExecutor:
@@ -751,175 +746,16 @@ class RestrictedShellExecutor:
         *,
         timeout_s: float,
     ) -> tuple[bytes, bytes, int, bool]:
-        if argv[0] not in {"python", "python3"}:
-            sandbox_argv = self._build_sandbox_command(argv)
-            return await self._run_process(
-                sandbox_argv,
-                timeout_s=timeout_s,
-                cwd=None,
-                env=self._restricted_env(),
-            )
-
-        with tempfile.TemporaryDirectory(
-            prefix="flight-source-broker-",
-            dir="/tmp",
-        ) as broker_root:
-            broker_path = Path(broker_root)
-            (broker_path / "requests").mkdir()
-            (broker_path / "responses").mkdir()
-            stop_broker = asyncio.Event()
-            broker_task = asyncio.create_task(
-                self._serve_snapshot_git_requests(
-                    broker_path,
-                    stop_broker,
-                    deadline=asyncio.get_running_loop().time() + timeout_s,
-                )
-            )
-            try:
-                sandbox_argv = self._build_sandbox_command(
-                    argv,
-                    broker_root=broker_path,
-                )
-                return await self._run_process(
-                    sandbox_argv,
-                    timeout_s=timeout_s,
-                    cwd=None,
-                    env=self._restricted_env(),
-                )
-            finally:
-                stop_broker.set()
-                broker_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await broker_task
-
-    async def _serve_snapshot_git_requests(
-        self,
-        broker_root: Path,
-        stop: asyncio.Event,
-        *,
-        deadline: float | None = None,
-    ) -> None:
-        request_dir = broker_root / "requests"
-        response_dir = broker_root / "responses"
-        request_count = 0
-        while True:
-            if stop.is_set():
-                for request_path in request_dir.glob("request-*.json"):
-                    request_path.unlink(missing_ok=True)
-                return
-
-            request_paths = list(
-                islice(
-                    request_dir.glob("request-*.json"),
-                    SOURCE_BROKER_BATCH_SIZE,
-                )
-            )
-            for request_path in request_paths:
-                if stop.is_set():
-                    request_path.unlink(missing_ok=True)
-                    continue
-                if SOURCE_BROKER_REQUEST_NAME.fullmatch(request_path.name) is None:
-                    request_path.unlink(missing_ok=True)
-                    continue
-                response_path = response_dir / request_path.name.replace(
-                    "request-",
-                    "response-",
-                    1,
-                )
-                request_count += 1
-                remaining = (
-                    deadline - asyncio.get_running_loop().time()
-                    if deadline is not None
-                    else DEFAULT_TIMEOUT_S
-                )
-                if request_count > SOURCE_BROKER_MAX_REQUESTS:
-                    response = {
-                        "stdout": "",
-                        "stderr": (
-                            "PermissionError: source-broker request limit "
-                            "exceeded\n"
-                        ),
-                        "returncode": 126,
-                    }
-                elif remaining <= 0:
-                    response = {
-                        "stdout": "",
-                        "stderr": "TimeoutError: source-broker deadline expired\n",
-                        "returncode": 124,
-                    }
-                else:
-                    response = await self._snapshot_git_response(
-                        request_path,
-                        timeout_s=min(remaining, DEFAULT_TIMEOUT_S),
-                    )
-                temporary_response = response_path.with_suffix(".tmp")
-                temporary_response.write_text(
-                    json.dumps(response),
-                    encoding="utf-8",
-                )
-                temporary_response.replace(response_path)
-                request_path.unlink(missing_ok=True)
-
-            await asyncio.sleep(0.01)
-
-    async def _snapshot_git_response(
-        self,
-        request_path: Path,
-        *,
-        timeout_s: float = DEFAULT_TIMEOUT_S,
-    ) -> dict[str, Any]:
-        try:
-            request = json.loads(
-                self._read_source_broker_request(request_path)
-            )
-            requested_args = request.get("argv")
-            if (
-                not isinstance(requested_args, list)
-                or not all(isinstance(arg, str) for arg in requested_args)
-            ):
-                raise ValueError("Source-broker argv must be a list of strings.")
-
-            loop = asyncio.get_running_loop()
-            started_at = loop.time()
-            git_argv = await self._snapshot_git_command_async(
-                ["git", *requested_args],
-                timeout_s=timeout_s,
-            )
-            remaining = timeout_s - (loop.time() - started_at)
-            if remaining <= 0:
-                raise TimeoutError(
-                    "Snapshot Git request expired during validation."
-                )
-            stdout, stderr, returncode, timed_out = await self._run_process(
-                git_argv,
-                timeout_s=remaining,
-                cwd=self.cwd,
-                env=self._restricted_env(),
-            )
-            return {
-                "stdout": self._truncate(
-                    stdout.decode("utf-8", errors="replace")
-                ),
-                "stderr": self._truncate(
-                    stderr.decode("utf-8", errors="replace")
-                ),
-                "returncode": 124 if timed_out else returncode,
-            }
-        except TimeoutError as exc:
-            return {
-                "stdout": "",
-                "stderr": f"TimeoutError: {exc}\n",
-                "returncode": 124,
-            }
-        except Exception as exc:
-            return {
-                "stdout": "",
-                "stderr": f"{type(exc).__name__}: {exc}\n",
-                "returncode": 126,
-            }
+        sandbox_argv = self._build_sandbox_command(argv)
+        return await self._run_process(
+            sandbox_argv,
+            timeout_s=timeout_s,
+            cwd=None,
+            env=self._restricted_env(),
+        )
 
     async def preflight(self) -> None:
-        checks = ["import os", "import subprocess", "from pathlib import Path"]
+        checks = ["import os", "from pathlib import Path"]
         input_environments = {
             "flight.ulg": "FLIGHT_LOG_ULOG",
             "mission.plan": "FLIGHT_LOG_MISSION",
@@ -941,14 +777,6 @@ else:
     )
 """.strip()
             )
-        if self.source_snapshot is not None:
-            checks.append(
-                "subprocess.run("
-                "['git', '-C', os.environ['FLIGHT_LOG_PX4_REPOSITORY'], "
-                "'ls-tree', '--name-only', "
-                "os.environ['FLIGHT_LOG_PX4_COMMIT'], '--'], "
-                "check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)"
-            )
         stdout, stderr, returncode, timed_out = (
             await self._run_sandboxed_process(
                 ["python", "-c", "\n".join(checks)],
@@ -961,55 +789,18 @@ else:
                 errors="replace",
             ).strip()
             raise RuntimeError(
-                "The analysis shell sandbox or snapshot source bridge is "
-                "unavailable"
+                "The analysis shell sandbox is unavailable"
                 + (f": {detail}" if detail else ".")
             )
-
-    @staticmethod
-    def _read_source_broker_request(request_path: Path) -> str:
-        flags = os.O_RDONLY
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        flags |= getattr(os, "O_NONBLOCK", 0)
-        descriptor = os.open(request_path, flags)
-        try:
-            file_status = os.fstat(descriptor)
-            if not stat.S_ISREG(file_status.st_mode):
-                raise ValueError(
-                    "Source-broker request must be a regular file."
-                )
-            if file_status.st_size >= SOURCE_BROKER_REQUEST_LIMIT:
-                raise ValueError("Oversized source-broker request.")
-
-            chunks: list[bytes] = []
-            bytes_read = 0
-            while True:
-                remaining = SOURCE_BROKER_REQUEST_LIMIT - bytes_read
-                chunk = os.read(descriptor, min(remaining, 64 * 1024))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                bytes_read += len(chunk)
-                if bytes_read >= SOURCE_BROKER_REQUEST_LIMIT:
-                    raise ValueError("Oversized source-broker request.")
-            return b"".join(chunks).decode("utf-8")
-        finally:
-            os.close(descriptor)
 
     def _build_sandbox_command(
         self,
         argv: list[str],
-        *,
-        broker_root: Path | None = None,
     ) -> list[str]:
         bwrap = shutil.which("bwrap")
         if bwrap is None:
             raise RuntimeError(
                 "bubblewrap is required for workspace-scoped shell execution."
-            )
-        if not SNAPSHOT_GIT_PROXY.is_file():
-            raise RuntimeError(
-                f"Snapshot Git proxy is unavailable: {SNAPSHOT_GIT_PROXY}"
             )
 
         command = [
@@ -1050,11 +841,6 @@ else:
                 "--ro-bind",
                 str(Path(sys.prefix).resolve()),
                 "/venv",
-                "--dir",
-                "/sandbox-bin",
-                "--ro-bind",
-                str(SNAPSHOT_GIT_PROXY),
-                "/sandbox-bin/git",
             ]
         )
 
@@ -1066,39 +852,11 @@ else:
                 ["--ro-bind", str(target), f"/inputs/{input_name}"]
             )
 
-        if broker_root is not None:
-            request_dir = broker_root / "requests"
-            response_dir = broker_root / "responses"
-            if not request_dir.is_dir() or not response_dir.is_dir():
-                raise RuntimeError(
-                    "Snapshot Git broker request/response directories are "
-                    "not initialized."
-                )
-            command.extend(
-                [
-                    "--dir",
-                    "/broker",
-                    "--dir",
-                    "/broker/requests",
-                    "--dir",
-                    "/broker/responses",
-                    "--bind",
-                    str(request_dir),
-                    "/broker/requests",
-                    "--ro-bind",
-                    str(response_dir),
-                    "/broker/responses",
-                    "--setenv",
-                    "FLIGHT_LOG_SOURCE_BROKER",
-                    "/broker",
-                ]
-            )
-
         command.extend(
             [
                 "--setenv",
                 "PATH",
-                "/sandbox-bin:/venv/bin:/usr/bin:/bin",
+                "/venv/bin:/usr/bin:/bin",
                 "--setenv",
                 "HOME",
                 "/work",
@@ -1122,17 +880,6 @@ else:
                 os.environ.get("LANG", "C.UTF-8"),
             ]
         )
-        if self.source_snapshot is not None:
-            command.extend(
-                [
-                    "--setenv",
-                    "FLIGHT_LOG_PX4_REPOSITORY",
-                    SOURCE_ALIAS,
-                    "--setenv",
-                    "FLIGHT_LOG_PX4_COMMIT",
-                    SNAPSHOT_TOKEN,
-                ]
-            )
         if "flight.ulg" in self.input_paths:
             command.extend(
                 [
@@ -1184,7 +931,7 @@ else:
                 timeout=timeout_s,
             )
             return stdout, stderr, process.returncode, False
-        except TimeoutError:
+        except asyncio.TimeoutError:
             if process.returncode is None:
                 process.kill()
             stdout, stderr = await communication
@@ -1219,19 +966,13 @@ else:
         }
         env = {key: value for key, value in os.environ.items() if key in keep}
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
-        if self.source_snapshot is not None:
-            env.update(
-                {
-                    "FLIGHT_LOG_PX4_REPOSITORY": SOURCE_ALIAS,
-                    "FLIGHT_LOG_PX4_COMMIT": SNAPSHOT_TOKEN,
-                }
-            )
         return env
 
 
 BASE_INSTRUCTIONS = """
-You are analyzing a PX4 ULog and, when available, its exact resolved
-PX4-Autopilot source snapshot.
+You are the sole analyst for a PX4 flight log. Keep the complete investigation
+in this one agent context: inspect the log, inspect the exact source snapshot,
+form explanations, run checks, reconsider them, and write the final report.
 
 Available workspace entries:
 - /inputs/flight.ulg: the read-only input log (also FLIGHT_LOG_ULOG)
@@ -1239,69 +980,49 @@ Available workspace entries:
 - the current directory: writable per-run scripts and intermediate data
 - /plots/: persistent plot output
 
-Use Python with pyulog to inspect the actual ULog. Decide which commands and
-analyses are needed from the user's question.
+Use Python with pyulog to inspect the actual ULog. Write and run your own
+Python scripts whenever calculations, time alignment, plots, or hypothesis
+tests would help answer the user's question. Choose the investigation from the
+question and the evidence you discover; do not rely on a fixed mechanism
+catalog, topic list, or module-specific procedure.
 
-PX4 source is not exposed as a working-tree directory. Read it through the
-executor's commit-pinned Git interface:
+When an exact PX4 source snapshot is available, read it with the separate
+commit-pinned Git commands:
 - Search: git -C PX4-Autopilot grep -n -F "term" SNAPSHOT -- src/
 - Read: git -C PX4-Autopilot show SNAPSHOT:src/module/file.cpp
 - List: git -C PX4-Autopilot ls-tree -r --name-only SNAPSHOT -- src/
 - Schema read: git -C PX4-Autopilot show SNAPSHOT:msg/VehicleStatus.msg
 
-Use other snapshot-relative path scopes, including msg/, when the evidence
-requires them; the src/ forms above are examples, not a source-path limit.
-
 SNAPSHOT is a virtual revision token. The executor replaces it with the
 resolved full commit SHA. Never use HEAD, a branch, a tag, or a literal hash.
+The examples are not a source-path limit; inspect any snapshot-relative source,
+schema, build, or configuration file that is relevant.
 For an initialized submodule, use its path as the virtual Git directory, for
 example git -C PX4-Autopilot/src/modules/mavlink/mavlink show SNAPSHOT:path.
 The executor resolves SNAPSHOT to the gitlink commit recorded by the parent.
 
 Python, rg, sed, and find run in a filesystem sandbox containing only this
 analysis workspace, its read-only input files, the plot directory, and runtime
-libraries. They cannot see the PX4 working tree. For more complex in-memory
-source processing, Python may invoke the same three Git commands using
-FLIGHT_LOG_PX4_REPOSITORY and FLIGHT_LOG_PX4_COMMIT. Those variables contain
-the virtual PX4-Autopilot and SNAPSHOT tokens; a broker binds every request to
-the resolved commit and permits no checkout or write operation.
+libraries. They cannot see the PX4 checkout. Use the separate Git tool calls
+for source and Python for ULog analysis.
 
-Required analysis behavior:
-- Treat the deterministic prepass and resolved-source status supplied with
-  this run as authoritative. Do not repeat source resolution or select a
-  different source revision.
-- Ground flight-specific claims in values read from /inputs/flight.ulg. Source code
-  describes possible firmware behavior; it does not prove that behavior was
-  active in this flight.
-- Choose the investigation appropriate to the user's question. When making a
-  causal claim, do not stop at the first plausible source match. Start from
-  the logged value or event being explained and trace upstream through the
-  assignments, constraints, branches, and helpers that can change it. Confirm
-  that the relevant runtime conditions were active.
-- Test causal explanations with evidence aligned to the same time interval
-  and expressed in compatible units or representations. An enabled parameter,
-  a matching downstream value, correlation, or independently computed extrema
-  do not by themselves establish causality.
-- Consider competing explanations discovered along the relevant source path.
-  If the available log cannot distinguish them, report the result as
-  unresolved or lower confidence.
-- Only present numeric or exclusion checks as performed evidence when they
-  were actually evaluated during this run. A check that merely restates the
-  observed symptom is not causal verification.
-- Clearly distinguish ULog observations, source-confirmed behavior, inference,
-  contradicting evidence, and unresolved evidence. Calibrate confidence to
-  the available evidence.
-- Complete only the assigned evidence stage. The final report stage answers
-  the user's question using the required FlightLogReport schema.
+Start with local evidence. Quantify the symptom in the ULog, trace a relevant
+source mechanism when source is available, and run calculations that could
+distinguish that mechanism from plausible alternatives. Actively try to
+falsify the leading explanation instead of merely collecting supporting facts.
+Source code establishes possible firmware behavior, not that the behavior
+occurred in this flight. Keep ULog observations, source facts, calculations,
+inferences, contradicting evidence, and unresolved questions distinct.
 
-Tool use:
-- Choose commands, statistics, scripts, and plots based on the question.
-- Analyze complete data or source when needed, but keep returned excerpts and
-  printed results relevant and bounded. Do not omit evidence merely for
-  compactness.
-- Reuse successful results instead of repeating identical commands.
-- If a plot is useful, save it under /plots/.
-- The executor rejects pipes, shell redirection, and command chaining.
+If web search is available, use it only after the ULog and exact source leave a
+material external-context gap. Web results cannot replace flight evidence or
+the resolved source snapshot. If the available evidence cannot discriminate
+between explanations, say so and lower confidence rather than forcing an
+answer.
+
+Save useful plots under /plots/. Keep command output relevant enough to reason
+from, and reuse results already obtained. The executor accepts one command at
+a time and rejects pipes, redirection, and command chaining.
 - To create a temporary script, use Python, for example:
   python -c "from pathlib import Path; Path('analysis.py').write_text('...')"
 """
@@ -1376,6 +1097,12 @@ async def analyze_flight_log(
     if max_total_requests is not None and max_total_requests < 1:
         raise ValueError("max_total_requests must be at least 1")
 
+    model_name = model or os.environ.get("OPENAI_MODEL", "gpt-5.6")
+    turn_limit = (
+        min(max_turns, max_total_requests)
+        if max_total_requests is not None
+        else max_turns
+    )
     work_dir = prepare_workspace(
         log_path_obj,
         output_dir_obj,
@@ -1402,15 +1129,13 @@ async def analyze_flight_log(
             "force_mechanism_refresh": force_mechanism_refresh,
             "dag_discovery": dag_discovery,
             "dag_cache_dir": dag_cache_dir,
-            "analysis_architecture": "staged_evidence_v1",
+            "analysis_architecture": "single_agent_v1",
+            "model": model_name,
+            "reasoning_effort": "high",
             "enable_web_fallback": enable_web_fallback,
             "web_search_context": web_search_context,
-            "max_turns_per_stage": max_turns,
-            "max_total_requests": (
-                max_total_requests
-                if max_total_requests is not None
-                else max_turns
-            ),
+            "max_turns": turn_limit,
+            "max_total_requests": max_total_requests,
         }
     )
     audit_logger.log_event("run.started")
@@ -1458,11 +1183,12 @@ async def analyze_flight_log(
                 "no PX4 source repository was provided."
             )
 
-        await RestrictedShellExecutor(
+        shell_executor = RestrictedShellExecutor(
             work_dir,
             source_snapshot,
             input_paths=analysis_inputs,
-        ).preflight()
+        )
+        await shell_executor.preflight()
 
         started_at = time.perf_counter()
         audit_logger.log_event(
@@ -1475,35 +1201,63 @@ async def analyze_flight_log(
             },
         )
 
-        def shell_tool_factory(source_access: bool) -> ShellTool:
-            return ShellTool(
-                executor=RestrictedShellExecutor(
-                    work_dir,
-                    source_snapshot if source_access else None,
-                    input_paths=analysis_inputs,
-                ),
-                needs_approval=False,
+        instructions = BASE_INSTRUCTIONS
+        if project_instructions:
+            instructions += (
+                "\n\nPX4 PROJECT INSTRUCTIONS\n"
+                "========================\n"
+                + project_instructions
             )
 
-        staged_result = await run_staged_analysis(
+        tools: list[Any] = [
+            ShellTool(
+                executor=shell_executor,
+                needs_approval=False,
+            )
+        ]
+        if enable_web_fallback:
+            tools.append(
+                WebSearchTool(
+                    search_context_size=web_search_context,
+                    external_web_access=True,
+                )
+            )
+
+        agent = Agent(
+            name="PX4 ULog Analyst",
+            model=model_name,
+            instructions=instructions,
+            tools=tools,
+            model_settings=ModelSettings(
+                reasoning=Reasoning(effort="high"),
+            ),
+            output_type=FlightLogReport,
+        )
+        prompt = _analysis_prompt(
             user_question=user_question,
             inventory=inventory,
             source_snapshot=source_snapshot,
             mission_path=mission_path_obj,
-            work_dir=work_dir,
             plots_dir=output_dir_obj / "plots",
-            model=model or os.environ.get("OPENAI_MODEL", "gpt-5.6"),
-            max_turns=max_turns,
-            max_total_requests=max_total_requests,
-            project_instructions=project_instructions,
-            base_instructions=BASE_INSTRUCTIONS,
-            audit_logger=audit_logger,
-            shell_tool_factory=shell_tool_factory,
-            enable_web_fallback=enable_web_fallback,
-            web_search_context=web_search_context,
+            web_search_available=enable_web_fallback,
         )
-        report = staged_result.report
-        usage = staged_result.usage
+        result = await Runner.run(
+            agent,
+            prompt,
+            max_turns=turn_limit,
+            hooks=AgentRunAuditHooks(audit_logger),
+        )
+        log_run_items(audit_logger, getattr(result, "new_items", []) or [])
+        report = (
+            result.final_output
+            if isinstance(result.final_output, FlightLogReport)
+            else FlightLogReport.model_validate(result.final_output)
+        )
+        report = _normalize_report_plot_paths(
+            report,
+            plots_dir=output_dir_obj / "plots",
+        )
+        usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
         audit_logger.log_event(
             "agent.shell_analysis.finished",
             output=report.model_dump(),
@@ -1513,7 +1267,6 @@ async def analyze_flight_log(
         audit_logger.save_usage(usage)
 
         validation = validate_report(report)
-        validation_required_downgrade = not validation.passed
         audit_logger.log_event(
             "validation.finished",
             output=validation.model_dump(),
@@ -1526,16 +1279,6 @@ async def analyze_flight_log(
                 output=validation.model_dump(),
             )
 
-        report = reconcile_report_with_evidence_state(
-            report,
-            evidence_state=staged_result.evidence_state,
-            unresolved_reason=(
-                "The generated structured report did not retain the evidence "
-                "required for a confirmed causal conclusion."
-                if validation_required_downgrade
-                else None
-            ),
-        )
         _save_report(report, report_path)
         audit_logger.log_event(
             "run.finished",
@@ -1549,6 +1292,100 @@ async def analyze_flight_log(
     except Exception as exc:
         audit_logger.log_event("run.failed", error=repr(exc))
         raise
+
+
+def _analysis_prompt(
+    *,
+    user_question: str,
+    inventory: dict[str, Any],
+    source_snapshot: SourceSnapshot | None,
+    mission_path: Path | None,
+    plots_dir: Path,
+    web_search_available: bool,
+) -> str:
+    compact_inventory = {
+        "firmware_version": inventory.get("firmware_version"),
+        "firmware_branch": inventory.get("firmware_branch"),
+        "logged_git_hash": inventory.get("git_hash"),
+        "resolved_source_commit": (
+            source_snapshot.commit_sha if source_snapshot else None
+        ),
+        "airframe": inventory.get("airframe"),
+        "duration_s": inventory.get("duration_s"),
+        "available_topics": inventory.get("available_topics") or [],
+        "missing_topics": inventory.get("missing_topics") or [],
+        "warnings": inventory.get("warnings") or [],
+    }
+    source_note = (
+        "The exact source snapshot is available through SNAPSHOT."
+        if source_snapshot is not None
+        else (
+            "No exact source snapshot is available. Do not make claims that "
+            "require source confirmation."
+        )
+    )
+    mission_note = (
+        "/inputs/mission.plan is available."
+        if mission_path is not None
+        else "No mission file was supplied."
+    )
+    web_note = (
+        "Web search is available if local evidence leaves an external-context gap."
+        if web_search_available
+        else "Web search is disabled for this run."
+    )
+    return f"""
+Use pyulog and the available tools to answer the user's question about
+/inputs/flight.ulg.
+
+User question:
+{user_question}
+
+Deterministic prepass:
+{json.dumps(make_json_safe(compact_inventory), indent=2, sort_keys=True)}
+
+{source_note}
+{mission_note}
+{web_note}
+
+Do the analysis yourself in this context. Generate and run Python checks as
+needed, inspect the exact source with the pinned Git commands, test the leading
+explanation against alternatives, and try to falsify it before concluding.
+Return the existing FlightLogReport schema. Save plots under /plots/ and use
+/plots/<relative-path> in plot references; the runner maps produced artifacts
+to {plots_dir.resolve()}. Do not write report.json yourself.
+"""
+
+
+def _normalize_report_plot_paths(
+    report: FlightLogReport,
+    *,
+    plots_dir: Path,
+) -> FlightLogReport:
+    plot_root = plots_dir.resolve()
+    available = {
+        f"/plots/{path.resolve().relative_to(plot_root).as_posix()}": str(
+            path.resolve()
+        )
+        for path in sorted(plot_root.rglob("*"))
+        if path.is_file()
+        and not path.is_symlink()
+        and path.resolve().is_relative_to(plot_root)
+    }
+    for hypothesis in report.ranked_hypotheses:
+        for plot in hypothesis.plots:
+            if not plot.path:
+                continue
+            host_path = available.get(plot.path)
+            if host_path is None:
+                plot.warnings.append(
+                    "The report referenced a plot that was not produced "
+                    "during this analysis."
+                )
+                plot.path = ""
+            else:
+                plot.path = host_path
+    return report
 
 
 def _run_audited_stage(
@@ -1657,25 +1494,25 @@ def parse_args() -> argparse.Namespace:
         "--max-turns",
         type=int,
         default=20,
-        help="Maximum turns for each evidence stage",
+        help="Maximum turns in the single analysis run",
     )
     parser.add_argument(
         "--max-total-requests",
         type=int,
         help=(
-            "Maximum model requests across all stages; defaults to --max-turns"
+            "Optional request cap; the lower of this and --max-turns is used"
         ),
     )
     parser.add_argument(
         "--no-web-fallback",
         action="store_true",
-        help="Do not run the bounded web-assisted retry after an insufficient local pass",
+        help="Do not make web search available to the analysis agent",
     )
     parser.add_argument(
         "--web-context",
         choices=("low", "medium", "high"),
         default="medium",
-        help="Context size for the conditional web-search stage",
+        help="Context size when the agent chooses web search",
     )
     return parser.parse_args()
 
