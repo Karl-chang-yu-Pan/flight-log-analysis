@@ -51,6 +51,28 @@ def _empty_report() -> FlightLogReport:
     )
 
 
+def test_default_max_turns_is_shared_by_api_and_cli(monkeypatch):
+    assert analyzer.DEFAULT_MAX_TURNS == 30
+    assert (
+        analyzer.analyze_flight_log.__kwdefaults__["max_turns"]
+        == analyzer.DEFAULT_MAX_TURNS
+    )
+
+    monkeypatch.setattr(
+        analyzer.sys,
+        "argv",
+        [
+            "analyzer.py",
+            "--ulog",
+            "flight.ulg",
+            "--question",
+            "What happened?",
+        ],
+    )
+
+    assert analyzer.parse_args().max_turns == analyzer.DEFAULT_MAX_TURNS
+
+
 def test_base_instructions_define_lean_single_agent_contract():
     instructions = " ".join(analyzer.BASE_INSTRUCTIONS.split())
 

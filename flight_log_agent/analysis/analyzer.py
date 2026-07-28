@@ -76,6 +76,7 @@ FORBIDDEN_SHELL_TOKENS = {
 }
 MAX_OUTPUT_CHARS = 600_000
 DEFAULT_TIMEOUT_S = 1200
+DEFAULT_MAX_TURNS = 30
 SOURCE_ALIAS = "PX4-Autopilot"
 SNAPSHOT_TOKEN = "SNAPSHOT"
 READ_ONLY_GIT_SUBCOMMANDS = {"grep", "show", "ls-tree"}
@@ -1076,7 +1077,7 @@ async def analyze_flight_log(
     dag_cache_dir: str = ".flightlog_cache",
     *,
     model: str | None = None,
-    max_turns: int = 20,
+    max_turns: int = DEFAULT_MAX_TURNS,
     max_total_requests: int | None = None,
     project_instructions: str = "",
     enable_web_fallback: bool = True,
@@ -1501,7 +1502,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-turns",
         type=int,
-        default=20,
+        default=DEFAULT_MAX_TURNS,
         help="Maximum turns in the single analysis run",
     )
     parser.add_argument(
