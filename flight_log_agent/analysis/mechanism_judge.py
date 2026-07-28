@@ -603,6 +603,13 @@ terminal — operations (target <- expression @ file:line), branch
 predicates, evidence leaves (logged signals, parameters, constants),
 unresolved symbols, and the per-round discovery trace.
 
+Each rendered entry is one SOURCE SITE, not one call instance: a body reached
+from several call sites appears once, with `instances` giving the count.
+Grouping is path-insensitive, so an entry naming a role in
+`roles_with_alternative_producers` is reached by every producer shown for that
+role, while any single execution uses ONE of them — treat those producers as
+alternatives, never as one combined path.
+
 Decide from these facts only:
 - sufficient: does the selected DAG connect the terminal to logged
   signals / parameters / constants well enough to answer the question?
@@ -618,15 +625,18 @@ Decide from these facts only:
   the questioned quantity).
 - next_terminals: when NO given candidate holds the questioned quantity
   at its decision site, name a better bare variable (with file and surveyed
-  source_target_id when available) from the rendering's operations.
+  source_target_id when available) from the rendering's operations or from
+  other_writes_not_reaching_terminal, which lists writes present in the
+  loaded source that do not reach the selected terminal.
 
 When sufficient is false, use essential_gaps and expand_calls as diagnostics
 over the completed fixed-point graph. Fill next_terminals only when a shown
 source write proves that the selected terminal is wrong; one validated
 replacement terminal may be followed up.
 
-Branch entries contain a stable id, predicate, flight-data feasibility,
-and the exact active_windows. always_false means the predicate never held
+Branch entries contain a stable id, predicate, flight-data feasibility, and
+active_windows covering when ANY instance of that source branch was active.
+always_false means the predicate never held
 in THIS flight — treat that path as inactive and do NOT demand its
 grounding; always_true held throughout. For questions about
 behavior that occurs only sometimes, prefer the branch whose active
@@ -658,9 +668,9 @@ file. Never select them either. When proposing next_terminals, always
 include terminal_file (the file whose operations show the write) so
 validation can scope the slice.
 
-next_terminals entries must name a symbol that the rendering's
-operations show being written, or a write target listed in
-source_survey when one is given. A symbol that appears in neither does
+next_terminals entries must name a symbol that the rendering's operations or
+other_writes_not_reaching_terminal show being written, or a write target
+listed in source_survey when one is given. A symbol that appears in neither does
 not exist in the pinned source and yields no mechanism.
 
 Never request raw source; never speculate beyond the rendering.
