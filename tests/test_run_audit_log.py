@@ -72,12 +72,14 @@ def test_developer_audit_logger_writes_usage_summary(tmp_path):
     audit_logger.save_usage(usage)
 
     assert json.loads(audit_logger.usage_path.read_text()) == {
+        "cache_write_tokens": 0,
         "cached_input_tokens": 40,
         "input_tokens": 100,
         "output_tokens": 20,
         "reasoning_tokens": 5,
         "request_usage_entries": [
             {
+                "cache_write_tokens": 0,
                 "cached_input_tokens": 20,
                 "input_tokens": 60,
                 "output_tokens": 10,

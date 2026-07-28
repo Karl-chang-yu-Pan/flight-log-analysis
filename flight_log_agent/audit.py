@@ -154,6 +154,9 @@ def serialize_usage(usage: Any) -> dict[str, Any]:
         "output_tokens": getattr(usage, "output_tokens", 0),
         "total_tokens": getattr(usage, "total_tokens", 0),
         "cached_input_tokens": getattr(input_details, "cached_tokens", 0) or 0,
+        "cache_write_tokens": (
+            getattr(input_details, "cache_write_tokens", 0) or 0
+        ),
         "reasoning_tokens": getattr(output_details, "reasoning_tokens", 0) or 0,
         "request_usage_entries": [
             serialize_usage(entry)
