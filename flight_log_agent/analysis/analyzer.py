@@ -1020,6 +1020,14 @@ the resolved source snapshot. If the available evidence cannot discriminate
 between explanations, say so and lower confidence rather than forcing an
 answer.
 
+Before every additional tool call, perform a completion check: can the
+available evidence already answer the user's question with uncertainty
+represented honestly, and could the proposed call materially change the
+conclusion or confidence? If the question can already be answered and the call
+is not material, stop using tools and return FlightLogReport immediately.
+Continue only to resolve a specific material uncertainty; do not use tools for
+redundant confirmation, cosmetic improvements, or artifact housekeeping.
+
 Save useful plots under /plots/. Keep command output relevant enough to reason
 from, and reuse results already obtained. The executor accepts one command at
 a time and rejects pipes, redirection, and command chaining.

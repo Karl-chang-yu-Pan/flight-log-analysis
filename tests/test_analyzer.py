@@ -67,6 +67,19 @@ def test_base_instructions_define_lean_single_agent_contract():
     assert "source broker" not in instructions
 
 
+def test_base_instructions_check_completion_before_more_tool_calls():
+    instructions = " ".join(analyzer.BASE_INSTRUCTIONS.split())
+
+    assert "Before every additional tool call" in instructions
+    assert "could the proposed call materially change" in instructions
+    assert "return FlightLogReport immediately" in instructions
+    assert (
+        "Continue only to resolve a specific material uncertainty"
+        in instructions
+    )
+    assert "artifact housekeeping" in instructions
+
+
 @pytest.mark.parametrize(
     "removed_instruction",
     [
