@@ -13,6 +13,8 @@ const state = {
   hiddenPlotSeries: {},
   analysisRunId: null,
   analysisPollTimer: null,
+  analysisHistory: [],
+  analysisHistoryError: "",
   sidebarCollapsed: false,
   plotSidebarCollapsed: false,
   availableTags: [],
@@ -57,7 +59,7 @@ const els = {
   analysisButton: document.getElementById("analysisButton"),
   analysisStatus: document.getElementById("analysisStatus"),
   analysisProgress: document.getElementById("analysisProgress"),
-  analysisReport: document.getElementById("analysisReport"),
+  analysisTimeline: document.getElementById("analysisTimeline"),
   changedParameterRows: document.getElementById("changedParameterRows"),
   timelineRows: document.getElementById("timelineRows"),
   logTagPanel: document.getElementById("logTagPanel"),
@@ -180,8 +182,11 @@ async function loadReview() {
     }
     els.analysisSourcePath.value = result?.inputs?.source_path || "";
     updateKmlDownloadAvailability();
-    await refreshLoadedLogTags();
     resetAnalysis();
+    await Promise.all([
+      refreshLoadedLogTags(),
+      loadAnalysisHistory(),
+    ]);
     renderAll();
     setReviewLoadProgress("Generating plots");
     const plotsLoaded = await loadInteractivePlots();
@@ -211,6 +216,7 @@ async function startAnalysis() {
   const question = els.analysisQuestion.value.trim()
     || "Analyze this flight log and identify the most likely root causes.";
   const payload = {
+    browse_log_id: currentBrowseLogId(),
     log_path: inputs.log_path,
     mission_path: inputs.mission_path,
     source_path: currentSourcePath || inputs.source_path,
@@ -224,7 +230,6 @@ async function startAnalysis() {
 
   clearAnalysisPoll();
   els.analysisButton.disabled = true;
-  els.analysisReport.innerHTML = "";
   els.analysisProgress.innerHTML = `<div class="progress-item active">Starting analysis...</div>`;
   setAnalysisStatus("Starting");
 
@@ -239,6 +244,7 @@ async function startAnalysis() {
       throw new Error(result.error || `HTTP ${response.status}`);
     }
     state.analysisRunId = result.run_id;
+    els.analysisQuestion.value = "";
     renderAnalysisRun(result);
     state.analysisPollTimer = window.setInterval(pollAnalysisRun, 1000);
   } catch (error) {
@@ -261,6 +267,7 @@ async function pollAnalysisRun() {
     if (result.status === "completed" || result.status === "failed") {
       clearAnalysisPoll();
       els.analysisButton.disabled = !state.payload;
+      await loadAnalysisHistory();
     }
   } catch (error) {
     clearAnalysisPoll();
@@ -277,11 +284,8 @@ function renderAnalysisRun(run) {
     ? messages.map((message, index) => renderProgressItem(message, index === messages.length - 1, run.status)).join("")
     : `<div class="progress-item active">${escapeHtml(statusText(run.status, ""))}</div>`;
 
-  if (run.status === "failed") {
-    els.analysisReport.innerHTML = `<p class="message-item">${escapeHtml(run.error || "Analysis failed.")}</p>`;
-  } else if (run.report) {
-    renderAnalysisReport(run.report);
-  }
+  upsertAnalysisHistoryEntry(run);
+  renderAnalysisTimeline();
 }
 
 function renderProgressItem(item, isLatest, status) {
@@ -297,12 +301,12 @@ function renderProgressItem(item, isLatest, status) {
   `;
 }
 
-function renderAnalysisReport(report) {
+function analysisReportHtml(report) {
   const hypotheses = report.ranked_hypotheses || [];
   const intentSummary = report.question_intent_summary || "";
   const legacyAssumptions = report.assumption_header || "";
   const legacyTimeline = report.timeline_summary || "";
-  els.analysisReport.innerHTML = `
+  return `
     <div class="report-block">
       <h3>Summary</h3>
       <p>${escapeHtml(report.final_summary || "")}</p>
@@ -316,6 +320,113 @@ function renderAnalysisReport(report) {
     <div class="hypothesis-list">
       ${hypotheses.map(renderHypothesis).join("")}
     </div>
+  `;
+}
+
+async function loadAnalysisHistory() {
+  const browseLogId = currentBrowseLogId();
+  if (!browseLogId) {
+    state.analysisHistory = [];
+    state.analysisHistoryError = "";
+    renderAnalysisTimeline();
+    return;
+  }
+
+  try {
+    const payload = await fetchJson(
+      `/api/analysis-history?browse_log_id=${encodeURIComponent(browseLogId)}`,
+    );
+    state.analysisHistory = payload.entries || [];
+    state.analysisHistoryError = "";
+  } catch (error) {
+    state.analysisHistoryError = error.message;
+  }
+  renderAnalysisTimeline();
+}
+
+function upsertAnalysisHistoryEntry(run) {
+  const runId = String(run?.run_id || "");
+  if (!runId) return;
+  const index = state.analysisHistory.findIndex((entry) => entry.run_id === runId);
+  const existing = index >= 0 ? state.analysisHistory[index] : {};
+  const entry = {
+    ...existing,
+    ...run,
+    question: run.question || run.user_question || existing.question || "",
+  };
+  if (index >= 0) {
+    state.analysisHistory[index] = entry;
+  } else {
+    state.analysisHistory.push(entry);
+  }
+  state.analysisHistoryError = "";
+}
+
+function renderAnalysisTimeline() {
+  const warning = state.analysisHistoryError
+    ? `
+      <p class="analysis-history-empty">Could not load analysis history: ${escapeHtml(state.analysisHistoryError)}</p>
+    `
+    : "";
+
+  const entries = [...state.analysisHistory].sort(compareAnalysisHistoryEntries);
+  if (!entries.length) {
+    els.analysisTimeline.innerHTML = warning || `
+      <p class="analysis-history-empty">No questions have been asked about this log yet.</p>
+    `;
+    return;
+  }
+
+  els.analysisTimeline.innerHTML = warning + entries
+    .map((entry, index) => renderAnalysisTurn(entry, index === entries.length - 1))
+    .join("");
+}
+
+function compareAnalysisHistoryEntries(left, right) {
+  const timeDifference = Number(left.created_at || 0) - Number(right.created_at || 0);
+  return timeDifference || String(left.run_id || "").localeCompare(String(right.run_id || ""));
+}
+
+function renderAnalysisTurn(entry, isLatest) {
+  const timestamp = formatAnalysisTimestamp(entry.created_at);
+  return `
+    <article class="analysis-turn" data-analysis-run-id="${escapeAttr(entry.run_id || "")}">
+      <div class="analysis-message analysis-message-user">
+        <div class="analysis-message-header">
+          <strong>You</strong>
+          ${timestamp ? `<time>${escapeHtml(timestamp)}</time>` : ""}
+        </div>
+        <p>${escapeHtml(entry.question || "Analyze this flight log.")}</p>
+      </div>
+      <div class="analysis-message analysis-message-assistant">
+        <div class="analysis-message-header">
+          <strong>Flight Log Agent</strong>
+          <span class="status-badge">${escapeHtml(statusText(entry.status, entry.progress?.phase))}</span>
+        </div>
+        ${analysisAnswerHtml(entry, isLatest)}
+      </div>
+    </article>
+  `;
+}
+
+function analysisAnswerHtml(entry, isLatest) {
+  if (entry.status === "failed") {
+    return `<p class="analysis-answer-error">${escapeHtml(entry.error || "Analysis failed.")}</p>`;
+  }
+  if (entry.status !== "completed") {
+    const phase = entry.progress?.phase || statusText(entry.status, "");
+    return `<p class="analysis-answer-pending">${escapeHtml(phase)}</p>`;
+  }
+  if (!entry.report) {
+    return `<p class="analysis-answer-error">The analysis completed without a stored report.</p>`;
+  }
+
+  return `
+    <p class="analysis-answer-summary">${escapeHtml(entry.report.final_summary || "Analysis complete.")}</p>
+    <details class="analysis-answer-details"${isLatest ? " open" : ""}>
+      <summary>View full structured analysis</summary>
+      <div class="analysis-report">${analysisReportHtml(entry.report)}</div>
+    </details>
   `;
 }
 
@@ -467,10 +578,12 @@ function renderPlots(plots) {
 function resetAnalysis() {
   clearAnalysisPoll();
   state.analysisRunId = null;
+  state.analysisHistory = [];
+  state.analysisHistoryError = "";
   els.analysisButton.disabled = !state.payload;
   els.analysisStatus.textContent = "Idle";
   els.analysisProgress.innerHTML = "";
-  els.analysisReport.innerHTML = "";
+  renderAnalysisTimeline();
 }
 
 function clearAnalysisPoll() {
@@ -1830,6 +1943,19 @@ function formatEventTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatAnalysisTimestamp(value) {
+  const numeric = Number(value);
+  const date = new Date(Number.isFinite(numeric) && numeric < 1e12 ? numeric * 1000 : value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function artifactUrl(path) {

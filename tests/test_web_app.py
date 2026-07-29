@@ -1,4 +1,5 @@
 from io import BytesIO
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
@@ -256,6 +257,77 @@ def test_analysis_runs_keep_distinct_work_and_report_directories(
             web_app.ANALYSIS_RUNS.pop(second["run_id"], None)
 
 
+def test_analysis_run_uses_indexed_upload_and_persists_history(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+    upload_root = tmp_path / "uploads"
+    log_path = upload_root / "upload-123" / "flight.ulg"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_bytes(b"ulog")
+    browse_row = {
+        "id": "browse-123",
+        "log_path": str(log_path),
+        "review_inputs": {
+            "mission_path": str(log_path.parent / "mission.plan"),
+            "source_path": str(tmp_path / "PX4-Autopilot"),
+        },
+    }
+    monkeypatch.setattr(web_app, "UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(web_app, "OUTPUT_ROOT", tmp_path / "outputs")
+    monkeypatch.setattr(web_app, "get_log", lambda _db_path, _log_id: browse_row)
+    monkeypatch.setattr(web_app.threading, "Thread", FakeThread)
+
+    run = web_app.start_analysis_run({
+        "browse_log_id": "browse-123",
+        "log_path": str(tmp_path / "untrusted.ulg"),
+        "user_question": "Why did RTL start?",
+    })
+
+    try:
+        assert run["log_path"] == str(log_path)
+        assert run["mission_path"] == browse_row["review_inputs"]["mission_path"]
+        assert run["source_path"] == browse_row["review_inputs"]["source_path"]
+        history_path = (
+            log_path.parent
+            / "analysis_history"
+            / f"{run['run_id']}.json"
+        )
+        queued = web_app.load_history_records(history_path.parent)
+        assert queued[0]["question"] == "Why did RTL start?"
+        assert queued[0]["status"] == "queued"
+
+        report = {
+            "final_summary": "RTL was triggered by the configured failsafe.",
+            "ranked_hypotheses": [{"title": "Failsafe"}],
+        }
+        web_app._update_analysis_run(
+            run["run_id"],
+            status="completed",
+            finished_at=30.0,
+            report=report,
+        )
+
+        persisted = json.loads(history_path.read_text(encoding="utf-8"))
+        assert persisted["question"] == "Why did RTL start?"
+        assert persisted["report"] == report
+        history = web_app.analysis_history_snapshot("browse-123")
+        assert history == {
+            "browse_log_id": "browse-123",
+            "entries": [persisted],
+        }
+    finally:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS.pop(run["run_id"], None)
+
+
 def test_resolve_artifact_path_allows_outputs_and_rejects_other_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(web_app, "OUTPUT_ROOT", tmp_path / "outputs")
     plot_dir = web_app.OUTPUT_ROOT / "test_artifacts"
@@ -326,6 +398,22 @@ def test_upload_review_and_browse_pages_have_separate_navigation_contracts():
     assert 'id="plotNavigationMenu"' in review_html
     assert 'id="plotNavigation"' in review_html
     assert "/review?browse_id=" in browse_js
+
+
+def test_review_analysis_uses_durable_independent_history_timeline():
+    review_html = (web_app.WEB_DIR / "review.html").read_text(encoding="utf-8")
+    app_js = (web_app.WEB_DIR / "app.js").read_text(encoding="utf-8")
+    styles = (web_app.WEB_DIR / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="analysisTimeline"' in review_html
+    assert "Ask about this log" in review_html
+    assert "/api/analysis-history?browse_log_id=" in app_js
+    assert "browse_log_id: currentBrowseLogId()" in app_js
+    assert "state.analysisHistory" in app_js
+    assert "renderAnalysisTurn" in app_js
+    assert "View full structured analysis" in app_js
+    assert ".analysis-message-user" in styles
+    assert ".analysis-message-assistant" in styles
 
 
 def test_review_plot_controls_use_dropdown_navigation_and_tracker_overlays():

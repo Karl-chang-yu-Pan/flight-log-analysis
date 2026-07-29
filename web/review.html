@@ -167,15 +167,19 @@
               <input id="analysisSourcePath" type="text" placeholder="optional PX4 checkout">
             </label>
           </div>
+          <div
+            id="analysisTimeline"
+            class="analysis-timeline"
+            aria-live="polite"
+          ></div>
+          <div id="analysisProgress" class="progress-list"></div>
           <div class="analysis-controls">
             <label>
-              Question
+              Ask about this log
               <textarea id="analysisQuestion" rows="3" placeholder="Why did the aircraft drop altitude right after transition?"></textarea>
             </label>
             <button id="analysisButton" type="button" disabled>Run Analysis</button>
           </div>
-          <div id="analysisProgress" class="progress-list"></div>
-          <div id="analysisReport" class="analysis-report"></div>
         </section>
 
         <section class="canvas-section">

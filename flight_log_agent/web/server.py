@@ -22,6 +22,11 @@ from pyulog import ULog
 from flight_log_agent.ulog.preparse_view import build_preparse_payload
 from flight_log_agent.audit import DEFAULT_DEV_LOG_ROOT, make_json_safe
 from flight_log_agent.ulog.interactive_plots import build_interactive_plot_payload
+from flight_log_agent.web.analysis_history import (
+    load_history_records,
+    resolve_history_directory,
+    write_history_record,
+)
 from flight_log_agent.web.browse_index import (
     BrowseConfig,
     add_log_tag,
@@ -119,6 +124,10 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/analyze-runs/"):
             self._handle_analysis_status(path.removeprefix("/api/analyze-runs/"))
+            return
+
+        if path == "/api/analysis-history":
+            self._handle_analysis_history(parsed.query)
             return
 
         if path == "/artifacts":
@@ -426,6 +435,9 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
             return
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
+            return
 
         self._send_json(analysis_run_snapshot(run["run_id"]))
 
@@ -440,6 +452,18 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "analysis run not found"}, status=404)
             return
 
+        self._send_json(snapshot)
+
+    def _handle_analysis_history(self, query: str) -> None:
+        browse_log_id = _first_param(parse_qs(query), "browse_log_id")
+        try:
+            snapshot = analysis_history_snapshot(browse_log_id)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except Exception as exc:
+            self._send_json({"error": repr(exc)}, status=500)
+            return
         self._send_json(snapshot)
 
     def _handle_interactive_plots(self) -> None:
@@ -575,7 +599,16 @@ def _optional_payload_path(payload: dict[str, Any], key: str) -> str | None:
 
 
 def start_analysis_run(payload: dict[str, Any]) -> dict[str, Any]:
-    log_path = str(payload.get("log_path") or "").strip()
+    browse_log_id = str(payload.get("browse_log_id") or "").strip()
+    browse_row = (
+        get_log(BROWSE_CONFIG.browse_db_path, browse_log_id)
+        if browse_log_id
+        else None
+    )
+    if browse_row is not None:
+        log_path = str(browse_row.get("log_path") or "").strip()
+    else:
+        log_path = str(payload.get("log_path") or "").strip()
     if not log_path:
         raise ValueError("log_path is required")
 
@@ -583,31 +616,49 @@ def start_analysis_run(payload: dict[str, Any]) -> dict[str, Any]:
     if not user_question:
         raise ValueError("user_question is required")
 
+    stored_inputs = (browse_row or {}).get("review_inputs") or {}
     run_id = uuid.uuid4().hex
     output_dir = OUTPUT_ROOT / f"web_{run_id}"
+    history_dir = resolve_history_directory(
+        log_path,
+        upload_root=UPLOAD_ROOT,
+        fallback_root=OUTPUT_ROOT / "analysis_history",
+        history_key=browse_log_id or None,
+    )
     run = {
         "run_id": run_id,
+        "browse_log_id": browse_log_id or None,
         "status": "queued",
         "created_at": time.time(),
         "started_at": None,
         "finished_at": None,
         "error": None,
+        "history_error": None,
         "traceback": None,
         "log_path": log_path,
-        "mission_path": _optional_payload_path(payload, "mission_path"),
-        "source_path": _optional_payload_path(payload, "source_path"),
+        "mission_path": (
+            _optional_payload_path(payload, "mission_path")
+            or stored_inputs.get("mission_path")
+        ),
+        "source_path": (
+            _optional_payload_path(payload, "source_path")
+            or stored_inputs.get("source_path")
+        ),
+        "user_question": user_question,
         "output_dir": str(output_dir),
         "report_path": str(output_dir / "report.json"),
         "dev_log_dir": str(WEB_DEV_LOG_ROOT / run_id),
+        "history_dir": str(history_dir),
         "report": None,
     }
 
+    _persist_analysis_run_history(run)
     with ANALYSIS_RUNS_LOCK:
         ANALYSIS_RUNS[run_id] = run
 
     thread = threading.Thread(
         target=_run_analysis_job,
-        args=(run_id, user_question),
+        args=(run_id,),
         name=f"flight-log-analysis-{run_id[:8]}",
         daemon=True,
     )
@@ -623,13 +674,33 @@ def analysis_run_snapshot(run_id: str) -> dict[str, Any] | None:
         snapshot = {
             key: value
             for key, value in run.items()
-            if key != "traceback"
+            if key not in {"history_dir", "traceback"}
         }
 
     events = read_analysis_events(run_id)
     snapshot["events"] = events
     snapshot["progress"] = build_analysis_progress(snapshot["status"], events)
     return snapshot
+
+
+def analysis_history_snapshot(browse_log_id: str) -> dict[str, Any]:
+    clean_browse_log_id = str(browse_log_id or "").strip()
+    if not clean_browse_log_id:
+        raise ValueError("browse_log_id is required")
+    browse_row = get_log(BROWSE_CONFIG.browse_db_path, clean_browse_log_id)
+    log_path = str(browse_row.get("log_path") or "").strip()
+    if not log_path:
+        raise ValueError("indexed log has no log_path")
+    history_dir = resolve_history_directory(
+        log_path,
+        upload_root=UPLOAD_ROOT,
+        fallback_root=OUTPUT_ROOT / "analysis_history",
+        history_key=clean_browse_log_id,
+    )
+    return {
+        "browse_log_id": clean_browse_log_id,
+        "entries": load_history_records(history_dir),
+    }
 
 
 def read_analysis_events(run_id: str) -> list[dict[str, Any]]:
@@ -937,18 +1008,19 @@ def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
         return default
 
 
-def _run_analysis_job(run_id: str, user_question: str) -> None:
+def _run_analysis_job(run_id: str, user_question: str | None = None) -> None:
     _update_analysis_run(run_id, status="running", started_at=time.time())
     try:
         from flight_log_agent.analysis.analyzer import analyze_flight_log
 
         with ANALYSIS_RUNS_LOCK:
             run = dict(ANALYSIS_RUNS[run_id])
+        question = user_question or run["user_question"]
 
         report = asyncio.run(
             analyze_flight_log(
                 log_path=run["log_path"],
-                user_question=user_question,
+                user_question=question,
                 mission_path=run["mission_path"],
                 source_path=run["source_path"],
                 output_dir=run["output_dir"],
@@ -974,8 +1046,41 @@ def _run_analysis_job(run_id: str, user_question: str) -> None:
 
 def _update_analysis_run(run_id: str, **fields: Any) -> None:
     with ANALYSIS_RUNS_LOCK:
-        if run_id in ANALYSIS_RUNS:
-            ANALYSIS_RUNS[run_id].update(fields)
+        run = ANALYSIS_RUNS.get(run_id)
+        if run is None:
+            return
+        run.update(fields)
+        snapshot = dict(run)
+
+    try:
+        _persist_analysis_run_history(snapshot)
+    except Exception as exc:
+        with ANALYSIS_RUNS_LOCK:
+            if run_id in ANALYSIS_RUNS:
+                ANALYSIS_RUNS[run_id]["history_error"] = repr(exc)
+
+
+def _persist_analysis_run_history(run: dict[str, Any]) -> None:
+    history_dir = run.get("history_dir")
+    if not history_dir:
+        return
+    write_history_record(
+        history_dir,
+        {
+            "schema_version": 1,
+            "run_id": run["run_id"],
+            "browse_log_id": run.get("browse_log_id"),
+            "status": run["status"],
+            "question": run["user_question"],
+            "created_at": run.get("created_at"),
+            "started_at": run.get("started_at"),
+            "finished_at": run.get("finished_at"),
+            "output_dir": run["output_dir"],
+            "report_path": run["report_path"],
+            "report": run.get("report"),
+            "error": run.get("error"),
+        },
+    )
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
