@@ -426,6 +426,11 @@ def test_review_plot_controls_use_dropdown_navigation_and_tracker_overlays():
     assert 'plotTrackerCanvas-${escapeAttr(plot.id)}' in app_js
     assert "requestAnimationFrame(flushSharedPlotTracker)" in app_js
     assert "drawInteractivePlotTrackers(plots, { visibleOnly: true })" in app_js
+    assert "new window.IntersectionObserver" in app_js
+    assert 'root: els.plotSidebar' in app_js
+    assert 'els.plotSidebar.addEventListener("scroll"' not in app_js
+    assert "plotTrackerDrawnRevisions" in app_js
+    assert "state.plotVisibilityObserver !== observer" in app_js
     assert ".plot-navigation-menu" in styles
     assert "position: absolute" in styles
 

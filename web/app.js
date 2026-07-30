@@ -7,7 +7,10 @@ const state = {
   sharedPlotTracker: null,
   pendingPlotTracker: null,
   plotTrackerFrame: null,
-  plotScrollFrame: null,
+  plotVisibilityObserver: null,
+  visiblePlotIds: new Set(),
+  plotTrackerRevision: 0,
+  plotTrackerDrawnRevisions: {},
   plotResizeTimer: null,
   plotRenderMetrics: {},
   hiddenPlotSeries: {},
@@ -101,7 +104,6 @@ els.plotNavigation.addEventListener("click", (event) => {
   if (plot) plot.scrollIntoView({ block: "start" });
   els.plotNavigationMenu.removeAttribute("open");
 });
-els.plotSidebar.addEventListener("scroll", scheduleVisiblePlotTrackerDraw, { passive: true });
 document.addEventListener("click", (event) => {
   if (!els.plotNavigationMenu.open || els.plotNavigationMenu.contains(event.target)) return;
   els.plotNavigationMenu.removeAttribute("open");
@@ -165,13 +167,12 @@ async function loadReview() {
       window.cancelAnimationFrame(state.plotTrackerFrame);
       state.plotTrackerFrame = null;
     }
-    if (state.plotScrollFrame != null) {
-      window.cancelAnimationFrame(state.plotScrollFrame);
-      state.plotScrollFrame = null;
-    }
+    disconnectPlotVisibilityObserver();
     state.plotTrackers = {};
     state.sharedPlotTracker = null;
     state.pendingPlotTracker = null;
+    state.plotTrackerRevision = 0;
+    state.plotTrackerDrawnRevisions = {};
     state.plotRenderMetrics = {};
     state.hiddenPlotSeries = {};
     state.availableTags = [];
@@ -771,6 +772,7 @@ function initializePlotTrackers(plots) {
 
 function renderInteractivePlots() {
   const plots = state.plotPayload?.plots || [];
+  disconnectPlotVisibilityObserver();
   if (!state.payload) {
     els.plotSidebarStatus.textContent = "Load a log";
     renderPlotNavigation([]);
@@ -792,6 +794,7 @@ function renderInteractivePlots() {
     : `<p class="plot-empty">No Flight Review plot signals were available in this log.</p>`;
 
   bindInteractivePlots(plots);
+  observeInteractivePlots(plots);
   window.requestAnimationFrame(() => drawInteractivePlots(plots));
 }
 
@@ -904,15 +907,51 @@ function flushSharedPlotTracker() {
     const slider = document.getElementById(`plotTracker-${plot.id}`);
     if (slider) slider.value = String(tracker);
   });
+  state.plotTrackerRevision += 1;
   drawInteractivePlotTrackers(plots, { visibleOnly: true });
 }
 
-function scheduleVisiblePlotTrackerDraw() {
-  if (state.plotScrollFrame != null) return;
-  state.plotScrollFrame = window.requestAnimationFrame(() => {
-    state.plotScrollFrame = null;
-    drawInteractivePlotTrackers(state.plotPayload?.plots || [], { visibleOnly: true });
+function observeInteractivePlots(plots) {
+  if (!plots.length || typeof window.IntersectionObserver !== "function") return;
+
+  const plotsById = new Map(plots.map((plot) => [plot.id, plot]));
+  const observer = new window.IntersectionObserver((entries) => {
+    if (state.plotVisibilityObserver !== observer) return;
+    entries.forEach((entry) => {
+      const plotId = entry.target.dataset.plotId;
+      if (!plotId) return;
+      if (!entry.isIntersecting) {
+        state.visiblePlotIds.delete(plotId);
+        return;
+      }
+
+      state.visiblePlotIds.add(plotId);
+      const plot = plotsById.get(plotId);
+      if (
+        plot
+        && state.plotTrackerDrawnRevisions[plotId] !== state.plotTrackerRevision
+      ) {
+        drawInteractivePlotTracker(plot);
+      }
+    });
+  }, {
+    root: els.plotSidebar,
+    rootMargin: "200px 0px",
+    threshold: 0,
   });
+  state.plotVisibilityObserver = observer;
+
+  els.plotRows.querySelectorAll(".interactive-plot").forEach((section) => {
+    observer.observe(section);
+  });
+}
+
+function disconnectPlotVisibilityObserver() {
+  if (state.plotVisibilityObserver) {
+    state.plotVisibilityObserver.disconnect();
+    state.plotVisibilityObserver = null;
+  }
+  state.visiblePlotIds.clear();
 }
 
 function schedulePlotResize() {
@@ -931,19 +970,14 @@ function drawInteractivePlots(plots) {
 
 function drawInteractivePlotTrackers(plots, { visibleOnly = false } = {}) {
   plots.forEach((plot) => {
-    if (!visibleOnly || isPlotNearViewport(plot)) drawInteractivePlotTracker(plot);
+    if (
+      !visibleOnly
+      || !state.plotVisibilityObserver
+      || state.visiblePlotIds.has(plot.id)
+    ) {
+      drawInteractivePlotTracker(plot);
+    }
   });
-}
-
-function isPlotNearViewport(plot) {
-  const canvas = document.getElementById(`plotTrackerCanvas-${plot.id}`);
-  const section = canvas?.closest(".interactive-plot");
-  if (!section) return false;
-  const plotRect = section.getBoundingClientRect();
-  const sidebarRect = els.plotSidebar.getBoundingClientRect();
-  const margin = 200;
-  return plotRect.bottom >= sidebarRect.top - margin
-    && plotRect.top <= sidebarRect.bottom + margin;
 }
 
 function drawResizedInteractivePlots(plots) {
@@ -989,6 +1023,7 @@ function drawInteractivePlotTracker(plot) {
   }
 
   updatePlotReadout(plot);
+  state.plotTrackerDrawnRevisions[plot.id] = state.plotTrackerRevision;
 }
 
 function prepareCanvas(canvas) {
