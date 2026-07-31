@@ -23,8 +23,23 @@ from flight_log_agent.web.airframe_assets import (
 ERROR_LEVELS = {"EMERGENCY", "ALERT", "CRITICAL", "ERROR"}
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
+BROWSE_SCHEMA_VERSION = 1
 DEFAULT_AIRFRAME_ASSET_ROOT = Path(__file__).resolve().parents[2] / "web" / "airframes"
 BUNDLED_AIRFRAME_METADATA_PATH = DEFAULT_AIRFRAME_ASSET_ROOT / "AirframeFactMetaData.xml"
+FLIGHT_REVIEW_LOG_COLUMNS = ("Date", "OriginalFilename", "Description")
+FLIGHT_REVIEW_GENERATED_COLUMNS = (
+    "Duration",
+    "MavType",
+    "AutostartId",
+    "Hardware",
+    "Software",
+    "NumLoggedErrors",
+    "FlightModes",
+    "SoftwareVersion",
+    "StartTime",
+    "FlightModeDurations",
+    "UUID",
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +49,22 @@ class BrowseConfig:
     flight_review_db_path: Path | None = None
     flight_review_log_dir: Path | None = None
     airframe_image_root: Path | None = None
+
+
+def with_flight_review_storage_path(
+    config: BrowseConfig,
+    storage_path: str | Path,
+) -> BrowseConfig:
+    clean_path = str(storage_path).strip()
+    if not clean_path:
+        raise ValueError("flight_review_storage_path must not be empty")
+    return BrowseConfig(
+        browse_db_path=config.browse_db_path,
+        flight_review_storage_path=Path(clean_path).expanduser(),
+        flight_review_db_path=None,
+        flight_review_log_dir=None,
+        airframe_image_root=config.airframe_image_root,
+    )
 
 
 def resolve_flight_review_db_path(config: BrowseConfig) -> Path | None:
@@ -125,53 +156,116 @@ def upsert_log_from_path(
     with _connect(db_path) as con:
         _ensure_schema(con)
         _upsert_log(con, record)
+        con.commit()
     return record
 
 
-def import_flight_review(config: BrowseConfig) -> dict[str, Any]:
+def sync_flight_review(config: BrowseConfig) -> dict[str, Any]:
     source_db = resolve_flight_review_db_path(config)
     log_dir = resolve_flight_review_log_dir(config)
     if source_db is None:
         raise ValueError("flight_review_db_path or flight_review_storage_path is required")
     if log_dir is None:
         raise ValueError("flight_review_log_dir or flight_review_storage_path is required")
-    if not source_db.is_file():
-        raise ValueError(f"Flight Review database does not exist: {source_db}")
-    if not log_dir.is_dir():
-        raise ValueError(f"Flight Review log directory does not exist: {log_dir}")
 
-    imported = 0
+    source_db_path = source_db.expanduser().resolve()
+    log_dir_path = log_dir.expanduser().resolve()
+    browse_db_path = config.browse_db_path.expanduser().resolve()
+    if not source_db_path.is_file():
+        raise ValueError(f"Flight Review database does not exist: {source_db_path}")
+    if not log_dir_path.is_dir():
+        raise ValueError(f"Flight Review log directory does not exist: {log_dir_path}")
+    if _paths_refer_to_same_file(source_db_path, browse_db_path):
+        raise ValueError("Flight Review source database must differ from browse database")
+
     skipped_missing_logs = 0
     airframes = load_browse_airframe_metadata(config)
     airframe_image_root = resolve_airframe_image_root(config)
-    with sqlite3.connect(source_db) as source_con, _connect(config.browse_db_path) as dest_con:
-        source_con.row_factory = sqlite3.Row
+    counts = {"added": 0, "updated": 0, "unchanged": 0}
+    with _connect(browse_db_path) as dest_con:
         _ensure_schema(dest_con)
-        for row in source_con.execute(_flight_review_import_sql()):
-            log_id = str(row["Id"] or "").strip()
-            if not log_id:
-                continue
-            log_path = log_dir / f"{log_id}.ulg"
-            if not log_path.is_file():
-                skipped_missing_logs += 1
-                continue
+        dest_con.execute("BEGIN IMMEDIATE")
+        try:
+            _claim_flight_review_source(dest_con, source_db_path, log_dir_path)
+            with _connect_flight_review_source(source_db_path) as source_con:
+                source_con.execute("BEGIN")
+                rows = _flight_review_rows(source_con)
+                source_con.rollback()
 
-            record = _record_from_flight_review_row(
-                row,
-                log_path,
-                airframes,
-                airframe_image_root,
+            records: list[dict[str, Any]] = []
+            for row in rows:
+                log_id = _flight_review_log_id(row["Id"])
+                if log_id is None:
+                    continue
+                log_path = _flight_review_log_path(log_dir_path, log_id)
+                if not log_path.is_file():
+                    skipped_missing_logs += 1
+                    continue
+                records.append(
+                    _record_from_flight_review_row(
+                        row,
+                        log_path,
+                        airframes,
+                        airframe_image_root,
+                        log_id=log_id,
+                    )
+                )
+
+            dest_con.execute(
+                "CREATE TEMP TABLE flight_review_sync_seen(id TEXT PRIMARY KEY)"
             )
-            _upsert_log(dest_con, record)
-            imported += 1
+            for record in records:
+                dest_con.execute(
+                    "INSERT INTO flight_review_sync_seen(id) VALUES (?)",
+                    (record["id"],),
+                )
+                outcome = _upsert_log(dest_con, record)
+                counts[outcome] += 1
+
+            now = _iso_utc(datetime.now(timezone.utc))
+            newly_unavailable = dest_con.execute(
+                """
+                UPDATE browse_logs
+                SET source_available = 0, updated_at = ?
+                WHERE source_kind = 'flight_review'
+                  AND source_available = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM flight_review_sync_seen
+                      WHERE flight_review_sync_seen.id = browse_logs.id
+                  )
+                """,
+                (now,),
+            ).rowcount
+            unavailable = dest_con.execute(
+                """
+                SELECT COUNT(*)
+                FROM browse_logs
+                WHERE source_kind = 'flight_review'
+                  AND source_available = 0
+                """
+            ).fetchone()[0]
+            dest_con.commit()
+        except Exception:
+            dest_con.rollback()
+            raise
 
     return {
-        "imported": imported,
+        "imported": len(records),
+        **counts,
+        "missing": skipped_missing_logs,
         "skipped_missing_logs": skipped_missing_logs,
+        "newly_unavailable": newly_unavailable,
+        "unavailable": unavailable,
         "source_db": str(source_db),
         "log_dir": str(log_dir),
         "browse_db": str(config.browse_db_path),
     }
+
+
+def import_flight_review(config: BrowseConfig) -> dict[str, Any]:
+    """Compatibility wrapper for the original manual import entry point."""
+    return sync_flight_review(config)
 
 
 def query_logs(
@@ -205,7 +299,9 @@ def query_logs(
 
     with _connect(db_path) as con:
         con.row_factory = sqlite3.Row
-        total = con.execute("SELECT COUNT(*) FROM browse_logs").fetchone()[0]
+        total = con.execute(
+            "SELECT COUNT(*) FROM browse_logs WHERE source_available = 1"
+        ).fetchone()[0]
         filtered = con.execute(f"SELECT COUNT(*) FROM browse_logs {where}", params).fetchone()[0]
         rows = con.execute(
             f"""
@@ -247,9 +343,15 @@ def list_tags(db_path: Path) -> list[dict[str, Any]]:
         con.row_factory = sqlite3.Row
         rows = con.execute(
             """
-            SELECT tags.name, COUNT(log_tags.log_id) AS log_count
+            SELECT
+                tags.name,
+                COUNT(
+                    CASE WHEN browse_logs.source_available = 1
+                    THEN log_tags.log_id END
+                ) AS log_count
             FROM tags
             LEFT JOIN log_tags ON log_tags.tag_id = tags.id
+            LEFT JOIN browse_logs ON browse_logs.id = log_tags.log_id
             GROUP BY tags.id
             ORDER BY tags.name COLLATE NOCASE
             """
@@ -382,13 +484,21 @@ def build_log_record_from_path(
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(db_path)
+    con = sqlite3.connect(db_path, timeout=30)
+    con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=30000")
     return con
 
 
 def _ensure_schema(con: sqlite3.Connection) -> None:
+    schema_version = int(con.execute("PRAGMA user_version").fetchone()[0])
+    if schema_version > BROWSE_SCHEMA_VERSION:
+        raise ValueError(
+            "browse database schema is newer than this application "
+            f"({schema_version} > {BROWSE_SCHEMA_VERSION})"
+        )
+
     con.executescript(
         """
         CREATE TABLE IF NOT EXISTS browse_logs(
@@ -412,6 +522,7 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             flight_modes_json TEXT NOT NULL DEFAULT '[]',
             metadata_json TEXT NOT NULL DEFAULT '{}',
             search_text TEXT NOT NULL DEFAULT '',
+            source_available INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -431,19 +542,56 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
             FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS browse_sync_sources(
+            source_kind TEXT PRIMARY KEY,
+            source_db_path TEXT NOT NULL,
+            log_dir_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_browse_logs_upload_date ON browse_logs(upload_date);
         CREATE INDEX IF NOT EXISTS idx_browse_logs_log_date ON browse_logs(log_date);
         CREATE INDEX IF NOT EXISTS idx_browse_logs_error_count ON browse_logs(error_count);
         CREATE INDEX IF NOT EXISTS idx_log_tags_tag_id ON log_tags(tag_id);
         """
     )
+    browse_log_columns = {
+        row[1] for row in con.execute("PRAGMA table_info('browse_logs')")
+    }
+    if "source_available" not in browse_log_columns:
+        con.execute(
+            "ALTER TABLE browse_logs "
+            "ADD COLUMN source_available INTEGER NOT NULL DEFAULT 1"
+        )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_browse_logs_source_available "
+        "ON browse_logs(source_available)"
+    )
+    con.execute(f"PRAGMA user_version={BROWSE_SCHEMA_VERSION}")
     con.commit()
 
 
-def _upsert_log(con: sqlite3.Connection, record: dict[str, Any]) -> None:
+def _upsert_log(con: sqlite3.Connection, record: dict[str, Any]) -> str:
     now = _iso_utc(datetime.now(timezone.utc))
-    existing = con.execute("SELECT created_at FROM browse_logs WHERE id = ?", (record["id"],)).fetchone()
-    created_at = existing[0] if existing else now
+    values = _serialized_log_values(record)
+    existing = con.execute(
+        """
+        SELECT
+            source_kind, source_log_id, log_path, original_filename,
+            upload_date, log_date, vehicle_type, airframe_name, airframe_group,
+            airframe_id, airframe_image_key, hardware, software,
+            software_version, duration_s, error_count, flight_modes_json,
+            metadata_json, search_text, source_available, created_at
+        FROM browse_logs
+        WHERE id = ?
+        """,
+        (record["id"],),
+    ).fetchone()
+    if existing is not None and tuple(existing[:-1]) == values:
+        return "unchanged"
+
+    created_at = existing[-1] if existing else now
     con.execute(
         """
         INSERT INTO browse_logs(
@@ -451,9 +599,9 @@ def _upsert_log(con: sqlite3.Connection, record: dict[str, Any]) -> None:
             upload_date, log_date, vehicle_type, airframe_name, airframe_group,
             airframe_id, airframe_image_key, hardware, software, software_version,
             duration_s, error_count, flight_modes_json, metadata_json, search_text,
-            created_at, updated_at
+            source_available, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             source_kind = excluded.source_kind,
             source_log_id = excluded.source_log_id,
@@ -474,58 +622,205 @@ def _upsert_log(con: sqlite3.Connection, record: dict[str, Any]) -> None:
             flight_modes_json = excluded.flight_modes_json,
             metadata_json = excluded.metadata_json,
             search_text = excluded.search_text,
+            source_available = excluded.source_available,
             updated_at = excluded.updated_at
         """,
         (
             record["id"],
-            record.get("source_kind") or "local",
-            record.get("source_log_id"),
-            record["log_path"],
-            record.get("original_filename"),
-            record.get("upload_date"),
-            record.get("log_date"),
-            record.get("vehicle_type"),
-            record.get("airframe_name"),
-            record.get("airframe_group"),
-            record.get("airframe_id"),
-            record.get("airframe_image_key") or DEFAULT_AIRFRAME_IMAGE_KEY,
-            record.get("hardware"),
-            record.get("software"),
-            record.get("software_version"),
-            record.get("duration_s"),
-            int(record.get("error_count") or 0),
-            json.dumps(record.get("flight_modes") or [], sort_keys=True),
-            json.dumps(record.get("metadata") or {}, sort_keys=True),
-            record.get("search_text") or _build_search_text(record),
+            *values,
             created_at,
             now,
         ),
     )
-    con.commit()
+    return "updated" if existing is not None else "added"
 
 
-def _flight_review_import_sql() -> str:
-    return """
-        SELECT
-            Logs.Id,
-            Logs.Date,
-            Logs.OriginalFilename,
-            Logs.Description,
-            LogsGenerated.Duration,
-            LogsGenerated.MavType,
-            LogsGenerated.AutostartId,
-            LogsGenerated.Hardware,
-            LogsGenerated.Software,
-            LogsGenerated.NumLoggedErrors,
-            LogsGenerated.FlightModes,
-            LogsGenerated.SoftwareVersion,
-            LogsGenerated.StartTime,
-            LogsGenerated.FlightModeDurations,
-            LogsGenerated.UUID
-        FROM Logs
-        LEFT JOIN LogsGenerated ON Logs.Id = LogsGenerated.Id
-        ORDER BY Logs.Date DESC
-    """
+def _serialized_log_values(record: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        record.get("source_kind") or "local",
+        record.get("source_log_id"),
+        record["log_path"],
+        record.get("original_filename"),
+        record.get("upload_date"),
+        record.get("log_date"),
+        record.get("vehicle_type"),
+        record.get("airframe_name"),
+        record.get("airframe_group"),
+        record.get("airframe_id"),
+        record.get("airframe_image_key") or DEFAULT_AIRFRAME_IMAGE_KEY,
+        record.get("hardware"),
+        record.get("software"),
+        record.get("software_version"),
+        record.get("duration_s"),
+        int(record.get("error_count") or 0),
+        json.dumps(record.get("flight_modes") or [], sort_keys=True),
+        json.dumps(record.get("metadata") or {}, sort_keys=True),
+        record.get("search_text") or _build_search_text(dict(record)),
+        1,
+    )
+
+
+def _connect_flight_review_source(source_db: Path) -> sqlite3.Connection:
+    source_uri = f"{source_db.resolve().as_uri()}?mode=ro"
+    con = sqlite3.connect(source_uri, uri=True, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA query_only=ON")
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+
+def _paths_refer_to_same_file(left: Path, right: Path) -> bool:
+    if left == right:
+        return True
+    if not right.exists():
+        return False
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
+def _claim_flight_review_source(
+    con: sqlite3.Connection,
+    source_db: Path,
+    log_dir: Path,
+) -> None:
+    source_db_path = str(source_db.resolve())
+    log_dir_path = str(log_dir.resolve())
+    existing = con.execute(
+        """
+        SELECT source_db_path, log_dir_path
+        FROM browse_sync_sources
+        WHERE source_kind = 'flight_review'
+        """
+    ).fetchone()
+    if existing is None:
+        _validate_unbound_flight_review_rows(con, log_dir)
+    elif tuple(existing) != (source_db_path, log_dir_path):
+        _raise_different_flight_review_source()
+
+    now = _iso_utc(datetime.now(timezone.utc))
+    con.execute(
+        """
+        INSERT INTO browse_sync_sources(
+            source_kind, source_db_path, log_dir_path, created_at, updated_at
+        )
+        VALUES ('flight_review', ?, ?, ?, ?)
+        ON CONFLICT(source_kind) DO UPDATE SET updated_at = excluded.updated_at
+        """,
+        (source_db_path, log_dir_path, now, now),
+    )
+
+
+def _validate_unbound_flight_review_rows(
+    con: sqlite3.Connection,
+    log_dir: Path,
+) -> None:
+    requested_log_dir = log_dir.resolve()
+    existing_paths = con.execute(
+        """
+        SELECT log_path
+        FROM browse_logs
+        WHERE source_kind = 'flight_review'
+        """
+    ).fetchall()
+    for (path_value,) in existing_paths:
+        if not path_value:
+            _raise_different_flight_review_source()
+        existing_log_dir = Path(str(path_value)).expanduser().resolve().parent
+        if existing_log_dir != requested_log_dir:
+            _raise_different_flight_review_source()
+
+
+def _raise_different_flight_review_source() -> None:
+    raise ValueError(
+        "browse database is already synchronized with a different "
+        "Flight Review source; use the original storage path or a "
+        "different browse database"
+    )
+
+
+def _flight_review_rows(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    logs_columns = _sqlite_table_columns(con, "Logs")
+    if not logs_columns:
+        raise ValueError("Flight Review database is missing the Logs table")
+    if "id" not in logs_columns:
+        raise ValueError("Flight Review Logs table is missing required Id column")
+
+    generated_columns = _sqlite_table_columns(con, "LogsGenerated")
+    if generated_columns and "id" not in generated_columns:
+        raise ValueError(
+            "Flight Review LogsGenerated table is missing required Id column"
+        )
+
+    select_parts = ['Logs."Id" AS "Id"']
+    select_parts.extend(
+        _optional_source_column("Logs", column, logs_columns)
+        for column in FLIGHT_REVIEW_LOG_COLUMNS
+    )
+    select_parts.extend(
+        _optional_source_column(
+            "LogsGenerated",
+            column,
+            generated_columns,
+        )
+        for column in FLIGHT_REVIEW_GENERATED_COLUMNS
+    )
+    join = (
+        'LEFT JOIN LogsGenerated ON Logs."Id" = LogsGenerated."Id"'
+        if generated_columns
+        else ""
+    )
+    order_by = 'Logs."Date" DESC' if "date" in logs_columns else 'Logs."Id" ASC'
+    sql = (
+        f"SELECT {', '.join(select_parts)} "
+        f"FROM Logs {join} ORDER BY {order_by}"
+    )
+    return con.execute(sql).fetchall()
+
+
+def _sqlite_table_columns(con: sqlite3.Connection, table_name: str) -> set[str]:
+    quoted_name = table_name.replace("'", "''")
+    return {
+        str(row[1]).casefold()
+        for row in con.execute(f"PRAGMA table_info('{quoted_name}')")
+    }
+
+
+def _optional_source_column(
+    table_name: str,
+    column_name: str,
+    available_columns: set[str],
+) -> str:
+    if column_name.casefold() in available_columns:
+        return f'{table_name}."{column_name}" AS "{column_name}"'
+    return f'NULL AS "{column_name}"'
+
+
+def _flight_review_log_id(value: Any) -> str | None:
+    log_id = "" if value is None else str(value).strip()
+    if not log_id:
+        return None
+    if (
+        log_id in {".", ".."}
+        or "/" in log_id
+        or "\\" in log_id
+        or "\x00" in log_id
+    ):
+        raise ValueError(f"invalid Flight Review log id: {log_id!r}")
+    return log_id
+
+
+def _flight_review_log_path(log_dir: Path, log_id: str) -> Path:
+    root = log_dir.resolve()
+    candidate = (root / f"{log_id}.ulg").resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Flight Review log path escapes configured directory: {log_id!r}"
+        ) from exc
+    return candidate
 
 
 def _record_from_flight_review_row(
@@ -533,15 +828,17 @@ def _record_from_flight_review_row(
     log_path: Path,
     airframes: Mapping[str, Mapping[str, str]],
     airframe_image_root: Path,
+    *,
+    log_id: str,
 ) -> dict[str, Any]:
     upload_date = _coerce_datetime_iso(row["Date"])
     log_date = _iso_from_timestamp(row["StartTime"])
     flight_modes = _split_csv_values(row["FlightModes"])
     airframe = airframes.get(str(row["AutostartId"] or ""))
     record = {
-        "id": f"flight_review:{row['Id']}",
+        "id": f"flight_review:{log_id}",
         "source_kind": "flight_review",
-        "source_log_id": str(row["Id"]),
+        "source_log_id": log_id,
         "log_path": str(log_path),
         "original_filename": _clean_optional(row["OriginalFilename"]) or log_path.name,
         "upload_date": upload_date,
@@ -563,7 +860,7 @@ def _record_from_flight_review_row(
         "flight_modes": flight_modes,
         "metadata": {
             "flight_review": {
-                "id": row["Id"],
+                "id": log_id,
                 "description": row["Description"],
                 "flight_mode_durations": row["FlightModeDurations"],
                 "uuid": row["UUID"],
@@ -583,7 +880,7 @@ def _build_filter_clause(
     log_start: str,
     log_end: str,
 ) -> tuple[str, list[Any]]:
-    clauses: list[str] = []
+    clauses = ["source_available = 1"]
     params: list[Any] = []
 
     clean_search = str(search or "").strip().lower()
@@ -613,8 +910,6 @@ def _build_filter_clause(
         params.extend(normalized_tags)
         params.append(len(set(normalized_tags)))
 
-    if not clauses:
-        return "", []
     return "WHERE " + " AND ".join(f"({clause})" for clause in clauses), params
 
 

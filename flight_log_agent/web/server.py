@@ -33,14 +33,15 @@ from flight_log_agent.web.browse_index import (
     create_tag,
     ensure_browse_db,
     get_log,
-    import_flight_review,
     list_tags,
     load_browse_airframe_metadata,
     query_logs,
     refresh_airframe_image_keys,
     remove_log_tag,
     resolve_airframe_image_root,
+    sync_flight_review,
     upsert_log_from_path,
+    with_flight_review_storage_path,
 )
 from flight_log_agent.web.log_downloads import (
     build_kml_download,
@@ -74,6 +75,7 @@ UPLOAD_FIELDS = {
 
 ANALYSIS_RUNS: dict[str, dict[str, Any]] = {}
 ANALYSIS_RUNS_LOCK = threading.Lock()
+FLIGHT_REVIEW_SYNC_LOCK = threading.Lock()
 
 
 class FlightLogWebHandler(BaseHTTPRequestHandler):
@@ -372,14 +374,33 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
 
     def _handle_browse_import(self) -> None:
         try:
-            payload = import_flight_review(BROWSE_CONFIG)
+            request_payload = self._read_json_body()
+            sync_config = browse_sync_config(BROWSE_CONFIG, request_payload)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
             return
-        except Exception as exc:
-            self._send_json({"error": repr(exc)}, status=500)
+
+        if not FLIGHT_REVIEW_SYNC_LOCK.acquire(blocking=False):
+            self._send_json(
+                {"error": "Flight Review synchronization is already running"},
+                status=409,
+            )
             return
-        self._send_json(payload)
+
+        try:
+            try:
+                payload = sync_flight_review(sync_config)
+                status = 200
+            except ValueError as exc:
+                payload = {"error": str(exc)}
+                status = 400
+            except Exception as exc:
+                payload = {"error": repr(exc)}
+                status = 500
+        finally:
+            FLIGHT_REVIEW_SYNC_LOCK.release()
+
+        self._send_json(payload, status=status)
 
     def _handle_create_browse_tag(self) -> None:
         try:
@@ -959,6 +980,18 @@ def browse_config_payload() -> dict[str, Any]:
             else None
         ),
     }
+
+
+def browse_sync_config(
+    config: BrowseConfig,
+    payload: dict[str, Any],
+) -> BrowseConfig:
+    if "flight_review_storage_path" not in payload:
+        return config
+    storage_path = payload["flight_review_storage_path"]
+    if not isinstance(storage_path, str):
+        raise ValueError("flight_review_storage_path must be a string")
+    return with_flight_review_storage_path(config, storage_path)
 
 
 def index_browse_log(

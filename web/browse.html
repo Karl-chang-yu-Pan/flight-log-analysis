@@ -15,9 +15,32 @@
         </div>
         <div class="browse-actions">
           <a class="button-link" href="/upload">Upload Log</a>
-          <button id="importFlightReview" type="button">Import Flight Review</button>
         </div>
       </header>
+
+      <section class="browse-sync" aria-labelledby="flightReviewSyncHeading">
+        <div class="browse-sync-copy">
+          <h2 id="flightReviewSyncHeading">Flight Review synchronization</h2>
+          <p>Update this app's browse database from an existing Flight Review installation.</p>
+        </div>
+        <form id="flightReviewSyncForm" class="browse-sync-form" aria-busy="false">
+          <label for="flightReviewStoragePath">
+            Storage path on this server
+            <input
+              id="flightReviewStoragePath"
+              type="text"
+              placeholder="/path/to/flight-review-storage"
+              aria-describedby="flightReviewStorageHelp"
+              autocomplete="off"
+              spellcheck="false">
+          </label>
+          <button id="importFlightReview" type="submit">Synchronize</button>
+          <p id="flightReviewStorageHelp" class="browse-sync-help">
+            Expected to contain <code>logs.sqlite</code> and <code>log_files/</code>. Leave blank to use the server configuration. Use this server-local path control only in a trusted deployment.
+          </p>
+          <output id="flightReviewSyncStatus" class="browse-sync-status" aria-live="polite"></output>
+        </form>
+      </section>
 
       <section class="browse-filters" aria-label="Browse filters">
         <label>

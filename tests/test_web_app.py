@@ -15,12 +15,25 @@ from flight_log_agent.web.log_downloads import (
 )
 from flight_log_agent.web.server import (
     analysis_event_message,
+    browse_sync_config,
     build_analysis_progress,
     public_ngrok_url,
     safe_upload_filename,
     save_upload_form,
     validate_ulog_file,
 )
+
+
+def _json_request_handler(payload):
+    body = json.dumps(payload).encode("utf-8")
+    handler = object.__new__(web_app.FlightLogWebHandler)
+    handler.headers = {"Content-Length": str(len(body))}
+    handler.rfile = BytesIO(body)
+    responses = []
+    handler._send_json = lambda value, status=200: responses.append(
+        (status, value)
+    )
+    return handler, responses
 
 
 def test_public_ngrok_url_prefers_https():
@@ -78,6 +91,104 @@ def test_save_upload_form_writes_files_under_unique_run_dir(tmp_path):
     assert saved["log_file"].parent.parent == tmp_path
     assert saved["log_file"].read_bytes().startswith(ULog.HEADER_BYTES)
     assert saved["mission_file"].read_bytes() == b"{}"
+
+
+def test_browse_sync_config_uses_request_scoped_storage_override(tmp_path):
+    original = web_app.BrowseConfig(
+        browse_db_path=tmp_path / "browse.sqlite",
+        flight_review_storage_path=tmp_path / "configured-storage",
+        flight_review_db_path=tmp_path / "configured.sqlite",
+        flight_review_log_dir=tmp_path / "configured-logs",
+        airframe_image_root=tmp_path / "airframes",
+    )
+
+    assert browse_sync_config(original, {}) is original
+
+    overridden = browse_sync_config(
+        original,
+        {"flight_review_storage_path": "  ~/flight-review-data  "},
+    )
+
+    assert overridden.browse_db_path == original.browse_db_path
+    assert overridden.flight_review_storage_path == (
+        Path.home() / "flight-review-data"
+    )
+    assert overridden.flight_review_db_path is None
+    assert overridden.flight_review_log_dir is None
+    assert overridden.airframe_image_root == original.airframe_image_root
+    assert original.flight_review_db_path == tmp_path / "configured.sqlite"
+
+    with pytest.raises(ValueError, match="must be a string"):
+        browse_sync_config(original, {"flight_review_storage_path": 123})
+    with pytest.raises(ValueError, match="must not be empty"):
+        browse_sync_config(original, {"flight_review_storage_path": "  "})
+
+
+def test_browse_sync_handler_passes_path_and_releases_lock(tmp_path, monkeypatch):
+    configured = web_app.BrowseConfig(
+        browse_db_path=tmp_path / "browse.sqlite",
+        flight_review_storage_path=tmp_path / "configured",
+    )
+    captured = {}
+
+    def fake_sync(config):
+        captured["config"] = config
+        return {"imported": 1, "added": 1}
+
+    monkeypatch.setattr(web_app, "BROWSE_CONFIG", configured)
+    monkeypatch.setattr(web_app, "sync_flight_review", fake_sync)
+    handler, responses = _json_request_handler({
+        "flight_review_storage_path": str(tmp_path / "entered"),
+    })
+
+    handler._handle_browse_import()
+
+    assert responses == [(200, {"imported": 1, "added": 1})]
+    assert captured["config"].flight_review_storage_path == tmp_path / "entered"
+    assert web_app.FLIGHT_REVIEW_SYNC_LOCK.acquire(blocking=False)
+    web_app.FLIGHT_REVIEW_SYNC_LOCK.release()
+
+
+def test_browse_sync_handler_rejects_overlapping_request():
+    handler, responses = _json_request_handler({})
+    assert web_app.FLIGHT_REVIEW_SYNC_LOCK.acquire(blocking=False)
+    try:
+        handler._handle_browse_import()
+    finally:
+        web_app.FLIGHT_REVIEW_SYNC_LOCK.release()
+
+    assert responses == [(
+        409,
+        {"error": "Flight Review synchronization is already running"},
+    )]
+
+
+def test_browse_sync_handler_releases_lock_after_failure(monkeypatch):
+    def fail_sync(_config):
+        raise RuntimeError("sync failed")
+
+    monkeypatch.setattr(web_app, "sync_flight_review", fail_sync)
+    handler, responses = _json_request_handler({})
+
+    handler._handle_browse_import()
+
+    assert responses == [(500, {"error": "RuntimeError('sync failed')"})]
+    assert web_app.FLIGHT_REVIEW_SYNC_LOCK.acquire(blocking=False)
+    web_app.FLIGHT_REVIEW_SYNC_LOCK.release()
+
+
+def test_browse_sync_handler_returns_value_error_and_releases_lock(monkeypatch):
+    def fail_sync(_config):
+        raise ValueError("source schema is invalid")
+
+    monkeypatch.setattr(web_app, "sync_flight_review", fail_sync)
+    handler, responses = _json_request_handler({})
+
+    handler._handle_browse_import()
+
+    assert responses == [(400, {"error": "source schema is invalid"})]
+    assert web_app.FLIGHT_REVIEW_SYNC_LOCK.acquire(blocking=False)
+    web_app.FLIGHT_REVIEW_SYNC_LOCK.release()
 
 
 def test_analysis_event_message_maps_run_progress_events():
@@ -435,6 +546,7 @@ def test_kml_download_contains_flight_track_coordinates():
 def test_upload_review_and_browse_pages_have_separate_navigation_contracts():
     upload_html = (web_app.WEB_DIR / "index.html").read_text(encoding="utf-8")
     review_html = (web_app.WEB_DIR / "review.html").read_text(encoding="utf-8")
+    browse_html = (web_app.WEB_DIR / "browse.html").read_text(encoding="utf-8")
     browse_js = (web_app.WEB_DIR / "browse.js").read_text(encoding="utf-8")
 
     assert 'id="uploadForm"' in upload_html
@@ -446,6 +558,14 @@ def test_upload_review_and_browse_pages_have_separate_navigation_contracts():
     assert 'id="logTagSearch"' in review_html
     assert 'id="plotNavigationMenu"' in review_html
     assert 'id="plotNavigation"' in review_html
+    assert 'id="flightReviewStoragePath"' in browse_html
+    assert 'id="flightReviewSyncStatus"' in browse_html
+    assert "Synchronize" in browse_html
+    assert "flight_review_storage_path: storagePath" in browse_js
+    assert 'count("imported")' in browse_js
+    assert 'fetchJson("/api/browse-import-flight-review"' in browse_js
+    assert 'count("newly_unavailable")' in browse_js
+    assert 'count("unavailable")' in browse_js
     assert "/review?browse_id=" in browse_js
 
 

@@ -1371,7 +1371,7 @@ h2 {
 
 .browse-page {
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   min-height: 100vh;
   padding: 16px;
   gap: 12px;
@@ -1399,6 +1399,7 @@ h2 {
 }
 
 .browse-actions button,
+.browse-sync-form button,
 .button-link,
 .tag-create button,
 .tag-editor button,
@@ -1418,12 +1419,78 @@ h2 {
 }
 
 .browse-actions button:disabled,
+.browse-sync-form button:disabled,
 .tag-create button:disabled,
 .tag-editor button:disabled,
 .browse-pagination button:disabled {
   border-color: var(--line-strong);
   background: var(--line-strong);
   cursor: not-allowed;
+}
+
+.browse-sync {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.55fr) minmax(360px, 1.45fr);
+  gap: 16px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.browse-sync-copy h2 {
+  font-size: 15px;
+}
+
+.browse-sync-copy p,
+.browse-sync-help,
+.browse-sync-status {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.browse-sync-copy p {
+  margin-top: 4px;
+}
+
+.browse-sync-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 8px;
+  align-items: end;
+}
+
+.browse-sync-form label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.browse-sync-form input {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 7px 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.browse-sync-help,
+.browse-sync-status {
+  grid-column: 1 / -1;
+  min-height: 16px;
+}
+
+.browse-sync-status[data-state="success"] {
+  color: var(--accent);
+}
+
+.browse-sync-status[data-state="error"] {
+  color: var(--danger);
 }
 
 .browse-filters {
@@ -1660,6 +1727,10 @@ h2 {
     flex-direction: column;
   }
 
+  .browse-sync {
+    grid-template-columns: 1fr;
+  }
+
   .browse-filters {
     grid-template-columns: 1fr;
   }
@@ -1674,5 +1745,15 @@ h2 {
 
   .browse-table-shell {
     max-height: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .browse-sync-form {
+    grid-template-columns: 1fr;
+  }
+
+  .browse-sync-form button {
+    width: 100%;
   }
 }

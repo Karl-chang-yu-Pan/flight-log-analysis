@@ -19,6 +19,9 @@ const browseEls = {
   logStart: document.getElementById("logStart"),
   logEnd: document.getElementById("logEnd"),
   tagFilters: document.getElementById("tagFilters"),
+  flightReviewSyncForm: document.getElementById("flightReviewSyncForm"),
+  flightReviewStoragePath: document.getElementById("flightReviewStoragePath"),
+  flightReviewSyncStatus: document.getElementById("flightReviewSyncStatus"),
   importFlightReview: document.getElementById("importFlightReview"),
   rows: document.getElementById("browseRows"),
   prevPage: document.getElementById("prevPage"),
@@ -44,7 +47,10 @@ function bindBrowseEvents() {
     });
   }
 
-  browseEls.importFlightReview.addEventListener("click", importFlightReview);
+  browseEls.flightReviewSyncForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    importFlightReview();
+  });
   browseEls.prevPage.addEventListener("click", () => {
     browseState.offset = Math.max(0, browseState.offset - browseState.limit);
     refreshBrowse();
@@ -203,16 +209,48 @@ function renderPagination() {
 
 async function importFlightReview() {
   browseEls.importFlightReview.disabled = true;
-  setStatus("Importing Flight Review logs");
+  browseEls.flightReviewSyncForm.setAttribute("aria-busy", "true");
+  setFlightReviewSyncStatus("Synchronizing Flight Review logs", "loading");
   try {
-    const result = await fetchJson("/api/browse-import-flight-review", { method: "POST" });
-    setStatus(`Imported ${result.imported || 0} logs`);
+    const storagePath = browseEls.flightReviewStoragePath.value.trim();
+    const payload = storagePath ? { flight_review_storage_path: storagePath } : {};
+    const result = await fetchJson("/api/browse-import-flight-review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
     await refreshBrowse();
+    setFlightReviewSyncStatus(formatFlightReviewSyncSummary(result), "success");
   } catch (error) {
-    setStatus(error.message);
+    setFlightReviewSyncStatus(error.message, "error");
   } finally {
+    browseEls.flightReviewSyncForm.setAttribute("aria-busy", "false");
     browseEls.importFlightReview.disabled = false;
   }
+}
+
+function formatFlightReviewSyncSummary(result) {
+  const count = (name) => {
+    const value = Number(result[name] || 0);
+    return Number.isFinite(value) ? value : 0;
+  };
+  const missing = result.missing == null
+    ? count("skipped_missing_logs")
+    : count("missing");
+  const added = result.added == null ? count("imported") : count("added");
+  return [
+    `Added ${added}`,
+    `updated ${count("updated")}`,
+    `unchanged ${count("unchanged")}`,
+    `missing ${missing}`,
+    `newly unavailable ${count("newly_unavailable")}`,
+    `unavailable total ${count("unavailable")}`,
+  ].join(", ");
+}
+
+function setFlightReviewSyncStatus(message, state = "") {
+  browseEls.flightReviewSyncStatus.textContent = message;
+  browseEls.flightReviewSyncStatus.dataset.state = state;
 }
 
 async function fetchJson(url, options) {

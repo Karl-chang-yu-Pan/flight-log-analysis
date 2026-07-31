@@ -140,12 +140,16 @@ Add a local browse DB/index for browse support.
 
 The browse DB should be our own reconstructed database, not the Flight Review
 database. If an existing Flight Review-format database is available, treat it as
-an optional read-only import source. Do not mutate the Flight Review database.
+an optional read-only synchronization source. Do not mutate the Flight Review
+database.
 
 The browse page should query only our browse DB/API during normal operation.
-Import/rebuild code can read the Flight Review database and log directory, then
-populate our browse DB with normalized rows for our UI, search model, and
-user-managed tags.
+Synchronization code reads the Flight Review database and log directory, then
+updates our browse DB with normalized rows for our UI, search model, and
+user-managed tags. It updates only changed source metadata. Source rows whose
+database entry or ULog disappears are marked unavailable and omitted from
+normal browsing; they are not deleted, so local tags and analysis history remain
+recoverable.
 
 The index should store:
 
@@ -162,9 +166,9 @@ The index should store:
 - Flight modes
 - User-added tags
 
-## Flight Review Import Configuration
+## Flight Review Synchronization Configuration
 
-Support importing existing Flight Review-format log data through configurable
+Support synchronizing existing Flight Review-format log data through configurable
 paths:
 
 - `flight_review_storage_path`
@@ -184,8 +188,23 @@ Path resolution should work as follows:
 - Else if `flight_review_storage_path` is set, use `<flight_review_storage_path>/log_files`.
 - Store our reconstructed browse database at `browse_db_path`.
 
-The importer should preserve the existing Flight Review database and log files
-intact. Rebuild/resync should only write to our browse DB.
+The Browse page also provides a server-local Flight Review storage-path field.
+A non-empty value overrides configured Flight Review source paths only for that
+synchronization request; it never changes `browse_db_path` and is not persisted.
+Leaving the field empty uses the environment or command-line configuration.
+Each browse database is bound to the first successfully synchronized Flight
+Review source. A later request must use that same canonical database and log
+directory, preventing identical Flight Review log IDs from different
+installations from overwriting one another.
+Because the application has no authentication layer, browser-entered server
+paths are intended only for trusted local deployments. Remote exposure requires
+an authorization policy outside this synchronization feature.
+
+Synchronization must preserve the existing Flight Review database and log
+files intact. It opens the source SQLite database read-only and writes only to
+our browse DB. The operation is atomic, rejects overlapping requests in the web
+process, and reports added, updated, unchanged, missing-file, newly unavailable,
+and current unavailable counts.
 
 ## Upload And Review Layout
 
