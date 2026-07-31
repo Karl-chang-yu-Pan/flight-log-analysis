@@ -138,6 +138,22 @@ def test_analysis_event_message_maps_run_progress_events():
         "event": "postprocess_plot.started",
         "name": "generate_signal_plot",
     })["message"] == "Generating report plots"
+    assert analysis_event_message({
+        "event": "hosted_tool.item",
+        "raw_item": {"type": "web_search_call"},
+    })["message"] == "Using web search"
+    for raw_item in [
+        {"type": "web_search_output"},
+        {"type": "shell_call"},
+        {"type": "shell_call_output"},
+        {"type": "file_search_call"},
+        {},
+        None,
+    ]:
+        assert analysis_event_message({
+            "event": "hosted_tool.item",
+            "raw_item": raw_item,
+        }) is None
 
 
 def test_build_analysis_progress_uses_latest_progress_message():
@@ -155,6 +171,39 @@ def test_build_analysis_progress_uses_latest_progress_message():
         "Started analysis run",
         "Normalizing question intent",
         "Searching PX4 source",
+    ]
+
+
+def test_build_analysis_progress_distinguishes_shell_from_web_search():
+    progress = build_analysis_progress(
+        "running",
+        [
+            {"event": "run.started"},
+            {"event": "llm.started"},
+            {
+                "event": "hosted_tool.item",
+                "raw_item": {"type": "shell_call"},
+            },
+            {
+                "event": "hosted_tool.item",
+                "raw_item": {"type": "shell_call_output"},
+            },
+            {
+                "event": "hosted_tool.item",
+                "raw_item": {"type": "web_search_call"},
+            },
+            {
+                "event": "hosted_tool.item",
+                "raw_item": {"type": "web_search_output"},
+            },
+        ],
+    )
+
+    assert progress["phase"] == "Using web search"
+    assert [message["message"] for message in progress["messages"]] == [
+        "Started analysis run",
+        "Analyzing with agent",
+        "Using web search",
     ]
 
 

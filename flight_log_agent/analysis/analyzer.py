@@ -147,6 +147,10 @@ SED_PRINT_EXPRESSION = re.compile(r"(?:[0-9]+|\$)(?:,(?:[0-9]+|\$))?p")
 SOURCE_ALIAS_MAX_CHARS = 4096
 SOURCE_ALIAS_MAX_PARTS = 64
 SOURCE_ALIAS_MAX_RESOLUTION_ATTEMPTS = 128
+DUPLICATE_SNAPSHOT_GIT_READ_MESSAGE = (
+    "Duplicate immutable snapshot Git read suppressed; reuse the earlier "
+    "result for this exact command."
+)
 
 
 class RestrictedShellExecutor:
@@ -164,6 +168,7 @@ class RestrictedShellExecutor:
             name: path.expanduser().resolve()
             for name, path in (input_paths or {}).items()
         }
+        self._completed_snapshot_git_reads: dict[tuple[str, ...], int] = {}
         unknown_inputs = set(self.input_paths) - {
             "flight.ulg",
             "mission.plan",
@@ -636,6 +641,7 @@ class RestrictedShellExecutor:
     async def __call__(self, request: ShellCommandRequest) -> ShellResult:
         action = request.data.action
         outputs: list[ShellCommandOutput] = []
+        duplicate_snapshot_git_reads_suppressed = 0
 
         requested_timeout_s = (
             (action.timeout_ms or 0) / 1000 if action.timeout_ms else DEFAULT_TIMEOUT_S
@@ -657,6 +663,24 @@ class RestrictedShellExecutor:
                         argv,
                         timeout_s=timeout_s,
                     )
+                    cache_key = tuple(argv)
+                    cached_exit_code = self._completed_snapshot_git_reads.get(
+                        cache_key
+                    )
+                    if cached_exit_code is not None:
+                        outputs.append(
+                            ShellCommandOutput(
+                                command=command,
+                                stdout=DUPLICATE_SNAPSHOT_GIT_READ_MESSAGE,
+                                stderr="",
+                                outcome=ShellCallOutcome(
+                                    type="exit",
+                                    exit_code=cached_exit_code,
+                                ),
+                            )
+                        )
+                        duplicate_snapshot_git_reads_suppressed += 1
+                        continue
                     remaining = timeout_s - (loop.time() - started_at)
                     if remaining <= 0:
                         raise TimeoutError(
@@ -701,6 +725,15 @@ class RestrictedShellExecutor:
                         ),
                     )
                 )
+                if (
+                    argv[0] == "git"
+                    and not timed_out
+                    and (
+                        exit_code == 0
+                        or (argv[3] == "grep" and exit_code == 1)
+                    )
+                ):
+                    self._completed_snapshot_git_reads[tuple(argv)] = exit_code
 
             except TimeoutError as exc:
                 timed_out = True
@@ -737,6 +770,9 @@ class RestrictedShellExecutor:
                 "working_directory": str(self.cwd),
                 "source_snapshot": (
                     self.source_snapshot.identity if self.source_snapshot else None
+                ),
+                "duplicate_snapshot_git_reads_suppressed": (
+                    duplicate_snapshot_git_reads_suppressed
                 ),
             },
         )

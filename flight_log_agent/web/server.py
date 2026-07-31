@@ -817,7 +817,12 @@ def analysis_event_message(event: dict[str, Any]) -> dict[str, Any] | None:
     elif event_name == "postprocess_plot.finished":
         message = "Generated report plots"
     elif event_name == "hosted_tool.item":
-        message = "Using web search"
+        raw_item = event.get("raw_item")
+        if (
+            isinstance(raw_item, dict)
+            and raw_item.get("type") == "web_search_call"
+        ):
+            message = "Using web search"
 
     if message is None:
         return None

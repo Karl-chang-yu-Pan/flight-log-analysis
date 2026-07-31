@@ -111,6 +111,14 @@ def test_log_run_items_captures_hosted_tool_search_items(tmp_path):
             type="tool_search_output_item",
             raw_item={"type": "web_search_output", "results": [{"title": "PX4"}]},
         ),
+        SimpleNamespace(
+            type="tool_call_item",
+            raw_item={"type": "shell_call", "call_id": "shell_123"},
+        ),
+        SimpleNamespace(
+            type="tool_call_output_item",
+            raw_item={"type": "shell_call_output", "call_id": "shell_123"},
+        ),
     ]
 
     log_run_items(audit_logger, items)
@@ -120,7 +128,11 @@ def test_log_run_items_captures_hosted_tool_search_items(tmp_path):
         "hosted_tool.item",
         "hosted_tool.item",
         "hosted_tool.item",
+        "hosted_tool.item",
+        "hosted_tool.item",
     ]
     assert events[0]["raw_item"]["id"] == "ws_123"
     assert events[1]["raw_item"]["query"] == "PX4 NAV_ACC_RAD"
     assert events[2]["raw_item"]["results"] == [{"title": "PX4"}]
+    assert events[3]["raw_item"]["type"] == "shell_call"
+    assert events[4]["raw_item"]["type"] == "shell_call_output"

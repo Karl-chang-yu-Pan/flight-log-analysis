@@ -51,6 +51,17 @@ def _empty_report() -> FlightLogReport:
     )
 
 
+def _shell_request(*commands: str, timeout_ms: int | None = None):
+    return SimpleNamespace(
+        data=SimpleNamespace(
+            action=SimpleNamespace(
+                commands=list(commands),
+                timeout_ms=timeout_ms,
+            )
+        )
+    )
+
+
 def test_default_max_turns_is_shared_by_api_and_cli(monkeypatch):
     assert analyzer.DEFAULT_MAX_TURNS == 30
     assert (
@@ -332,6 +343,160 @@ def test_snapshot_git_commands_resolve_recorded_submodule_gitlink(tmp_path):
         capture_output=True,
         text=True,
     ).stdout == "<old />\n"
+
+
+@pytest.mark.parametrize(
+    ("first_command", "duplicate_command"),
+    [
+        (
+            "git -C PX4-Autopilot show SNAPSHOT:src/module.cpp",
+            "git -C PX4-Autopilot show SNAPSHOT:src/module.cpp",
+        ),
+        (
+            'git -C PX4-Autopilot grep -n -F "term" SNAPSHOT -- src/',
+            "git -C PX4-Autopilot grep -n -F 'term' SNAPSHOT -- src/",
+        ),
+        (
+            "git -C PX4-Autopilot ls-tree -r --name-only SNAPSHOT -- src/",
+            "git -C PX4-Autopilot ls-tree -r --name-only SNAPSHOT -- src/",
+        ),
+    ],
+)
+def test_duplicate_snapshot_git_reads_are_suppressed(
+    tmp_path,
+    monkeypatch,
+    first_command,
+    duplicate_command,
+):
+    snapshot = SourceSnapshot(tmp_path / "PX4-Autopilot", "a" * 40)
+    executor = analyzer.RestrictedShellExecutor(tmp_path, snapshot)
+    process_calls = []
+
+    async def fake_run_process(argv, **_kwargs):
+        process_calls.append(argv)
+        return b"source result\n", b"", 0, False
+
+    monkeypatch.setattr(executor, "_run_process", fake_run_process)
+
+    result = asyncio.run(
+        executor(_shell_request(first_command, duplicate_command))
+    )
+
+    assert len(process_calls) == 1
+    assert len(result.output) == 2
+    assert result.output[0].command == first_command
+    assert result.output[0].stdout == "source result\n"
+    assert result.output[0].exit_code == 0
+    assert result.output[1].command == duplicate_command
+    assert (
+        result.output[1].stdout
+        == analyzer.DUPLICATE_SNAPSHOT_GIT_READ_MESSAGE
+    )
+    assert result.output[1].stderr == ""
+    assert result.output[1].exit_code == 0
+    assert result.provider_data["duplicate_snapshot_git_reads_suppressed"] == 1
+
+
+def test_duplicate_snapshot_git_grep_no_match_preserves_exit_status(
+    tmp_path,
+    monkeypatch,
+):
+    snapshot = SourceSnapshot(tmp_path / "PX4-Autopilot", "a" * 40)
+    executor = analyzer.RestrictedShellExecutor(tmp_path, snapshot)
+    process_calls = []
+    command = 'git -C PX4-Autopilot grep -n -F "missing" SNAPSHOT -- src/'
+
+    async def fake_run_process(argv, **_kwargs):
+        process_calls.append(argv)
+        return b"", b"", 1, False
+
+    monkeypatch.setattr(executor, "_run_process", fake_run_process)
+
+    first = asyncio.run(executor(_shell_request(command)))
+    duplicate = asyncio.run(executor(_shell_request(command)))
+
+    assert len(process_calls) == 1
+    assert first.output[0].stdout == ""
+    assert first.output[0].exit_code == 1
+    assert duplicate.output[0].stdout == analyzer.DUPLICATE_SNAPSHOT_GIT_READ_MESSAGE
+    assert duplicate.output[0].exit_code == 1
+    assert duplicate.provider_data["duplicate_snapshot_git_reads_suppressed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "timed_out"),
+    [
+        (2, False),
+        (124, True),
+    ],
+)
+def test_snapshot_git_failures_and_timeouts_remain_retryable(
+    tmp_path,
+    monkeypatch,
+    exit_code,
+    timed_out,
+):
+    snapshot = SourceSnapshot(tmp_path / "PX4-Autopilot", "a" * 40)
+    executor = analyzer.RestrictedShellExecutor(tmp_path, snapshot)
+    process_calls = []
+    command = "git -C PX4-Autopilot show SNAPSHOT:src/module.cpp"
+
+    async def fake_run_process(argv, **_kwargs):
+        process_calls.append(argv)
+        return b"", b"read failed", exit_code, timed_out
+
+    monkeypatch.setattr(executor, "_run_process", fake_run_process)
+
+    first = asyncio.run(executor(_shell_request(command)))
+    second = asyncio.run(executor(_shell_request(command)))
+
+    assert len(process_calls) == 2
+    assert first.output[0].exit_code == exit_code
+    assert second.output[0].exit_code == exit_code
+    assert second.output[0].stdout == ""
+    assert second.provider_data["duplicate_snapshot_git_reads_suppressed"] == 0
+
+
+def test_workspace_commands_are_never_deduplicated(tmp_path, monkeypatch):
+    executor = analyzer.RestrictedShellExecutor(tmp_path)
+    process_calls = []
+    command = 'python -c "print(1)"'
+
+    async def fake_sandboxed_process(argv, **_kwargs):
+        process_calls.append(argv)
+        return f"run {len(process_calls)}\n".encode(), b"", 0, False
+
+    monkeypatch.setattr(
+        executor,
+        "_run_sandboxed_process",
+        fake_sandboxed_process,
+    )
+
+    result = asyncio.run(executor(_shell_request(command, command)))
+
+    assert len(process_calls) == 2
+    assert [item.stdout for item in result.output] == ["run 1\n", "run 2\n"]
+    assert result.provider_data["duplicate_snapshot_git_reads_suppressed"] == 0
+
+
+def test_snapshot_git_read_suppression_is_per_executor(tmp_path, monkeypatch):
+    snapshot = SourceSnapshot(tmp_path / "PX4-Autopilot", "a" * 40)
+    first_executor = analyzer.RestrictedShellExecutor(tmp_path, snapshot)
+    second_executor = analyzer.RestrictedShellExecutor(tmp_path, snapshot)
+    process_calls = []
+    command = "git -C PX4-Autopilot show SNAPSHOT:src/module.cpp"
+
+    async def fake_run_process(argv, **_kwargs):
+        process_calls.append(argv)
+        return b"source result\n", b"", 0, False
+
+    monkeypatch.setattr(first_executor, "_run_process", fake_run_process)
+    monkeypatch.setattr(second_executor, "_run_process", fake_run_process)
+
+    asyncio.run(first_executor(_shell_request(command)))
+    asyncio.run(second_executor(_shell_request(command)))
+
+    assert len(process_calls) == 2
 
 
 @pytest.mark.parametrize(
