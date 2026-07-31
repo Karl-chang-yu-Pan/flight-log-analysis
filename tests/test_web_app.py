@@ -431,6 +431,9 @@ def test_review_plot_controls_use_dropdown_navigation_and_tracker_overlays():
     assert 'els.plotSidebar.addEventListener("scroll"' not in app_js
     assert "plotTrackerDrawnRevisions" in app_js
     assert "state.plotVisibilityObserver !== observer" in app_js
+    assert "plotSectionIsNearViewport(section)" in app_js
+    assert "drawInteractivePlots(plots, { visibleOnly: observerActive })" in app_js
+    assert "if (!isPlotVisibleOrUnobserved(plot.id)) return;" in app_js
     assert ".plot-navigation-menu" in styles
     assert "position: absolute" in styles
 
@@ -451,6 +454,45 @@ def test_review_plot_controls_use_dropdown_navigation_and_tracker_overlays():
     assert "drawInteractivePlotTrackers(plots, { visibleOnly: true })" in tracker_handler
     assert "drawInteractivePlots" not in left_sidebar_handler
     assert "drawInteractivePlots" not in right_sidebar_handler
+
+
+def test_review_plot_renderer_supports_additive_flight_review_contract():
+    app_js = (web_app.WEB_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert 'const showTimeControls = plot.kind !== "spectrum";' in app_js
+    assert 'plot.kind !== "local_position" && plot.kind !== "spectrum"' in app_js
+    assert 'if (plot.kind === "spectrum") return;' in app_js
+    assert 'series.interpolation === "step_after" ? "previous" : "linear"' in app_js
+    assert 'interpolation === "step_after"' in app_js
+    assert "series.frequencies_hz || []" in app_js
+    assert "series.values || []" in app_js
+    assert "marker.frequency_hz" in app_js
+    assert "band.min == null ? yRange[0]" in app_js
+    assert "band.max == null ? yRange[1]" in app_js
+    assert "span.start_x" in app_js
+    assert "span.end_x" in app_js
+    assert "!span.series_key" in app_js
+    assert "isPlotSourceVisible(plot.id, span.series_key)" in app_js
+
+    timeseries_renderer = app_js.split(
+        "function drawTimeseriesPlot",
+        1,
+    )[1].split("function drawTimeseriesTracker", 1)[0]
+    band_index = timeseries_renderer.index(
+        "drawHorizontalBands(ctx, bounds, yRange, plot.horizontal_bands || [])"
+    )
+    grid_index = timeseries_renderer.index("drawGrid(ctx, bounds)")
+    series_index = timeseries_renderer.index("visibleSeries.forEach")
+    span_index = timeseries_renderer.index("drawHorizontalSpans")
+
+    assert band_index < grid_index < series_index < span_index
+
+    spectrum_renderer = app_js.split(
+        "function drawSpectrumPlot",
+        1,
+    )[1].split("function drawSpectrogramImage", 1)[0]
+    assert "drawHorizontalSpans(" in spectrum_renderer
+    assert "drawFrequencyMarkers(" in spectrum_renderer
 
 
 def test_review_tags_are_searchable_and_load_progress_covers_plot_generation():

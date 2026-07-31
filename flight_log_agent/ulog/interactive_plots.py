@@ -8,6 +8,27 @@ from typing import Any, Iterable
 import numpy as np
 from pyulog import ULog
 
+from flight_log_agent.ulog.interactive_plot_families import (
+    PlotContext,
+    build_actuator_output_plots,
+    build_airspeed_plot,
+    build_distance_sensor_plot,
+    build_estimator_flags_plot,
+    build_failsafe_flags_plot,
+    build_fft_plots,
+    build_fifo_plots,
+    build_manual_control_plot,
+    build_motor_rpm_plots,
+    build_sampling_regularity_plot,
+    build_temperature_plot,
+    build_thrust_magnetic_plot,
+    build_vibration_plot,
+    build_visual_odometry_plots,
+)
+from flight_log_agent.ulog.interactive_plot_data import (
+    downsample_pair as downsample_diagnostic_pair,
+)
+from flight_log_agent.ulog.interactive_plot_spectra import summed_spectrogram
 from flight_log_agent.ulog.plots import (
     _json_safe_value,
     _timestamp_to_seconds,
@@ -127,9 +148,13 @@ TIMESERIES_PLOTS = [
             {"label": "Roll", "signals": ["vehicle_attitude.roll"]},
             {"label": "Pitch", "signals": ["vehicle_attitude.pitch"]},
             {"label": "Yaw", "signals": ["vehicle_attitude.yaw"]},
-            {"label": "Roll setpoint", "signals": ["vehicle_attitude_setpoint.roll_d"]},
-            {"label": "Pitch setpoint", "signals": ["vehicle_attitude_setpoint.pitch_d"]},
-            {"label": "Yaw setpoint", "signals": ["vehicle_attitude_setpoint.yaw_d"]},
+            {"label": "Roll setpoint", "signals": ["vehicle_attitude_setpoint.roll_d"], "interpolation": "step_after"},
+            {"label": "Pitch setpoint", "signals": ["vehicle_attitude_setpoint.pitch_d"], "interpolation": "step_after"},
+            {"label": "Yaw setpoint", "signals": ["vehicle_attitude_setpoint.yaw_d"], "interpolation": "step_after"},
+            {"label": "Yaw FF setpoint", "signals": ["vehicle_attitude_setpoint.yaw_sp_move_rate"], "interpolation": "step_after"},
+            {"label": "Roll groundtruth", "signals": ["vehicle_attitude_groundtruth.roll"]},
+            {"label": "Pitch groundtruth", "signals": ["vehicle_attitude_groundtruth.pitch"]},
+            {"label": "Yaw groundtruth", "signals": ["vehicle_attitude_groundtruth.yaw"]},
         ],
     },
     {
@@ -139,9 +164,15 @@ TIMESERIES_PLOTS = [
             {"label": "Roll rate", "signals": ["vehicle_angular_velocity.xyz[0]", "vehicle_attitude.rollspeed"]},
             {"label": "Pitch rate", "signals": ["vehicle_angular_velocity.xyz[1]", "vehicle_attitude.pitchspeed"]},
             {"label": "Yaw rate", "signals": ["vehicle_angular_velocity.xyz[2]", "vehicle_attitude.yawspeed"]},
-            {"label": "Roll rate setpoint", "signals": ["vehicle_rates_setpoint.roll"]},
-            {"label": "Pitch rate setpoint", "signals": ["vehicle_rates_setpoint.pitch"]},
-            {"label": "Yaw rate setpoint", "signals": ["vehicle_rates_setpoint.yaw"]},
+            {"label": "Roll rate setpoint", "signals": ["vehicle_rates_setpoint.roll"], "interpolation": "step_after"},
+            {"label": "Pitch rate setpoint", "signals": ["vehicle_rates_setpoint.pitch"], "interpolation": "step_after"},
+            {"label": "Yaw rate setpoint", "signals": ["vehicle_rates_setpoint.yaw"], "interpolation": "step_after"},
+            {"label": "Roll rate integral ×100", "signals": ["rate_ctrl_status.rollspeed_integ"], "scale": 100.0},
+            {"label": "Pitch rate integral ×100", "signals": ["rate_ctrl_status.pitchspeed_integ"], "scale": 100.0},
+            {"label": "Yaw rate integral ×100", "signals": ["rate_ctrl_status.yawspeed_integ"], "scale": 100.0},
+            {"label": "Roll rate groundtruth", "signals": ["vehicle_angular_velocity_groundtruth.xyz[0]", "vehicle_attitude_groundtruth.rollspeed"]},
+            {"label": "Pitch rate groundtruth", "signals": ["vehicle_angular_velocity_groundtruth.xyz[1]", "vehicle_attitude_groundtruth.pitchspeed"]},
+            {"label": "Yaw rate groundtruth", "signals": ["vehicle_angular_velocity_groundtruth.xyz[2]", "vehicle_attitude_groundtruth.yawspeed"]},
         ],
     },
     {
@@ -151,9 +182,9 @@ TIMESERIES_PLOTS = [
             {"label": "X", "signals": ["vehicle_local_position.x"]},
             {"label": "Y", "signals": ["vehicle_local_position.y"]},
             {"label": "Z", "signals": ["vehicle_local_position.z"]},
-            {"label": "X setpoint", "signals": ["vehicle_local_position_setpoint.x"]},
-            {"label": "Y setpoint", "signals": ["vehicle_local_position_setpoint.y"]},
-            {"label": "Z setpoint", "signals": ["vehicle_local_position_setpoint.z"]},
+            {"label": "X setpoint", "signals": ["vehicle_local_position_setpoint.x"], "interpolation": "step_after"},
+            {"label": "Y setpoint", "signals": ["vehicle_local_position_setpoint.y"], "interpolation": "step_after"},
+            {"label": "Z setpoint", "signals": ["vehicle_local_position_setpoint.z"], "interpolation": "step_after"},
         ],
     },
     {
@@ -163,32 +194,19 @@ TIMESERIES_PLOTS = [
             {"label": "VX", "signals": ["vehicle_local_position.vx"]},
             {"label": "VY", "signals": ["vehicle_local_position.vy"]},
             {"label": "VZ", "signals": ["vehicle_local_position.vz"]},
-            {"label": "VX setpoint", "signals": ["vehicle_local_position_setpoint.vx"]},
-            {"label": "VY setpoint", "signals": ["vehicle_local_position_setpoint.vy"]},
-            {"label": "VZ setpoint", "signals": ["vehicle_local_position_setpoint.vz"]},
+            {"label": "VX setpoint", "signals": ["vehicle_local_position_setpoint.vx"], "interpolation": "step_after"},
+            {"label": "VY setpoint", "signals": ["vehicle_local_position_setpoint.vy"], "interpolation": "step_after"},
+            {"label": "VZ setpoint", "signals": ["vehicle_local_position_setpoint.vz"], "interpolation": "step_after"},
         ],
     },
     {
-        "id": "visual_odometry_position",
-        "title": "Visual Odometry Position",
-        "series": [
-            {"label": "X", "signals": ["vehicle_visual_odometry.x"]},
-            {"label": "Y", "signals": ["vehicle_visual_odometry.y"]},
-            {"label": "Z", "signals": ["vehicle_visual_odometry.z"]},
-            {"label": "Groundtruth X", "signals": ["vehicle_local_position_groundtruth.x"]},
-            {"label": "Groundtruth Y", "signals": ["vehicle_local_position_groundtruth.y"]},
-            {"label": "Groundtruth Z", "signals": ["vehicle_local_position_groundtruth.z"]},
-        ],
+        "id": "visual_odometry_plots",
+        "builder": build_visual_odometry_plots,
+        "many": True,
     },
     {
         "id": "airspeed",
-        "title": "Airspeed",
-        "series": [
-            {"label": "True airspeed", "signals": ["airspeed_validated.true_airspeed_m_s", "airspeed.true_airspeed"]},
-            {"label": "Indicated airspeed", "signals": ["airspeed.indicated_airspeed_m_s"]},
-            {"label": "GPS speed", "signals": ["vehicle_gps_position.vel_m_s"]},
-            {"label": "Airspeed setpoint", "signals": ["tecs_status.true_airspeed_sp", "tecs_status.airspeed_sp"]},
-        ],
+        "builder": build_airspeed_plot,
     },
     {
         "id": "tecs",
@@ -200,34 +218,17 @@ TIMESERIES_PLOTS = [
     },
     {
         "id": "manual_control",
-        "title": "Manual Control Inputs",
-        "y_range": [-1.1, 1.1],
-        "series": [
-            {"label": "Roll", "signals": ["manual_control_setpoint.roll", "manual_control_setpoint.y"]},
-            {"label": "Pitch", "signals": ["manual_control_setpoint.pitch", "manual_control_setpoint.x"]},
-            {"label": "Yaw", "signals": ["manual_control_setpoint.yaw", "manual_control_setpoint.r"]},
-            {"label": "Throttle", "signals": ["manual_control_setpoint.throttle", "manual_control_setpoint.z"]},
-            {"label": "Mode slot", "signals": ["manual_control_switches.mode_slot"]},
-            {"label": "Kill switch", "signals": ["manual_control_switches.kill_switch"]},
-        ],
+        "builder": build_manual_control_plot,
     },
     {
-        "id": "motor_outputs",
-        "title": "Motor Outputs",
-        "y_range": [-1.0, 1.0],
-        "series": [
-            {"label": f"Motor {index + 1}", "signals": [f"actuator_motors.control[{index}]"]}
-            for index in range(8)
-        ],
+        "id": "actuator_output_plots",
+        "builder": build_actuator_output_plots,
+        "many": True,
     },
     {
-        "id": "servo_outputs",
-        "title": "Servo Outputs",
-        "y_range": [-1.0, 1.0],
-        "series": [
-            {"label": f"Servo {index + 1}", "signals": [f"actuator_servos.control[{index}]"]}
-            for index in range(8)
-        ],
+        "id": "motor_rpm_plots",
+        "builder": build_motor_rpm_plots,
+        "many": True,
     },
     {
         "id": "raw_acceleration",
@@ -240,11 +241,7 @@ TIMESERIES_PLOTS = [
     },
     {
         "id": "vibration",
-        "title": "Vibration Metrics",
-        "series": [
-            {"label": f"IMU {index}", "signals": [f"vehicle_imu_status.accel_vibration_metric"]}
-            for index in range(1)
-        ],
+        "builder": build_vibration_plot,
     },
     {
         "id": "raw_gyro",
@@ -273,8 +270,14 @@ TIMESERIES_PLOTS = [
             {"label": "EPV", "signals": ["vehicle_gps_position.epv"]},
             {"label": "HDOP", "signals": ["vehicle_gps_position.hdop"]},
             {"label": "VDOP", "signals": ["vehicle_gps_position.vdop"]},
+            {"label": "Speed accuracy", "signals": ["vehicle_gps_position.s_variance_m_s"]},
             {"label": "Satellites", "signals": ["vehicle_gps_position.satellites_used"]},
+            {"label": "GPS fix", "signals": ["vehicle_gps_position.fix_type"], "interpolation": "step_after"},
         ],
+    },
+    {
+        "id": "distance_sensor",
+        "builder": build_distance_sensor_plot,
     },
     {
         "id": "gps_noise_jamming",
@@ -285,6 +288,10 @@ TIMESERIES_PLOTS = [
         ],
     },
     {
+        "id": "thrust_magnetic_field",
+        "builder": build_thrust_magnetic_plot,
+    },
+    {
         "id": "power",
         "title": "Power",
         "series": [
@@ -292,49 +299,65 @@ TIMESERIES_PLOTS = [
             {"label": "Current", "signals": ["battery_status.current_a"]},
             {"label": "Discharged", "signals": ["battery_status.discharged_mah"]},
             {"label": "Remaining", "signals": ["battery_status.remaining"]},
-            {"label": "5V rail", "signals": ["system_power.voltage5v_v"]},
+            {"label": "OCV estimate", "signals": ["battery_status.ocv_estimate"]},
+            {"label": "Internal resistance", "signals": ["battery_status.internal_resistance_estimate"]},
+            {
+                "label": "5V rail",
+                "signals": ["system_power.voltage5v_v"],
+                "omit_if_all_zero": True,
+            },
+            {
+                "label": "3.3V rail",
+                "signals": ["system_power.sensors3v3[0]"],
+                "omit_if_all_zero": True,
+            },
         ],
     },
     {
         "id": "temperature",
-        "title": "Temperature",
-        "series": [
-            {"label": "Barometer", "signals": ["sensor_baro.temperature"]},
-            {"label": "Airspeed", "signals": ["airspeed.air_temperature_celsius"]},
-            {"label": "Battery", "signals": ["battery_status.temperature"]},
-        ],
+        "builder": build_temperature_plot,
     },
     {
         "id": "estimator_flags",
-        "title": "Estimator Flags",
-        "series": [
-            {"label": "Health flags", "signals": ["estimator_status.health_flags"]},
-            {"label": "Timeout flags", "signals": ["estimator_status.timeout_flags"]},
-            {"label": "Innovation check flags", "signals": ["estimator_status.innovation_check_flags"]},
-        ],
+        "builder": build_estimator_flags_plot,
     },
     {
         "id": "failsafe_flags",
-        "title": "Failsafe Flags",
-        "series": [
-            {"label": "Failsafe", "signals": ["vehicle_status.failsafe"]},
-            {"label": "User took over", "signals": ["failsafe_flags.failsafe_and_user_took_over"]},
-            {"label": "Offboard lost", "signals": ["failsafe_flags.offboard_control_signal_lost"]},
-        ],
+        "builder": build_failsafe_flags_plot,
     },
     {
         "id": "cpu_ram",
         "title": "CPU & RAM",
         "y_range": [0.0, 1.0],
+        "mean_spans": True,
         "series": [
             {"label": "CPU load", "signals": ["cpuload.load"]},
             {"label": "RAM usage", "signals": ["cpuload.ram_usage"]},
         ],
     },
+    {
+        "id": "sampling_regularity",
+        "builder": build_sampling_regularity_plot,
+    },
 ]
 
 
 SPECTROGRAM_PLOTS = [
+    {
+        "id": "acceleration_spectrogram",
+        "title": "Acceleration Power Spectral Density",
+        "candidates": [
+            {
+                "topic": "sensor_combined",
+                "fields": [
+                    "accelerometer_m_s2[0]",
+                    "accelerometer_m_s2[1]",
+                    "accelerometer_m_s2[2]",
+                ],
+                "labels": ["X", "Y", "Z"],
+            },
+        ],
+    },
     {
         "id": "angular_velocity_spectrogram",
         "title": "Angular Velocity Spectrogram",
@@ -395,6 +418,15 @@ def build_interactive_plot_payload(
     overlays = _build_overlays(ulog, start_s, end_s)
 
     plots: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    context = PlotContext(
+        ulog=ulog,
+        start_s=start_s,
+        end_s=end_s,
+        overlays=overlays,
+        max_points=max_points,
+        colors=COLORS8,
+    )
     local_plot = _build_local_position_plot(ulog, start_s, end_s, max_points)
     if local_plot is not None:
         plots.append(local_plot)
@@ -402,22 +434,65 @@ def build_interactive_plot_payload(
     plots.extend(_build_velocity_frame_plots(ulog, start_s, end_s, max_points))
 
     for definition in TIMESERIES_PLOTS:
-        plot = _build_timeseries_plot(definition, ulog, start_s, end_s, overlays, max_points)
-        if plot is not None:
-            plots.append(plot)
+        try:
+            builder = definition.get("builder")
+            if builder is None:
+                plot = _build_timeseries_plot(
+                    definition,
+                    ulog,
+                    start_s,
+                    end_s,
+                    overlays,
+                    max_points,
+                )
+                if plot is not None:
+                    plots.append(plot)
+            elif definition.get("many"):
+                plots.extend(builder(context) or [])
+            else:
+                plot = builder(context)
+                if plot is not None:
+                    plots.append(plot)
+        except Exception as exc:
+            warnings.append(f"{definition['id']}: {exc}")
 
     plots.extend(_build_actuator_control_plots(ulog, start_s, end_s, overlays, max_points))
+    _append_plot_family(plots, warnings, "fft_plots", build_fft_plots, context)
 
     for definition in SPECTROGRAM_PLOTS:
-        plot = _build_spectrogram_plot(definition, ulog, start_s, end_s, max_points)
-        if plot is not None:
-            plots.append(plot)
+        try:
+            plot = _build_spectrogram_plot(
+                definition,
+                ulog,
+                start_s,
+                end_s,
+                max_points,
+            )
+            if plot is not None:
+                plots.append(plot)
+        except Exception as exc:
+            warnings.append(f"{definition['id']}: {exc}")
+
+    _append_plot_family(plots, warnings, "fifo_plots", build_fifo_plots, context)
 
     return {
         "plots": plots,
         "time_range_s": [_round_float(start_s), _round_float(end_s)],
-        "warnings": [],
+        "warnings": warnings,
     }
+
+
+def _append_plot_family(
+    plots: list[dict[str, Any]],
+    warnings: list[str],
+    family_id: str,
+    builder: Any,
+    context: PlotContext,
+) -> None:
+    try:
+        plots.extend(builder(context) or [])
+    except Exception as exc:
+        warnings.append(f"{family_id}: {exc}")
 
 
 def _build_timeseries_plot(
@@ -430,29 +505,64 @@ def _build_timeseries_plot(
 ) -> dict[str, Any] | None:
     series = []
     warnings = []
+    mean_spans = []
     for index, series_def in enumerate(definition["series"]):
         resolved = _resolve_first_available(ulog, series_def["signals"], start_s, end_s)
         if resolved is None:
             continue
 
-        time_s, values = _downsample_pair(resolved["time_s"], resolved["values"], max_points)
-        series.append(
-            {
-                "key": _series_key(definition["id"], series_def["label"]),
-                "label": series_def["label"],
-                "signal": resolved["signal"],
-                "unit": resolved.get("unit"),
-                "axis_label": resolved.get("axis_label"),
-                "color": COLORS8[index % len(COLORS8)],
-                "time_s": time_s,
-                "values": values,
-            }
-        )
+        scale = float(series_def.get("scale", 1.0))
+        values = [float(value) * scale for value in resolved["values"]]
+        if series_def.get("omit_if_all_zero") and not any(
+            math.isfinite(value) and abs(value) > 0.0001
+            for value in values
+        ):
+            continue
+        finite_values = [value for value in values if math.isfinite(value)]
+        if definition.get("mean_spans") and finite_values:
+            mean_spans.append(
+                {
+                    "value": _round_float(float(np.mean(finite_values))),
+                    "color": COLORS8[index % len(COLORS8)],
+                    "label": f"{series_def['label']} mean",
+                    "series_key": _series_key(
+                        definition["id"],
+                        series_def["label"],
+                    ),
+                }
+            )
+        interpolation = series_def.get("interpolation", "linear")
+        if interpolation == "step_after":
+            time_s, values = downsample_diagnostic_pair(
+                resolved["time_s"],
+                values,
+                max_points,
+                preserve_steps=True,
+            )
+        else:
+            time_s, values = _downsample_pair(
+                resolved["time_s"],
+                values,
+                max_points,
+            )
+        item = {
+            "key": _series_key(definition["id"], series_def["label"]),
+            "label": series_def["label"],
+            "signal": resolved["signal"],
+            "unit": resolved.get("unit"),
+            "axis_label": resolved.get("axis_label"),
+            "color": COLORS8[index % len(COLORS8)],
+            "time_s": time_s,
+            "values": values,
+        }
+        if interpolation != "linear":
+            item["interpolation"] = interpolation
+        series.append(item)
 
     if not series:
         return None
 
-    return {
+    plot = {
         "id": definition["id"],
         "title": definition["title"],
         "kind": "timeseries",
@@ -462,6 +572,11 @@ def _build_timeseries_plot(
         "overlays": overlays,
         "warnings": warnings,
     }
+    if definition.get("horizontal_bands"):
+        plot["horizontal_bands"] = definition["horizontal_bands"]
+    if definition.get("mean_spans"):
+        plot["horizontal_spans"] = mean_spans
+    return plot
 
 
 def _build_local_position_plot(
@@ -1096,51 +1211,44 @@ def _build_spectrogram_plot(
     if timestamps is None:
         return None
 
-    try:
-        data_len = len(timestamps)
-    except TypeError:
-        return None
-    if data_len < 256:
-        return None
-
-    try:
-        first_timestamp = float(_json_safe_value(timestamps[0]))
-        last_timestamp = float(_json_safe_value(timestamps[data_len - 1]))
-    except (TypeError, ValueError, IndexError):
-        return None
-
-    delta_t = ((last_timestamp - first_timestamp) * 1.0e-6) / data_len
-    if delta_t <= 0:
-        return None
-
-    sampling_frequency = 1.0 / delta_t
-    if sampling_frequency < 100 or sampling_frequency == float("inf"):
-        return None
-
-    arrays = []
+    arrays: list[np.ndarray] = []
     for field in candidate["fields"]:
         values = data.get(field)
         if values is None:
             return None
         try:
-            array = np.asarray([float(_json_safe_value(value)) for value in values[:data_len]], dtype=float)
+            arrays.append(np.asarray(values, dtype=float))
         except (TypeError, ValueError):
             return None
-        if len(array) != data_len or not np.isfinite(array).any():
-            return None
-        arrays.append(np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0))
 
-    frequency, times, values_db = _spectrogram_sum(arrays, first_timestamp, delta_t)
-    if len(times) == 0:
+    try:
+        timestamp_array = np.asarray(timestamps, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    data_len = min(len(timestamp_array), *(len(array) for array in arrays))
+    if data_len < 256:
+        return None
+    timestamp_array = timestamp_array[:data_len]
+    arrays = [array[:data_len] for array in arrays]
+    finite_rows = np.isfinite(timestamp_array)
+    for array in arrays:
+        finite_rows &= np.isfinite(array)
+    if np.count_nonzero(finite_rows) < 256:
         return None
 
-    if len(times) > max_points:
-        step = max(1, math.ceil(len(times) / max_points))
-        times = times[::step]
-        values_db = values_db[:, ::step]
+    spectrogram = summed_spectrogram(
+        timestamp_array[finite_rows],
+        [array[finite_rows] for array in arrays],
+        max_time_bins=max_points,
+    )
+    if spectrogram is None:
+        return None
 
+    frequency = np.asarray(spectrogram["frequencies_hz"], dtype=float)
+    times = np.asarray(spectrogram["time_s"], dtype=float)
+    values_db = np.asarray(spectrogram["values_db"], dtype=float)
     finite_values = values_db[np.isfinite(values_db)]
-    if finite_values.size == 0:
+    if not frequency.size or not times.size or finite_values.size == 0:
         return None
 
     return {
@@ -1156,7 +1264,9 @@ def _build_spectrogram_plot(
             for row in values_db
         ],
         "value_range_db": [_round_float(float(np.min(finite_values))), _round_float(float(np.max(finite_values)))],
-        "sampling_frequency_hz": _round_float(sampling_frequency),
+        "sampling_frequency_hz": _round_float(
+            float(spectrogram["sampling_frequency_hz"])
+        ),
         "source": candidate["topic"],
         "fields": candidate["fields"],
         "labels": candidate["labels"],
@@ -1516,47 +1626,6 @@ def _first_spectrogram_candidate(ulog: Any, candidates: list[dict[str, Any]]) ->
         if all(field in data for field in candidate["fields"]):
             return {**candidate, "dataset": dataset}
     return None
-
-
-def _spectrogram_sum(
-    arrays: list[np.ndarray],
-    first_timestamp: float,
-    delta_t: float,
-    *,
-    window_length: int = 256,
-    noverlap: int = 128,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    step = window_length - noverlap
-    if step <= 0 or not arrays:
-        return np.asarray([]), np.asarray([]), np.asarray([[]])
-
-    data_len = min(len(array) for array in arrays)
-    if data_len < window_length:
-        return np.asarray([]), np.asarray([]), np.asarray([[]])
-
-    starts = np.arange(0, data_len - window_length + 1, step)
-    frequency = np.fft.rfftfreq(window_length, delta_t)
-    window = np.hanning(window_length)
-    window_power = float(np.sum(window * window)) or 1.0
-    sampling_frequency = 1.0 / delta_t
-    sum_psd = np.zeros((len(frequency), len(starts)))
-
-    for array in arrays:
-        trimmed = array[:data_len]
-        for column, start_index in enumerate(starts):
-            segment = np.asarray(trimmed[start_index:start_index + window_length], dtype=float)
-            segment = segment - np.mean(segment)
-            fft_values = np.fft.rfft(segment * window)
-            psd = (np.abs(fft_values) ** 2) / (sampling_frequency * window_power)
-            if len(psd) > 2:
-                psd[1:-1] *= 2.0
-            sum_psd[:, column] += psd
-
-    sum_psd = np.maximum(sum_psd, np.finfo(float).tiny)
-    values_db = 10.0 * np.log10(sum_psd)
-    time_offsets = (starts + window_length / 2.0) * delta_t
-    time_s = (first_timestamp * 1.0e-6) + time_offsets
-    return frequency, time_s, values_db
 
 
 def _downsample_pair(

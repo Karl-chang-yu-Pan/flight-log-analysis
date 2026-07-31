@@ -761,6 +761,7 @@ function initializePlotTrackers(plots) {
   }
 
   plots.forEach((plot) => {
+    if (plot.kind === "spectrum") return;
     const [start, end] = plot.time_range_s || [0, 0];
     if (state.plotTrackers[plot.id] !== undefined) return;
     const initial = Number.isFinite(state.sharedPlotTracker)
@@ -789,13 +790,14 @@ function renderInteractivePlots() {
 
   els.plotSidebarStatus.textContent = plots.length ? `${plots.length} plots` : "No plottable data";
   renderPlotNavigation(plots);
+  state.plotRenderMetrics = {};
   els.plotRows.innerHTML = plots.length
     ? plots.map((plot, index) => renderInteractivePlot(plot, index)).join("")
     : `<p class="plot-empty">No Flight Review plot signals were available in this log.</p>`;
 
   bindInteractivePlots(plots);
-  observeInteractivePlots(plots);
-  window.requestAnimationFrame(() => drawInteractivePlots(plots));
+  const observerActive = observeInteractivePlots(plots);
+  window.requestAnimationFrame(() => drawInteractivePlots(plots, { visibleOnly: observerActive }));
 }
 
 function renderPlotNavigation(plots) {
@@ -807,8 +809,9 @@ function renderPlotNavigation(plots) {
 }
 
 function renderInteractivePlot(plot, index) {
+  const showTimeControls = plot.kind !== "spectrum";
   const [start, end] = plot.time_range_s || [0, 0];
-  const tracker = clampTracker(plot.id, start, end);
+  const tracker = showTimeControls ? clampTracker(plot.id, start, end) : null;
   const sources = plot.kind === "local_position"
     ? (plot.traces || [])
     : plot.kind === "spectrogram" ? [] : (plot.series || []);
@@ -818,23 +821,29 @@ function renderInteractivePlot(plot, index) {
     <section class="interactive-plot" id="plot-${index}" data-plot-id="${escapeAttr(plot.id)}">
       <div class="interactive-plot-header">
         <h3>${escapeHtml(plot.title)}</h3>
-        <span class="plot-time" id="plotTime-${escapeAttr(plot.id)}">${escapeHtml(formatLogTime(tracker))}</span>
+        ${showTimeControls
+          ? `<span class="plot-time" id="plotTime-${escapeAttr(plot.id)}">${escapeHtml(formatLogTime(tracker))}</span>`
+          : ""}
       </div>
       <div class="plot-canvas-stack">
         <canvas class="plot-canvas" id="plotCanvas-${escapeAttr(plot.id)}"></canvas>
-        <canvas class="plot-tracker-canvas" id="plotTrackerCanvas-${escapeAttr(plot.id)}" aria-hidden="true"></canvas>
+        ${showTimeControls
+          ? `<canvas class="plot-tracker-canvas" id="plotTrackerCanvas-${escapeAttr(plot.id)}" aria-hidden="true"></canvas>`
+          : ""}
       </div>
-      <div class="plot-tracker">
-        <input
-          id="plotTracker-${escapeAttr(plot.id)}"
-          type="range"
-          min="${escapeAttr(start)}"
-          max="${escapeAttr(end)}"
-          step="${escapeAttr(step)}"
-          value="${escapeAttr(tracker)}"
-          ${end <= start ? "disabled" : ""}
-        >
-      </div>
+      ${showTimeControls ? `
+        <div class="plot-tracker">
+          <input
+            id="plotTracker-${escapeAttr(plot.id)}"
+            type="range"
+            min="${escapeAttr(start)}"
+            max="${escapeAttr(end)}"
+            step="${escapeAttr(step)}"
+            value="${escapeAttr(tracker)}"
+            ${end <= start ? "disabled" : ""}
+          >
+        </div>
+      ` : ""}
       <div class="plot-legend">
         ${sources.map((source) => renderPlotToggle(plot.id, source)).join("")}
       </div>
@@ -864,7 +873,7 @@ function bindInteractivePlots(plots) {
       });
     }
 
-    if (canvas && plot.kind !== "local_position") {
+    if (canvas && plot.kind !== "local_position" && plot.kind !== "spectrum") {
       canvas.addEventListener("click", (event) => {
         const time = canvasTimeFromEvent(canvas, plot, event);
         if (time == null) return;
@@ -880,7 +889,7 @@ function bindInteractivePlots(plots) {
       if (!plotId || !sourceKey) return;
       state.hiddenPlotSeries[`${plotId}:${sourceKey}`] = !input.checked;
       const plot = (state.plotPayload?.plots || []).find((candidate) => candidate.id === plotId);
-      if (plot) drawInteractivePlot(plot);
+      if (plot && isPlotVisibleOrUnobserved(plot.id)) drawInteractivePlot(plot);
     });
   });
 }
@@ -901,6 +910,7 @@ function flushSharedPlotTracker() {
   const plots = state.plotPayload?.plots || [];
   state.sharedPlotTracker = time;
   plots.forEach((plot) => {
+    if (plot.kind === "spectrum") return;
     const [start, end] = plot.time_range_s || [0, 0];
     const tracker = clampTime(time, start, end);
     state.plotTrackers[plot.id] = tracker;
@@ -912,7 +922,7 @@ function flushSharedPlotTracker() {
 }
 
 function observeInteractivePlots(plots) {
-  if (!plots.length || typeof window.IntersectionObserver !== "function") return;
+  if (!plots.length || typeof window.IntersectionObserver !== "function") return false;
 
   const plotsById = new Map(plots.map((plot) => [plot.id, plot]));
   const observer = new window.IntersectionObserver((entries) => {
@@ -927,8 +937,13 @@ function observeInteractivePlots(plots) {
 
       state.visiblePlotIds.add(plotId);
       const plot = plotsById.get(plotId);
-      if (
-        plot
+      if (!plot) return;
+      const metrics = state.plotRenderMetrics[plotId] || {};
+      const canvas = document.getElementById(`plotCanvas-${plotId}`);
+      if (!metrics.staticDrawn || (canvas && canvasNeedsResize(canvas))) {
+        drawInteractivePlot(plot);
+      } else if (
+        plot.kind !== "spectrum"
         && state.plotTrackerDrawnRevisions[plotId] !== state.plotTrackerRevision
       ) {
         drawInteractivePlotTracker(plot);
@@ -943,7 +958,22 @@ function observeInteractivePlots(plots) {
 
   els.plotRows.querySelectorAll(".interactive-plot").forEach((section) => {
     observer.observe(section);
+    if (!plotSectionIsNearViewport(section)) return;
+    const plotId = section.dataset.plotId;
+    const plot = plotsById.get(plotId);
+    if (!plot) return;
+    state.visiblePlotIds.add(plotId);
+    drawInteractivePlot(plot);
   });
+  return true;
+}
+
+function plotSectionIsNearViewport(section) {
+  const sectionRect = section.getBoundingClientRect();
+  const rootRect = els.plotSidebar.getBoundingClientRect();
+  const margin = 200;
+  return sectionRect.bottom >= rootRect.top - margin
+    && sectionRect.top <= rootRect.bottom + margin;
 }
 
 function disconnectPlotVisibilityObserver() {
@@ -964,8 +994,16 @@ function schedulePlotResize() {
   }, 100);
 }
 
-function drawInteractivePlots(plots) {
-  plots.forEach(drawInteractivePlot);
+function isPlotVisibleOrUnobserved(plotId) {
+  return !state.plotVisibilityObserver || state.visiblePlotIds.has(plotId);
+}
+
+function drawInteractivePlots(plots, { visibleOnly = false } = {}) {
+  plots.forEach((plot) => {
+    if (!visibleOnly || isPlotVisibleOrUnobserved(plot.id)) {
+      drawInteractivePlot(plot);
+    }
+  });
 }
 
 function drawInteractivePlotTrackers(plots, { visibleOnly = false } = {}) {
@@ -982,6 +1020,7 @@ function drawInteractivePlotTrackers(plots, { visibleOnly = false } = {}) {
 
 function drawResizedInteractivePlots(plots) {
   plots.forEach((plot) => {
+    if (!isPlotVisibleOrUnobserved(plot.id)) return;
     const canvas = document.getElementById(`plotCanvas-${plot.id}`);
     if (canvas && canvasNeedsResize(canvas)) drawInteractivePlot(plot);
   });
@@ -999,14 +1038,20 @@ function drawInteractivePlot(plot) {
     drawLocalPositionPlot(ctx, canvas, bounds, plot);
   } else if (plot.kind === "spectrogram") {
     drawSpectrogramPlot(ctx, canvas, bounds, plot);
+  } else if (plot.kind === "spectrum") {
+    drawSpectrumPlot(ctx, canvas, bounds, plot);
   } else {
     drawTimeseriesPlot(ctx, canvas, bounds, plot);
   }
 
-  drawInteractivePlotTracker(plot);
+  const metrics = state.plotRenderMetrics[plot.id] || {};
+  metrics.staticDrawn = true;
+  state.plotRenderMetrics[plot.id] = metrics;
+  if (plot.kind !== "spectrum") drawInteractivePlotTracker(plot);
 }
 
 function drawInteractivePlotTracker(plot) {
+  if (plot.kind === "spectrum") return;
   const canvas = document.getElementById(`plotTrackerCanvas-${plot.id}`);
   if (!canvas) return;
 
@@ -1072,9 +1117,11 @@ function drawPlotFrame(ctx, canvas, bounds) {
 
 function drawTimeseriesPlot(ctx, canvas, bounds, plot) {
   const visibleSeries = (plot.series || []).filter((series) => isPlotSourceVisible(plot.id, series.key));
+  const visibleSpans = visibleHorizontalSpans(plot);
   const xRange = plot.time_range_s || [0, 1];
-  const yRange = resolveTimeseriesYRange(plot, visibleSeries);
+  const yRange = resolveTimeseriesYRange(plot, visibleSeries, visibleSpans);
   drawTimeOverlays(ctx, bounds, xRange, plot.overlays || []);
+  drawHorizontalBands(ctx, bounds, yRange, plot.horizontal_bands || []);
   drawGrid(ctx, bounds);
 
   visibleSeries.forEach((series) => {
@@ -1086,14 +1133,26 @@ function drawTimeseriesPlot(ctx, canvas, bounds, plot) {
       xRange,
       yRange,
       series.color,
+      series.interpolation,
     );
   });
+  drawHorizontalSpans(
+    ctx,
+    bounds,
+    xRange,
+    yRange,
+    visibleSpans,
+  );
 }
 
 function drawTimeseriesTracker(ctx, bounds, plot) {
   const visibleSeries = (plot.series || []).filter((series) => isPlotSourceVisible(plot.id, series.key));
   const xRange = plot.time_range_s || [0, 1];
-  const yRange = resolveTimeseriesYRange(plot, visibleSeries);
+  const yRange = resolveTimeseriesYRange(
+    plot,
+    visibleSeries,
+    visibleHorizontalSpans(plot),
+  );
   const tracker = clampTracker(plot.id, xRange[0], xRange[1]);
   drawTimeTracker(ctx, bounds, tracker, xRange);
   drawTimeseriesTrackerPoints(ctx, bounds, visibleSeries, tracker, xRange, yRange);
@@ -1152,6 +1211,38 @@ function drawSpectrogramTracker(ctx, bounds, plot) {
   const tracker = clampTracker(plot.id, xRange[0], xRange[1]);
   drawTimeTracker(ctx, bounds, tracker, xRange);
   updatePlotTime(plot.id, tracker);
+}
+
+function drawSpectrumPlot(ctx, canvas, bounds, plot) {
+  const visibleSeries = (plot.series || [])
+    .filter((series) => isPlotSourceVisible(plot.id, series.key));
+  const visibleSpans = visibleHorizontalSpans(plot);
+  const xRange = plot.frequency_range_hz || numericRange(
+    visibleSeries.flatMap((series) => series.frequencies_hz || []),
+  );
+  const yRange = resolveSpectrumYRange(plot, visibleSeries, visibleSpans);
+  drawGrid(ctx, bounds);
+
+  visibleSeries.forEach((series) => {
+    drawLine(
+      ctx,
+      series.frequencies_hz || [],
+      series.values || [],
+      bounds,
+      xRange,
+      yRange,
+      series.color,
+    );
+  });
+  drawHorizontalSpans(
+    ctx,
+    bounds,
+    xRange,
+    yRange,
+    visibleSpans,
+  );
+  drawFrequencyMarkers(ctx, bounds, xRange, plot.frequency_markers || []);
+  updatePlotReadout(plot);
 }
 
 function drawSpectrogramImage(ctx, bounds, plot, xRange, yRange) {
@@ -1224,7 +1315,93 @@ function drawGrid(ctx, bounds) {
   ctx.restore();
 }
 
-function drawLine(ctx, xs, ys, bounds, xRange, yRange, color) {
+function drawHorizontalBands(ctx, bounds, yRange, bands) {
+  bands.forEach((band) => {
+    const min = band.min == null ? yRange[0] : Number(band.min);
+    const max = band.max == null ? yRange[1] : Number(band.max);
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return;
+    const y1 = yToCanvas(min, bounds, yRange);
+    const y2 = yToCanvas(max, bounds, yRange);
+    ctx.save();
+    ctx.globalAlpha = band.alpha != null && Number.isFinite(Number(band.alpha))
+      ? Number(band.alpha)
+      : 0.12;
+    ctx.fillStyle = band.color || "#b7c0b5";
+    ctx.fillRect(
+      bounds.left,
+      Math.min(y1, y2),
+      bounds.right - bounds.left,
+      Math.max(1, Math.abs(y2 - y1)),
+    );
+    if (band.label) {
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = band.color || "#687168";
+      ctx.font = "10px sans-serif";
+      ctx.fillText(String(band.label), bounds.left + 4, Math.min(y1, y2) + 11);
+    }
+    ctx.restore();
+  });
+}
+
+function drawHorizontalSpans(ctx, bounds, xRange, yRange, spans) {
+  spans.forEach((span) => {
+    const value = Number(span.value);
+    if (!Number.isFinite(value)) return;
+    const start = span.start_x != null && Number.isFinite(Number(span.start_x))
+      ? Number(span.start_x)
+      : xRange[0];
+    const end = span.end_x != null && Number.isFinite(Number(span.end_x))
+      ? Number(span.end_x)
+      : xRange[1];
+    const x1 = xToCanvas(start, bounds, xRange);
+    const x2 = xToCanvas(end, bounds, xRange);
+    const y = yToCanvas(value, bounds, yRange);
+    ctx.save();
+    ctx.globalAlpha = span.alpha != null && Number.isFinite(Number(span.alpha))
+      ? Number(span.alpha)
+      : 0.8;
+    ctx.strokeStyle = span.color || "#687168";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x1, y);
+    ctx.lineTo(x2, y);
+    ctx.stroke();
+    if (span.label) {
+      ctx.fillStyle = span.color || "#687168";
+      ctx.font = "10px sans-serif";
+      ctx.fillText(String(span.label), Math.min(x1, x2) + 4, y - 3);
+    }
+    ctx.restore();
+  });
+}
+
+function drawFrequencyMarkers(ctx, bounds, xRange, markers) {
+  markers.forEach((marker) => {
+    const frequency = Number(marker.frequency_hz);
+    if (!Number.isFinite(frequency)) return;
+    if (frequency < xRange[0] || frequency > xRange[1]) return;
+    const x = xToCanvas(frequency, bounds, xRange);
+    ctx.save();
+    ctx.strokeStyle = marker.color || "#687168";
+    ctx.fillStyle = marker.color || "#687168";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, bounds.top);
+    ctx.lineTo(x, bounds.bottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (marker.label) {
+      ctx.font = "10px sans-serif";
+      ctx.translate(x + 3, bounds.top + 4);
+      ctx.rotate(Math.PI / 2);
+      ctx.fillText(String(marker.label), 0, 0);
+    }
+    ctx.restore();
+  });
+}
+
+function drawLine(ctx, xs, ys, bounds, xRange, yRange, color, interpolation = "linear") {
   if (!xs.length || !ys.length) return;
 
   ctx.save();
@@ -1232,6 +1409,7 @@ function drawLine(ctx, xs, ys, bounds, xRange, yRange, color) {
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   let started = false;
+  let previousY = null;
   xs.forEach((xValue, index) => {
     const yValue = ys[index];
     if (!Number.isFinite(xValue) || !Number.isFinite(yValue)) return;
@@ -1240,9 +1418,13 @@ function drawLine(ctx, xs, ys, bounds, xRange, yRange, color) {
     if (!started) {
       ctx.moveTo(x, y);
       started = true;
+    } else if (interpolation === "step_after") {
+      ctx.lineTo(x, previousY);
+      ctx.lineTo(x, y);
     } else {
       ctx.lineTo(x, y);
     }
+    previousY = y;
   });
   if (started) ctx.stroke();
   ctx.restore();
@@ -1282,7 +1464,11 @@ function drawTimeTracker(ctx, bounds, time, xRange) {
 
 function drawTimeseriesTrackerPoints(ctx, bounds, seriesList, tracker, xRange, yRange) {
   seriesList.forEach((series) => {
-    const value = sampleSeriesAtTime(series, tracker);
+    const value = sampleSeriesAtTime(
+      series,
+      tracker,
+      series.interpolation === "step_after" ? "previous" : "linear",
+    );
     if (value == null) return;
     drawMarker(ctx, xToCanvas(tracker, bounds, xRange), yToCanvas(value, bounds, yRange), series.color);
   });
@@ -1313,8 +1499,13 @@ function canvasTimeFromEvent(canvas, plot, event) {
 function updatePlotReadout(plot) {
   const readout = document.getElementById(`plotReadout-${plot.id}`);
   if (!readout) return;
-  const tracker = state.plotTrackers[plot.id] ?? 0;
 
+  if (plot.kind === "spectrum") {
+    readout.innerHTML = spectrumReadout(plot);
+    return;
+  }
+
+  const tracker = state.plotTrackers[plot.id] ?? 0;
   if (plot.kind === "local_position") {
     readout.innerHTML = localPositionReadout(plot, tracker);
   } else if (plot.kind === "spectrogram") {
@@ -1328,7 +1519,11 @@ function timeseriesReadout(plot, tracker) {
   const rows = (plot.series || [])
     .filter((series) => isPlotSourceVisible(plot.id, series.key))
     .map((series) => {
-      const value = sampleSeriesAtTime(series, tracker);
+      const value = sampleSeriesAtTime(
+        series,
+        tracker,
+        series.interpolation === "step_after" ? "previous" : "linear",
+      );
       const suffix = series.unit ? ` ${series.unit}` : "";
       return readoutRow(series.label, value == null ? "n/a" : `${formatNumber(value)}${suffix}`);
     });
@@ -1382,6 +1577,36 @@ function spectrogramReadout(plot, tracker) {
     rows.push(readoutRow("Sample rate", `${formatNumber(plot.sampling_frequency_hz)} Hz`));
   }
   return rows.join("");
+}
+
+function spectrumReadout(plot) {
+  const rows = (plot.series || [])
+    .filter((series) => isPlotSourceVisible(plot.id, series.key))
+    .map((series) => {
+      const peak = spectrumPeak(series);
+      if (!peak) return readoutRow(series.label, "n/a");
+      const suffix = series.unit ? ` ${series.unit}` : "";
+      return readoutRow(
+        series.label,
+        `${formatNumber(peak.frequency)} Hz (${formatNumber(peak.value)}${suffix})`,
+      );
+    });
+  if (Number.isFinite(plot.sampling_frequency_hz)) {
+    rows.push(readoutRow("Sample rate", `${formatNumber(plot.sampling_frequency_hz)} Hz`));
+  }
+  return rows.length ? rows.join("") : readoutRow("Visible series", "none");
+}
+
+function spectrumPeak(series) {
+  const frequencies = series.frequencies_hz || [];
+  const values = series.values || [];
+  let peak = null;
+  frequencies.forEach((frequency, index) => {
+    const value = values[index];
+    if (!Number.isFinite(frequency) || !Number.isFinite(value) || frequency <= 0) return;
+    if (!peak || value > peak.value) peak = { frequency, value };
+  });
+  return peak;
 }
 
 function readoutRow(label, value) {
@@ -1444,7 +1669,14 @@ function numericRange(values) {
   return [min - padding, max + padding];
 }
 
-function resolveTimeseriesYRange(plot, visibleSeries) {
+function visibleHorizontalSpans(plot) {
+  return (plot.horizontal_spans || []).filter(
+    (span) => !span.series_key
+      || isPlotSourceVisible(plot.id, span.series_key),
+  );
+}
+
+function resolveTimeseriesYRange(plot, visibleSeries, visibleSpans = visibleHorizontalSpans(plot)) {
   if (Array.isArray(plot.y_range) && plot.y_range.length >= 2) {
     return plot.y_range;
   }
@@ -1453,10 +1685,27 @@ function resolveTimeseriesYRange(plot, visibleSeries) {
   const visibilityKey = visibleSeries.map((series) => series.key).join("|");
   if (cache.yRangeKey !== visibilityKey) {
     cache.yRangeKey = visibilityKey;
-    cache.yRange = numericRange(visibleSeries.flatMap((series) => series.values || []));
+    const annotationValues = [
+      ...(plot.horizontal_bands || []).flatMap((band) => [band.min, band.max]),
+      ...visibleSpans.map((span) => span.value),
+    ].filter((value) => value != null).map(Number).filter(Number.isFinite);
+    cache.yRange = numericRange([
+      ...visibleSeries.flatMap((series) => series.values || []),
+      ...annotationValues,
+    ]);
     state.plotRenderMetrics[plot.id] = cache;
   }
   return cache.yRange || [0, 1];
+}
+
+function resolveSpectrumYRange(plot, visibleSeries, visibleSpans = visibleHorizontalSpans(plot)) {
+  if (Array.isArray(plot.y_range) && plot.y_range.length >= 2) {
+    return plot.y_range;
+  }
+  return numericRange([
+    ...visibleSeries.flatMap((series) => series.values || []),
+    ...visibleSpans.map((span) => span.value),
+  ]);
 }
 
 function resolveLocalPositionRange(plot, visibleTraces, bounds) {
