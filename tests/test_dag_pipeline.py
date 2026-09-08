@@ -65,6 +65,26 @@ def _logged_input(local: str, signal: str, line: int) -> dict:
     }
 
 
+@pytest.fixture(params=["terminal", "checkpoint"])
+def replay_engine(request):
+    """Exercise one numerical contract through both public replay boundaries."""
+    from flight_log_agent.analysis.dag_pipeline import replay_terminal_expressions
+    from flight_log_agent.analysis.dag_replay import observed_checkpoint_roots, replay_dag_roots
+
+    def replay(dag, path, parameters, logged, **kwargs):
+        if request.param == "terminal":
+            return replay_terminal_expressions(dag, path, parameters, logged, **kwargs)
+        groups = observed_checkpoint_roots(dag)
+        assert len(groups) == 1
+        observed, roots = next(iter(groups.items()))
+        assert observed in logged
+        return replay_dag_roots(
+            dag, roots, observed, parameter_values=parameters, **kwargs
+        )
+
+    return replay
+
+
 @pytest.fixture(autouse=True)
 def _stub_stage_signal_samples(monkeypatch):
     from flight_log_agent.analysis import dag_pipeline
@@ -721,7 +741,7 @@ def test_complete_replay_distinguishes_match_mismatch_and_missing_policy(monkeyp
     assert partial["complete"] is False
 
 
-def test_replay_reuses_supplied_dag_signal_data(monkeypatch):
+def test_replay_reuses_supplied_dag_signal_data(monkeypatch, replay_engine):
     from flight_log_agent.analysis import dag_pipeline
     from flight_log_agent.analysis.mechanism_dag import (
         build_mechanism_dag,
@@ -764,7 +784,7 @@ def test_replay_reuses_supplied_dag_signal_data(monkeypatch):
         raise AssertionError("replay must reuse the selected DAG's signal data")
 
     monkeypatch.setattr(dag_pipeline, "_signal_samples_for_dag", unexpected_load)
-    replay = dag_pipeline.replay_terminal_expressions(
+    replay = replay_engine(
         dag,
         Path("/nonexistent.ulg"),
         {},
@@ -896,7 +916,7 @@ def test_replay_combines_mutually_exclusive_writers_piecewise(monkeypatch):
     assert all(result["match_fraction"] == 1.0 for result in replay["results"])
 
 
-def test_replay_reconstructs_nested_internal_flow_from_dag_edges():
+def test_replay_reconstructs_nested_internal_flow_from_dag_edges(replay_engine):
     from flight_log_agent.analysis import dag_pipeline
     from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
 
@@ -944,7 +964,7 @@ def test_replay_reconstructs_nested_internal_flow_from_dag_edges():
         logged_signals=set(samples),
     )
 
-    replay = dag_pipeline.replay_terminal_expressions(
+    replay = replay_engine(
         dag,
         Path("/unused.ulg"),
         {},
@@ -959,7 +979,7 @@ def test_replay_reconstructs_nested_internal_flow_from_dag_edges():
     assert replay["results"][0]["grounded"] is None
 
 
-def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges():
+def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges(replay_engine):
     from flight_log_agent.analysis import dag_pipeline
     from flight_log_agent.analysis.mechanism_dag import (
         build_mechanism_dag,
@@ -1024,7 +1044,7 @@ def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges():
         prune_dead=False,
     )
 
-    replay = dag_pipeline.replay_terminal_expressions(
+    replay = replay_engine(
         annotated,
         Path("/unused.ulg"),
         {},
@@ -1036,6 +1056,254 @@ def test_replay_selects_mutually_exclusive_internal_writers_from_dag_edges():
     assert replay["status"] == "matched"
     assert replay["complete"] is True
     assert replay["results"][0]["match_fraction"] == 1.0
+
+
+def _checkpoint_fixture(expression="input_value", input_signal="input.value"):
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    dag = build_mechanism_dag(
+        [
+            _logged_input("input_value", input_signal, 1),
+            {
+                "target_symbol": "output.value",
+                "source_symbol": expression,
+                "assignment_path": [{"file": "a.cpp", "line": 2, "expression": expression}],
+                "expression_ref": _exact_expression(expression, "input_value"),
+                "external_target_signal": True,
+                "synthetic_boundary_transfer": True,
+                "boundary_direction": "publish",
+                "control_predicates": [],
+                "function": "A::run",
+            },
+        ],
+        "output.value", logged_signals={input_signal, "output.value"},
+    )
+    samples = {
+        input_signal: [(0.0, 5.0), (2.0, 5.0), (4.0, 5.0), (6.0, 5.0), (10.0, 5.0)],
+        "output.value": [(0.0, 8.0), (2.0, 5.0), (4.0, 5.0), (6.0, 8.0), (10.0, 8.0)],
+    }
+    policies = {signal: {"method": "linear"} for signal in samples}
+    return dag, samples, policies
+
+
+def _checkpoint_replay(dag, samples, policies, scope=None, **kwargs):
+    from flight_log_agent.analysis.dag_replay import observed_checkpoint_roots, replay_dag_roots
+
+    return replay_dag_roots(
+        dag, observed_checkpoint_roots(dag)["output.value"], "output.value",
+        signal_samples=samples, signal_policies=policies, scope=scope, **kwargs,
+    )
+
+
+@pytest.mark.parametrize("windows", [((2.0, 4.0),), ((2.0, 2.5), (3.5, 4.0))])
+def test_checkpoint_scope_uses_requested_domain_not_whole_log(windows):
+    from flight_log_agent.analysis.dag_replay import EvaluationScope
+
+    dag, samples, policies = _checkpoint_fixture()
+    assert _checkpoint_replay(dag, samples, policies)["status"] == "mismatched"
+    replay = _checkpoint_replay(dag, samples, policies, EvaluationScope(windows))
+    assert replay["status"] == "matched"
+    assert replay["evaluation_windows"] == list(windows)
+    assert replay["results"][0]["max_abs_error"] == 0
+
+
+@pytest.mark.parametrize("result", [
+    {"windows": None, "error": "unknown frame"},
+    {"windows": []},
+    {"windows": [[4, 2]]},
+    {"windows": [[float("nan"), 5]]},
+    {"windows": [[20, 30]]},
+])
+def test_invalid_empty_or_unobserved_scope_never_counts_as_match(result):
+    from flight_log_agent.analysis.dag_replay import EvaluationScope
+
+    dag, samples, policies = _checkpoint_fixture()
+    replay = _checkpoint_replay(dag, samples, policies, EvaluationScope.from_result(result))
+    assert replay["status"] == "not_attempted"
+    assert replay["complete"] is False
+
+
+def test_scope_outside_observation_coverage_remains_partial():
+    from flight_log_agent.analysis.dag_replay import EvaluationScope
+
+    dag, samples, policies = _checkpoint_fixture()
+    replay = _checkpoint_replay(dag, samples, policies, EvaluationScope(((-1, 4),)))
+    assert replay["status"] == "partial"
+    assert replay["complete"] is False
+    assert replay["results"][0]["mismatched_samples"] > 0
+
+
+def test_checkpoint_cannot_hide_another_known_writer():
+    from flight_log_agent.analysis.dag_replay import EvaluationScope, observed_checkpoint_roots, replay_dag_roots
+
+    dag, samples, policies = _checkpoint_fixture()
+    roots = observed_checkpoint_roots(dag)["output.value"]
+    writer = next(v for v in dag.vertices if v.id == roots[0])
+    dag.vertices.append(writer.model_copy(update={"id": "another_writer"}))
+    result = replay_dag_roots(
+        dag, roots, "output.value", signal_samples=samples, signal_policies=policies,
+        scope=EvaluationScope(((2.0, 4.0),)),
+    )
+    assert result["status"] == "partial"
+    assert result["missing_writer_ids"] == ["another_writer"]
+
+
+def test_observed_output_cannot_verify_itself(replay_engine):
+    dag, samples, policies = _checkpoint_fixture(input_signal="output.value")
+    replay = replay_engine(
+        dag, Path("/unused.ulg"), {}, set(samples),
+        signal_samples=samples, signal_policies=policies,
+    )
+    assert replay["status"] == "not_attempted"
+    assert "also an input" in replay["reason"]
+    assert replay["blocking_vertex_ids"]
+
+
+def test_type_only_observation_is_not_checkpoint_proof(replay_engine):
+    dag, samples, policies = _checkpoint_fixture()
+    leaf = next(v for v in dag.vertices if v.kind == "evidence" and v.signal_name == "input.value")
+    leaf.metadata = {"grounded_via": "declared_type"}
+    replay = replay_engine(
+        dag, Path("/unused.ulg"), {}, set(samples),
+        signal_samples=samples, signal_policies=policies,
+    )
+    assert replay["status"] == "not_attempted"
+    assert replay["blocking_vertex_ids"] == [leaf.id]
+
+
+@pytest.mark.parametrize("expression,input_value,observed", [
+    pytest.param("max(10.0, 2.0 * input_value)", 10.0, 20.0, id="rtl-floor"),
+    pytest.param("19.0 * sqrt(1.0 / cos(input_value))", 0.8726646259971648,
+                 23.698446, id="airspeed-load-factor"),
+])
+def test_successful_run_numeric_checkpoints(replay_engine, expression, input_value, observed):
+    """Archived numeric checkpoints, not proof of the full cone or slew behavior."""
+    dag, samples, policies = _checkpoint_fixture(expression)
+    samples = {
+        "input.value": [(0.0, input_value), (10.0, input_value)],
+        "output.value": [(0.0, observed), (10.0, observed)],
+    }
+    result = replay_engine(
+        dag, Path("/unused.ulg"), {}, set(samples),
+        signal_samples=samples, signal_policies=policies,
+    )
+    assert result["status"] == "matched"
+    assert result["results"][0]["max_abs_error"] < 0.00001
+
+
+def test_checkpoint_program_and_prepared_samples_are_reused(monkeypatch):
+    from flight_log_agent.analysis import dag_replay
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+    from flight_log_agent.analysis.mechanism_dag import prepare_signal_series, sample_prepared_signal
+
+    dag, samples, policies = _checkpoint_fixture()
+    prepared = prepare_signal_series(samples, policies)
+    program = DAGValueProgram(dag)
+    session = program.bind(sample_resolver=lambda s, t: sample_prepared_signal(prepared, s, t))
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("checkpoint must reuse its round's compiled program and samples")
+
+    monkeypatch.setattr(dag_replay, "DAGValueProgram", unexpected)
+    monkeypatch.setattr(dag_replay, "prepare_signal_series", unexpected)
+    replay = _checkpoint_replay(
+        dag, samples, policies, prepared_signal_series=prepared,
+        value_program=program, value_session=session,
+    )
+    assert replay["status"] == "mismatched"
+
+
+def _run_checkpoint_trial(tmp_path, monkeypatch, backend):
+    from flight_log_agent.analysis import dag_pipeline
+
+    root = tmp_path / "source"
+    root.mkdir()
+    path = root / "sample.cpp"
+    path.write_text("""
+void A::run()
+{
+    topic_in_s input;
+    orb_copy(ORB_ID(topic_in), _sub, &input);
+    topic_out_s output;
+    output.value = input.value * 2.0f;
+    orb_publish(ORB_ID(topic_out), _pub, &output);
+}
+""", encoding="utf-8")
+    profiler = MechanismSourceProfiler(root, rg_path="missing-rg", source_parser_backend=backend)
+    samples = {
+        "topic_in.value": [(0.0, 5.0), (10.0, 5.0)],
+        "topic_out.value": [(0.0, 10.0), (10.0, 10.0)],
+    }
+    policies = {signal: {"method": "linear", "unit": "m"} for signal in samples}
+    scopes_evaluated = []
+    original_windows = dag_pipeline.evaluate_questioned_condition_windows
+
+    def windows(*args, **kwargs):
+        scopes_evaluated.append(kwargs.get("candidates"))
+        return original_windows(*args, **kwargs)
+
+    monkeypatch.setattr(dag_pipeline, "evaluate_questioned_condition_windows", windows)
+    monkeypatch.setattr(dag_pipeline, "_signal_samples_for_dag", lambda *_args, **_kwargs: samples)
+    payloads = []
+    events = []
+
+    async def runner(agent, payload):
+        if agent is seeder_agent:
+            return DiscoverySeeds(
+                seeds=["A::run"],
+                candidate_terminals=[TerminalCandidate(terminal="output.value", terminal_file="sample.cpp")],
+                questioned_condition=QuestionedCondition(
+                    signal_hint="topic_out.value", op=">", reference="1",
+                    units="m", frame="test frame",
+                ),
+            )
+        payloads.append(payload)
+        return DiscoveryVerdict(sufficient=False, selected_terminal=next(iter(payload["candidates"])))
+
+    def observe(summary):
+        assert scopes_evaluated and scopes_evaluated[0] is None
+        assert not payloads, "checkpoint must run before the judge"
+        events.append(summary)
+
+    kwargs = dict(
+        inventory={"parameters": {}}, logged_signals=set(samples), schema_signals=set(samples),
+        signal_policies=policies, run_agent=runner,
+    )
+    trial = asyncio.run(run_dag_discovery_stage(
+        profiler, tmp_path / "cache", "why?", "source", Path("/stubbed.ulg"),
+        checkpoint_diagnostics=True, checkpoint_observer=observe, **kwargs,
+    ))
+    assert events == trial.checkpoint_rounds
+    assert events
+    assert events[0]["scope"]["windows"] == ((0.0, 10.0),), events[0]["scope"]
+    checkpoint = events[0]["checkpoints"]["topic_out.value"]
+    assert events[0]["resources"]["checkpoint_wall_s"] >= 0
+    control = asyncio.run(run_dag_discovery_stage(
+        profiler, tmp_path / "cache", "why?", "source", Path("/stubbed.ulg"), **kwargs,
+    ))
+    assert control.checkpoint_rounds == []
+    assert trial.report.model_dump() == control.report.model_dump()
+    assert trial.judged.selected.files_loaded == control.judged.selected.files_loaded
+    assert trial.judged.selected.dag.model_dump() == control.judged.selected.dag.model_dump()
+    assert payloads[0] == payloads[1]
+    return checkpoint
+
+
+@pytest.mark.parametrize("backend", ["legacy", "tree_sitter"])
+def test_checkpoint_trial_does_not_change_discovery_or_judge(tmp_path, monkeypatch, backend):
+    _run_checkpoint_trial(tmp_path, monkeypatch, backend)
+
+
+@pytest.mark.parametrize("backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(
+        strict=True,
+        reason="Legacy assignments declare expression dependencies inexact; numerical retirement parity remains open",
+    )),
+    "tree_sitter",
+])
+def test_checkpoint_source_replay_matches_observation(tmp_path, monkeypatch, backend):
+    checkpoint = _run_checkpoint_trial(tmp_path, monkeypatch, backend)
+    assert checkpoint["status"] == "matched", str(checkpoint)
 
 
 def test_validation_downgrade_resynchronizes_confirmation_lists():

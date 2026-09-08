@@ -529,6 +529,12 @@ async def analyze_flight_log(
                     "question_intent": question_intent.model_dump(),
                 },
                 signal_policies=dag_signal_policies,
+                checkpoint_diagnostics=os.environ.get(
+                    "FLIGHT_LOG_DAG_CHECKPOINTS", ""
+                ).lower() in {"1", "true", "yes", "on"},
+                checkpoint_observer=lambda summary: audit_logger.log_event(
+                    "dag_checkpoint.round.finished", output=summary
+                ),
                 source_root=source_snapshot.repository_path,
                 logged_signals=dag_observed_signals,
                 schema_signals=dag_schema_signals,

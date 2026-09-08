@@ -1578,6 +1578,7 @@ def discover_mechanism_dag(
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
     preranked_files: Optional[Sequence[str]] = None,
     round_annotator: Optional[Callable[[MechanismDAG], MechanismDAG]] = None,
+    round_observer: Optional[Callable[[MechanismDAG, MechanismDAG, int], None]] = None,
 ) -> DiscoveryResult:
     """Build a DAG by exact, provenance-checked fixed-point expansion.
 
@@ -1597,6 +1598,10 @@ def discover_mechanism_dag(
     ``max_rounds``, ``max_files_per_round``, and ``max_files_total`` remain in
     the API for compatibility but are intentionally ignored. They previously
     made source-search order affect correctness.
+
+    ``round_observer`` receives the source graph and its annotated/pruned view
+    after each round. It is diagnostic only; its return value cannot change
+    source admission, the frontier, or the stopping condition.
     """
     _ = (cache_root, source_root, max_rounds, max_files_per_round, max_files_total)
     terminal_as_given = str(terminal or "").strip()
@@ -1804,6 +1809,8 @@ def discover_mechanism_dag(
         references = _reachable_frontier_references(
             list(dag.unresolved_references), dag, frontier_dag
         )
+        if round_observer is not None:
+            round_observer(dag, frontier_dag, index)
         known_classes = set(inputs.structure.direct_bases)
         for owner, bases in inputs.structure.direct_bases.items():
             owner_record = next(

@@ -5686,6 +5686,7 @@ def evaluate_feasibility(
         metadata["static_evaluation"] = (
             {
                 "status": "value",
+                "assumed": True,
                 "reason": "temporary: uORB freshness gate assumed fresh",
             }
             if fresh_verdict is not None
@@ -5711,40 +5712,33 @@ def evaluate_feasibility(
             )
         )
 
-    updated_edges = list(dag.edges)
-    kept_ids = {v.id for v in updated_vertices}
-
-    if prune_dead:
-        # Incoming control edges encode the operation's reachability
-        # conjunction. One false conjunct makes the operation unreachable.
-        control_by_op: dict[str, list[str]] = {}
-        for edge in updated_edges:
-            if edge.kind == "control":
-                control_by_op.setdefault(edge.target_id, []).append(edge.source_id)
-
-        dead_op_ids: set[str] = set()
-        for op_id, branch_ids in control_by_op.items():
-            if branch_ids and any(verdicts.get(bid) == "always_false" for bid in branch_ids):
-                dead_op_ids.add(op_id)
-
-        # Also mark always_false branches as dead once every operation
-        # they gate is gone (which is by definition here).
-        dead_branch_ids = {bid for bid, verdict in verdicts.items() if verdict == "always_false"}
-
-        kept_ids -= dead_op_ids | dead_branch_ids
-        updated_vertices = [v for v in updated_vertices if v.id in kept_ids]
-        updated_edges = [
-            e for e in updated_edges
-            if e.source_id in kept_ids and e.target_id in kept_ids
-        ]
-
-    return MechanismDAG(
+    annotated = MechanismDAG(
         dag_id=dag.dag_id,
         terminal=dag.terminal,
         vertices=updated_vertices,
-        edges=updated_edges,
+        edges=list(dag.edges),
         unresolved_symbols=dag.unresolved_symbols,
     )
+    return prune_infeasible_operations(annotated) if prune_dead else annotated
+
+
+def prune_infeasible_operations(dag: MechanismDAG) -> MechanismDAG:
+    """Apply existing conjunction pruning without reevaluating the graph."""
+    dead_branches = {
+        vertex.id for vertex in dag.vertices
+        if vertex.kind == "branch" and vertex.feasibility_verdict == "always_false"
+    }
+    # A single false control conjunct makes its operation unreachable.
+    dead_operations = {
+        edge.target_id for edge in dag.edges
+        if edge.kind == "control" and edge.source_id in dead_branches
+    }
+    kept = {vertex.id for vertex in dag.vertices} - dead_branches - dead_operations
+    return dag.model_copy(update={
+        "vertices": [vertex for vertex in dag.vertices if vertex.id in kept],
+        "edges": [edge for edge in dag.edges
+                  if edge.source_id in kept and edge.target_id in kept],
+    })
 
 
 def _reduce_predicate(

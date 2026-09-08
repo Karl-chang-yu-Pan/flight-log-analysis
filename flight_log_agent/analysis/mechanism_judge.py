@@ -723,6 +723,7 @@ async def discover_with_judge(
     seeds_override: Optional[DiscoverySeeds] = None,
     annotate: Optional[Callable[[DiscoveryResult], Any]] = None,
     condition_windows: Optional[Callable[["QuestionedCondition"], Any]] = None,
+    on_seeds: Optional[Callable[[DiscoverySeeds], None]] = None,
     **discovery_kwargs: Any,
 ) -> JudgedDiscovery:
     """Seeder → deterministic fixpoint per candidate terminal → judge.
@@ -812,6 +813,8 @@ async def discover_with_judge(
     seeds = seeds.model_copy(
         update={"seeds": dedupe_keep_order([*intent_seeds, *seeds.seeds])}
     )
+    if on_seeds is not None:
+        on_seeds(seeds)
 
     annotated_by_terminal: dict[str, Any] = {}
 
@@ -1026,6 +1029,8 @@ async def discover_with_judge(
                 ),
             }
         )
+        if on_seeds is not None:
+            on_seeds(seeds)
         _slice_candidates(retry.candidate_terminals)
 
     # A candidate whose slice found nothing can't ground anything —

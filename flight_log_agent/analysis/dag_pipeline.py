@@ -12,20 +12,26 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+import resource
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Callable, Optional, Union
+
+from flight_log_agent.analysis.dag_replay import (
+    EvaluationScope,
+    observed_checkpoint_roots,
+    replay_dag_roots,
+)
 
 from flight_log_agent.analysis.dag_value import DAGValueProgram
 from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.mechanism_dag import (
-    DAGValueSeries,
     MechanismDAG,
     PreparedSignalSeries,
-    boolean_sample_windows,
-    evaluate_dag_vertex_series,
     evaluate_feasibility,
     prepare_signal_series,
+    prune_infeasible_operations,
     sample_prepared_signal,
 )
 from flight_log_agent.analysis.mechanism_discovery import DiscoveryResult
@@ -135,14 +141,15 @@ class DagStageResult:
     layer4_hit: bool
     report: FlightLogReport
     replay: Optional[dict[str, Any]] = None
+    checkpoint_rounds: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _signal_samples_for_dag(
-    dag: MechanismDAG, log_path: Path
+    dag: MechanismDAG, log_path: Path, *, additional_signals: tuple[str, ...] = ()
 ) -> dict[str, list[tuple[float, Any]]]:
-    """Load ULog samples for every logged-signal evidence leaf in ``dag``."""
+    """Load graph evidence and any independent checkpoint observations together."""
     references = sorted(
-        {
+        set(additional_signals) | {
             str(v.signal_name)
             for v in dag.vertices
             if v.kind == "evidence" and v.sub_kind == "logged_signal" and v.signal_name
@@ -386,15 +393,17 @@ def evaluate_questioned_condition_windows(
     log_path: Path,
     parameter_values: dict[str, Any],
     signal_policies: dict[str, Any],
+    candidate_dags: Optional[list[MechanismDAG]] = None,
 ) -> dict[str, Any]:
     """Evaluate a typed, multi-signal questioned comparison over a ULog."""
     from flight_log_agent.analysis.mechanism_dag import _evaluate_predicate_intervals
 
-    dags = [
-        result.dag
-        for result in (candidates or {}).values()
-        if result is not None and getattr(result, "dag", None) is not None
-    ] if isinstance(candidates, dict) else []
+    dags = list(candidate_dags or [])
+    if candidate_dags is None and isinstance(candidates, dict):
+        dags = [
+            result.dag for result in candidates.values()
+            if result is not None and getattr(result, "dag", None) is not None
+        ]
     units, unit_error = _parse_questioned_units(condition.units)
     stated_frame = str(condition.frame or "").strip()
     if unit_error:
@@ -476,72 +485,6 @@ def evaluate_questioned_condition_windows(
     }
 
 
-# The five distinct replay states (core correctness invariant):
-# ``matched`` is supporting evidence and ``mismatched`` contradictory
-# evidence ONLY when replay completeness (writer reachability domains,
-# ordering, retained state, alignment, coverage) is trustworthy.
-# ``partial`` and ``unevaluable`` are unresolved evidence;
-# ``not_attempted`` is neutral.
-ReplayStatus = Literal[
-    "not_attempted", "unevaluable", "partial", "matched", "mismatched"
-]
-
-
-def _intersect_windows(
-    first: list[tuple[float, float]],
-    second: list[tuple[float, float]],
-) -> list[tuple[float, float]]:
-    intersections: list[tuple[float, float]] = []
-    for first_start, first_end in first:
-        for second_start, second_end in second:
-            start = max(first_start, second_start)
-            end = min(first_end, second_end)
-            if start <= end:
-                intersections.append((start, end))
-    return _merge_windows(intersections)
-
-
-def _merge_windows(windows: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    merged: list[list[float]] = []
-    for start, end in sorted(windows):
-        if end < start:
-            continue
-        if not merged or start > merged[-1][1]:
-            merged.append([start, end])
-        else:
-            merged[-1][1] = max(merged[-1][1], end)
-    return [(start, end) for start, end in merged]
-
-
-def _window_duration(windows: list[tuple[float, float]]) -> float:
-    return sum(max(0.0, end - start) for start, end in _merge_windows(windows))
-
-
-def _replay_tolerance(
-    samples: list[tuple[float, Any]],
-    policy: Optional[Any],
-) -> float:
-    """Derive a numerical tolerance from data scale and declared policy."""
-    values = [
-        float(value)
-        for _timestamp, value in samples
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-    ]
-    if not values:
-        return 1e-9
-    if policy is not None and hasattr(policy, "model_dump"):
-        policy = policy.model_dump()
-    if str((policy or {}).get("method") or "") == "discrete_hold":
-        return 1e-9
-    ordered = sorted(abs(value) for value in values)
-    scale = ordered[len(ordered) // 2]
-    sorted_values = sorted(values)
-    median_value = sorted_values[len(sorted_values) // 2]
-    deviations = sorted(abs(value - median_value) for value in values)
-    robust_variation = deviations[len(deviations) // 2]
-    return max(1e-6, 1e-3 * max(scale, robust_variation))
-
-
 def replay_terminal_expressions(
     annotated: MechanismDAG,
     log_path: Path,
@@ -612,191 +555,15 @@ def replay_terminal_expressions(
         prepared_series.update(
             prepare_signal_series(missing_samples, signal_policies)
         )
-    observed_samples = list(prepared_series[observed].samples)
-    observed_policy = (signal_policies or {}).get(observed)
-    tolerance = _replay_tolerance(observed_samples, observed_policy)
-    observed_span = (observed_samples[0][0], observed_samples[-1][0])
-    span_duration = observed_span[1] - observed_span[0]
-    value_program = DAGValueProgram(annotated)
-
-    def resolve_sample(signal: str, timestamp: float) -> Optional[Any]:
-        return sample_prepared_signal(prepared_series, signal, timestamp)
-
-    value_session = value_program.bind(
+    return replay_dag_roots(
+        annotated,
+        [op.id for op in terminal_ops],
+        observed,
         parameter_values=parameter_values,
-        sample_resolver=resolve_sample,
+        signal_samples=samples,
+        signal_policies=signal_policies,
+        prepared_signal_series=prepared_series,
     )
-
-    vertices = {vertex.id: vertex for vertex in annotated.vertices}
-    controls_by_op: dict[str, list[str]] = {}
-    for edge in annotated.edges:
-        if edge.kind == "control":
-            controls_by_op.setdefault(edge.target_id, []).append(edge.source_id)
-
-    results: list[dict[str, Any]] = []
-    writer_domains: list[tuple[str, list[tuple[float, float]]]] = []
-    complete = True
-    for op in terminal_ops:
-        reachability = (op.metadata or {}).get("reachability") or {}
-        domain = [observed_span]
-        writer_complete = bool(reachability.get("exact", False))
-        for branch_id in controls_by_op.get(op.id, []):
-            branch = vertices.get(branch_id)
-            if branch is None or branch.kind != "branch":
-                writer_complete = False
-                continue
-            if branch.feasibility_verdict == "always_false":
-                domain = []
-            elif branch.feasibility_verdict == "always_true":
-                branch_domain = [observed_span]
-            elif branch.active_windows:
-                branch_domain = list(branch.active_windows)
-                policies_used = (branch.metadata or {}).get("sampling_policies") or {}
-                if not policies_used or "unknown" in policies_used.values():
-                    writer_complete = False
-            else:
-                branch_domain = []
-                writer_complete = False
-            if domain:
-                domain = _intersect_windows(domain, branch_domain)
-
-        if not domain:
-            results.append(
-                {
-                    "operation_id": op.id,
-                    "expression": op.expression,
-                    "grounded": None,
-                    "evaluation_mode": "dag_value_plan",
-                    "evaluable": True,
-                    "active_windows": domain,
-                    "active_duration": 0.0,
-                    "matched_duration": 0.0,
-                    "match_fraction": None,
-                }
-            )
-            writer_domains.append((op.id, domain))
-            complete = complete and writer_complete
-            continue
-
-        reconstructed: DAGValueSeries = evaluate_dag_vertex_series(
-            annotated,
-            op.id,
-            parameter_values=parameter_values,
-            signal_samples=samples,
-            signal_policies=signal_policies,
-            prepared_signal_series=prepared_series,
-            timestamps=(timestamp for timestamp, _value in observed_samples),
-            evaluation_windows=domain,
-            value_program=value_program,
-            value_session=value_session,
-        )
-        comparison_samples: list[tuple[float, bool]] = []
-        comparison_complete = reconstructed.complete
-        for timestamp, expected_value in reconstructed.samples:
-            observed_value = sample_prepared_signal(
-                prepared_series, observed, timestamp
-            )
-            if not isinstance(expected_value, (int, float)) or not isinstance(
-                observed_value, (int, float)
-            ):
-                comparison_complete = False
-                continue
-            comparison_samples.append(
-                (
-                    timestamp,
-                    abs(float(expected_value) - float(observed_value))
-                    <= tolerance,
-                )
-            )
-        if not comparison_samples:
-            results.append(
-                {
-                    "operation_id": op.id,
-                    "expression": op.expression,
-                    "grounded": None,
-                    "evaluation_mode": "dag_value_plan",
-                    "evaluable": False,
-                    "active_windows": domain,
-                    "reason": reconstructed.reason,
-                }
-            )
-            complete = False
-            continue
-        input_policies_complete = (
-            reconstructed.policies_complete
-            if reconstructed.referenced_signals
-            else True
-        )
-        if not input_policies_complete or observed_policy is None:
-            writer_complete = False
-        writer_complete = writer_complete and comparison_complete
-        match_windows = boolean_sample_windows(comparison_samples)
-        active_duration = _window_duration(domain)
-        matched_duration = _window_duration(_intersect_windows(match_windows, domain))
-        results.append(
-            {
-                "operation_id": op.id,
-                "expression": op.expression,
-                "grounded": None,
-                "evaluation_mode": "dag_value_plan",
-                "evaluable": True,
-                "active_windows": domain,
-                "active_duration": round(active_duration, 6),
-                "matched_duration": round(matched_duration, 6),
-                "match_fraction": (
-                    round(matched_duration / active_duration, 3)
-                    if active_duration
-                    else None
-                ),
-            }
-        )
-        writer_domains.append((op.id, domain))
-        complete = complete and writer_complete
-
-    merged_domain = _merge_windows(
-        [window for _operation_id, domain in writer_domains for window in domain]
-    )
-    summed_writer_duration = sum(
-        _window_duration(domain) for _operation_id, domain in writer_domains
-    )
-    covered_duration = _window_duration(merged_domain)
-    non_overlapping = abs(summed_writer_duration - covered_duration) <= 1e-6
-    covers_output = (
-        len(merged_domain) == 1
-        and merged_domain[0][0] <= observed_span[0]
-        and merged_domain[0][1] >= observed_span[1]
-    )
-    complete = complete and non_overlapping and covers_output and span_duration > 0
-
-    if not results:
-        status: ReplayStatus = "unevaluable"
-        reason = "no terminal operation was available for DAG replay"
-    elif not any(r.get("evaluable") for r in results):
-        status = "unevaluable"
-        reason = "no terminal operation was evaluable through DAG edges"
-    elif not complete:
-        status = "partial"
-        reason = (
-            "writer reachability, policy, non-overlap, or output-domain "
-            "coverage is incomplete"
-        )
-    else:
-        matched_duration = sum(
-            float(result.get("matched_duration") or 0.0)
-            for result in results
-            if result.get("evaluable")
-        )
-        match_fraction = matched_duration / covered_duration if covered_duration else 0.0
-        status = "matched" if match_fraction >= 0.95 else "mismatched"
-        reason = f"complete piecewise replay match fraction {match_fraction:.3f}"
-    return {
-        "status": status,
-        "complete": complete,
-        "reason": reason,
-        "observed": observed,
-        "tolerance": round(tolerance, 6),
-        "results": results,
-    }
 
 
 def build_report_from_dag(
@@ -1067,6 +834,8 @@ async def run_dag_discovery_stage(
     run_agent: Any = None,
     context: Optional[dict[str, Any]] = None,
     signal_policies: Optional[dict[str, Any]] = None,
+    checkpoint_diagnostics: bool = False,
+    checkpoint_observer: Optional[Callable[[dict[str, Any]], None]] = None,
     **discovery_kwargs: Any,
 ) -> DagStageResult:
     """Run fresh DAG discovery, feasibility, replay, and report construction.
@@ -1079,11 +848,33 @@ async def run_dag_discovery_stage(
 
     ``ulog_hash`` and ``cache_root`` remain in the stable call contract for
     that future reactivation and for the discovery API, respectively.
+
+    Opt-in checkpoint diagnostics replay source-proven publication roots each
+    round. They never alter expansion, judge input, or report confirmation.
+    Only compact results survive a round; graph programs stay run-local.
     """
     cache_root = Path(cache_root)
     cached_seeds = None
 
     parameter_values = dict((inventory or {}).get("parameters") or {})
+    logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
+    checkpoint_rounds: list[dict[str, Any]] = []
+    scope: Optional[EvaluationScope] = None
+    questioned_condition: Any = None
+
+    def prepare_scope(seeds: DiscoverySeeds) -> None:
+        nonlocal scope, questioned_condition
+        questioned_condition = seeds.questioned_condition
+        scope = None
+        if questioned_condition is not None:
+            scope = EvaluationScope.from_result(evaluate_questioned_condition_windows(
+                questioned_condition,
+                candidates=None,
+                logged_set=logged_set,
+                log_path=log_path,
+                parameter_values=parameter_values,
+                signal_policies=signal_policies or {},
+            ))
     signal_data: dict[
         int,
         tuple[
@@ -1104,24 +895,54 @@ async def run_dag_discovery_stage(
     def annotate_dag(dag: MechanismDAG) -> MechanismDAG:
         if annotation.get("dag") is dag:
             return annotation["annotated"]
-        samples = _signal_samples_for_dag(dag, log_path)
+        annotation.clear()
+        wall_started = time.perf_counter()
+        cpu_started = time.process_time()
+        if checkpoint_diagnostics:
+            samples = _signal_samples_for_dag(
+                dag, log_path,
+                additional_signals=tuple(
+                    signal for signal in observed_checkpoint_roots(dag)
+                    if signal in logged_set
+                ),
+            )
+        else:
+            samples = _signal_samples_for_dag(dag, log_path)
         prepared_series = prepare_signal_series(samples, signal_policies)
         program = DAGValueProgram(dag)
-        annotated = evaluate_feasibility(
+        session = program.bind(
+            parameter_values=parameter_values,
+            sample_resolver=lambda signal, timestamp: sample_prepared_signal(
+                prepared_series, signal, timestamp
+            ),
+        )
+        full_annotation = evaluate_feasibility(
             dag,
             parameter_values=parameter_values,
             signal_samples=samples,
             signal_policies=signal_policies,
             prepared_signal_series=prepared_series,
             value_program=program,
+            value_session=session,
+            prune_dead=not checkpoint_diagnostics,
         )
-        annotation.clear()
+        annotated = (
+            prune_infeasible_operations(full_annotation)
+            if checkpoint_diagnostics else full_annotation
+        )
         annotation.update(
             {
                 "dag": dag,
                 "annotated": annotated,
                 "samples": samples,
                 "prepared": prepared_series,
+                **({
+                    "full_annotation": full_annotation,
+                    "program": program,
+                    "session": session,
+                } if checkpoint_diagnostics else {}),
+                "feasibility_wall_s": time.perf_counter() - wall_started,
+                "feasibility_cpu_s": time.process_time() - cpu_started,
             }
         )
         return annotated
@@ -1135,8 +956,66 @@ async def run_dag_discovery_stage(
         signal_data[id(result)] = (annotation["samples"], annotation["prepared"])
         return annotated
 
-    logged_set = {str(s) for s in (discovery_kwargs.get("logged_signals") or ())}
     discovery_kwargs.setdefault("round_annotator", annotate_dag)
+
+    previous_observer = discovery_kwargs.get("round_observer")
+
+    def observe_round(dag: MechanismDAG, _feasible: MechanismDAG, index: int) -> None:
+        nonlocal scope
+        annotate_dag(dag)
+        wall_started = time.perf_counter()
+        cpu_started = time.process_time()
+        if scope is not None and scope.windows is None and questioned_condition is not None:
+            scope = EvaluationScope.from_result(evaluate_questioned_condition_windows(
+                questioned_condition,
+                candidates=None,
+                candidate_dags=[dag],
+                logged_set=logged_set,
+                log_path=log_path,
+                parameter_values=parameter_values,
+                signal_policies=signal_policies or {},
+            ))
+        checkpoints = {
+            signal: replay_dag_roots(
+                annotation["full_annotation"], roots, signal,
+                parameter_values=parameter_values,
+                signal_samples=annotation["samples"],
+                signal_policies=signal_policies,
+                prepared_signal_series=annotation["prepared"],
+                value_program=annotation["program"],
+                value_session=annotation["session"],
+                scope=scope,
+            )
+            for signal, roots in observed_checkpoint_roots(dag).items()
+            if signal in logged_set
+        }
+        summary = {
+            "diagnostic_only": True,
+            "round_index": index,
+            "dag_id": dag.dag_id,
+            "terminal": dag.terminal,
+            "scope": scope.as_payload() if scope is not None else None,
+            "checkpoints": checkpoints,
+            "unresolved_references": [
+                reference.model_dump(mode="json") for reference in dag.unresolved_references
+            ],
+            "resources": {
+                "feasibility_wall_s": annotation["feasibility_wall_s"],
+                "feasibility_cpu_s": annotation["feasibility_cpu_s"],
+                "checkpoint_wall_s": time.perf_counter() - wall_started,
+                "checkpoint_cpu_s": time.process_time() - cpu_started,
+                # Linux process high-water mark, not memory allocated by this round.
+                "process_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            },
+        }
+        checkpoint_rounds.append(summary)
+        if checkpoint_observer is not None:
+            checkpoint_observer(summary)
+        if previous_observer is not None:
+            previous_observer(dag, _feasible, index)
+
+    if checkpoint_diagnostics:
+        discovery_kwargs["round_observer"] = observe_round
 
     def condition_windows(condition: Any, candidates: Any = None) -> Optional[dict[str, Any]]:
         return evaluate_questioned_condition_windows(
@@ -1158,6 +1037,7 @@ async def run_dag_discovery_stage(
         seeds_override=cached_seeds,
         annotate=annotate,
         condition_windows=condition_windows,
+        on_seeds=prepare_scope if checkpoint_diagnostics else None,
         parameter_values=parameter_values,
         inventory=inventory,
         **discovery_kwargs,
@@ -1199,4 +1079,5 @@ async def run_dag_discovery_stage(
         layer4_hit=False,
         report=report,
         replay=replay,
+        checkpoint_rounds=checkpoint_rounds,
     )
