@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
+from flight_log_agent.analysis.dag_checkpoint import assess_checkpoint
 from flight_log_agent.analysis.dag_replay import (
     EvaluationScope,
     observed_checkpoint_roots,
@@ -976,8 +977,10 @@ async def run_dag_discovery_stage(
                 signal_policies=signal_policies or {},
             ))
         checkpoints = {
-            signal: replay_dag_roots(
+            signal: assess_checkpoint(
                 annotation["full_annotation"], roots, signal,
+                source_dag=dag,
+                observed_signals=logged_set,
                 parameter_values=parameter_values,
                 signal_samples=annotation["samples"],
                 signal_policies=signal_policies,
@@ -987,8 +990,17 @@ async def run_dag_discovery_stage(
                 scope=scope,
             )
             for signal, roots in observed_checkpoint_roots(dag).items()
-            if signal in logged_set
         }
+        terminal_checkpoint = None
+        if not checkpoints:
+            terminal_checkpoint = assess_checkpoint(
+                annotation["full_annotation"],
+                [vertex.id for vertex in dag.vertices if vertex.metadata.get("is_terminal")],
+                None, source_dag=dag, observed_signals=logged_set,
+                parameter_values=parameter_values, signal_samples=annotation["samples"],
+                signal_policies=signal_policies, prepared_signal_series=annotation["prepared"],
+                value_program=annotation["program"], value_session=annotation["session"], scope=scope,
+            )
         summary = {
             "diagnostic_only": True,
             "round_index": index,
@@ -996,6 +1008,7 @@ async def run_dag_discovery_stage(
             "terminal": dag.terminal,
             "scope": scope.as_payload() if scope is not None else None,
             "checkpoints": checkpoints,
+            "terminal_checkpoint": terminal_checkpoint,
             "unresolved_references": [
                 reference.model_dump(mode="json") for reference in dag.unresolved_references
             ],

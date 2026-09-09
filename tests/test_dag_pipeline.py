@@ -1213,7 +1213,7 @@ def test_checkpoint_program_and_prepared_samples_are_reused(monkeypatch):
     assert replay["status"] == "mismatched"
 
 
-def _run_checkpoint_trial(tmp_path, monkeypatch, backend):
+def _run_checkpoint_trial(tmp_path, monkeypatch, backend, *, observe_input=True):
     from flight_log_agent.analysis import dag_pipeline
 
     root = tmp_path / "source"
@@ -1235,6 +1235,9 @@ void A::run()
         "topic_out.value": [(0.0, 10.0), (10.0, 10.0)],
     }
     policies = {signal: {"method": "linear", "unit": "m"} for signal in samples}
+    schema_signals = set(samples)
+    if not observe_input:
+        samples.pop("topic_in.value")
     scopes_evaluated = []
     original_windows = dag_pipeline.evaluate_questioned_condition_windows
 
@@ -1266,7 +1269,7 @@ void A::run()
         events.append(summary)
 
     kwargs = dict(
-        inventory={"parameters": {}}, logged_signals=set(samples), schema_signals=set(samples),
+        inventory={"parameters": {}}, logged_signals=set(samples), schema_signals=schema_signals,
         signal_policies=policies, run_agent=runner,
     )
     trial = asyncio.run(run_dag_discovery_stage(
@@ -1304,6 +1307,18 @@ def test_checkpoint_trial_does_not_change_discovery_or_judge(tmp_path, monkeypat
 def test_checkpoint_source_replay_matches_observation(tmp_path, monkeypatch, backend):
     checkpoint = _run_checkpoint_trial(tmp_path, monkeypatch, backend)
     assert checkpoint["status"] == "matched", str(checkpoint)
+    assert checkpoint["analysis_requirements"] == []
+    assert checkpoint["authorizes_discovery_stop"] is False
+
+
+@pytest.mark.parametrize("backend", ["legacy", "tree_sitter"])
+def test_source_checkpoint_requests_missing_observation_through_shared_pipeline(tmp_path, monkeypatch, backend):
+    checkpoint = _run_checkpoint_trial(tmp_path, monkeypatch, backend, observe_input=False)
+    assert checkpoint["complete"] is False
+    assert checkpoint["status"] == "not_attempted"
+    assert any(requirement["kind"] == "observation_data"
+               and requirement.get("signal") == "topic_in.value"
+               for requirement in checkpoint["analysis_requirements"])
 
 
 def test_validation_downgrade_resynchronizes_confirmation_lists():

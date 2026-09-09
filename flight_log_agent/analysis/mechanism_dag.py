@@ -5712,13 +5712,7 @@ def evaluate_feasibility(
             )
         )
 
-    annotated = MechanismDAG(
-        dag_id=dag.dag_id,
-        terminal=dag.terminal,
-        vertices=updated_vertices,
-        edges=list(dag.edges),
-        unresolved_symbols=dag.unresolved_symbols,
-    )
+    annotated = dag.model_copy(update={"vertices": updated_vertices, "edges": list(dag.edges)})
     return prune_infeasible_operations(annotated) if prune_dead else annotated
 
 

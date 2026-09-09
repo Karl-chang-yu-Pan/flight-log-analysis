@@ -30,11 +30,57 @@ judge prompts/payloads, or the public report schema.
   temporal/provenance semantics rather than a numerical confidence upgrade.
 - Record checkpoint errors, writer coverage, compiler dependency issues, and
   unresolved source references with their graph identities.
+- Assess the checkpoint's value, control, and selection dependencies before
+  replay. Require positive source-located publication and subscription
+  transfers, actual observation availability, and known sampling policies.
+- Return stable, run-local checkpoint identities, dependency vertex IDs,
+  `analysis_requirements`, and the constructor's exact typed `source_requests`.
+  Missing local producers are linkage requirements, not bare-name searches.
+- Include every known alternative publication writer. Only exact evaluated
+  false gates can discharge inactive writer inputs; assumption-based gates
+  and incomplete evaluation domains cannot establish verification.
+- When a terminal has no publication binding, emit `terminal_checkpoint`
+  requirements rather than an unexplained empty checkpoint collection.
+- Preserve internal source frontier references through feasibility annotation;
+  their exclusion from the public serialized DAG schema is unchanged.
 
 The numerical check covers the supplied graph, not the completeness of source
 discovery. A local match does not establish that all applicable source writers
 have been discovered, that upstream behavior is explained, or that the judge
 should confirm a mechanism.
+
+## Remaining-Analysis Requirements
+
+`assess_checkpoint` in `analysis/dag_checkpoint.py` is a deterministic, no-I/O
+entry point over an existing graph. It reuses `DAGValueProgram` and the shared
+replay engine; it neither constructs a second mechanism nor searches source.
+It can run on a small source-backed graph without exhaustive discovery.
+
+Requirements distinguish scoped source discovery, broken source linkage,
+missing observation bindings/data, sampling policy, control-flow exactness
+and coverage, receiver-state/transfer-time alignment, expression support,
+comparison scope, and incomplete replay. A false gate on an input copy does
+not discharge receiver-state obligations: skipping a copy retains old storage
+rather than proving it equals the latest topic sample.
+Each requirement names its graph vertex and available source context. Source
+requests are copied from graph-originated frontier records, never invented by
+matching a local variable to a topic. A frontier without a graph origin is
+reported as unclassified linkage rather than silently discarded.
+
+An outstanding requirement prevents a numerical upgrade. A successful result
+explicitly has `verification_scope="known_graph"` and
+`authorizes_discovery_stop=false`. Discovery of additional writers can change
+that assessment; numerical agreement does not close the source frontier.
+Requirement collection is conservative, including dependencies of gates used
+to prove inactivity. It does not yet trace short-circuit operand demands or
+choose the next expansion request automatically.
+
+The opt-in runner currently calls this assessment after the round's existing
+feasibility pass. It therefore does not yet bypass the full-round feasibility
+memory issue or candidate-admission macro-lookup cost found in the real-log
+audit. Those costs, receiver-state/transfer-time semantics, and the TECS local
+reference linkage remain separate work; this step makes their proof gaps
+explicit instead of treating an incomplete checkpoint as verified.
 
 ## Enabling The Trial
 
@@ -62,13 +108,17 @@ analysis caches remain disabled. The neighboring worktree is unchanged.
 ## Verification
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_dag_pipeline.py tests/test_mechanism_judge.py tests/test_mechanism_discovery.py tests/test_mechanism_dag.py
+.venv/bin/python -m pytest -q tests/test_dag_checkpoint.py tests/test_dag_pipeline.py tests/test_mechanism_judge.py tests/test_mechanism_discovery.py tests/test_mechanism_dag.py
 ```
 
 Shared numerical contracts exercise terminal and checkpoint entry points with
 the same inputs and assertions. Source-to-pipeline trial tests run against both
 legacy and tree-sitter extraction, verifying unchanged graphs, loaded files,
 judge payloads, and reports with diagnostics on/off.
+The same source-to-pipeline fixture also checks missing observed inputs against
+both backends. Assessment tests cover unrelated branches, scoped source
+requests, declared-only observations, unlinked locals and guard operands,
+assumed gates, inactive alternatives, and stale compiled programs.
 
 The stronger numerical source-fixture expectation has a strict expected failure
 for legacy extraction: its assignments mark expression dependencies inexact,
