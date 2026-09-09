@@ -2104,6 +2104,33 @@ def test_unloaded_possible_call_effect_is_a_typed_gap_not_inline_fetch():
     assert reference.argument_count == 2
 
 
+@pytest.mark.parametrize("terminal", ["out.alt", "answer"])
+def test_missing_mutator_request_retains_terminal_and_consumer_origins(terminal):
+    bindings = [
+        _fake_binding(binding_id="initial", target="out.alt", expression="0",
+                      file="main.cpp", line=3, function="run", logged_signal=""),
+        _fake_binding(binding_id="first", target="first", expression="out.alt",
+                      file="main.cpp", line=40, function="run", logged_signal=""),
+        _fake_binding(binding_id="second", target="second", expression="out.alt",
+                      file="main.cpp", line=41, function="run", logged_signal=""),
+        _fake_binding(binding_id="answer", target="answer", expression="first + second",
+                      file="main.cpp", line=42, function="run", logged_signal=""),
+    ]
+    for binding in bindings:
+        binding["callable_id"] = "main.cpp:1:run:"
+    dag = build_mechanism_dag(
+        bindings, terminal, terminal_file="main.cpp",
+        call_statements=[{"name": "fill", "args": ["&out"], "file": "main.cpp",
+                          "line": 30, "function": "run", "callable_id": "main.cpp:1:run:"}],
+    )
+    reference = next(r for r in dag.unresolved_references if r.symbol == "fill")
+    expected_variables = {"out.alt"} if terminal == "out.alt" else {"first", "second"}
+    expected_ids = {v.id for v in dag.vertices if v.variable in expected_variables}
+    assert expected_ids
+    assert expected_ids <= set(reference.origin_vertex_ids)
+    assert set(reference.origin_vertex_ids) <= {v.id for v in dag.vertices}
+
+
 def test_receiver_call_result_does_not_admit_other_receiver_methods():
     probes: list[str] = []
 

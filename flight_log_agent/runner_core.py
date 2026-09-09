@@ -532,6 +532,9 @@ async def analyze_flight_log(
                 checkpoint_diagnostics=os.environ.get(
                     "FLIGHT_LOG_DAG_CHECKPOINTS", ""
                 ).lower() in {"1", "true", "yes", "on"},
+                checkpoint_discovery=os.environ.get(
+                    "FLIGHT_LOG_DAG_CHECKPOINTS", ""
+                ).lower() in {"1", "true", "yes", "on"},
                 checkpoint_observer=lambda summary: audit_logger.log_event(
                     "dag_checkpoint.round.finished", output=summary
                 ),

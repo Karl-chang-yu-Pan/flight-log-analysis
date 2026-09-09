@@ -283,6 +283,15 @@ class DAGValueSession:
             for vertex_id in dict.fromkeys(vertex_ids)
         }
 
+    def release_timestamp_values(self) -> None:
+        """End one shared timestamp batch; retain only static evaluation results.
+
+        This evaluator has no persistent state interpreter. Dynamic entries
+        memoize pure evaluation, not vehicle state or signal history.
+        """
+        self._value_cache = {key: value for key, value in self._value_cache.items() if key[1] is None}
+        self._sample_cache.clear()
+
     def _evaluate_vertex(
         self,
         vertex_id: str,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 from collections import defaultdict
 from typing import Any, Iterable, Optional, Sequence
 
@@ -24,6 +25,14 @@ from flight_log_agent.utils import stable_id
 
 def _policy(value: Any) -> dict[str, Any]:
     return value.model_dump() if hasattr(value, "model_dump") else value or {}
+
+
+def _same_source_value(left: Any, right: Any) -> bool:
+    # A declared NaN is stable source metadata, not a changed program.
+    return left is right or left == right or (
+        isinstance(left, float) and isinstance(right, float)
+        and math.isnan(left) and math.isnan(right)
+    )
 
 
 def _unbound_operands(expression: Any) -> list[str]:
@@ -54,6 +63,7 @@ def assess_checkpoint(
     value_program: Optional[DAGValueProgram] = None,
     value_session: Optional[DAGValueSession] = None,
     scope: Optional[EvaluationScope] = None,
+    attempt_replay: bool = True,
 ) -> dict[str, Any]:
     """Identify graph-local obligations before attempting numerical replay.
 
@@ -95,6 +105,8 @@ def assess_checkpoint(
                 assumptions=list(scope.assumptions))
 
     observed_set = set(observed_signals)
+    parameters = (value_session.parameters if value_session is not None else
+                  {str(name).upper(): value for name, value in (parameter_values or {}).items()})
     policies = signal_policies or {}
     prepared = prepared_signal_series or {}
 
@@ -187,7 +199,8 @@ def assess_checkpoint(
             getattr(actual, key) != getattr(expected, key)
             for key in ("kind", "sub_kind", "variable", "expression", "lowered_expression",
                         "predicate_raw", "signal_name", "file", "line")
-        ) or any(actual.metadata.get(key) != expected.metadata.get(key) for key in semantic_metadata):
+        ) or any(not _same_source_value(actual.metadata.get(key), expected.metadata.get(key))
+                 for key in semantic_metadata):
             raise ValueError("value_program does not describe the checkpoint source graph")
         if value_program is not None or value_session is not None:
             expected_data = {(e.source_id, e.role, e.via) for e in source_incoming[vertex_id] if e.kind == "data"}
@@ -244,7 +257,10 @@ def assess_checkpoint(
         if vertex_id in inactive:
             continue
         if vertex.kind == "evidence":
-            if vertex.sub_kind == "logged_signal":
+            if vertex.sub_kind == "parameter":
+                if metadata.get("value") is None and parameters.get(str(vertex.signal_name or "").upper()) is None:
+                    require("parameter_data", "required parameter value is unavailable", vertex_id, parameter=vertex.signal_name)
+            elif vertex.sub_kind == "logged_signal":
                 signal = str(vertex.signal_name or "")
                 check_signal(signal, vertex_id)
                 transfers = [vertices[edge.target_id] for edge in outgoing[vertex_id]
@@ -301,7 +317,7 @@ def assess_checkpoint(
     # No numeric upgrade is allowed while graph-local proof obligations remain.
     # In particular, missing storage writers cannot be erased by a local match.
     replay: Optional[dict[str, Any]] = None
-    if not requirements:
+    if not requirements and attempt_replay:
         replay = replay_dag_roots(
             view, sorted(roots), str(observed), parameter_values=parameter_values,
             signal_samples=signal_samples, signal_policies=signal_policies,
@@ -330,3 +346,21 @@ def assess_checkpoint(
             key=lambda item: json.dumps(item, sort_keys=True),
         ),
     }
+
+
+def dependency_view(dag: MechanismDAG, roots: Iterable[str]) -> MechanismDAG:
+    """An ancestor-closed graph view, preserving original vertex/edge identities."""
+    incoming: dict[str, list[str]] = defaultdict(list)
+    for edge in dag.edges:
+        incoming[edge.target_id].append(edge.source_id)
+    relevant = set(roots)
+    pending = list(relevant)
+    while pending:
+        for predecessor in incoming[pending.pop()]:
+            if predecessor not in relevant:
+                relevant.add(predecessor)
+                pending.append(predecessor)
+    return dag.model_copy(update={
+        "vertices": [v for v in dag.vertices if v.id in relevant],
+        "edges": [e for e in dag.edges if e.source_id in relevant and e.target_id in relevant],
+    })

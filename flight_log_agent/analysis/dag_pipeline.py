@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 from flight_log_agent.analysis.dag_checkpoint import assess_checkpoint
+from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
 from flight_log_agent.analysis.dag_replay import (
     EvaluationScope,
     observed_checkpoint_roots,
@@ -712,10 +713,20 @@ def build_report_from_dag(
 
     replay_status = str((replay or {}).get("status") or "not_attempted")
     replay_mismatch = replay_status == "mismatched"
+    checkpoint_unresolved = bool(
+        replay and "authorizes_discovery_stop" in replay
+        and not replay["authorizes_discovery_stop"]
+    )
+    if checkpoint_unresolved:
+        unresolved_evidence.insert(0, "source-backed checkpoint remains unresolved")
+        unresolved_evidence.extend(
+            str(requirement.get("reason") or requirement.get("kind"))
+            for requirement in replay.get("analysis_requirements", [])
+        )
     has_numeric_replay = any(
         result.get("evaluable") for result in (replay or {}).get("results", [])
     )
-    if replay_mismatch:
+    if replay_mismatch or checkpoint_unresolved:
         confidence = "unresolved"
     elif (
         verdict.sufficient
@@ -768,7 +779,7 @@ def build_report_from_dag(
         source_refs=source_refs[:8],
         expected_logged_signature=signature[:12],
         applicability=ApplicabilityReport(
-            applicable=verdict.sufficient and branches_verified and not replay_mismatch,
+            applicable=verdict.sufficient and branches_verified and not replay_mismatch and not checkpoint_unresolved,
             supported_conditions=supported[:12],
             excluded_by=excluded[:12],
             unresolved_conditions=unresolved_conditions[:12],
@@ -837,6 +848,7 @@ async def run_dag_discovery_stage(
     signal_policies: Optional[dict[str, Any]] = None,
     checkpoint_diagnostics: bool = False,
     checkpoint_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+    checkpoint_discovery: bool = False,
     **discovery_kwargs: Any,
 ) -> DagStageResult:
     """Run fresh DAG discovery, feasibility, replay, and report construction.
@@ -852,6 +864,9 @@ async def run_dag_discovery_stage(
 
     Opt-in checkpoint diagnostics replay source-proven publication roots each
     round. They never alter expansion, judge input, or report confirmation.
+    ``checkpoint_discovery`` instead makes that assessment control expansion:
+    evaluate ready dependencies, request exact missing source, and stop verified
+    or explicitly unresolved. A local match is not the judge's question verdict.
     Only compact results survive a round; graph programs stay run-local.
     """
     cache_root = Path(cache_root)
@@ -951,6 +966,8 @@ async def run_dag_discovery_stage(
     def annotate(result: DiscoveryResult) -> Optional[MechanismDAG]:
         if result.dag is None:
             return None
+        if result.checkpoint is not None:
+            return result.checkpoint.annotated
         annotated = annotate_dag(result.dag)
         # Retained per CANDIDATE (not per round) because replay needs the
         # selected candidate's series after the verdict.
@@ -1027,8 +1044,45 @@ async def run_dag_discovery_stage(
         if previous_observer is not None:
             previous_observer(dag, _feasible, index)
 
-    if checkpoint_diagnostics:
+    if checkpoint_diagnostics and not checkpoint_discovery:
         discovery_kwargs["round_observer"] = observe_round
+
+    if checkpoint_discovery:
+        def control_round(dag: MechanismDAG, index: int):
+            nonlocal scope
+            wall_started, cpu_started = time.perf_counter(), time.process_time()
+            target = None
+            if questioned_condition is not None:
+                scope = EvaluationScope.from_result(evaluate_questioned_condition_windows(
+                    questioned_condition, candidates=None, candidate_dags=[dag], logged_set=logged_set,
+                    log_path=log_path, parameter_values=parameter_values, signal_policies=signal_policies or {},
+                ))
+                target, _error, _candidates = resolve_questioned_signal(
+                    questioned_condition.signal_hint, logged_set, [dag],
+                )
+                # An unresolved/multi-signal target cannot silently become a
+                # terminal-only claim and authorize early verification.
+                target = target or ""
+            result = evaluate_checkpoint_round(
+                dag, parameter_values=parameter_values, observed_signals=logged_set,
+                signal_policies=signal_policies or {}, scope=scope, question_target=target,
+                load_samples=lambda view, observed: _signal_samples_for_dag(view, log_path, additional_signals=observed),
+            )
+            summary = {
+                **result.summary, "diagnostic_only": False, "round_index": index,
+                "dag_id": dag.dag_id, "terminal": dag.terminal,
+                "scope": scope.as_payload() if scope is not None else None,
+                "unresolved_references": [r.model_dump(mode="json") for r in dag.unresolved_references],
+                "resources": {"checkpoint_wall_s": time.perf_counter() - wall_started,
+                              "checkpoint_cpu_s": time.process_time() - cpu_started,
+                              "process_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss},
+            }
+            result.summary = summary
+            checkpoint_rounds.append(summary)
+            if checkpoint_observer is not None:
+                checkpoint_observer(summary)
+            return result
+        discovery_kwargs["checkpoint_evaluator"] = control_round
 
     def condition_windows(condition: Any, candidates: Any = None) -> Optional[dict[str, Any]]:
         return evaluate_questioned_condition_windows(
@@ -1050,7 +1104,7 @@ async def run_dag_discovery_stage(
         seeds_override=cached_seeds,
         annotate=annotate,
         condition_windows=condition_windows,
-        on_seeds=prepare_scope if checkpoint_diagnostics else None,
+        on_seeds=prepare_scope if checkpoint_diagnostics or checkpoint_discovery else None,
         parameter_values=parameter_values,
         inventory=inventory,
         **discovery_kwargs,
@@ -1063,7 +1117,11 @@ async def run_dag_discovery_stage(
             annotated = annotate(selected)
 
     replay: Optional[dict[str, Any]] = None
-    if annotated is not None:
+    if selected is not None and selected.checkpoint is not None:
+        replay = selected.checkpoint.summary.get("selected_checkpoint") or {
+            "status": "not_attempted", "complete": False, "reason": selected.checkpoint.summary["reason"],
+        }
+    elif annotated is not None:
         selected_signal_data = signal_data.get(id(selected))
         replay = replay_terminal_expressions(
             annotated,

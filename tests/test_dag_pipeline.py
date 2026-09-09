@@ -404,6 +404,15 @@ def test_replay_status_gates_the_confidence_upgrade(tmp_path):
     assert unresolved.ranked_hypotheses[0].confidence == "medium"
     assert unresolved.ranked_hypotheses[0].contradicting_evidence == []
 
+    for numeric in (partial, matched):
+        incomplete_checkpoint = dict(numeric, authorizes_discovery_stop=False,
+                                    analysis_requirements=[{"reason": "missing source writer"}])
+        blocked = build_report_from_dag("why?", judged, result.dag, replay=incomplete_checkpoint)
+        assert blocked.confirmed == []
+        assert blocked.ranked_hypotheses[0].confidence == "unresolved"
+        assert not blocked.ranked_hypotheses[0].applicability.applicable
+        assert "missing source writer" in blocked.ranked_hypotheses[0].unresolved_evidence
+
     skipped = build_report_from_dag(
         "why?", judged, result.dag,
         replay={"status": "not_attempted", "complete": False, "reason": "r"})
@@ -1213,7 +1222,7 @@ def test_checkpoint_program_and_prepared_samples_are_reused(monkeypatch):
     assert replay["status"] == "mismatched"
 
 
-def _run_checkpoint_trial(tmp_path, monkeypatch, backend, *, observe_input=True):
+def _run_checkpoint_trial(tmp_path, monkeypatch, backend, *, observe_input=True, checkpoint_control=False):
     from flight_log_agent.analysis import dag_pipeline
 
     root = tmp_path / "source"
@@ -1274,7 +1283,7 @@ void A::run()
     )
     trial = asyncio.run(run_dag_discovery_stage(
         profiler, tmp_path / "cache", "why?", "source", Path("/stubbed.ulg"),
-        checkpoint_diagnostics=True, checkpoint_observer=observe, **kwargs,
+        checkpoint_diagnostics=True, checkpoint_discovery=checkpoint_control, checkpoint_observer=observe, **kwargs,
     ))
     assert events == trial.checkpoint_rounds
     assert events
@@ -1285,9 +1294,17 @@ void A::run()
         profiler, tmp_path / "cache", "why?", "source", Path("/stubbed.ulg"), **kwargs,
     ))
     assert control.checkpoint_rounds == []
-    assert trial.report.model_dump() == control.report.model_dump()
+    if not checkpoint_control:
+        assert trial.report.model_dump() == control.report.model_dump()
+    else:
+        assert not trial.report.confirmed
+        assert not control.report.confirmed
     assert trial.judged.selected.files_loaded == control.judged.selected.files_loaded
     assert trial.judged.selected.dag.model_dump() == control.judged.selected.dag.model_dump()
+    if checkpoint_control:
+        for candidate in payloads[0]["candidates"].values():
+            assert "discovery_checkpoint" in candidate
+            candidate.pop("discovery_checkpoint")
     assert payloads[0] == payloads[1]
     return checkpoint
 
@@ -1319,6 +1336,21 @@ def test_source_checkpoint_requests_missing_observation_through_shared_pipeline(
     assert any(requirement["kind"] == "observation_data"
                and requirement.get("signal") == "topic_in.value"
                for requirement in checkpoint["analysis_requirements"])
+
+
+@pytest.mark.parametrize("backend", ["legacy", "tree_sitter"])
+def test_checkpoint_control_uses_shared_source_pipeline(tmp_path, monkeypatch, backend):
+    _run_checkpoint_trial(tmp_path, monkeypatch, backend, checkpoint_control=True)
+
+
+@pytest.mark.parametrize("backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="Legacy numerical extraction dependencies remain inexact")),
+    "tree_sitter",
+])
+def test_checkpoint_control_shared_numerical_contract(tmp_path, monkeypatch, backend):
+    checkpoint = _run_checkpoint_trial(tmp_path, monkeypatch, backend, checkpoint_control=True)
+    assert checkpoint["status"] == "matched"
+    assert checkpoint["authorizes_discovery_stop"] is True
 
 
 def test_validation_downgrade_resynchronizes_confirmation_lists():

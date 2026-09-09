@@ -728,6 +728,7 @@ class _DAGBuilder:
         self.edges: dict[tuple[str, str, str, str, str], DAGEdge] = {}
         self.unresolved_symbols: set[str] = set()
         self._unresolved_references: dict[tuple[Any, ...], UnresolvedSourceReference] = {}
+        self._terminal_reference_keys: set[tuple[Any, ...]] = set()
 
         # Memoization tables.
         self._evidence_by_signal: dict[tuple[Any, ...], str] = {}
@@ -952,10 +953,10 @@ class _DAGBuilder:
             None,
             None,
         )
-        frontier: deque[tuple[str, Any, Scope]] = deque(
-            [("terminal", self.terminal_raw, terminal_scope)]
+        frontier: deque[tuple[str, Any, Scope, str]] = deque(
+            [("terminal", self.terminal_raw, terminal_scope, "")]
         )
-        walked: set[tuple[str, str, Scope, str]] = set()
+        walked: set[tuple[Any, ...]] = set()
         materialized_helpers: set[tuple[str, str]] = set()
         self._emitted_ids: set[int] = set()
         self._emitted_bindings: list[dict[str, Any]] = []
@@ -967,6 +968,7 @@ class _DAGBuilder:
             *,
             read_before_write_target: str = "",
             before_call_site_id: str = "",
+            origin_vertex_id: str = "",
         ) -> None:
             if not expression:
                 return
@@ -994,30 +996,31 @@ class _DAGBuilder:
                         if before_call_site_id
                         else raw
                     )
-                    frontier.append(("symbol", symbol_payload, symbol_scope))
+                    frontier.append(("symbol", symbol_payload, symbol_scope, origin_vertex_id))
             for invocation in self._find_helper_calls(
                 expression,
                 scope[0],
                 scope_function=scope[1],
                 line=scope[2],
                 expression_ref=expression_ref,
+                origin_vertex_id=origin_vertex_id,
             ):
                 invocation_key = (
                     invocation.source_site_id,
                     invocation.result_path,
                 )
                 if invocation_key not in materialized_helpers:
-                    frontier.append(("helper", invocation, scope))
+                    frontier.append(("helper", invocation, scope, origin_vertex_id))
 
         while frontier:
-            kind, payload, scope = frontier.popleft()
+            kind, payload, scope, origin_vertex_id = frontier.popleft()
             if kind in {"symbol", "terminal"}:
                 is_terminal_root = kind == "terminal"
                 raw, before_call_site_id = (
                     payload if isinstance(payload, tuple) else (payload, "")
                 )
                 norm = exact_symbol(raw)
-                walk_key = (kind, norm, scope, before_call_site_id)
+                walk_key = (kind, norm, scope, before_call_site_id, origin_vertex_id)
                 if not norm or walk_key in walked:
                     continue
                 walked.add(walk_key)
@@ -1039,7 +1042,7 @@ class _DAGBuilder:
                 if is_terminal_root:
                     writers = self._writers_of(norm)
                     call_writers = self._writers_from_relevant_calls(
-                        norm, raw, scope, terminal=True
+                        norm, raw, scope, terminal=True, origin_vertex_id=origin_vertex_id
                     )
                     writers = self._dedupe_bindings([*writers, *call_writers])
                     if writers and self.terminal_identity is not None:
@@ -1082,6 +1085,7 @@ class _DAGBuilder:
                         raw,
                         scope,
                         terminal=False,
+                        origin_vertex_id=origin_vertex_id,
                     )
                     writers = self._dedupe_bindings([*writers, *call_writers])
                 writers = self._project_source_writers(writers, norm)
@@ -1099,6 +1103,7 @@ class _DAGBuilder:
                                 str(binding.get("source_symbol") or binding.get("expression") or ""),
                                 self._binding_walk_scope(binding),
                                 binding.get("expression_ref"),
+                                origin_vertex_id=self._binding_operation_id(binding)[0],
                                 read_before_write_target=(
                                     self._binding_read_before_write_target(binding)
                                 ),
@@ -1123,6 +1128,7 @@ class _DAGBuilder:
                                     < len(binding.get("control_expression_refs") or [])
                                     else None
                                 ),
+                                origin_vertex_id=self._binding_operation_id(binding)[0],
                             )
             else:  # helper
                 invocation = payload
@@ -1156,11 +1162,18 @@ class _DAGBuilder:
                         else "__return__"
                     )
                 )
-                frontier.append(("symbol", return_symbol, body_scope))
+                frontier.append(("symbol", return_symbol, body_scope, origin_vertex_id))
 
         # Wire edges now that every producer vertex has been emitted.
         for binding in self._emitted_bindings:
             self._wire_binding_edges(binding)
+
+        terminal_ids = [v.id for v in self.vertices.values() if v.metadata.get("is_terminal")]
+        for key in self._terminal_reference_keys:
+            reference = self._unresolved_references[key]
+            self._unresolved_references[key] = reference.model_copy(update={
+                "origin_vertex_ids": dedupe_keep_order([*reference.origin_vertex_ids, *terminal_ids]),
+            })
 
         return MechanismDAG(
             dag_id=stable_id("dag", (self.terminal, tuple(sorted(self.vertices.keys())))),
@@ -1657,6 +1670,7 @@ class _DAGBuilder:
         scope: SourceReadScope,
         *,
         terminal: bool,
+        origin_vertex_id: str = "",
     ) -> list[dict[str, Any]]:
         """Resolve calls whose source-proven effects can produce ``symbol``.
 
@@ -1772,7 +1786,7 @@ class _DAGBuilder:
                 allow_provider=False,
             )
             if helper_key is None:
-                self._record_unresolved(
+                reference_key = self._record_unresolved(
                     name,
                     kind="callable",
                     file=call_file,
@@ -1792,7 +1806,11 @@ class _DAGBuilder:
                     ),
                     argument_count=len(args),
                     source_site_id=str(source_call.get("source_site_id") or ""),
+                    origin_vertex_id=origin_vertex_id,
+                    origin_operand=symbol_raw,
                 )
+                if terminal:
+                    self._terminal_reference_keys.add(reference_key)
                 continue
             helper = self.helper_index.get(helper_key) or {}
             output_positions = set(_pointer_param_positions(helper).values())
@@ -3146,7 +3164,7 @@ class _DAGBuilder:
         source_site_id: str = "",
         origin_vertex_id: str = "",
         origin_operand: str = "",
-    ) -> None:
+    ) -> tuple[Any, ...]:
         identity = (
             self._reference_identity(symbol, file, scope_function, line)
             if kind in {"symbol", "member_writers", "storage_writers"}
@@ -3213,6 +3231,7 @@ class _DAGBuilder:
             )
         if kind not in {"member_writers", "storage_writers"}:
             self.unresolved_symbols.add(symbol)
+        return reference_key
 
     def _binding_site_scope(self, binding: dict[str, Any]) -> tuple[str, str]:
         """Where the binding's EXPRESSION text lives — the scope its
@@ -5537,6 +5556,9 @@ def evaluate_feasibility(
     value_program: Optional[DAGValueProgram] = None,
     value_session: Optional[DAGValueSession] = None,
     prune_dead: bool = True,
+    dynamic_branch_ids: Optional[set[str]] = None,
+    allow_assumptions: bool = True,
+    stream_timestamps: bool = False,
 ) -> MechanismDAG:
     """Pre-evaluate each ``branch`` vertex against known constants and
     optionally against time-varying signal samples.
@@ -5557,6 +5579,12 @@ def evaluate_feasibility(
     If ``prune_dead`` is set, operations whose only gating branches all
     resolve to ``always_false`` are removed along with the branches
     themselves (and their orphaned edges).
+
+    ``dynamic_branch_ids`` restricts timestamp work to structurally ready
+    checkpoint gates; static evaluation still visits every branch.
+    ``allow_assumptions=False`` requires derived evidence for every verdict.
+    ``stream_timestamps`` releases pure dynamic memoization after each shared
+    timestamp batch without changing resampling or branch-window semantics.
     """
     samples = signal_samples or {}
     policies = signal_policies or {}
@@ -5591,6 +5619,8 @@ def evaluate_feasibility(
     dynamic_roots_by_timestamp: dict[float, list[str]] = defaultdict(list)
     for vertex in branches:
         if static_results[vertex.id].status == "value":
+            continue
+        if dynamic_branch_ids is not None and vertex.id not in dynamic_branch_ids:
             continue
         referenced = tuple(
             signal
@@ -5648,6 +5678,8 @@ def evaluate_feasibility(
                 dynamic_results[vertex_id].append((timestamp, result.value))
             else:
                 dynamic_failures[vertex_id].append(result.reason or result.status)
+        if stream_timestamps:
+            session.release_timestamp_values()
 
     updated_vertices: list[DAGVertex] = []
     verdicts: dict[str, str] = {}
@@ -5673,7 +5705,7 @@ def evaluate_feasibility(
         # TEMPORARY stopgap: resolve a standalone uORB freshness/timeout gate
         # under the "data is fresh" assumption (see _freshness_gate_verdict).
         fresh_verdict: Optional[bool] = None
-        if verdict == "unknown" and not windows:
+        if allow_assumptions and verdict == "unknown" and not windows:
             fresh_verdict = _freshness_gate_verdict(
                 vertex.predicate_raw or vertex.predicate_lowered or ""
             )

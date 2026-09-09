@@ -6,7 +6,7 @@ Exactly two LLM touchpoints, neither inside the fixpoint loop:
   terminal symbols. Runs once, before discovery.
 * **Judge** — compact rendering of the discovered DAG(s) → sufficiency
   verdict, terminal selection, and unresolved diagnostics. Runs after
-  fixpoint convergence; only a validated replacement terminal can trigger
+  convergence or a deterministic checkpoint stop; only a validated replacement terminal can trigger
   one additional render and judgment.
 
 The judge consumes :func:`render_discovery_compact` — profile *facts*,
@@ -419,6 +419,18 @@ def render_discovery_compact(
 
     return {
         "terminal": dag.terminal if dag else None,
+        **({"discovery_checkpoint": {
+            "stop_reason": result.stop_reason,
+            "action": result.checkpoint.action,
+            "reason": result.checkpoint.summary["reason"],
+            "observed": (result.checkpoint.summary.get("selected_checkpoint") or {}).get("observed"),
+            "replay_status": (result.checkpoint.summary.get("selected_checkpoint") or {}).get("status"),
+            "verification_scope": (result.checkpoint.summary.get("selected_checkpoint") or {}).get("verification_scope"),
+            "requirements": [
+                {key: requirement.get(key) for key in ("id", "kind", "vertex_id", "file", "line", "reason")}
+                for requirement in (result.checkpoint.summary.get("selected_checkpoint") or {}).get("analysis_requirements", [])
+            ],
+        }} if result.checkpoint is not None else {}),
         **(
             {
                 "terminal_validation": {
@@ -602,6 +614,11 @@ Input: the question plus one compact DAG rendering per candidate
 terminal — operations (target <- expression @ file:line), branch
 predicates, evidence leaves (logged signals, parameters, constants),
 unresolved symbols, and the per-round discovery trace.
+
+A discovery_checkpoint records why deterministic source expansion stopped.
+Verified means the stated terminal/questioned-signal checkpoint passed its
+source and flight-data checks, not that every aspect of the question is
+explained. Unresolved requirements remain evidence against sufficiency.
 
 Each rendered entry is one SOURCE SITE, not one call instance: a body reached
 from several call sites appears once, with `instances` giving the count.

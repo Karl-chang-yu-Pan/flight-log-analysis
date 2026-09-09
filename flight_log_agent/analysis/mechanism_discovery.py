@@ -30,6 +30,7 @@ from flight_log_agent.analysis.source_expansion import (
     UnresolvedSourceReference,
     reference_receiver_is_source_boundary,
 )
+from flight_log_agent.analysis.checkpoint_discovery import CheckpointRound
 from flight_log_agent.analysis.mechanism_dag import (
     MechanismDAG,
     _DAGBuilder,
@@ -1511,6 +1512,8 @@ class DiscoveryResult:
     files_loaded: list[str]
     rounds: list[DiscoveryRound]
     terminal_validation: Optional[TerminalValidation] = None
+    checkpoint: Optional[CheckpointRound] = None
+    stop_reason: str = "frontier_exhausted"
 
 
 def _reachable_vertex_ids(dag: MechanismDAG) -> set[str]:
@@ -1579,6 +1582,7 @@ def discover_mechanism_dag(
     preranked_files: Optional[Sequence[str]] = None,
     round_annotator: Optional[Callable[[MechanismDAG], MechanismDAG]] = None,
     round_observer: Optional[Callable[[MechanismDAG, MechanismDAG, int], None]] = None,
+    checkpoint_evaluator: Optional[Callable[[MechanismDAG, int], CheckpointRound]] = None,
 ) -> DiscoveryResult:
     """Build a DAG by exact, provenance-checked fixed-point expansion.
 
@@ -1602,6 +1606,10 @@ def discover_mechanism_dag(
     ``round_observer`` receives the source graph and its annotated/pruned view
     after each round. It is diagnostic only; its return value cannot change
     source admission, the frontier, or the stopping condition.
+
+    ``checkpoint_evaluator`` is an optional deterministic controller. It runs
+    before whole-round feasibility and selects exact graph-originated requests,
+    or stops this source investigation with verified/unresolved evidence.
     """
     _ = (cache_root, source_root, max_rounds, max_files_per_round, max_files_total)
     terminal_as_given = str(terminal or "").strip()
@@ -1636,6 +1644,8 @@ def discover_mechanism_dag(
     inputs = DAGInputs()
     validation: Optional[TerminalValidation] = None
     visited: set[tuple[Any, ...]] = set()
+    checkpoint: Optional[CheckpointRound] = None
+    stop_reason = "frontier_exhausted"
 
     def bindings_write_terminal(bindings: Iterable[dict[str, Any]]) -> bool:
         canonical = exact_symbol(terminal)
@@ -1747,6 +1757,7 @@ def discover_mechanism_dag(
                 terminal_identity=requested_terminal_identity,
             )
         if validation.status != "valid":
+            stop_reason = "terminal_rejected"
             dag = None
             rounds.append(
                 DiscoveryRound(
@@ -1797,7 +1808,8 @@ def discover_mechanism_dag(
             )
         )
 
-        frontier_dag = (
+        checkpoint = checkpoint_evaluator(dag, index) if checkpoint_evaluator is not None else None
+        frontier_dag = checkpoint.annotated if checkpoint is not None else (
             round_annotator(dag)
             if round_annotator is not None
             else evaluate_feasibility(
@@ -1806,13 +1818,24 @@ def discover_mechanism_dag(
                 prune_dead=True,
             )
         )
-        references = _reachable_frontier_references(
+        references = list(checkpoint.references) if checkpoint is not None else _reachable_frontier_references(
             list(dag.unresolved_references), dag, frontier_dag
         )
         if round_observer is not None:
             round_observer(dag, frontier_dag, index)
+        if checkpoint is not None and checkpoint.action != "continue":
+            stop_reason = f"checkpoint_{checkpoint.action}"
+            break
         known_classes = set(inputs.structure.direct_bases)
+        required_owners = {
+            owner for reference in references
+            for owner in [reference.class_owner,
+                          reference.identity.class_owner if reference.identity else "",
+                          reference.identity.declaring_class if reference.identity else ""] if owner
+        }
         for owner, bases in inputs.structure.direct_bases.items():
+            if checkpoint is not None and owner not in required_owners:
+                continue
             owner_record = next(
                 (
                     item
@@ -1856,6 +1879,10 @@ def discover_mechanism_dag(
             if file_path not in facts_by_file
         ]
         if not pending:
+            if checkpoint is not None:
+                checkpoint.action = "unresolved"
+                checkpoint.summary.update(action="unresolved", reason="exact source frontier exhausted with outstanding checkpoint requirements")
+                stop_reason = "checkpoint_unresolved"
             break
         index += 1
 
@@ -1865,4 +1892,6 @@ def discover_mechanism_dag(
         files_loaded=loaded,
         rounds=rounds,
         terminal_validation=validation,
+        checkpoint=checkpoint,
+        stop_reason=stop_reason,
     )

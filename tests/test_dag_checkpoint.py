@@ -277,6 +277,18 @@ def test_changed_edges_cannot_reuse_an_old_program(checkpoint):
         assess(checkpoint, value_program=program)
 
 
+def test_nan_source_constant_is_not_mistaken_for_a_stale_program(checkpoint):
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+
+    dag = checkpoint[0]
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    root.metadata["value"] = float("nan")
+    program_graph = dag.model_copy(deep=True)
+    next(v for v in program_graph.vertices if v.id == root.id).metadata["value"] = float("nan")
+    result = assess(checkpoint, value_program=DAGValueProgram(program_graph))
+    assert result["status"] == "matched"
+
+
 def test_false_input_copy_gate_cannot_certify_latest_topic_value(checkpoint):
     from flight_log_agent.analysis.dag_value import DAGValueProgram
 
@@ -287,3 +299,115 @@ def test_false_input_copy_gate_cannot_certify_latest_topic_value(checkpoint):
     assert result["status"] == "not_attempted"
     assert "state_alignment" in kinds(result)
     assert transfer.id not in result["inactive_writer_ids"]
+
+
+def control(checkpoint, **kwargs):
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+
+    dag, samples, policies = checkpoint
+    return evaluate_checkpoint_round(
+        dag, parameter_values={}, observed_signals=set(samples), signal_policies=policies,
+        load_samples=lambda _view, _observed: samples, **kwargs,
+    )
+
+
+def test_checkpoint_controller_stops_on_verified_terminal(checkpoint):
+    result = control(checkpoint)
+    assert result.action == "verified"
+    assert result.summary["selected_checkpoint"]["authorizes_discovery_stop"] is True
+    assert result.references == []
+
+
+def test_checkpoint_controller_does_not_verify_a_different_question(checkpoint):
+    result = control(checkpoint, question_target="different.output")
+    assert result.action == "unresolved"
+    assert result.summary["selected_checkpoint"]["authorizes_discovery_stop"] is False
+
+
+def test_checkpoint_controller_keeps_numerical_contradiction(checkpoint):
+    checkpoint[1]["command.value"] = [(0.0, 100.0), (10.0, 100.0)]
+    result = control(checkpoint)
+    assert result.action == "unresolved"
+    assert result.summary["selected_checkpoint"]["status"] == "mismatched"
+
+
+def test_checkpoint_controller_evaluates_a_ready_logged_gate(checkpoint):
+    dag = checkpoint[0]
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    transfer = next(v for v in dag.vertices if v.metadata.get("boundary_direction") == "subscribe")
+    gate = add_gate(dag, root.id)
+    gate.predicate_raw = "sample > 0"
+    gate.metadata = {"source_expression_ref": expression("sample > 0", "sample"), "expression_inputs_exact": True}
+    gate.feasibility_verdict = "unknown"
+    dag.edges.append(DAGEdge(id="gate-input", source_id=transfer.id, target_id=gate.id, kind="data", role="sample"))
+    result = control(checkpoint)
+    assert result.summary["dynamic_gate_count"] == 1
+    assert result.action == "verified", result.summary
+
+
+def test_checkpoint_controller_does_not_schedule_missing_gate_inputs(checkpoint, monkeypatch):
+    from flight_log_agent.analysis.dag_value import DAGValueSession
+
+    dag = checkpoint[0]
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    gate = add_gate(dag, root.id)
+    gate.predicate_raw = "missing"
+    gate.metadata = {"source_expression_ref": expression("missing"), "expression_inputs_exact": True}
+    gate.feasibility_verdict = "unknown"
+    original = DAGValueSession.evaluate
+
+    def static_only(self, vertex_id, timestamp):
+        assert timestamp is None, "unlinked gate must not consume a flight timeline"
+        return original(self, vertex_id, timestamp)
+    monkeypatch.setattr(DAGValueSession, "evaluate", static_only)
+    result = control(checkpoint)
+    assert result.action == "unresolved"
+    assert result.summary["dynamic_gate_count"] == 0
+
+
+def test_checkpoint_controller_returns_only_relevant_exact_requests(checkpoint):
+    dag = checkpoint[0]
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    needed = UnresolvedSourceReference(symbol="reader", kind="callable", origin_vertex_ids=[root.id])
+    foreign = UnresolvedSourceReference(symbol="reader", kind="callable", file="other.cpp", origin_vertex_ids=["other"])
+    dag.unresolved_references.extend([needed, foreign])
+    result = control(checkpoint)
+    assert result.action == "continue"
+    assert result.references == [needed]
+
+
+def test_shared_source_request_blocks_every_gate_consumer(checkpoint):
+    dag = checkpoint[0]
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    gate = add_gate(dag, root.id)
+    gate.predicate_raw = "True"
+    gate.metadata = {"source_expression_ref": expression("True"), "expression_inputs_exact": True}
+    dag.unresolved_references.append(UnresolvedSourceReference(
+        symbol="reader", kind="callable", origin_vertex_ids=[root.id, gate.id],
+    ))
+    result = control(checkpoint)
+    assert result.summary["dynamic_gate_count"] == 0
+    assert result.action == "continue"
+
+
+def test_streamed_feasibility_matches_retained_results(checkpoint):
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+    from flight_log_agent.analysis.mechanism_dag import prepare_signal_series, sample_prepared_signal
+
+    dag, samples, policies = checkpoint
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    transfer = next(v for v in dag.vertices if v.metadata.get("boundary_direction") == "subscribe")
+    gate = add_gate(dag, root.id)
+    gate.predicate_raw = "sample > 0"
+    gate.metadata = {"source_expression_ref": expression("sample > 0", "sample"), "expression_inputs_exact": True}
+    dag.edges.append(DAGEdge(id="input", source_id=transfer.id, target_id=gate.id, kind="data", role="sample"))
+    prepared = prepare_signal_series(samples, policies)
+    program = DAGValueProgram(dag)
+    session = program.bind(sample_resolver=lambda s, t: sample_prepared_signal(prepared, s, t))
+    kwargs = dict(signal_samples=samples, signal_policies=policies, prepared_signal_series=prepared,
+                  value_program=program, prune_dead=False)
+    expected = evaluate_feasibility(dag, **kwargs)
+    actual = evaluate_feasibility(dag, value_session=session, stream_timestamps=True, **kwargs)
+    assert expected.model_dump() == actual.model_dump()
+    assert all(timestamp is None for _vertex, timestamp in session._value_cache)
+    assert session._sample_cache == {}

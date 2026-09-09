@@ -4021,3 +4021,68 @@ void run()
     }
     assert len(references) == len(declaration_ids)
     assert "work_queue.size" in result.dag.unresolved_symbols
+
+
+@pytest.mark.parametrize("action", ["verified", "unresolved"])
+def test_checkpoint_stop_precedes_whole_graph_annotation_and_expansion(tmp_path, monkeypatch, action):
+    from flight_log_agent.analysis.checkpoint_discovery import CheckpointRound
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+    from flight_log_agent.analysis.source_expansion import SourceExpansionResolver
+
+    profiler = _mini_tree(tmp_path, {
+        "sample.cpp": "void run() { float output = missing; }",
+    }, backend="tree_sitter")
+    calls = []
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("checkpoint stop must precede annotation and source search")
+
+    def checkpoint(dag, index):
+        calls.append(index)
+        assert dag.vertices
+        return CheckpointRound(action, dag, [], {"action": action})
+
+    monkeypatch.setattr(SourceExpansionResolver, "resolve", unexpected)
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=[], terminal="output", source_hash="hash",
+        preranked_files=["sample.cpp"], terminal_file="sample.cpp",
+        round_annotator=unexpected, checkpoint_evaluator=checkpoint,
+    )
+    assert calls == [0]
+    assert result.stop_reason == f"checkpoint_{action}"
+    assert result.files_loaded == ["sample.cpp"]
+
+
+def test_checkpoint_continues_only_its_requested_source_frontier(tmp_path, monkeypatch):
+    from flight_log_agent.analysis.checkpoint_discovery import CheckpointRound
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "sample.cpp": "extern float wanted; extern float unrelated; void run() { float output = wanted + unrelated; }",
+        "wanted.cpp": "float wanted = 3;",
+        "unrelated.cpp": "float unrelated = 9;",
+    }, backend="tree_sitter")
+    original = SourceExpansionResolver.resolve
+    searched = []
+
+    def resolve(self, reference, structure):
+        searched.append(reference.symbol)
+        assert reference.symbol == "wanted"
+        return original(self, reference, structure)
+
+    def checkpoint(dag, index):
+        references = [r for r in dag.unresolved_references if r.symbol == "wanted"]
+        assert references
+        return CheckpointRound("continue", dag, references, {"action": "continue"})
+
+    monkeypatch.setattr(SourceExpansionResolver, "resolve", resolve)
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=[], terminal="output", source_hash="hash",
+        preranked_files=["sample.cpp"], terminal_file="sample.cpp",
+        checkpoint_evaluator=checkpoint,
+    )
+    assert searched
+    assert result.files_loaded == ["sample.cpp", "wanted.cpp"]
+    assert len(result.rounds) == 2
+    assert result.stop_reason == "checkpoint_unresolved"
+    assert result.checkpoint.action == "unresolved"
