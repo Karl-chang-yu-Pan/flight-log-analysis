@@ -98,6 +98,9 @@ def test_base_instructions_define_lean_single_agent_contract():
     assert "Web results cannot replace flight evidence" in instructions
     assert "lower confidence rather than forcing an answer" in instructions
     assert "source broker" not in instructions
+    assert "read_px4_source_file" in instructions
+    assert "bounded region" in instructions
+    assert "oversized" in instructions
 
 
 def test_base_instructions_check_completion_before_more_tool_calls():
@@ -1085,6 +1088,10 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
         == "high"
     )
     assert "SNAPSHOT" in captured["agent_kwargs"]["instructions"]
+    assert any(
+        getattr(tool, "name", None) == "read_px4_source_file"
+        for tool in captured["agent_kwargs"]["tools"]
+    )
     assert "Keep this project context." in captured["agent_kwargs"]["instructions"]
     assert captured["max_turns"] == 12
     assert "What happened?" in captured["prompt"]

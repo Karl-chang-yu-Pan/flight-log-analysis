@@ -49,6 +49,7 @@ from flight_log_agent.analysis.report_validation import (
     enforce_validation_downgrades,
     validate_report,
 )
+from flight_log_agent.analysis.source_tools import make_read_px4_source_file_tool
 from flight_log_agent.audit import (
     AgentRunAuditHooks,
     DEFAULT_DEV_LOG_ROOT,
@@ -394,6 +395,15 @@ class RestrictedShellExecutor:
                 )
             source = resolved
         return source
+
+    def resolve_source_alias(self, alias: str) -> SourceSnapshot:
+        """Resolve a virtual PX4 Git directory to its pinned snapshot."""
+
+        if self.source_snapshot is None:
+            raise PermissionError(
+                "PX4 source is unavailable because the logged revision was not resolved."
+            )
+        return self._source_for_alias(alias)
 
     @staticmethod
     def _validate_source_alias(alias: str) -> tuple[str, ...]:
@@ -1026,9 +1036,9 @@ catalog, topic list, or module-specific procedure.
 When an exact PX4 source snapshot is available, read it with the separate
 commit-pinned Git commands:
 - Search: git -C PX4-Autopilot grep -n -F "term" SNAPSHOT -- src/
-- Read: git -C PX4-Autopilot show SNAPSHOT:src/module/file.cpp
+- Full-file read: git -C PX4-Autopilot show SNAPSHOT:src/module/file.cpp
 - List: git -C PX4-Autopilot ls-tree -r --name-only SNAPSHOT -- src/
-- Schema read: git -C PX4-Autopilot show SNAPSHOT:msg/VehicleStatus.msg
+- Full-schema read: git -C PX4-Autopilot show SNAPSHOT:msg/VehicleStatus.msg
 
 SNAPSHOT is a virtual revision token. The executor replaces it with the
 resolved full commit SHA. Never use HEAD, a branch, a tag, or a literal hash.
@@ -1037,6 +1047,14 @@ schema, build, or configuration file that is relevant.
 For an initialized submodule, use its path as the virtual Git directory, for
 example git -C PX4-Autopilot/src/modules/mavlink/mavlink show SNAPSHOT:path.
 The executor resolves SNAPSHOT to the gitlink commit recorded by the parent.
+
+After Git search identifies a relevant file and line, prefer the
+read_px4_source_file tool when only a bounded region is needed. Give it the
+same virtual Git directory, a path relative to that repository, and inclusive
+start and end lines. It returns numbered lines plus next_start_line for paging.
+Choose a focused range around the search hits instead of using an oversized
+range to reproduce a full-file read. Use git show only when the complete file
+is materially useful.
 
 Python, rg, sed, and find run in a filesystem sandbox containing only this
 analysis workspace, its read-only input files, the plot directory, and runtime
@@ -1260,6 +1278,12 @@ async def analyze_flight_log(
                 needs_approval=False,
             )
         ]
+        if source_snapshot is not None:
+            tools.append(
+                make_read_px4_source_file_tool(
+                    shell_executor.resolve_source_alias,
+                )
+            )
         if enable_web_fallback:
             tools.append(
                 WebSearchTool(
