@@ -982,12 +982,67 @@ def test_report_plot_paths_map_only_to_produced_artifacts(tmp_path):
     ]
 
 
+def test_inventory_write_failure_stops_before_model_request(tmp_path, monkeypatch):
+    log_path = tmp_path / "flight.ulg"
+    log_path.write_bytes(b"ULog")
+    output_dir = tmp_path / "output"
+    (output_dir / "work" / "ulog_inventory.json").mkdir(parents=True)
+    monkeypatch.setattr(analyzer, "resolve_source_path", lambda _: None)
+    monkeypatch.setattr(analyzer, "parse_ulog_inventory", lambda *_: {"warnings": []})
+    run = Mock()
+    monkeypatch.setattr(analyzer.Runner, "run", run)
+
+    with pytest.raises(IsADirectoryError):
+        asyncio.run(analyzer.analyze_flight_log(
+            str(log_path), "What happened?", output_dir=str(output_dir),
+            dev_log_root=str(tmp_path / "audit"), dev_run_id="write_failure",
+        ))
+
+    run.assert_not_called()
+    events = [json.loads(line) for line in (
+        tmp_path / "audit" / "write_failure" / "run_events.jsonl"
+    ).read_text().splitlines()]
+    assert events[-1]["event"] == "run.failed"
+    assert not (output_dir / "report.json").exists()
+
+
+def test_model_inventory_preserves_full_data_without_host_source_paths():
+    repository = Path("/host/private/PX4-Autopilot")
+    original = {
+        "source_path": str(repository),
+        "source_commit": "a" * 40,
+        "airframe": {"source": f"{repository}@{'a' * 40}", "name": "Example"},
+        "warnings": [f"Source unavailable: {repository}/module"],
+        "logged_messages": [{"message": "long message " * 6000}],
+        "parameters": {"ANY_NEW_PARAM": 3},
+        "future_metadata": {"nested": [1, 2, 3]},
+    }
+    before = json.dumps(original)
+
+    sanitized = analyzer._model_inventory(original, repository)
+
+    assert "source_path" not in sanitized
+    assert str(repository) not in json.dumps(sanitized)
+    assert sanitized["airframe"]["source"] == f"PX4-Autopilot@{'a' * 40}"
+    assert sanitized["warnings"] == ["Source unavailable: PX4-Autopilot/module"]
+    for key in ("source_commit", "logged_messages", "parameters", "future_metadata"):
+        assert sanitized[key] == original[key]
+    assert json.dumps(original) == before
+    sanitized["future_metadata"]["nested"].append(4)
+    assert original["future_metadata"]["nested"] == [1, 2, 3]
+    assert analyzer._model_inventory({"source_path": None, "warnings": []}, None) == {
+        "warnings": [],
+    }
+
+
 @pytest.mark.parametrize("enable_web_fallback", [True, False])
+@pytest.mark.parametrize("source_available", [True, False])
 def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
     tmp_path,
     monkeypatch,
     assert_analysis_engine_contract,
     enable_web_fallback,
+    source_available,
 ):
     log_path = tmp_path / "uploads" / "upload_1" / "flight.ulg"
     log_path.parent.mkdir(parents=True)
@@ -996,6 +1051,9 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
     source_path.mkdir()
     _git(source_path, "init")
     (source_path / "file.txt").write_text("source\n", encoding="utf-8")
+    airframe_dir = source_path / "ROMFS/px4fmu_common/init.d/airframes"
+    airframe_dir.mkdir(parents=True)
+    (airframe_dir / "777_example").write_text("# @name Example airframe\n", encoding="utf-8")
     logged_commit = _commit(source_path, "source")
     output_dir = tmp_path / "outputs" / "web_run_1"
     dev_log_root = tmp_path / "dev_logs"
@@ -1003,8 +1061,14 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
     parse_inventory = Mock(
         return_value={
             "firmware_version": "v1.0.0",
-            "git_hash": logged_commit,
-            "parameters": {},
+            "git_hash": logged_commit if source_available else None,
+            "parameters": {"EXAMPLE_PARAM": 42, "SYS_AUTOSTART": 777},
+            "topic_fields": {"vehicle_status": ["timestamp", "nav_state"]},
+            "topic_instances": {"vehicle_status": [
+                {"multi_id": 0, "fields": ["timestamp", "nav_state"], "sample_count": 12},
+                {"multi_id": 1, "fields": ["timestamp", "nav_state"], "sample_count": 7},
+            ]},
+            "logged_messages": [{"message": "example flight message", "time_s": 2.0}],
             "available_topics": ["vehicle_status"],
             "missing_topics": [],
             "warnings": [],
@@ -1026,6 +1090,23 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
             captured.setdefault("web_tools", []).append(kwargs)
 
     async def fake_run(agent, prompt, max_turns, hooks):
+        artifact = json.loads((output_dir / "work" / "ulog_inventory.json").read_text())
+        assert artifact["parameters"] == {"EXAMPLE_PARAM": 42, "SYS_AUTOSTART": 777}
+        if source_available:
+            assert artifact["airframe"]["name"] == "Example airframe"
+            assert artifact["airframe"]["source"] == f"PX4-Autopilot@{logged_commit}"
+            assert parse_inventory.return_value["source_path"] == str(source_path)
+        for key in ("topic_fields", "topic_instances", "logged_messages", "firmware_version"):
+            assert artifact[key] == parse_inventory.return_value[key]
+        assert "source_path" not in artifact
+        assert str(source_path) not in json.dumps(artifact)
+        assert artifact.get("source_commit") == (logged_commit if source_available else None)
+        assert bool(artifact["warnings"]) is (not source_available)
+        assert "/work/ulog_inventory.json" in prompt
+        assert "/inputs/flight.ulg" in prompt
+        assert "EXAMPLE_PARAM" not in prompt
+        assert "example flight message" not in prompt
+        assert str(source_path) not in prompt
         captured["agent"] = agent
         captured["prompt"] = prompt
         captured["max_turns"] = max_turns
@@ -1043,6 +1124,7 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
     monkeypatch.setattr(analyzer.Runner, "run", fake_run)
 
     async def fake_preflight(executor):
+        assert (output_dir / "work" / "ulog_inventory.json").is_file()
         captured["preflight_executor"] = executor
         return None
 
@@ -1072,13 +1154,15 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
     assert result is report
     source_executor = captured["shell_tool"].executor
     assert (
-        captured["preflight_executor"].source_snapshot.commit_sha
-        == logged_commit
+        captured["preflight_executor"].source_snapshot
+        == (SourceSnapshot(source_path, logged_commit) if source_available else None)
     )
     assert captured["preflight_executor"].input_paths == {
         "flight.ulg": log_path.resolve()
     }
-    assert source_executor.source_snapshot.commit_sha == logged_commit
+    assert source_executor.source_snapshot == (
+        SourceSnapshot(source_path, logged_commit) if source_available else None
+    )
     assert source_executor.cwd == (output_dir / "work").resolve()
     assert source_executor.input_paths == {"flight.ulg": log_path.resolve()}
     assert captured["agent_kwargs"]["output_type"] is FlightLogReport
@@ -1091,7 +1175,7 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
     assert any(
         getattr(tool, "name", None) == "read_px4_source_file"
         for tool in captured["agent_kwargs"]["tools"]
-    )
+    ) is source_available
     assert "Keep this project context." in captured["agent_kwargs"]["instructions"]
     assert captured["max_turns"] == 12
     assert "What happened?" in captured["prompt"]

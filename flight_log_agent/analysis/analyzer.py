@@ -68,6 +68,7 @@ from flight_log_agent.ulog.inventory import (
     enrich_inventory_from_source,
     parse_ulog_inventory,
 )
+from flight_log_agent.utils import json_safe_value
 
 
 ALLOWED_PROGRAMS = {"python", "python3", "rg", "git", "sed", "find"}
@@ -1250,6 +1251,13 @@ async def analyze_flight_log(
                 "no PX4 source repository was provided."
             )
 
+        model_inventory = _model_inventory(inventory, source_repository_path)
+        (work_dir / "ulog_inventory.json").write_text(
+            json.dumps(model_inventory, default=json_safe_value, ensure_ascii=False)
+            + "\n",
+            encoding="utf-8",
+        )
+
         shell_executor = RestrictedShellExecutor(
             work_dir,
             source_snapshot,
@@ -1308,7 +1316,7 @@ async def analyze_flight_log(
         )
         prompt = _analysis_prompt(
             user_question=user_question,
-            inventory=inventory,
+            inventory=model_inventory,
             source_snapshot=source_snapshot,
             mission_path=mission_path_obj,
             plots_dir=output_dir_obj / "plots",
@@ -1367,6 +1375,38 @@ async def analyze_flight_log(
         raise
 
 
+def _model_inventory(
+    inventory: dict[str, Any],
+    source_repository_path: Path | None,
+) -> dict[str, Any]:
+    """Copy the full inventory for the model without host repository paths."""
+
+    repository_paths = sorted(
+        {
+            str(path)
+            for path in (source_repository_path, inventory.get("source_path"))
+            if path
+        },
+        key=len,
+        reverse=True,
+    )
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: sanitize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        if isinstance(value, str):
+            for path in repository_paths:
+                value = value.replace(path, SOURCE_ALIAS)
+            return value
+        return value
+
+    return sanitize({
+        key: value for key, value in inventory.items() if key != "source_path"
+    })
+
+
 def _analysis_prompt(
     *,
     user_question: str,
@@ -1416,6 +1456,12 @@ User question:
 
 Deterministic prepass:
 {json.dumps(make_json_safe(compact_inventory), indent=2, sort_keys=True)}
+
+The full parsed inventory is available at /work/ulog_inventory.json. Query it
+selectively with Python for parameters, topic fields, topic instances and sample
+counts, logged messages, warnings, firmware metadata, and the resolved source
+commit when available. Avoid printing the entire inventory. Use
+/inputs/flight.ulg with pyulog for actual time-series calculations.
 
 {source_note}
 {mission_note}
