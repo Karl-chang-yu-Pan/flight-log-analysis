@@ -1036,6 +1036,7 @@ catalog, topic list, or module-specific procedure.
 When an exact PX4 source snapshot is available, read it with the separate
 commit-pinned Git commands:
 - Search: git -C PX4-Autopilot grep -n -F "term" SNAPSHOT -- src/
+- Scoped search with context: git -C PX4-Autopilot grep -n -F -m 5 -C 20 "term" SNAPSHOT -- src/module/
 - Full-file read: git -C PX4-Autopilot show SNAPSHOT:src/module/file.cpp
 - List: git -C PX4-Autopilot ls-tree -r --name-only SNAPSHOT -- src/
 - Full-schema read: git -C PX4-Autopilot show SNAPSHOT:msg/VehicleStatus.msg
@@ -1051,10 +1052,13 @@ The executor resolves SNAPSHOT to the gitlink commit recorded by the parent.
 After Git search identifies a relevant file and line, prefer the
 read_px4_source_file tool when only a bounded region is needed. Give it the
 same virtual Git directory, a path relative to that repository, and inclusive
-start and end lines. It returns numbered lines plus next_start_line for paging.
-Choose a focused range around the search hits instead of using an oversized
-range to reproduce a full-file read. Use git show only when the complete file
-is materially useful.
+start and end lines. Prefer scoped git grep with -C when matching lines and
+their context can answer the source question in one call. Request multiple
+independent narrow excerpts in the same turn when their locations are known.
+Avoid sequential 200-line paging and oversized ranges: read the relevant
+function or region around a hit. next_start_line only identifies a requested
+excerpt clipped by output limits; follow it only if the omitted lines matter.
+Use git show when the complete file is materially useful.
 
 Python, rg, sed, and find run in a filesystem sandbox containing only this
 analysis workspace, its read-only input files, the plot directory, and runtime
