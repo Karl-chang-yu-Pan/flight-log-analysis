@@ -1048,7 +1048,7 @@ async def run_dag_discovery_stage(
         discovery_kwargs["round_observer"] = observe_round
 
     if checkpoint_discovery:
-        def control_round(dag: MechanismDAG, index: int):
+        def control_round(dag: MechanismDAG, index: int, *, during_construction: bool = False):
             nonlocal scope
             wall_started, cpu_started = time.perf_counter(), time.process_time()
             target = None
@@ -1070,6 +1070,7 @@ async def run_dag_discovery_stage(
             )
             summary = {
                 **result.summary, "diagnostic_only": False, "round_index": index,
+                "phase": "construction" if during_construction else "round_complete",
                 "dag_id": dag.dag_id, "terminal": dag.terminal,
                 "scope": scope.as_payload() if scope is not None else None,
                 "unresolved_references": [r.model_dump(mode="json") for r in dag.unresolved_references],
@@ -1078,11 +1079,24 @@ async def run_dag_discovery_stage(
                               "process_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss},
             }
             result.summary = summary
-            checkpoint_rounds.append(summary)
+            # Keep proof payloads for completed rounds. Intermediate snapshots
+            # are transient; retaining every frontier/preflight would multiply
+            # memory by the number of dependency waves.
+            event = summary
+            if during_construction:
+                event = {key: summary[key] for key in (
+                    "phase", "diagnostic_only", "round_index", "dag_id", "terminal",
+                    "scope", "resources", "action", "pending_construction_count",
+                    "dynamic_gate_count",
+                )}
+            checkpoint_rounds.append(event)
             if checkpoint_observer is not None:
-                checkpoint_observer(summary)
+                checkpoint_observer(event)
             return result
         discovery_kwargs["checkpoint_evaluator"] = control_round
+        discovery_kwargs["construction_evaluator"] = lambda dag, index: control_round(
+            dag, index, during_construction=True,
+        )
 
     def condition_windows(condition: Any, candidates: Any = None) -> Optional[dict[str, Any]]:
         return evaluate_questioned_condition_windows(

@@ -1288,7 +1288,9 @@ void A::run()
     assert events == trial.checkpoint_rounds
     assert events
     assert events[0]["scope"]["windows"] == ((0.0, 10.0),), events[0]["scope"]
-    checkpoint = events[0]["checkpoints"]["topic_out.value"]
+    checkpoint = next(event["checkpoints"]["topic_out.value"] for event in reversed(events)
+                      if "topic_out.value" in event.get("checkpoints", {})
+                      and not event.get("pending_construction_count"))
     assert events[0]["resources"]["checkpoint_wall_s"] >= 0
     control = asyncio.run(run_dag_discovery_stage(
         profiler, tmp_path / "cache", "why?", "source", Path("/stubbed.ulg"), **kwargs,

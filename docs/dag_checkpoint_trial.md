@@ -102,10 +102,46 @@ not the entire question. The judge receives its scope and outstanding
 requirements. An unresolved checkpoint cannot become report confirmation even
 if a judge is sufficient or a partial numerical result exists.
 
-No file/round budget was introduced. Exact source admission is unchanged; eager
-helper materialization still occurs during construction. Missing source-writer
+No file/round budget was introduced. Exact source admission is unchanged. Missing source-writer
 coverage, receiver-state/transfer-time semantics, parser/linkage gaps, and
 candidate-admission costs are reported or measured, not waived by this control.
+
+### Staged Construction
+
+Checkpoint-controlled runs now suspend value expansion at dependency boundaries
+inside the same builder. Operations retain their source and invocation IDs.
+Control dependencies are walked first, and each suspension presents a coherently
+wired graph to the existing checkpoint assessment. Pending value operations are
+an internal field excluded from the public DAG serialization, not opaque source
+gaps or a second mechanism representation.
+
+- Missing expression helpers cannot invoke the inline provider in staged mode.
+  Their existing typed frontier preserves callable, receiver, source site, and
+  consumer identities for checkpoint-selected source discovery.
+- Known value work needed by controls resumes before guarded value work. Exact
+  inactivity can discharge a writer's inputs; unknown guards cannot. Conditional
+  subscriptions retain their receiver-state obligations.
+- Discharged work is reassessed at later boundaries. New definitions that remove
+  the inactivity proof cause that work to resume.
+- Derived edges, evidence leaves, and wiring requests are rebuilt at each
+  suspension against the current producers. Provisional opaque inputs cannot
+  remain attached once their source producer has been materialized.
+- Pending relevant construction prevents verification unless exact inactivity
+  discharges it. Outstanding source-writer requests still prevent verification;
+  exhausted search does not certify writer completeness.
+
+Construction callbacks and completed-round callbacks are separate. Intermediate
+audit events have `phase=construction` and compact resource/progress fields;
+completed rounds retain the proof payload with `phase=round_complete`.
+
+Eager construction remains the default without this option. Shared source-flow
+tests exercise eager/staged construction and both parser backends where supported.
+The real-log measurements below predate staged construction: they are a baseline,
+not evidence of its performance. Terminal caller-context registration and each
+control-dependency wave still run synchronously; the implementation does not
+provide a resource preemption guarantee inside those operations.
+New source files still enter through the existing outer discovery rounds; local
+resumption does not yet retain the builder across a source-admission round.
 
 ## Enabling The Trial
 

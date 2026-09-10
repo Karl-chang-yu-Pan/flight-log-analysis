@@ -1158,7 +1158,8 @@ void Rtl::update()
     assert result.dag.unresolved_symbols == []
 
 
-def test_fixpoint_provider_expands_cross_file_helper(tmp_path):
+@pytest.mark.parametrize("staged", [False, True])
+def test_fixpoint_provider_expands_cross_file_helper(tmp_path, staged):
     """A helper defined in a file discovery never seeded still expands:
     the on-demand provider finds ``Class::name(`` within the round, and
     the fetched file's facts join the next round."""
@@ -1179,12 +1180,22 @@ float Rtl::calc_gain(float base_in)
 """,
     })
 
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+
+    def checkpoint(dag, index):
+        return evaluate_checkpoint_round(
+            dag, parameter_values={}, observed_signals=set(), signal_policies={},
+            load_samples=lambda *_: {},
+        )
+
     result = discover_mechanism_dag(
         profiler,
         tmp_path / "cache",
         seeds=["pick_altitude"],
         terminal="_alt_out",
         source_hash="hash",
+        construction_evaluator=checkpoint if staged else None,
+        checkpoint_evaluator=checkpoint if staged else None,
     )
 
     helper_returns = [v for v in result.dag.vertices
@@ -2133,8 +2144,9 @@ class Control {
     )
 
 
+@pytest.mark.parametrize("staged", [False, True])
 def test_nested_helper_return_dataflow_is_backend_interchangeable(
-    tmp_path, source_backend
+    tmp_path, source_backend, staged
 ):
     source_file = "src/modules/example/nested_returns.cpp"
     profiler = _mini_tree(
@@ -2175,6 +2187,7 @@ void run()
         helper_expressions=inputs.helper_expressions,
         call_statements=inputs.call_statements,
         source_structure=inputs.structure,
+        construction_checkpoint=(lambda _: set()) if staged else None,
     )
 
     outer_returns = [
@@ -2197,8 +2210,9 @@ void run()
     )
 
 
+@pytest.mark.parametrize("staged", [False, True])
 def test_source_grounded_helper_condition_is_backend_interchangeable(
-    tmp_path, source_backend
+    tmp_path, source_backend, staged
 ):
     """Source-resolved calls, parameters, enums, and logged gates compose.
 
@@ -2283,6 +2297,7 @@ void Control::run()
         logged_signals={"destination.value", "status.vehicle_type"},
         enum_registry={"status": {"ROTARY": 1}},
         source_structure=inputs.structure,
+        construction_checkpoint=(lambda _: set()) if staged else None,
     )
 
     annotated = evaluate_feasibility(
@@ -2633,7 +2648,8 @@ void Mode::run()
     assert "global_position.alt" not in dag.unresolved_symbols
 
 
-def test_helper_return_consumes_aliased_call_result_without_flattening(tmp_path):
+@pytest.mark.parametrize("staged", [False, True])
+def test_helper_return_consumes_aliased_call_result_without_flattening(tmp_path, staged):
     source_file = "src/modules/mode/mode.cpp"
     profiler = _mini_tree(
         tmp_path,
@@ -2700,6 +2716,7 @@ void Mode::run()
         call_statements=inputs.call_statements,
         boundary_bindings=inputs.boundary_bindings,
         source_structure=inputs.structure,
+        construction_checkpoint=(lambda _: set()) if staged else None,
     )
 
     helper_return = next(
@@ -4086,3 +4103,36 @@ def test_checkpoint_continues_only_its_requested_source_frontier(tmp_path, monke
     assert len(result.rounds) == 2
     assert result.stop_reason == "checkpoint_unresolved"
     assert result.checkpoint.action == "unresolved"
+
+
+@pytest.mark.parametrize("guard", ["false", "true", "missing"])
+def test_staged_construction_gates_loaded_helper_materialization(tmp_path, guard):
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+
+    profiler = _mini_tree(tmp_path, {"sample.cpp": """
+float calculate(float input) { return input * 2.0f; }
+void run() {
+    bool gate = GUARD;
+    float output = 0;
+    if (gate) { output = calculate(7.0f); }
+}
+""".replace("GUARD", guard)}, backend="tree_sitter")
+    inputs = dag_inputs_from_facts(load_facts(profiler, tmp_path / "cache", ["sample.cpp"], "hash"))
+    snapshots = []
+
+    def checkpoint(dag):
+        snapshots.append(len(dag.vertices))
+        result = evaluate_checkpoint_round(
+            dag, parameter_values={}, observed_signals=set(), signal_policies={},
+            load_samples=lambda *_: {},
+        )
+        return set(result.summary["selected_checkpoint"]["inactive_writer_ids"])
+
+    dag = build_mechanism_dag(
+        inputs.bindings, "output", terminal_file="sample.cpp",
+        helper_expressions=inputs.helper_expressions, call_statements=inputs.call_statements,
+        source_structure=inputs.structure, construction_checkpoint=checkpoint,
+    )
+    assert snapshots
+    returns = [v for v in dag.vertices if str(v.provenance or "").startswith("helper_return:calculate@")]
+    assert bool(returns) == (guard != "false")

@@ -219,6 +219,7 @@ class MechanismDAG(BaseModel):
     unresolved_references: list[UnresolvedSourceReference] = Field(
         default_factory=list, exclude=True
     )
+    pending_construction: list[str] = Field(default_factory=list, exclude=True)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +386,7 @@ def build_mechanism_dag(
     boundary_bindings: Sequence[Any] = (),
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
     source_structure: Optional[SourceStructureIndex] = None,
+    construction_checkpoint: Optional[Callable[[MechanismDAG], set[str]]] = None,
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
 
@@ -422,12 +424,19 @@ def build_mechanism_dag(
     instances, and the leading-underscore member marker all distinguish.
     Source-object to logged-topic equivalence requires an explicit
     ``boundary_bindings`` entry.
+
+    ``construction_checkpoint`` enables staged construction and disables inline
+    helper fetching. At coherent dependency boundaries it receives this DAG
+    with internal pending-operation IDs and returns only IDs whose inactivity
+    has been proven from exact source controls over the comparison domain.
+    Missing definitions remain typed source requests; known pending values are
+    resumed in this builder, without reconstructing their invocation scopes.
     """
     builder = _DAGBuilder(
         source_bindings=[_as_binding_dict(b) for b in source_bindings],
         terminal=terminal,
         helper_index=_index_helpers(helper_expressions),
-        helper_body_provider=helper_body_provider,
+        helper_body_provider=None if construction_checkpoint is not None else helper_body_provider,
         parameter_predicates=list(parameter_predicates),
         parameter_values=dict(parameter_values or {}),
         source_root=Path(source_root) if source_root else None,
@@ -443,7 +452,7 @@ def build_mechanism_dag(
         enum_registry=dict(enum_registry or {}),
         source_structure=source_structure or SourceStructureIndex(),
     )
-    return builder.build()
+    return builder.build(construction_checkpoint=construction_checkpoint)
 
 
 # ---------------------------------------------------------------------------
@@ -927,7 +936,11 @@ class _DAGBuilder:
     # Build
     # ------------------------------------------------------------
 
-    def build(self) -> MechanismDAG:
+    def build(
+        self,
+        *,
+        construction_checkpoint: Optional[Callable[[MechanismDAG], set[str]]] = None,
+    ) -> MechanismDAG:
         """Build the DAG via one interleaved backward fixpoint.
 
         Starting from the terminal, every helper invocation receives a private
@@ -960,6 +973,19 @@ class _DAGBuilder:
         materialized_helpers: set[tuple[str, str]] = set()
         self._emitted_ids: set[int] = set()
         self._emitted_bindings: list[dict[str, Any]] = []
+        deferred: dict[str, dict[str, Any]] = {}
+        discharged: set[str] = set()
+
+        def enqueue_value(binding: dict[str, Any]) -> None:
+            if not binding.get("external_source_signal"):
+                enqueue_expression(
+                    str(binding.get("source_symbol") or binding.get("expression") or ""),
+                    self._binding_walk_scope(binding), binding.get("expression_ref"),
+                    origin_vertex_id=self._binding_operation_id(binding)[0],
+                    read_before_write_target=self._binding_read_before_write_target(binding),
+                    before_call_site_id=(str(binding.get("call_site_id") or "")
+                                         if binding.get("synthetic_call_binding") else ""),
+                )
 
         def enqueue_expression(
             expression: str,
@@ -1012,7 +1038,42 @@ class _DAGBuilder:
                 if invocation_key not in materialized_helpers:
                     frontier.append(("helper", invocation, scope, origin_vertex_id))
 
-        while frontier:
+        while frontier or deferred or discharged:
+            if not frontier:
+                snapshot = self._construction_snapshot(set(deferred) | discharged)
+                inactive = construction_checkpoint(snapshot) if construction_checkpoint else set()
+                # Newly materialized definitions can change guard evaluation.
+                # A prior discharge is not a permanent pruning certificate.
+                resumed = discharged - inactive
+                for binding in self._emitted_bindings:
+                    vertex_id = self._binding_operation_id(binding)[0]
+                    if vertex_id in resumed:
+                        deferred[vertex_id] = binding
+                discharged.difference_update(resumed)
+                # Only the checkpoint's source/domain-proven inactivity may
+                # discharge pending value work. Unknown paths are resumed.
+                for vertex_id in set(deferred) & inactive:
+                    discharged.add(vertex_id)
+                    del deferred[vertex_id]
+                if not deferred:
+                    del snapshot
+                    break
+                incoming: dict[str, list[str]] = defaultdict(list)
+                for edge in snapshot.edges:
+                    incoming[edge.target_id].append(edge.source_id)
+                pending_controls = [v.id for v in snapshot.vertices if v.kind == "branch"]
+                control_dependencies: set[str] = set()
+                while pending_controls:
+                    vertex_id = pending_controls.pop()
+                    if vertex_id in control_dependencies:
+                        continue
+                    control_dependencies.add(vertex_id)
+                    pending_controls.extend(incoming[vertex_id])
+                needed = set(deferred) & control_dependencies
+                for vertex_id in sorted(needed or set(deferred)):
+                    enqueue_value(deferred.pop(vertex_id))
+                del snapshot
+                continue
             kind, payload, scope, origin_vertex_id = frontier.popleft()
             if kind in {"symbol", "terminal"}:
                 is_terminal_root = kind == "terminal"
@@ -1091,28 +1152,19 @@ class _DAGBuilder:
                 writers = self._project_source_writers(writers, norm)
                 if writers:
                     for binding in writers:
-                        if id(binding) not in self._emitted_ids:
+                        newly_emitted = id(binding) not in self._emitted_ids
+                        if newly_emitted:
                             self._emitted_ids.add(id(binding))
                             self._emitted_bindings.append(binding)
                             self._emit_operation_vertex(
                                 binding,
                                 is_terminal=self._binding_reaches_terminal(binding),
                             )
-                        if not binding.get("external_source_signal"):
-                            enqueue_expression(
-                                str(binding.get("source_symbol") or binding.get("expression") or ""),
-                                self._binding_walk_scope(binding),
-                                binding.get("expression_ref"),
-                                origin_vertex_id=self._binding_operation_id(binding)[0],
-                                read_before_write_target=(
-                                    self._binding_read_before_write_target(binding)
-                                ),
-                                before_call_site_id=(
-                                    str(binding.get("call_site_id") or "")
-                                    if binding.get("synthetic_call_binding")
-                                    else ""
-                                ),
-                            )
+                        if construction_checkpoint is not None:
+                            if newly_emitted:
+                                deferred[self._binding_operation_id(binding)[0]] = binding
+                        else:
+                            enqueue_value(binding)
                         # A branch's inputs are part of the mechanism:
                         # walking predicate symbols emits the internal-state
                         # writers that feasibility grounding later follows.
@@ -1164,9 +1216,28 @@ class _DAGBuilder:
                 )
                 frontier.append(("symbol", return_symbol, body_scope, origin_vertex_id))
 
-        # Wire edges now that every producer vertex has been emitted.
+        return self._construction_snapshot(discharged)
+
+    def _construction_snapshot(self, pending: set[str]) -> MechanismDAG:
+        """Wire a coherent view without retaining provisional missing inputs.
+
+        Source operations and invocation identities survive suspension. Derived
+        edges/leaves are rewired against the current producer index so an early
+        opaque leaf or source request cannot survive after its producer arrives.
+        """
+        self.vertices = {key: value.model_copy(deep=True) for key, value in self.vertices.items()
+                         if value.kind == "operation"}
+        self.edges = {}
+        self._evidence_by_signal = {}
+        self._branch_by_site = {}
+        self._producers_by_symbol = {}
+        self._producer_shapes = defaultdict(list)
+        for vertex in self.vertices.values():
+            self._index_producer(exact_symbol(vertex.variable or ""), vertex.id)
+        walk_references = dict(self._unresolved_references)
+        walk_symbols = set(self.unresolved_symbols)
         for binding in self._emitted_bindings:
-            self._wire_binding_edges(binding)
+            self._wire_binding_edges(binding, controls_only=self._binding_operation_id(binding)[0] in pending)
 
         terminal_ids = [v.id for v in self.vertices.values() if v.metadata.get("is_terminal")]
         for key in self._terminal_reference_keys:
@@ -1175,14 +1246,18 @@ class _DAGBuilder:
                 "origin_vertex_ids": dedupe_keep_order([*reference.origin_vertex_ids, *terminal_ids]),
             })
 
-        return MechanismDAG(
+        snapshot = MechanismDAG(
             dag_id=stable_id("dag", (self.terminal, tuple(sorted(self.vertices.keys())))),
             terminal=self.terminal_raw,
             vertices=[self.vertices[key] for key in self.vertices],
             edges=[self.edges[key] for key in self.edges],
             unresolved_symbols=sorted(self.unresolved_symbols),
             unresolved_references=list(self._unresolved_references.values()),
+            pending_construction=sorted(pending),
         )
+        self._unresolved_references = walk_references
+        self.unresolved_symbols = walk_symbols
+        return snapshot
 
     # ------------------------------------------------------------
     # Native backward-walk helpers
@@ -3701,7 +3776,7 @@ class _DAGBuilder:
             self._index_producer(target_norm, op_id)
         return op_id
 
-    def _wire_binding_edges(self, binding: dict[str, Any]) -> None:
+    def _wire_binding_edges(self, binding: dict[str, Any], *, controls_only: bool = False) -> None:
         op_id, _target_raw, file, line, target_norm, expression = self._binding_operation_id(binding)
 
         # Attach control-predicate branches at their OWN source sites —
@@ -3750,6 +3825,9 @@ class _DAGBuilder:
                 condition_ref=condition_ref,
             )
             self._add_edge(branch_id, op_id, kind="control")
+
+        if controls_only:
+            return
 
         # Wire each source-expression symbol as an incoming data edge,
         # resolved in the binding's own callable scope.
@@ -6399,6 +6477,11 @@ def split_by_terminal(dag: MechanismDAG) -> list[MechanismDAG]:
                 vertices=selected_vertices,
                 edges=selected_edges,
                 unresolved_symbols=sorted(surviving_symbols),
+                unresolved_references=[
+                    reference for reference in dag.unresolved_references
+                    if not reference.origin_vertex_ids or reachable.intersection(reference.origin_vertex_ids)
+                ],
+                pending_construction=[vertex_id for vertex_id in dag.pending_construction if vertex_id in reachable],
             )
         )
     return subgraphs

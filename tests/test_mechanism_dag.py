@@ -2293,7 +2293,8 @@ def test_only_exact_source_boundary_transfer_call_skips_helper_expansion():
     assert probes == ["update"]
 
 
-def test_unresolved_receiver_calls_share_one_provider_lookup_identity():
+@pytest.mark.parametrize("staged", [False, True])
+def test_unresolved_receiver_calls_share_one_provider_lookup_identity(staged):
     probes: list[str] = []
 
     def provider(name, reference=None):
@@ -2322,12 +2323,13 @@ def test_unresolved_receiver_calls_share_one_provider_lookup_identity():
         },
     )
     binding = structure.enrich_bindings([binding])[0]
-    build_mechanism_dag(
+    dag = build_mechanism_dag(
         [binding],
         "answer",
         terminal_file="main.cpp",
         source_structure=structure,
         helper_body_provider=provider,
+        construction_checkpoint=(lambda _: set()) if staged else None,
         call_statements=[
             _fake_call(
                 "compute",
@@ -2343,7 +2345,11 @@ def test_unresolved_receiver_calls_share_one_provider_lookup_identity():
         ],
     )
 
-    assert probes == ["compute"]
+    assert probes == ([] if staged else ["compute"])
+    references = [r for r in dag.unresolved_references if r.kind == "callable"]
+    assert references
+    assert all(r.receiver == "client" and r.source_site_id and r.origin_vertex_ids for r in references)
+    assert all(r.callable_id == "main.cpp:1:Controller::run:" for r in references)
 
 
 def test_helper_body_provider_lazily_supplies_missing_helper():

@@ -105,6 +105,7 @@ def assess_checkpoint(
                 assumptions=list(scope.assumptions))
 
     observed_set = set(observed_signals)
+    pending_construction = set(source.pending_construction)
     parameters = (value_session.parameters if value_session is not None else
                   {str(name).upper(): value for name, value in (parameter_values or {}).items()})
     policies = signal_policies or {}
@@ -255,6 +256,9 @@ def assess_checkpoint(
         vertex = vertices[vertex_id]
         metadata = vertex.metadata or {}
         if vertex_id in inactive:
+            continue
+        if vertex_id in pending_construction:
+            require("construction", "source value dependencies have not been materialized", vertex_id)
             continue
         if vertex.kind == "evidence":
             if vertex.sub_kind == "parameter":

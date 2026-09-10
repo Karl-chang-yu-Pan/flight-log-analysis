@@ -122,5 +122,6 @@ def evaluate_checkpoint_round(
         "selected_checkpoint": selected,
         "preflight": {signal or "internal_terminal": value for signal, value in preflight.items()},
         "dynamic_gate_count": len(ready),
+        "pending_construction_count": len(dag.pending_construction),
         "reason": "source-backed checkpoint verified" if verified else "checkpoint has outstanding analysis requirements",
     })

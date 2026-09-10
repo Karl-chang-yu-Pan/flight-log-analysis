@@ -411,3 +411,108 @@ def test_streamed_feasibility_matches_retained_results(checkpoint):
     assert expected.model_dump() == actual.model_dump()
     assert all(timestamp is None for _vertex, timestamp in session._value_cache)
     assert session._sample_cache == {}
+
+
+def test_pending_value_work_cannot_verify_even_when_old_edges_match(checkpoint):
+    dag = checkpoint[0]
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    dag.pending_construction = [root.id]
+    result = control(checkpoint)
+    assert result.action == "unresolved"
+    assert result.summary["selected_checkpoint"]["status"] == "not_attempted"
+    assert "construction" in kinds(result.summary["selected_checkpoint"])
+    assert "pending_construction" not in dag.model_dump()
+
+
+def test_pending_conditional_subscription_is_not_discharged(checkpoint):
+    dag = checkpoint[0]
+    transfer = next(v for v in dag.vertices if v.metadata.get("boundary_direction") == "subscribe")
+    add_gate(dag, transfer.id)
+    dag.pending_construction = [transfer.id]
+    result = control(checkpoint)
+    selected = result.summary["selected_checkpoint"]
+    assert result.action == "unresolved"
+    assert transfer.id not in selected["inactive_writer_ids"]
+    assert "construction" in kinds(selected)
+
+
+def test_terminal_views_preserve_pending_work_and_writer_requirements(checkpoint):
+    from flight_log_agent.analysis.mechanism_dag import split_by_terminal
+
+    dag = checkpoint[0]
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    other = root.model_copy(update={"id": "other-root"})
+    dag.vertices.append(other)
+    dag.pending_construction = [root.id]
+    request = UnresolvedSourceReference(symbol="writer", kind="callable", origin_vertex_ids=[root.id])
+    dag.unresolved_references.append(request)
+    selected = next(view for view in split_by_terminal(dag) if root.id in {v.id for v in view.vertices})
+    assert selected.pending_construction == [root.id]
+    assert selected.unresolved_references == [request]
+
+
+@pytest.mark.parametrize("gate_value", ["False", "True", "unavailable"])
+def test_construction_resumes_guard_inputs_before_guarded_values(gate_value):
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+
+    def binding(target, value, line, inputs=(), controls=()):
+        return {"target_symbol": target, "source_symbol": value,
+                "expression_ref": expression(value, *inputs),
+                "assignment_path": [{"file": "sample.cpp", "line": line}],
+                "function": "run", "control_predicates": list(controls),
+                "control_expression_refs": [expression(p, p) for p in controls]}
+
+    bindings = [binding("seed", gate_value, 1, () if gate_value != "unavailable" else (gate_value,)),
+                binding("gate", "seed", 2, ("seed",)),
+                binding("output", "missing_value", 3, ("missing_value",), ("gate",))]
+    snapshots = []
+
+    def checkpoint(dag):
+        snapshots.append(dag)
+        result = evaluate_checkpoint_round(
+            dag, parameter_values={}, observed_signals=set(), signal_policies={},
+            load_samples=lambda *_: {},
+        )
+        assert result.action != "verified"
+        return set(result.summary["selected_checkpoint"]["inactive_writer_ids"])
+
+    staged = build_mechanism_dag(bindings, "output", construction_checkpoint=checkpoint)
+    assert len(snapshots) >= 2
+    assert snapshots[0].pending_construction
+    assert not any(v.signal_name == "missing_value" for v in snapshots[0].vertices)
+    gate = next(v for v in staged.vertices if v.variable == "gate")
+    assert all(not (v.sub_kind == "opaque_symbol" and v.signal_name == "gate") for v in staged.vertices)
+    assert any(e.source_id == gate.id and e.kind == "data" for e in staged.edges)
+    if gate_value == "False":
+        assert staged.pending_construction
+        assert not any(v.signal_name == "missing_value" for v in staged.vertices)
+    else:
+        assert staged.pending_construction == []
+        eager = build_mechanism_dag(bindings, "output")
+        assert {v.id: v.model_dump() for v in staged.vertices} == {v.id: v.model_dump() for v in eager.vertices}
+        assert {e.id: e.model_dump() for e in staged.edges} == {e.id: e.model_dump() for e in eager.edges}
+        assert staged.unresolved_symbols == eager.unresolved_symbols
+
+
+def test_construction_revisits_discharge_after_new_definitions():
+    def binding(target, value, line, *inputs):
+        return {"target_symbol": target, "source_symbol": value,
+                "expression_ref": expression(value, *inputs),
+                "assignment_path": [{"file": "sample.cpp", "line": line}], "function": "run"}
+
+    bindings = [binding("left", "missing", 1, "missing"),
+                binding("step", "1", 2), binding("right", "step", 3, "step"),
+                binding("output", "left + right", 4, "left", "right")]
+    discharged = []
+
+    def checkpoint(dag):
+        left = next((v for v in dag.vertices if v.variable == "left"), None)
+        if left is not None and not discharged:
+            discharged.append(left.id)
+            return {left.id}
+        return set()
+
+    dag = build_mechanism_dag(bindings, "output", construction_checkpoint=checkpoint)
+    assert discharged
+    assert dag.pending_construction == []
+    assert "missing" in dag.unresolved_symbols

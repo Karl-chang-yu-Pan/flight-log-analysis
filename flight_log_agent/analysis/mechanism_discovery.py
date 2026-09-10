@@ -1583,6 +1583,7 @@ def discover_mechanism_dag(
     round_annotator: Optional[Callable[[MechanismDAG], MechanismDAG]] = None,
     round_observer: Optional[Callable[[MechanismDAG, MechanismDAG, int], None]] = None,
     checkpoint_evaluator: Optional[Callable[[MechanismDAG, int], CheckpointRound]] = None,
+    construction_evaluator: Optional[Callable[[MechanismDAG, int], CheckpointRound]] = None,
 ) -> DiscoveryResult:
     """Build a DAG by exact, provenance-checked fixed-point expansion.
 
@@ -1610,6 +1611,11 @@ def discover_mechanism_dag(
     ``checkpoint_evaluator`` is an optional deterministic controller. It runs
     before whole-round feasibility and selects exact graph-originated requests,
     or stops this source investigation with verified/unresolved evidence.
+
+    ``construction_evaluator`` additionally assesses coherent partial graphs
+    before guarded value expansion. Its exact inactive-writer result controls
+    local materialization, not source admission or whole-question sufficiency.
+    Keeping it separate preserves the completed-round callback contract.
     """
     _ = (cache_root, source_root, max_rounds, max_files_per_round, max_files_total)
     terminal_as_given = str(terminal or "").strip()
@@ -1777,6 +1783,12 @@ def discover_mechanism_dag(
             structure=inputs.structure,
             resolver=resolver,
         )
+
+        def construction_checkpoint(snapshot: MechanismDAG) -> set[str]:
+            assessment = construction_evaluator(snapshot, index)
+            selected = assessment.summary.get("selected_checkpoint") or {}
+            return set(selected.get("inactive_writer_ids") or ())
+
         dag = build_mechanism_dag(
             inputs.bindings,
             terminal,
@@ -1795,6 +1807,7 @@ def discover_mechanism_dag(
             boundary_bindings=inputs.boundary_bindings,
             enum_registry=enum_registry,
             source_structure=inputs.structure,
+            construction_checkpoint=construction_checkpoint if construction_evaluator is not None else None,
         )
 
         unresolved = set(dag.unresolved_symbols)
