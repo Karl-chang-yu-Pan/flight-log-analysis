@@ -140,8 +140,78 @@ The real-log measurements below predate staged construction: they are a baseline
 not evidence of its performance. Terminal caller-context registration and each
 control-dependency wave still run synchronously; the implementation does not
 provide a resource preemption guarantee inside those operations.
-New source files still enter through the existing outer discovery rounds; local
-resumption does not yet retain the builder across a source-admission round.
+New source files enter through the existing exact-source discovery rounds.
+Checkpoint-controlled discovery retains one `DAGConstructionSession` and builder
+across these rounds. Source admission refreshes declaration/call indexes and
+suspends previously materialized values for revalidation. The demanded read
+relationships and operation identities remain in the session; obsolete caller
+instances cannot remain live producers after their reaching definitions change.
+
+### Demand Contract Follow-up
+
+The controller returns explicit `ConstructionDemand` operation IDs from checkpoint
+construction requirements. Scheduling distinguishes guard construction, guard
+source discovery, local calculation construction, other exact source discovery,
+and blocked analysis. A missing guard helper suspends guarded value work while
+its exact source request is searched. An exhausted search releases scheduling
+priority, not the unresolved proof obligation: other work may resume in the same
+builder while the guard stays unknown. No source/file/round budget was added.
+
+The builder leaves unrequested work pending; an empty demand suspends instead of
+expanding every deferred value. Legacy inactive-only callbacks remain available
+for shared comparison tests. Source discovery still uses the existing typed
+frontier, and neither pending work nor empty searches authorize verification.
+
+Source-proven intermediate publications within the final target's dependencies
+are assessed separately, including all their known alternative writers. Their
+observations are loaded alongside the selected target's inputs. A local match
+retains `known_graph` scope and cannot authorize stopping for the final question;
+a local mismatch cannot be concealed by downstream numerical agreement. These
+are views and evaluations of the same DAG, not a second mechanism or generated
+formula. Intermediate requirements guide local construction without replacing
+the question target.
+
+Branch wiring considers exact source expression records before spelling-only
+records at the same site, avoiding the observed consumer-arrival regression.
+Shared eager/staged tests reverse consumer order and retain exact branch inputs.
+
+Selection remains rooted in the final target's dependencies; it does not invent
+bindings or seek unrelated observed outputs to obtain a passing comparison.
+Derived snapshot wiring and source indexes are still rebuilt when required;
+fully incremental indexing/wiring and run-local sample reuse are not claimed.
+The prior experimental full runs stayed unresolved and increased RTL/airspeed
+CPU cost; takeoff hit its memory guard. No full-run improvement is claimed for
+this follow-up.
+
+### Follow-up Verification
+
+Focused checks passed: 389 tests, with two existing expected legacy-parser
+failures. Coverage includes guard-source-before-value-source ordering, false
+guards skipping value discovery, true guards resuming it, unknown guards
+remaining obligations after exhausted searches, retained builder identity,
+late-caller equivalence with a fresh build, and intermediate comparison scope.
+
+Resource-audited RTL/airspeed first-round probes completed without guards and
+stopped for guard-related source requirements with values still pending. These
+are deterministic fixed-terminal checks with no APIs or persistent analysis
+caches, not complete question-to-report runs. Commands, source hashes, exact
+graphs/frontiers, demands and resource samples are retained under
+`outputs/checkpoint_demand_audit_20260911/`.
+
+Two-round probes also completed without resource guards. Each recorded exactly
+one builder initialization and one source admission on that same builder, then
+continued requesting guard-source dependencies with values still pending.
+
+| Case | Two-Round Wall | Python CPU | Peak Tree PSS | Pending Values |
+| --- | ---: | ---: | ---: | ---: |
+| RTL | 24.65 s | 8.09 s | 147.72 MiB | 5 |
+| Airspeed | 42.82 s | 10.62 s | 185.09 MiB | 16 |
+
+Python CPU is from the final child event; PSS includes the sampled process tree.
+Both retain unresolved requirements and neither is verified. Two rounds validate
+source-admission continuation, not complete discovery, flight-wide correctness,
+or a performance comparison with an exhausted full run. The audit adapter and
+supervisor source are embedded in each scope's metadata JSON for reproducibility.
 
 ## Enabling The Trial
 
@@ -177,8 +247,11 @@ analysis caches remain disabled. The neighboring worktree is unchanged.
 
 Shared numerical contracts exercise terminal and checkpoint entry points with
 the same inputs and assertions. Source-to-pipeline trial tests run against both
-legacy and tree-sitter extraction, verifying unchanged graphs, loaded files,
-judge payloads, and reports with diagnostics on/off.
+legacy and tree-sitter extraction, verifying unchanged causal renders, loaded
+files, and reports with diagnostics on/off. The internal-value candidate may
+add a downstream publication witness; the shared pipeline test asserts that
+exact vertex/edge and diagnostic-write delta before comparing the remaining
+payload. This is not unrestricted permission for judge-input differences.
 The same source-to-pipeline fixture also checks missing observed inputs against
 both backends. Assessment tests cover unrelated branches, scoped source
 requests, declared-only observations, unlinked locals and guard operands,
@@ -241,6 +314,120 @@ Artifacts: `outputs/checkpoint_control_audit_20260909T135250Z/audit.json`,
 with per-case commands, input hashes, raw graphs, frontiers, checkpoint
 requirements, per-stage timings, resource samples and captured stacks in
 that directory and the earlier batch directories referenced by the audit.
+
+## Conditional Observation Checks (2026-09-11)
+
+The staged builder now retains source-backed publication copy paths to values
+already present in the graph. These are downstream observation witnesses, not
+invented subscription edges or inversions of arithmetic. The correspondence
+requires parser-proven direct storage, scoped producers, a publication source
+site, and an unambiguous observed topic instance. Casts and other transforms
+are not treated as copies. The internal witness metadata is excluded from
+serialized DAG/report schemas.
+
+`dag_observation.py` checks local equations using the existing compiled graph
+expressions and source-linked intermediate observations. Inputs must have the
+same publication site, callable, topic instance and exact sample timestamp.
+Ambiguous producers, cross-publication alignment, circular observations and
+duplicate timestamps remain unevaluable. Explicit comparison windows are
+honored; unresolved or assumption-dependent windows do not authorize a check.
+
+A local match is conditional evidence only. It does not establish writer
+applicability, representation/timing equivalence, alternative-writer coverage,
+or intermediate-state initialization/history. The result explicitly retains
+these obligations and cannot authorize discovery stopping. It does not feed
+substitute values into the ordinary feasibility/replay session. No judge code,
+prompt, report schema, persistent cache, or paid API was changed or used.
+
+Source fixtures exercise the RTL floor, airspeed bank correction, TECS
+reference equation and takeoff stage selection with synthetic identifiers.
+These validate local calculation contracts, not the four flight explanations.
+The legacy backend has an additional strict expected failure because it does
+not provide the exact direct-copy metadata required by the shared contract.
+
+### Real-Source Staged Audit
+
+Artifacts and embedded harness/input hashes are under
+`outputs/observation_checkpoint_audit_20260911/`. Commands:
+
+```bash
+.venv/bin/python /tmp/checkpoint_demand_audit.py --output outputs/observation_checkpoint_audit_20260911 --scope first-round --cases rtl airspeed tecs_height_rate takeoff
+.venv/bin/python /tmp/checkpoint_demand_audit.py --output outputs/observation_checkpoint_audit_20260911 --scope two-round --cases rtl airspeed tecs_height_rate takeoff
+```
+
+These are fresh, fixed-terminal deterministic probes, with no question-intent
+or judge APIs and no explicit question-event windows. They are not complete
+question-to-report runs. Each case runs sequentially at reduced priority on
+one CPU, with a 600-second timeout, 450 MiB sustained tree-PSS guard, 1000 MiB
+emergency RSS guard, and minimum available host-memory guard. These are test
+supervisor limits, not production discovery limits or completeness evidence.
+
+| First-Round Case | Wall Time | Main Python CPU | Peak Tree PSS |
+| --- | ---: | ---: | ---: |
+| RTL | 15.58 s | 2.73 s | 109.84 MiB |
+| Airspeed | 28.70 s | 12.28 s | 149.01 MiB |
+| TECS height rate | 19.63 s | 6.39 s | 145.96 MiB |
+| Takeoff | 44.34 s | 22.44 s | 186.60 MiB |
+
+All first-round probes exited normally without resource guards. CPU figures
+come from the main Python process's final event, not cumulative subprocess
+CPU. Wall time includes source/log setup. Per-stage events and checkpoint
+timings are preserved alongside the resource samples.
+
+RTL still has no usable local equation observation in round one. Airspeed
+has 13 publication-backed local candidates, all unevaluable because operands
+have missing/alternative writers. Takeoff has 12 unevaluable candidates at
+the mission-item altitude copy: its unbound member expression is not a
+compiled arithmetic equation. TECS has no local arithmetic candidate and
+stops on source linkage, including the debug-output member read. None of
+these results verifies the flight explanation. The staged implementation is
+not yet equivalent to the neighboring successful analyses.
+
+Focused regression command:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_dag_checkpoint.py tests/test_dag_pipeline.py tests/test_mechanism_judge.py tests/test_mechanism_discovery.py tests/test_mechanism_dag.py tests/test_tree_sitter_source.py tests/test_source_expression.py tests/test_mechanism_source_profiler.py
+```
+
+Result: **528 passed, 3 expected legacy-parser failures**, 16.95 seconds.
+`git diff --check` also passed. The full unrelated repository suite, full
+discovery-to-exhaustion probes, event-window flight explanations, and live
+question-to-report/API behavior were not verified by these staged checks.
+
+The observations expose a scheduling limitation as well as linkage gaps:
+local equations whose inputs are pending still wait behind guard-source
+requests. Conditional local calculation demand must eventually be distinct
+from permission to consider a guarded writer active; supporting the former
+must not silently grant the latter. Missing declaration/receiver links and
+unknown alternative-writer coverage also remain separate obligations.
+
+The first-round airspeed build also shows an added-cost regression relative
+to `outputs/checkpoint_demand_audit_20260911/`: main-process construction CPU
+increased from 1.37 to 8.77 seconds while the graph grew from 64/114 to 90/166
+vertices/edges. This identifies the observation-enabled build for profiling;
+it does not isolate an individual helper as the cause. Takeoff's first
+post-checkpoint expansion requests 793 references (594 callable, 185 symbol,
+14 storage-writer). A guard-first policy still authorizes substantial source
+work before a useful local equation is available. Neither issue is addressed
+by adding a production cap or treating an unresolved check as verified.
+
+| Requested Two-Round Case | Wall Time | Main Python CPU | Peak Tree PSS | Outcome |
+| --- | ---: | ---: | ---: | --- |
+| RTL | 23.65 s | 8.28 s | 148.06 MiB | Guard source required, 5 pending |
+| Airspeed | 72.59 s | 26.07 s | 188.20 MiB | Guard source required, 16 pending |
+| TECS height rate | 29.21 s | 6.53 s | 139.53 MiB | Blocked after one round on source linkage |
+| Takeoff | 548.40 s | 250.48 s | 359.72 MiB | Guard source required, 145 pending |
+
+All exited normally without resource guards. Each used one builder;
+RTL/airspeed/takeoff admitted source into that same instance once. TECS had
+no source admission and did not fabricate a second round. No local equation
+matched: airspeed retained 13 unevaluable candidates, takeoff 12, and the
+other cases had none. Takeoff's second build consumed 324.19 seconds wall
+time and 206.91 seconds main-process CPU after expansion/source admission;
+its intermediate feasibility passes were short. Resumability is demonstrated,
+but efficient construction and useful real-flight conditional evaluation are
+not finished. Broader full-discovery runs were not launched after this
+staged result exposed those remaining gaps.
 
 ## Remaining Work
 

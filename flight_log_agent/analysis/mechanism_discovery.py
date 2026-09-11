@@ -32,6 +32,7 @@ from flight_log_agent.analysis.source_expansion import (
 )
 from flight_log_agent.analysis.checkpoint_discovery import CheckpointRound
 from flight_log_agent.analysis.mechanism_dag import (
+    DAGConstructionSession,
     MechanismDAG,
     _DAGBuilder,
     build_mechanism_dag,
@@ -1652,6 +1653,7 @@ def discover_mechanism_dag(
     visited: set[tuple[Any, ...]] = set()
     checkpoint: Optional[CheckpointRound] = None
     stop_reason = "frontier_exhausted"
+    construction_session = DAGConstructionSession() if construction_evaluator is not None else None
 
     def bindings_write_terminal(bindings: Iterable[dict[str, Any]]) -> bool:
         canonical = exact_symbol(terminal)
@@ -1732,8 +1734,11 @@ def discover_mechanism_dag(
 
     index = 0
     first_pass = True
-    while first_pass or pending:
+    resume_construction = False
+    while first_pass or pending or resume_construction:
         first_pass = False
+        local_resume = resume_construction
+        resume_construction = False
         new_files = [file_path for file_path in pending if file_path not in facts_by_file]
         pending = []
         for file_path in new_files:
@@ -1741,7 +1746,8 @@ def discover_mechanism_dag(
             facts_by_file[file_path] = facts
             loaded.append(file_path)
 
-        inputs = dag_inputs_from_facts(facts_by_file.values())
+        if new_files or not local_resume:
+            inputs = dag_inputs_from_facts(facts_by_file.values())
 
         # Gate the build on terminal validation. A verdict scoped to a
         # resolved file is locked — later rounds load foreign files whose
@@ -1784,14 +1790,11 @@ def discover_mechanism_dag(
             resolver=resolver,
         )
 
-        def construction_checkpoint(snapshot: MechanismDAG) -> set[str]:
+        def construction_checkpoint(snapshot: MechanismDAG):
             assessment = construction_evaluator(snapshot, index)
-            selected = assessment.summary.get("selected_checkpoint") or {}
-            return set(selected.get("inactive_writer_ids") or ())
+            return assessment.construction
 
-        dag = build_mechanism_dag(
-            inputs.bindings,
-            terminal,
+        build_arguments = dict(
             inventory=inventory,
             schema_signals=schema_signals,
             logged_signals=logged_signals,
@@ -1808,7 +1811,12 @@ def discover_mechanism_dag(
             enum_registry=enum_registry,
             source_structure=inputs.structure,
             construction_checkpoint=construction_checkpoint if construction_evaluator is not None else None,
+            construction_session=construction_session,
         )
+        if local_resume:
+            dag = construction_session.builder.build(construction_checkpoint=construction_checkpoint)
+        else:
+            dag = build_mechanism_dag(inputs.bindings, terminal, **build_arguments)
 
         unresolved = set(dag.unresolved_symbols)
         rounds.append(
@@ -1892,6 +1900,17 @@ def discover_mechanism_dag(
             if file_path not in facts_by_file
         ]
         if not pending:
+            if construction_session is not None and references:
+                attempted = {reference.visit_key() for reference in references}
+                builder = construction_session.builder
+                if attempted - builder.exhausted_source_requests:
+                    builder.exhausted_source_requests.update(attempted)
+                    # Empty searches release scheduling priority, never proof
+                    # obligations. Reassess other pending dependencies in the
+                    # same builder before declaring the investigation stuck.
+                    resume_construction = True
+                    index += 1
+                    continue
             if checkpoint is not None:
                 checkpoint.action = "unresolved"
                 checkpoint.summary.update(action="unresolved", reason="exact source frontier exhausted with outstanding checkpoint requirements")

@@ -418,10 +418,84 @@ def test_pending_value_work_cannot_verify_even_when_old_edges_match(checkpoint):
     root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
     dag.pending_construction = [root.id]
     result = control(checkpoint)
-    assert result.action == "unresolved"
+    assert result.action == "continue"
     assert result.summary["selected_checkpoint"]["status"] == "not_attempted"
     assert "construction" in kinds(result.summary["selected_checkpoint"])
     assert "pending_construction" not in dag.model_dump()
+    assert root.id in result.construction.materialize
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_branch_exactness_does_not_depend_on_consumer_arrival(staged, reverse):
+    bindings = []
+    for line, exact in [(2, True), (3, False)]:
+        binding = {"target_symbol": "output", "source_symbol": str(line),
+                   "assignment_path": [{"file": "sample.cpp", "line": line}],
+                   "function": "run", "control_predicates": ["flag"],
+                   "control_predicate_lines": [1],
+                   "control_predicate_site_ids": ["sample.cpp:1:if"]}
+        if exact:
+            binding["control_expression_refs"] = [expression("flag", "flag")]
+        bindings.append(binding)
+    dag = build_mechanism_dag(
+        list(reversed(bindings)) if reverse else bindings, "output",
+        construction_checkpoint=(lambda _: set()) if staged else None,
+    )
+    branches = [v for v in dag.vertices if v.kind == "branch"]
+    assert len(branches) == 1
+    assert branches[0].metadata["expression_inputs_exact"] is True
+    assert branches[0].metadata["source_expression_ref"]["input_symbols"] == ["flag"]
+    assert len([e for e in dag.edges if e.target_id == branches[0].id and e.kind == "data"]) == 1
+
+
+def test_explicit_empty_demand_preserves_unexpanded_work():
+    from flight_log_agent.analysis.mechanism_dag import ConstructionDemand
+
+    dag = build_mechanism_dag(
+        [{"target_symbol": "output", "source_symbol": "missing",
+          "expression_ref": expression("missing", "missing"),
+          "assignment_path": [{"file": "sample.cpp", "line": 1}], "function": "run"}],
+        "output", construction_checkpoint=lambda _: ConstructionDemand(),
+    )
+    assert dag.pending_construction
+    assert not any(v.signal_name == "missing" for v in dag.vertices)
+
+
+@pytest.mark.parametrize("local_matches", [False, True])
+def test_intermediate_calculation_cannot_replace_final_question(checkpoint, local_matches):
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+
+    dag, samples, policies = checkpoint
+    intermediate = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    intermediate.metadata.pop("is_terminal")
+    metadata = {**intermediate.metadata, "is_terminal": True,
+                "external_target_signal": "final.value",
+                "source_expression_ref": expression("command.value * 0", "command.value")}
+    final = intermediate.model_copy(update={
+        "id": "final", "variable": "final.value", "expression": "command.value * 0",
+        "lowered_expression": None, "metadata": metadata,
+    })
+    dag.vertices.append(final)
+    dag.edges.append(DAGEdge(id="to-final", source_id=intermediate.id, target_id=final.id,
+                             kind="data", role="command.value"))
+    samples["final.value"] = [(0., 0.), (10., 0.)]
+    policies["final.value"] = {"method": "linear"}
+    if local_matches:
+        dag.pending_construction = [final.id]
+    else:
+        samples["command.value"] = [(0., 9.), (10., 9.)]
+    result = evaluate_checkpoint_round(
+        dag, parameter_values={}, observed_signals=set(samples), signal_policies=policies,
+        load_samples=lambda *_: samples, question_target="final.value",
+    )
+    local = result.summary["intermediate_checkpoints"]["command.value"]
+    assert local["status"] == ("matched" if local_matches else "mismatched")
+    assert local["authorizes_discovery_stop"] is False
+    assert result.summary["selected_checkpoint"]["observed"] == "final.value"
+    assert result.action != "verified"
+    if local_matches:
+        assert final.id in result.construction.materialize
 
 
 def test_pending_conditional_subscription_is_not_discharged(checkpoint):
@@ -431,7 +505,7 @@ def test_pending_conditional_subscription_is_not_discharged(checkpoint):
     dag.pending_construction = [transfer.id]
     result = control(checkpoint)
     selected = result.summary["selected_checkpoint"]
-    assert result.action == "unresolved"
+    assert result.action == "continue"
     assert transfer.id not in selected["inactive_writer_ids"]
     assert "construction" in kinds(selected)
 
@@ -452,8 +526,10 @@ def test_terminal_views_preserve_pending_work_and_writer_requirements(checkpoint
 
 
 @pytest.mark.parametrize("gate_value", ["False", "True", "unavailable"])
-def test_construction_resumes_guard_inputs_before_guarded_values(gate_value):
+@pytest.mark.parametrize("explicit_demands", [False, True])
+def test_construction_resumes_guard_inputs_before_guarded_values(gate_value, explicit_demands):
     from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+    from flight_log_agent.analysis.mechanism_dag import DAGConstructionSession
 
     def binding(target, value, line, inputs=(), controls=()):
         return {"target_symbol": target, "source_symbol": value,
@@ -474,9 +550,22 @@ def test_construction_resumes_guard_inputs_before_guarded_values(gate_value):
             load_samples=lambda *_: {},
         )
         assert result.action != "verified"
+        if explicit_demands:
+            return result.construction
         return set(result.summary["selected_checkpoint"]["inactive_writer_ids"])
 
-    staged = build_mechanism_dag(bindings, "output", construction_checkpoint=checkpoint)
+    session = DAGConstructionSession()
+    staged = build_mechanism_dag(bindings, "output", construction_checkpoint=checkpoint,
+                                 construction_session=session)
+    if explicit_demands and gate_value == "unavailable":
+        assert staged.pending_construction
+        assert not any(v.signal_name == "missing_value" for v in staged.vertices)
+        # The host has searched this exact guard frontier and found no new
+        # facts. That permits further work, not an inactivity certificate.
+        session.builder.exhausted_source_requests.update(
+            reference.visit_key() for reference in staged.unresolved_references
+        )
+        staged = session.builder.build(construction_checkpoint=checkpoint)
     assert len(snapshots) >= 2
     assert snapshots[0].pending_construction
     assert not any(v.signal_name == "missing_value" for v in snapshots[0].vertices)

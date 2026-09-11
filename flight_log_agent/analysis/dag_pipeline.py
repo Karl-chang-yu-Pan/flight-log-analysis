@@ -1089,6 +1089,13 @@ async def run_dag_discovery_stage(
                     "scope", "resources", "action", "pending_construction_count",
                     "dynamic_gate_count",
                 )}
+                demand = summary.get("next_analysis") or {}
+                event["next_analysis"] = {
+                    "kind": demand.get("kind"),
+                    "operation_ids": demand.get("operation_ids", []),
+                    "guard_ids": demand.get("guard_ids", []),
+                    "source_request_count": len(demand.get("source_requests", [])),
+                }
             checkpoint_rounds.append(event)
             if checkpoint_observer is not None:
                 checkpoint_observer(event)

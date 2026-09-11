@@ -220,6 +220,8 @@ class MechanismDAG(BaseModel):
         default_factory=list, exclude=True
     )
     pending_construction: list[str] = Field(default_factory=list, exclude=True)
+    exhausted_source_requests: set[tuple[Any, ...]] = Field(default_factory=set, exclude=True)
+    observation_witnesses: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +273,8 @@ def _source_expression_metadata(
         ],
         "exact": bool(expression_ref.get("exact", False)),
     }
+    if expression_ref.get("direct_storage"):
+        record["direct_storage"] = str(expression_ref["direct_storage"])
     return {
         "source_expression": record["text"],
         "source_expression_ref": record,
@@ -365,6 +369,29 @@ def _parse_numeric_literal(
     return value if isinstance(value, (int, float, bool)) else None
 
 
+@dataclass(frozen=True)
+class ConstructionDemand:
+    """Run-local controller decision over existing operation identities.
+
+    Unrequested work stays pending, not disproven. An empty demand suspends
+    construction so the caller can obtain source or report a linkage blocker.
+    """
+
+    materialize: frozenset[str] = frozenset()
+    inactive: frozenset[str] = frozenset()
+
+
+@dataclass
+class DAGConstructionSession:
+    """One investigation's builder, retained across source-admission rounds.
+
+    This is execution state, not a persistent analysis cache. Source admission
+    refreshes declaration indexes and revalidates demanded reachability.
+    """
+
+    builder: Optional[_DAGBuilder] = None
+
+
 def build_mechanism_dag(
     source_bindings: Sequence[Any],
     terminal: str,
@@ -386,7 +413,8 @@ def build_mechanism_dag(
     boundary_bindings: Sequence[Any] = (),
     enum_registry: Optional[dict[str, dict[str, Any]]] = None,
     source_structure: Optional[SourceStructureIndex] = None,
-    construction_checkpoint: Optional[Callable[[MechanismDAG], set[str]]] = None,
+    construction_checkpoint: Optional[Callable[[MechanismDAG], set[str] | ConstructionDemand]] = None,
+    construction_session: Optional[DAGConstructionSession] = None,
 ) -> MechanismDAG:
     """Build a mechanism DAG for ``terminal``.
 
@@ -427,12 +455,14 @@ def build_mechanism_dag(
 
     ``construction_checkpoint`` enables staged construction and disables inline
     helper fetching. At coherent dependency boundaries it receives this DAG
-    with internal pending-operation IDs and returns only IDs whose inactivity
-    has been proven from exact source controls over the comparison domain.
+    with internal pending-operation IDs. A ConstructionDemand explicitly selects
+    operations to materialize and source/domain-proven inactive operations.
+    An empty demand suspends remaining work without treating it as complete.
+    Legacy comparison callbacks may still return only inactive IDs.
     Missing definitions remain typed source requests; known pending values are
     resumed in this builder, without reconstructing their invocation scopes.
     """
-    builder = _DAGBuilder(
+    configuration = dict(
         source_bindings=[_as_binding_dict(b) for b in source_bindings],
         terminal=terminal,
         helper_index=_index_helpers(helper_expressions),
@@ -452,6 +482,13 @@ def build_mechanism_dag(
         enum_registry=dict(enum_registry or {}),
         source_structure=source_structure or SourceStructureIndex(),
     )
+    if construction_session is None or construction_session.builder is None:
+        builder = _DAGBuilder(**configuration)
+        if construction_session is not None:
+            construction_session.builder = builder
+    else:
+        builder = construction_session.builder
+        builder.admit_source(**configuration)
     return builder.build(construction_checkpoint=construction_checkpoint)
 
 
@@ -461,7 +498,11 @@ def build_mechanism_dag(
 
 
 class _DAGBuilder:
-    def __init__(
+    def __init__(self, **configuration: Any) -> None:
+        self._configure_source(**configuration)
+        self._initialize_graph()
+
+    def _configure_source(
         self,
         *,
         source_bindings: list[dict[str, Any]],
@@ -733,6 +774,7 @@ class _DAGBuilder:
                 break
             pending_constants = unresolved
 
+    def _initialize_graph(self) -> None:
         self.vertices: dict[str, DAGVertex] = {}
         self.edges: dict[tuple[str, str, str, str, str], DAGEdge] = {}
         self.unresolved_symbols: set[str] = set()
@@ -760,6 +802,39 @@ class _DAGBuilder:
             str, list[list[tuple[dict[str, Any], tuple[str, str]]]]
         ] = {}
         self._index_source_call_edges()
+        self._walk_state: Optional[dict[str, Any]] = None
+        self.exhausted_source_requests: set[tuple[Any, ...]] = set()
+
+    def admit_source(self, **configuration: Any) -> None:
+        """Refresh source indexes without replacing this construction session.
+
+        Callable ownership and boundary bindings may improve with newly loaded
+        declarations. Revalidate the reachable walk, reusing operation objects
+        by exact identity; never retain old synthetic producers in the refreshed
+        source index merely because they existed in an earlier round.
+        """
+        if (configuration["terminal"] != self.terminal_raw
+                or configuration.get("terminal_file") != self.terminal_file):
+            raise ValueError("a construction session cannot change terminal identity")
+        self._configure_source(**configuration)
+        self._callers_by_callee.clear()
+        self._resolved_helper_key_by_call_site.clear()
+        self._caller_paths_cache.clear()
+        self._index_source_call_edges()
+        self._unresolved_references.clear()
+        self._terminal_reference_keys.clear()
+        self.unresolved_symbols.clear()
+        # Every materialized read must be checked against newly admitted
+        # writers. Suspend values again, retaining their operations and read
+        # dependencies; guards choose which of them need to resume.
+        if self._walk_state is not None:
+            state = self._walk_state
+            state["walked"].clear()
+            state["materialized_helpers"].clear()
+            state["deferred"].update(self._emitted_by_operation)
+            state["discharged"].clear()
+            state["frontier"].appendleft(state["terminal_request"])
+        self.exhausted_source_requests.clear()
 
     # ------------------------------------------------------------
     # Exact-identity indexes
@@ -939,7 +1014,7 @@ class _DAGBuilder:
     def build(
         self,
         *,
-        construction_checkpoint: Optional[Callable[[MechanismDAG], set[str]]] = None,
+        construction_checkpoint: Optional[Callable[[MechanismDAG], set[str] | ConstructionDemand]] = None,
     ) -> MechanismDAG:
         """Build the DAG via one interleaved backward fixpoint.
 
@@ -966,15 +1041,22 @@ class _DAGBuilder:
             None,
             None,
         )
-        frontier: deque[tuple[str, Any, Scope, str]] = deque(
-            [("terminal", self.terminal_raw, terminal_scope, "")]
-        )
-        walked: set[tuple[Any, ...]] = set()
-        materialized_helpers: set[tuple[str, str]] = set()
-        self._emitted_ids: set[int] = set()
-        self._emitted_bindings: list[dict[str, Any]] = []
-        deferred: dict[str, dict[str, Any]] = {}
-        discharged: set[str] = set()
+        if self._walk_state is None:
+            self._walk_state = {
+                "frontier": deque([("terminal", self.terminal_raw, terminal_scope, "")]),
+                "terminal_request": ("terminal", self.terminal_raw, terminal_scope, ""),
+                "walked": set(), "materialized_helpers": set(),
+                "deferred": {}, "discharged": set(), "read_producers": {},
+            }
+            self._emitted_ids: set[int] = set()
+            self._emitted_bindings: list[dict[str, Any]] = []
+            self._emitted_by_operation: dict[str, dict[str, Any]] = {}
+        frontier = self._walk_state["frontier"]
+        walked = self._walk_state["walked"]
+        materialized_helpers = self._walk_state["materialized_helpers"]
+        deferred = self._walk_state["deferred"]
+        discharged = self._walk_state["discharged"]
+        self._observe_values = construction_checkpoint is not None
 
         def enqueue_value(binding: dict[str, Any]) -> None:
             if not binding.get("external_source_signal"):
@@ -1041,7 +1123,8 @@ class _DAGBuilder:
         while frontier or deferred or discharged:
             if not frontier:
                 snapshot = self._construction_snapshot(set(deferred) | discharged)
-                inactive = construction_checkpoint(snapshot) if construction_checkpoint else set()
+                decision = construction_checkpoint(snapshot) if construction_checkpoint else set()
+                inactive = set(decision.inactive) if isinstance(decision, ConstructionDemand) else decision
                 # Newly materialized definitions can change guard evaluation.
                 # A prior discharge is not a permanent pruning certificate.
                 resumed = discharged - inactive
@@ -1058,6 +1141,15 @@ class _DAGBuilder:
                 if not deferred:
                     del snapshot
                     break
+                if isinstance(decision, ConstructionDemand):
+                    requested = set(decision.materialize) & set(deferred)
+                    if not requested:
+                        del snapshot
+                        break
+                    for vertex_id in sorted(requested):
+                        enqueue_value(deferred.pop(vertex_id))
+                    del snapshot
+                    continue
                 incoming: dict[str, list[str]] = defaultdict(list)
                 for edge in snapshot.edges:
                     incoming[edge.target_id].append(edge.source_id)
@@ -1085,6 +1177,8 @@ class _DAGBuilder:
                 if not norm or walk_key in walked:
                     continue
                 walked.add(walk_key)
+                producers: set[str] = set()
+                self._walk_state["read_producers"][walk_key] = producers
                 if (
                     norm != self.terminal
                     and self._source_constant_value(
@@ -1152,14 +1246,20 @@ class _DAGBuilder:
                 writers = self._project_source_writers(writers, norm)
                 if writers:
                     for binding in writers:
-                        newly_emitted = id(binding) not in self._emitted_ids
+                        operation_id = self._binding_operation_id(binding)[0]
+                        producers.add(operation_id)
+                        newly_emitted = operation_id not in self._emitted_by_operation
+                        previous = self._emitted_by_operation.get(operation_id)
+                        self._emitted_by_operation[operation_id] = binding
+                        if operation_id in deferred:
+                            deferred[operation_id] = binding
+                        if previous is not binding:
+                            self.vertices.pop(operation_id, None)
+                        self._emit_operation_vertex(
+                            binding, is_terminal=self._binding_reaches_terminal(binding),
+                        )
                         if newly_emitted:
                             self._emitted_ids.add(id(binding))
-                            self._emitted_bindings.append(binding)
-                            self._emit_operation_vertex(
-                                binding,
-                                is_terminal=self._binding_reaches_terminal(binding),
-                            )
                         if construction_checkpoint is not None:
                             if newly_emitted:
                                 deferred[self._binding_operation_id(binding)[0]] = binding
@@ -1216,7 +1316,7 @@ class _DAGBuilder:
                 )
                 frontier.append(("symbol", return_symbol, body_scope, origin_vertex_id))
 
-        return self._construction_snapshot(discharged)
+        return self._construction_snapshot(set(deferred) | discharged)
 
     def _construction_snapshot(self, pending: set[str]) -> MechanismDAG:
         """Wire a coherent view without retaining provisional missing inputs.
@@ -1225,8 +1325,27 @@ class _DAGBuilder:
         edges/leaves are rewired against the current producer index so an early
         opaque leaf or source request cannot survive after its producer arrives.
         """
+        # Reaching-definition updates can replace an old caller instance or
+        # writer. Retain its construction record, but never wire it as a live
+        # producer after no demanded read reaches it.
+        by_origin: dict[str, set[str]] = defaultdict(set)
+        for key, producers in self._walk_state["read_producers"].items():
+            by_origin[key[-1]].update(producers)
+        active: set[str] = set()
+        todo = list(by_origin[""])
+        while todo:
+            operation_id = todo.pop()
+            if operation_id in active:
+                continue
+            active.add(operation_id)
+            todo.extend(by_origin[operation_id])
+        self._emitted_bindings = [binding for key, binding in self._emitted_by_operation.items()
+                                  if key in active]
         self.vertices = {key: value.model_copy(deep=True) for key, value in self.vertices.items()
-                         if value.kind == "operation"}
+                         if value.kind == "operation" and key in active}
+        for binding in self._emitted_bindings:
+            self._emit_operation_vertex(binding, is_terminal=self._binding_reaches_terminal(binding))
+        pending = pending & active
         self.edges = {}
         self._evidence_by_signal = {}
         self._branch_by_site = {}
@@ -1236,8 +1355,19 @@ class _DAGBuilder:
             self._index_producer(exact_symbol(vertex.variable or ""), vertex.id)
         walk_references = dict(self._unresolved_references)
         walk_symbols = set(self.unresolved_symbols)
+        # Select source-backed predicate records before any consumer can emit
+        # a weaker spelling-only version of the same source branch.
+        branches = [branch for binding in self._emitted_bindings
+                    for branch in self._binding_branches(binding)]
+        branches.sort(key=lambda branch: not _source_expression_metadata(
+            branch.get("condition_ref"), branch["predicate"]
+        )["expression_inputs_exact"])
+        for branch in branches:
+            self._emit_branch(**branch)
         for binding in self._emitted_bindings:
             self._wire_binding_edges(binding, controls_only=self._binding_operation_id(binding)[0] in pending)
+
+        witnesses = self._wire_observation_witnesses() if self._observe_values else []
 
         terminal_ids = [v.id for v in self.vertices.values() if v.metadata.get("is_terminal")]
         for key in self._terminal_reference_keys:
@@ -1254,10 +1384,111 @@ class _DAGBuilder:
             unresolved_symbols=sorted(self.unresolved_symbols),
             unresolved_references=list(self._unresolved_references.values()),
             pending_construction=sorted(pending),
+            exhausted_source_requests=set(self.exhausted_source_requests),
+            observation_witnesses=witnesses,
         )
         self._unresolved_references = walk_references
         self.unresolved_symbols = walk_symbols
         return snapshot
+
+    def _wire_observation_witnesses(self) -> list[dict[str, Any]]:
+        """Attach source-proven copy paths to observed publications.
+
+        Only loaded source facts and exact scoped producers are consulted. A
+        witness is an observation of a value, not a reverse causal edge or a
+        subscription. Multiple writers and non-copy transformations stop this
+        correspondence walk; ordinary construction still owns those paths.
+        """
+        known = {key for key, vertex in self.vertices.items() if vertex.kind == "operation"}
+        witnesses: list[dict[str, Any]] = []
+        seen_publications: set[str] = set()
+        observed_by_topic: dict[str, list[str]] = defaultdict(list)
+        for signal in sorted(self.logged_signals):
+            parsed = parse_signal_reference(signal)
+            if parsed is not None:
+                observed_by_topic[parsed[0]].append(signal)
+
+        def copy_operand(binding: dict[str, Any]) -> Optional[str]:
+            ref = binding.get("expression_ref") or {}
+            if (not isinstance(ref, dict) or not ref.get("exact") or ref.get("call_results")
+                    or not ref.get("direct_storage")):
+                return None
+            if str(binding.get("assignment_operator") or "=") != "=":
+                return None
+            storage = str(ref["direct_storage"])
+            return storage if storage in (ref.get("input_symbols") or ()) else None
+
+        def trace(binding: dict[str, Any], seen: set[str]) -> Optional[list[dict[str, Any]]]:
+            path: list[dict[str, Any]] = []
+            while True:
+                vertex_id = self._binding_operation_id(binding)[0]
+                if vertex_id in seen:
+                    return None
+                seen.add(vertex_id)
+                path.append(binding)
+                if vertex_id in known:
+                    return path
+                operand = copy_operand(binding)
+                if not operand:
+                    return None
+                writers = self._project_source_writers(
+                    self._scoped_writers(exact_symbol(operand), operand, self._binding_walk_scope(binding)),
+                    exact_symbol(operand),
+                )
+                if len(writers) != 1:
+                    return None
+                binding = writers[0]
+
+        for publication in list(self._all_bindings):
+            if not (publication.get("synthetic_boundary_transfer")
+                    and publication.get("boundary_direction") == "publish"):
+                continue
+            target = exact_symbol(str(publication.get("target_symbol") or ""))
+            topic = strip_symbol_indices(target.split(".", 1)[0])
+            for signal in observed_by_topic.get(topic, ()):
+                # Resolve an omitted instance only through the actual inventory.
+                parsed = parse_signal_reference(signal)
+                if parsed is None:
+                    continue
+                reference = f"{parsed[0]}.{parsed[2]}" if target == parsed[0] else signal
+                if (not source_storage_produces_reference(target, reference)
+                        or self._observed_signal_placement(reference) != signal):
+                    continue
+                projected = self._project_binding_to_reference(publication, reference)
+                if projected is None:
+                    continue
+                pub_id = self._binding_operation_id(projected)[0]
+                if pub_id in seen_publications:
+                    continue
+                # Even an already constructed publication must be traced through
+                # its copy expression to identify the value it observes.
+                operand = copy_operand(projected)
+                if not operand:
+                    continue
+                writers = self._project_source_writers(
+                    self._scoped_writers(exact_symbol(operand), operand, self._binding_walk_scope(projected)),
+                    exact_symbol(operand),
+                )
+                if len(writers) != 1:
+                    continue
+                path = trace(writers[0], {pub_id})
+                if not path:
+                    continue
+                seen_publications.add(pub_id)
+                for binding in reversed([projected, *path[:-1]]):
+                    self._emit_operation_vertex(binding, is_terminal=False)
+                    self._wire_binding_edges(binding)
+                scope = self._binding_walk_scope(publication)
+                witnesses.append({
+                    "signal": signal, "publication_id": pub_id,
+                    "value_id": self._binding_operation_id(path[-1])[0],
+                    "copy_vertex_ids": [self._binding_operation_id(b)[0] for b in [projected, *path[:-1]]],
+                    "publication_site": str(publication.get("projection_source_site_id")
+                                            or publication.get("source_site_id") or ""),
+                    "file": scope[0], "callable": scope[1], "line": scope[2],
+                    "source_order": scope[3], "direction": "observes",
+                })
+        return witnesses
 
     # ------------------------------------------------------------
     # Native backward-walk helpers
@@ -2896,6 +3127,8 @@ class _DAGBuilder:
                 ),
                 "synthetic_source_projection": True,
                 "projection_of_target": target,
+                "projection_source_site_id": str(binding.get("projection_source_site_id")
+                                                 or binding.get("source_site_id") or ""),
                 "_projection_origin_token": binding.get(
                     "_projection_origin_token", id(binding)
                 ),
@@ -3776,7 +4009,7 @@ class _DAGBuilder:
             self._index_producer(target_norm, op_id)
         return op_id
 
-    def _wire_binding_edges(self, binding: dict[str, Any], *, controls_only: bool = False) -> None:
+    def _binding_branches(self, binding: dict[str, Any]) -> Iterable[dict[str, Any]]:
         op_id, _target_raw, file, line, target_norm, expression = self._binding_operation_id(binding)
 
         # Attach control-predicate branches at their OWN source sites —
@@ -3798,8 +4031,8 @@ class _DAGBuilder:
                 if position < len(predicate_sites)
                 else line
             )
-            branch_id = self._emit_branch(
-                str(predicate),
+            yield dict(
+                predicate=str(predicate),
                 file=(
                     str(predicate_files[position])
                     if position < len(predicate_files)
@@ -3824,7 +4057,11 @@ class _DAGBuilder:
                 ),
                 condition_ref=condition_ref,
             )
-            self._add_edge(branch_id, op_id, kind="control")
+
+    def _wire_binding_edges(self, binding: dict[str, Any], *, controls_only: bool = False) -> None:
+        op_id, _target_raw, file, line, target_norm, expression = self._binding_operation_id(binding)
+        for branch in self._binding_branches(binding):
+            self._add_edge(self._emit_branch(**branch), op_id, kind="control")
 
         if controls_only:
             return

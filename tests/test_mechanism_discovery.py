@@ -1202,6 +1202,21 @@ float Rtl::calc_gain(float base_in)
                       if v.provenance and v.provenance.startswith("helper_return")]
     assert helper_returns, "cross-file helper did not expand via provider"
     assert "src/lib/gain/gain.cpp" in result.files_loaded
+    fresh = build_mechanism_dag(
+        result.inputs.bindings, "_alt_out",
+        terminal_file=result.terminal_validation.resolved_file,
+        terminal_identity=result.terminal_validation.resolved_identity,
+        helper_expressions=result.inputs.helper_expressions,
+        call_statements=result.inputs.call_statements,
+        boundary_bindings=result.inputs.boundary_bindings,
+        source_structure=result.inputs.structure,
+    )
+    assert {v.id: v.model_dump() for v in result.dag.vertices} == {
+        v.id: v.model_dump() for v in fresh.vertices
+    }
+    assert {e.id: e.model_dump() for e in result.dag.edges} == {
+        e.id: e.model_dump() for e in fresh.edges
+    }
 
 
 def test_receiver_getter_reads_state_written_by_prior_call_site(tmp_path):
@@ -4136,3 +4151,250 @@ void run() {
     assert snapshots
     returns = [v for v in dag.vertices if str(v.provenance or "").startswith("helper_return:calculate@")]
     assert bool(returns) == (guard != "false")
+
+
+@pytest.mark.parametrize("guard", ["false", "true"])
+def test_guard_source_is_discovered_before_guarded_value(tmp_path, monkeypatch, guard):
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+    from flight_log_agent.analysis.mechanism_dag import _DAGBuilder
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "policy.hpp": "class Policy { public: bool allow(); float value(); void run(); float output; };",
+        "run.cpp": '#include "policy.hpp"\nvoid Policy::run() { if (allow()) { output = value(); } }',
+        "guard.cpp": '#include "policy.hpp"\nbool Policy::allow() { return ' + guard + '; }',
+        "value.cpp": '#include "policy.hpp"\nfloat Policy::value() { return 7.f; }',
+    }, backend="tree_sitter")
+    builders = []
+    original = _DAGBuilder.__init__
+
+    def initialize(self, **kwargs):
+        builders.append(self)
+        original(self, **kwargs)
+
+    monkeypatch.setattr(_DAGBuilder, "__init__", initialize)
+    decisions = []
+
+    def checkpoint(dag, index):
+        result = evaluate_checkpoint_round(
+            dag, parameter_values={}, observed_signals=set(), signal_policies={},
+            load_samples=lambda *_: {},
+        )
+        decisions.append((index, result.summary["next_analysis"]))
+        return result
+
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=[], terminal="output", terminal_file="run.cpp",
+        source_hash="hash", construction_evaluator=checkpoint, checkpoint_evaluator=checkpoint,
+    )
+    assert len(builders) == 1
+    assert "guard.cpp" in result.files_loaded
+    assert ("value.cpp" in result.files_loaded) == (guard == "true")
+    guard_round = next(r.index for r in result.rounds if "guard.cpp" in r.new_files)
+    if guard == "true":
+        value_round = next(r.index for r in result.rounds if "value.cpp" in r.new_files)
+        assert value_round > guard_round
+    assert any(item["kind"] == "guard_source" for _, item in decisions)
+    assert result.checkpoint.action != "verified"
+
+
+def test_source_admission_revalidates_late_caller_without_stale_producers(tmp_path):
+    from flight_log_agent.analysis.mechanism_dag import DAGConstructionSession
+
+    profiler = _mini_tree(tmp_path, {
+        "worker.hpp": "class Worker { public: void compute(float input); float output; };",
+        "worker.cpp": '#include "worker.hpp"\nvoid Worker::compute(float input) { output = input * 2.f; }',
+        "caller.cpp": '#include "worker.hpp"\nvoid invoke(Worker &worker) { worker.compute(3.f); }',
+    }, backend="tree_sitter")
+    session = DAGConstructionSession()
+
+    def build(files, retained):
+        inputs = dag_inputs_from_facts(load_facts(profiler, tmp_path / "cache", files, "hash"))
+        return build_mechanism_dag(
+            inputs.bindings, "output", terminal_file="worker.cpp",
+            helper_expressions=inputs.helper_expressions, call_statements=inputs.call_statements,
+            source_structure=inputs.structure, boundary_bindings=inputs.boundary_bindings,
+            construction_checkpoint=lambda _: set(), construction_session=retained,
+        )
+
+    before = build(["worker.hpp", "worker.cpp"], session)
+    builder = session.builder
+    after = build(["worker.hpp", "worker.cpp", "caller.cpp"], session)
+    fresh = build(["worker.hpp", "worker.cpp", "caller.cpp"], None)
+    assert session.builder is builder
+    assert {v.id for v in before.vertices if v.metadata.get("is_terminal")} != {
+        v.id for v in after.vertices if v.metadata.get("is_terminal")
+    }
+    assert {v.id: v.model_dump() for v in after.vertices} == {v.id: v.model_dump() for v in fresh.vertices}
+    assert {e.id: e.model_dump() for e in after.edges} == {e.id: e.model_dump() for e in fresh.edges}
+
+
+def _published_observation_probe(tmp_path, backend="tree_sitter", *, result_expression="measured * 2.f",
+                                 output_copy="result", observed_instances=(0,)):
+    source = """
+class Probe {
+    uORB::Publication<diagnostic_s> pub{ORB_ID(diagnostic)};
+    void run(float input) {
+        float measured = input;
+        float result = measured * 2.f;
+        diagnostic_s packet{};
+        packet.input = measured;
+        packet.result = result;
+        pub.publish(packet);
+    }
+};
+""".replace("measured * 2.f", result_expression).replace("packet.result = result;", f"packet.result = {output_copy};")
+    profiler = _mini_tree(tmp_path, {"sample.cpp": source}, backend=backend)
+    inputs = dag_inputs_from_facts(load_facts(profiler, tmp_path / "cache", ["sample.cpp"], "hash"))
+    samples = {f"diagnostic[{instance}].{field}": [(0., value), (1., value)]
+               for instance in observed_instances for field, value in [("input", 3.), ("result", 6.)]}
+    dag = build_mechanism_dag(
+        inputs.bindings, "result", terminal_file="sample.cpp", source_structure=inputs.structure,
+        call_statements=inputs.call_statements, boundary_bindings=inputs.boundary_bindings,
+        helper_expressions=inputs.helper_expressions, logged_signals=set(samples),
+        construction_checkpoint=lambda _: set(),
+    )
+    return dag, samples
+
+
+@pytest.mark.parametrize("backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="legacy assignments lack exact expression/copy metadata")),
+    "tree_sitter",
+])
+def test_published_intermediate_observes_source_value_without_subscription(tmp_path, backend):
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+    from flight_log_agent.analysis.dag_observation import observation_correspondences
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+
+    dag, samples = _published_observation_probe(tmp_path, backend)
+    correspondence = observation_correspondences(dag, DAGValueProgram(dag))
+    result_vertex = next(v for v in dag.vertices if v.variable == "result")
+    assert any(c["value_id"] == result_vertex.id and c["signal"] == "diagnostic[0].result"
+               for c in correspondence)
+    assert not any(v.metadata.get("boundary_direction") == "subscribe" for v in dag.vertices)
+    decision = evaluate_checkpoint_round(
+        dag, parameter_values={}, observed_signals=set(samples),
+        signal_policies={s: {"method": "linear"} for s in samples}, load_samples=lambda *_: samples,
+    )
+    check = next(c for c in decision.summary["local_equation_checks"] if c["root_vertex_id"] == result_vertex.id)
+    assert check["status"] == "matched", check
+    assert check["verification_scope"] == "local_equation_given_observations"
+    assert check["authorizes_discovery_stop"] is False
+    assert check["upstream_obligations_retained"] is True
+    assert decision.action != "verified"
+    assert "observation_witnesses" not in dag.model_dump()
+
+
+@pytest.mark.parametrize("copy", ["static_cast<int>(result)", "result * 3.f"])
+def test_observation_does_not_invert_transformation(tmp_path, copy):
+    dag, _ = _published_observation_probe(tmp_path, output_copy=copy)
+    assert not any(w["signal"].endswith(".result") for w in dag.observation_witnesses)
+
+
+def test_observation_does_not_guess_topic_instance(tmp_path):
+    dag, _ = _published_observation_probe(tmp_path, observed_instances=(0, 1))
+    assert dag.observation_witnesses == []
+
+
+@pytest.mark.parametrize("problem", [
+    "unaligned", "duplicate", "outside_scope", "mismatch", "circular",
+    "different_publication", "different_callable", "alternative_writer",
+])
+def test_local_observation_scope_and_alignment(tmp_path, problem):
+    from flight_log_agent.analysis.dag_observation import evaluate_local_observed_equations
+    from flight_log_agent.analysis.dag_replay import EvaluationScope
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+
+    dag, samples = _published_observation_probe(tmp_path)
+    if problem == "unaligned":
+        samples["diagnostic[0].input"] = [(0.1, 3.), (1.1, 3.)]
+    elif problem == "duplicate":
+        samples["diagnostic[0].input"].append((1., 4.))
+    elif problem in {"mismatch", "outside_scope"}:
+        samples["diagnostic[0].result"][0] = (0., 99.)
+    elif problem == "circular":
+        dag.observation_witnesses = [w for w in dag.observation_witnesses if w["signal"].endswith(".result")]
+    elif problem in {"different_publication", "different_callable"}:
+        witness = next(w for w in dag.observation_witnesses if w["signal"].endswith(".input"))
+        key = "publication_site" if problem == "different_publication" else "callable"
+        witness[key] += ":different"
+    elif problem == "alternative_writer":
+        root = next(v.id for v in dag.vertices if v.variable == "result")
+        edge = next(e for e in dag.edges if e.target_id == root and e.kind == "data")
+        original = next(v for v in dag.vertices if v.id == edge.source_id)
+        alternate = original.model_copy(update={"id": original.id + "_alternative"})
+        dag.vertices.append(alternate)
+        dag.edges.append(edge.model_copy(update={"id": edge.id + "_alternative", "source_id": alternate.id}))
+    program = DAGValueProgram(dag)
+    result = evaluate_local_observed_equations(
+        dag, program, signal_samples=samples, parameter_values={},
+        signal_policies={s: {"method": "linear"} for s in samples},
+        scope=EvaluationScope(windows=((1., 1.),)) if problem == "outside_scope" else None,
+        relevant_ids={v.id for v in dag.vertices},
+    )
+    root = next(v.id for v in dag.vertices if v.variable == "result")
+    check = next(c for c in result if c["root_vertex_id"] == root)
+    assert check["status"] == ("matched" if problem == "outside_scope" else "mismatched" if problem == "mismatch" else "unevaluable")
+    assert check["authorizes_discovery_stop"] is False
+
+
+@pytest.mark.parametrize("name,formula,rows", [
+    ("rtl_floor", "std::max(a, b * 2.f)", [(10., 10., 0., 20.)]),
+    ("airspeed_bank", "a * sqrtf(1.f / cosf(b))", [(19., 0.8726646259971648, 0., 23.698446)]),
+    ("tecs_reference", "(a - b) / 5.f + 0.3f * c", [(28.537527, 28.537385560152085, 3.3737552, 1.0121266)]),
+    ("takeoff_stage", "a ? b : c", [(1., 20., 7., 20.), (0., 20., 7., 7.)]),
+])
+def test_archived_calculation_shapes_use_source_and_observed_intermediates(tmp_path, name, formula, rows):
+    """Local acceptance shapes, not a substitute for the four real-source logs.
+
+    The equations are extracted from this source fixture, not passed directly
+    to replay. The numerical targets reflect the archived investigations.
+    Applicability, state history, and alternative-writer proofs remain open.
+    """
+    from flight_log_agent.analysis.dag_observation import evaluate_local_observed_equations
+    from flight_log_agent.analysis.dag_replay import EvaluationScope
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+
+    source = """
+class Instrument {
+    uORB::Publication<diagnostic_s> pub{ORB_ID(diagnostic)};
+    void run(float x, float y, float z) {
+        float a = x;
+        float b = y;
+        float c = z;
+        float result = FORMULA;
+        diagnostic_s packet{};
+        packet.a = a;
+        packet.b = b;
+        packet.c = c;
+        packet.result = result;
+        pub.publish(packet);
+    }
+};
+""".replace("FORMULA", formula)
+    profiler = _mini_tree(tmp_path, {"sample.cpp": source}, backend="tree_sitter")
+    inputs = dag_inputs_from_facts(load_facts(profiler, tmp_path / "cache", ["sample.cpp"], "hash"))
+    samples = {f"diagnostic[0].{field}": [(float(i), row[column]) for i, row in enumerate(rows)]
+               for column, field in enumerate(("a", "b", "c", "result"))}
+    dag = build_mechanism_dag(
+        inputs.bindings, "result", terminal_file="sample.cpp", source_structure=inputs.structure,
+        call_statements=inputs.call_statements, boundary_bindings=inputs.boundary_bindings,
+        helper_expressions=inputs.helper_expressions, logged_signals=set(samples),
+        construction_checkpoint=lambda _: set(),
+    )
+    program = DAGValueProgram(dag)
+    checks = evaluate_local_observed_equations(
+        dag, program, signal_samples=samples, parameter_values={},
+        signal_policies={s: {"method": "linear"} for s in samples},
+        scope=EvaluationScope(windows=((0., float(len(rows) - 1)),)),
+        relevant_ids={v.id for v in dag.vertices},
+    )
+    root = next(v.id for v in dag.vertices if v.variable == "result")
+    check = next(c for c in checks if c["root_vertex_id"] == root)
+    assert check["status"] == "matched", (name, check)
+    assert check["sample_count"] == len(rows)
+    assert check["observed_inputs"]
+    assert check["applicability_verified"] is False
+    assert check["writer_coverage_verified"] is False
+    assert check["upstream_obligations_retained"] is True
+    assert not check["authorizes_discovery_stop"]

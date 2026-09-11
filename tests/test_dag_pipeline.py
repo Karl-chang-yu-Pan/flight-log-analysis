@@ -1307,6 +1307,20 @@ void A::run()
         for candidate in payloads[0]["candidates"].values():
             assert "discovery_checkpoint" in candidate
             candidate.pop("discovery_checkpoint")
+        # The internal-value candidate now retains its source-proven downstream
+        # publication as an observation witness. Its causal render is unchanged;
+        # assert the exact diagnostic extension before comparing everything else.
+        candidate = payloads[0]["candidates"]["output.value"]
+        assert candidate["other_writes_not_reaching_terminal"] == [{
+            "target": "topic_out.value", "expression": "output.value",
+            "file": "sample.cpp", "line": 8, "reaches_terminal": False,
+        }]
+        candidate["other_writes_not_reaching_terminal"] = []
+        candidate["vertices"] -= 1
+        candidate["edges"] -= 1
+        for entry in candidate["rounds"]:
+            entry["vertices"] -= 1
+            entry["edges"] -= 1
     assert payloads[0] == payloads[1]
     return checkpoint
 
