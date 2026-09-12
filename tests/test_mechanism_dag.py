@@ -5,7 +5,7 @@ import re
 import pytest
 
 import flight_log_agent.analysis.dag_value as dag_value_module
-from flight_log_agent.analysis.dag_value import DAGValueProgram, DAGValueSession
+from flight_log_agent.analysis.dag_value import DAGValueContext, DAGValueProgram, DAGValueSession
 from flight_log_agent.analysis.mechanism_dag import (
     DAGEdge,
     DAGVertex,
@@ -4627,7 +4627,12 @@ def _shared_value_program_dag() -> MechanismDAG:
     )
 
 
-def test_dag_value_program_compiles_each_expression_once(monkeypatch):
+@pytest.fixture(params=[None, DAGValueContext(conditional_equations=True)], ids=["ordinary", "local"])
+def evaluation_context(request):
+    return request.param
+
+
+def test_dag_value_program_compiles_each_expression_once(monkeypatch, evaluation_context):
     compile_calls = []
     original = dag_value_module.compile_source_expression
 
@@ -4639,14 +4644,14 @@ def test_dag_value_program_compiles_each_expression_once(monkeypatch):
         dag_value_module, "compile_source_expression", counted_compile
     )
     program = DAGValueProgram(_shared_value_program_dag())
-    session = program.bind(sample_resolver=lambda _signal, _timestamp: 2.0)
+    session = program.bind(sample_resolver=lambda _signal, _timestamp: 2.0, context=evaluation_context)
     session.evaluate_many(("positive", "bounded"), 0.0)
     session.evaluate_many(("positive", "bounded"), 1.0)
 
     assert len(compile_calls) == 4
 
 
-def test_dag_value_session_normalizes_parameters_once():
+def test_dag_value_session_normalizes_parameters_once(evaluation_context):
     class CountingParameters(dict):
         calls = 0
 
@@ -4669,23 +4674,23 @@ def test_dag_value_session_normalizes_parameters_once():
     )
     branch = next(vertex for vertex in dag.vertices if vertex.kind == "branch")
     parameters = CountingParameters({"LIMIT": 2})
-    session = DAGValueProgram(dag).bind(parameter_values=parameters)
+    session = DAGValueProgram(dag).bind(parameter_values=parameters, context=evaluation_context)
 
     assert session.evaluate(branch.id, None).value is True
     assert session.evaluate(branch.id, None).value is True
     assert parameters.calls == 1
 
 
-def test_dag_value_session_shares_vertex_activity_and_sample_results(monkeypatch):
+def test_dag_value_session_shares_vertex_activity_and_sample_results(monkeypatch, evaluation_context):
     expression_calls = []
     activity_calls = []
     sample_calls = []
     original_expression = DAGValueSession._evaluate_expression_vertex
     original_activity = DAGValueSession._operation_activity
 
-    def counted_expression(self, vertex, timestamp, active):
+    def counted_expression(self, vertex, timestamp, active, **kwargs):
         expression_calls.append((vertex.id, timestamp))
-        return original_expression(self, vertex, timestamp, active)
+        return original_expression(self, vertex, timestamp, active, **kwargs)
 
     def counted_activity(self, vertex_id, timestamp, active):
         activity_calls.append((vertex_id, timestamp))
@@ -4697,6 +4702,7 @@ def test_dag_value_session_shares_vertex_activity_and_sample_results(monkeypatch
     monkeypatch.setattr(DAGValueSession, "_operation_activity", counted_activity)
     program = DAGValueProgram(_shared_value_program_dag())
     session = program.bind(
+        context=evaluation_context,
         sample_resolver=lambda signal, timestamp: (
             sample_calls.append((signal, timestamp)) or 2.0
         )

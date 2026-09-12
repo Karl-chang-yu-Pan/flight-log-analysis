@@ -13,8 +13,8 @@ from collections import defaultdict
 from typing import Any, Optional
 
 from flight_log_agent.analysis.dag_replay import EvaluationScope, _replay_tolerance
-from flight_log_agent.analysis.dag_value import DAGValueProgram
-from flight_log_agent.analysis.source_expression import SourceExpressionError
+from flight_log_agent.analysis.dag_value import DAGValueContext, DAGValueProgram, DAGValueResult
+from flight_log_agent.analysis.mechanism_dag import prepare_signal_series, sample_prepared_signal
 
 
 def observation_correspondences(dag: Any, program: DAGValueProgram) -> list[dict[str, Any]]:
@@ -66,6 +66,7 @@ def evaluate_local_observed_equations(
     signal_policies: dict[str, Any],
     scope: Optional[EvaluationScope],
     relevant_ids: set[str],
+    prepared_signal_series: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     """Check equations given source-linked values sampled in the same packet.
 
@@ -80,7 +81,8 @@ def evaluate_local_observed_equations(
     by_value: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in correspondences:
         by_value[item["value_id"]].append(item)
-    session = program.bind(parameter_values=parameter_values)
+    prepared = (prepared_signal_series if prepared_signal_series is not None
+                else prepare_signal_series(signal_samples, signal_policies))
     needed_signals = {item["signal"] for item in correspondences}
     series = {signal: dict(signal_samples.get(signal, ())) for signal in needed_signals}
     duplicate_times = {signal for signal in needed_signals
@@ -108,7 +110,7 @@ def evaluate_local_observed_equations(
         needs: dict[tuple[str, str, str], dict[str, Any]] = {}
         conditional_writers: set[str] = set()
 
-        def require(kind: str, vertex_id: str, operand: str = "", producers: tuple[str, ...] = ()) -> None:
+        def require(kind: str, vertex_id: str, operand: str = "", producers: tuple[str, ...] = (), reason: str = "") -> None:
             # Frontier provenance, not a new symbol search or control-ancestor
             # walk, identifies source needed by this particular value operand.
             vertex = program.vertices.get(vertex_id)
@@ -122,7 +124,7 @@ def evaluate_local_observed_equations(
                                else bool(symbols.intersection(r.origin_operands)))]
             needs[(kind, vertex_id, operand)] = {
                 "kind": kind, "vertex_id": vertex_id, "operand": operand,
-                "producer_ids": list(producers), "source_requests": references,
+                "producer_ids": list(producers), "source_requests": references, "reason": reason,
             }
         samples = signal_samples.get(output["signal"], [])
         valid_scope = scope is None or bool(scope.windows and not scope.error and not scope.assumptions)
@@ -136,10 +138,9 @@ def evaluate_local_observed_equations(
         if output["signal"] in duplicate_times:
             errors.add("publication has duplicate sample timestamps")
 
-        def value(vertex_id: str, timestamp: float, visiting: frozenset[str],
-                  consumer: str, operand: str) -> Any:
-            if vertex_id == root or vertex_id in visiting:
-                raise SourceExpressionError("circular local equation")
+        def observation(vertex_id: str, timestamp: Optional[float]) -> Optional[DAGValueResult]:
+            if vertex_id == root:
+                return None
             observations = by_value.get(vertex_id, [])
             aligned = [item for item in observations
                        if item["signal"] != output["signal"]
@@ -151,73 +152,51 @@ def evaluate_local_observed_equations(
             if len(identities) == 1:
                 observation = aligned[0]
                 if observation["signal"] in duplicate_times:
-                    raise SourceExpressionError("publication has duplicate sample timestamps")
+                    return DAGValueResult("unresolved", reason="publication has duplicate sample timestamps")
                 measured = series.get(observation["signal"], {}).get(timestamp)
                 if measured is None:
-                    raise SourceExpressionError("input lacks an exactly aligned publication sample")
+                    return DAGValueResult("unresolved", reason="input lacks an exactly aligned publication sample")
                 used[vertex_id] = observation
-                return measured
+                return DAGValueResult("value", value=measured, observed_vertex_ids=frozenset({vertex_id}))
             if observations:
-                raise SourceExpressionError("observation is circular, ambiguous, or requires cross-publication alignment")
-            if vertex_id in pending:
-                require("construction", vertex_id)
-                raise SourceExpressionError("local value dependencies have not been materialized")
-            static = session.evaluate(vertex_id, None)
-            if static.status == "value":
-                return static.value
-            producer = program.vertices.get(vertex_id)
-            reachability = producer.metadata.get("reachability", {}) if producer else {}
-            if producer is None or producer.kind != "operation" or not reachability.get("exact"):
-                require("source_linkage", consumer, operand, (vertex_id,))
-                raise SourceExpressionError("input has no aligned observation or exact source calculation")
-            return equation(vertex_id, timestamp, visiting | {vertex_id})
+                return DAGValueResult("unresolved", reason="observation is circular, ambiguous, or requires cross-publication alignment")
+            vertex = program.vertices[vertex_id]
+            if vertex.sub_kind == "logged_signal":
+                series_policy = prepared.get(vertex.signal_name)
+                if series_policy is None or series_policy.policy is None:
+                    return DAGValueResult("unresolved", reason="input samples or sampling policy are unavailable")
+            return None
 
-        def equation(vertex_id: str, timestamp: float, visiting: frozenset[str]) -> Any:
-            vertex = program.vertices.get(vertex_id)
-            if vertex and vertex.metadata.get("reachability", {}).get("all_of"):
-                conditional_writers.add(vertex_id)
-            if vertex_id in pending:
-                require("construction", vertex_id)
-                raise SourceExpressionError("local value dependencies have not been materialized")
-            compiled = program.compiled_vertices.get(vertex_id)
-            if compiled is None or compiled.expression is None or not compiled.exact:
-                require("expression", vertex_id)
-                raise SourceExpressionError("local source expression is not evaluable")
-            operands = dict(compiled.producers_by_operand)
-            operand_failed = False
-
-            def resolve(role: str) -> Any:
-                nonlocal operand_failed
-                producers = operands.get(role, ())
-                if len(producers) != 1:
-                    require("writer_coverage" if producers else "source_linkage", vertex_id, role, producers)
-                    raise SourceExpressionError("local operand has missing or alternative writers")
-                try:
-                    return value(producers[0], timestamp, visiting, vertex_id, role)
-                except SourceExpressionError:
-                    operand_failed = True
-                    raise
-
-            try:
-                return compiled.expression.evaluate(resolve)
-            except SourceExpressionError:
-                if not needs and not operand_failed:
-                    require("expression", vertex_id)
-                raise
+        session = program.bind(
+            parameter_values=parameter_values,
+            sample_resolver=lambda signal, timestamp: sample_prepared_signal(prepared, signal, timestamp),
+            context=DAGValueContext(
+                observation_resolver=observation, pending_vertices=frozenset(pending),
+                forbidden_signals=frozenset({output["signal"]}), conditional_equations=True,
+            ),
+        )
+        observed_ids: set[str] = set()
 
         for timestamp, observed in samples:
+            evaluated = session.evaluate(root, timestamp)
+            observed_ids.update(evaluated.observed_vertex_ids)
+            conditional_writers.update(evaluated.conditional_writer_ids)
+            for issue in evaluated.issues:
+                require(issue.kind, issue.vertex_id, issue.operand, issue.producer_ids, issue.reason)
+            session.release_timestamp_values()
+            if evaluated.status != "value":
+                errors.add(evaluated.reason or evaluated.status)
+                if any(need["kind"] in {"construction", "expression", "source_linkage"} for need in needs.values()):
+                    break
+                continue
             try:
-                predicted = float(equation(root, timestamp, frozenset({root})))
+                predicted = float(evaluated.value)
                 measured = float(observed)
                 if not math.isfinite(predicted) or not math.isfinite(measured):
-                    raise SourceExpressionError("non-finite local comparison")
+                    raise ValueError("non-finite local comparison")
                 comparisons.append((timestamp, predicted, measured))
-            except (SourceExpressionError, ValueError, TypeError, ArithmeticError) as exc:
+            except (ValueError, TypeError, ArithmeticError) as exc:
                 errors.add(str(exc))
-                if needs:
-                    # Structural prerequisites cannot change at later sample
-                    # timestamps. Let construction satisfy them before replay.
-                    break
         tolerance = _replay_tolerance(samples, signal_policies.get(output["signal"]))
         matched = sum(abs(predicted - measured) <= tolerance for _, predicted, measured in comparisons)
         complete = bool(samples) and len(comparisons) == len(samples) and not errors
@@ -228,7 +207,8 @@ def evaluate_local_observed_equations(
             "sample_count": len(comparisons), "requested_sample_count": len(samples),
             "matched_sample_count": matched, "tolerance": tolerance,
             "max_absolute_error": max((abs(p - y) for _, p, y in comparisons), default=None),
-            "observed_inputs": list(used.values()), "requirements": sorted(errors),
+            "observed_inputs": [item for vertex_id, item in used.items() if vertex_id in observed_ids],
+            "requirements": sorted(errors),
             "input_requirements": list(needs.values()),
             "conditional_writer_ids": sorted(conditional_writers),
             "scope": scope.as_payload() if scope is not None else None,

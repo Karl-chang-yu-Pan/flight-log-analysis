@@ -9,7 +9,7 @@ text; every non-local value still comes through a DAG edge.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from types import MappingProxyType
 from typing import Any, Callable, Literal, Optional
@@ -30,10 +30,47 @@ _PARAMETER_ACCESSOR = re.compile(
 
 
 @dataclass(frozen=True)
+class DAGValueIssue:
+    kind: str
+    vertex_id: str
+    operand: str = ""
+    producer_ids: tuple[str, ...] = ()
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class DAGValueResult:
     status: ValueStatus
     value: Any = None
     reason: str = ""
+    issues: tuple[DAGValueIssue, ...] = ()
+    observed_vertex_ids: frozenset[str] = frozenset()
+    conditional_writer_ids: frozenset[str] = frozenset()
+
+    def with_dependencies(self, *results: "DAGValueResult") -> "DAGValueResult":
+        if not any(r.issues or r.observed_vertex_ids or r.conditional_writer_ids for r in results):
+            return self
+        return replace(
+            self,
+            issues=tuple(dict.fromkeys(issue for result in (self, *results) for issue in result.issues)),
+            observed_vertex_ids=frozenset().union(self.observed_vertex_ids, *(r.observed_vertex_ids for r in results)),
+            conditional_writer_ids=frozenset().union(self.conditional_writer_ids, *(r.conditional_writer_ids for r in results)),
+        )
+
+
+@dataclass(frozen=True)
+class DAGValueContext:
+    """Explicit local-check boundaries, isolated from ordinary replay sessions.
+
+    The caller validates source/observation correspondence. Unknown reachability
+    may condition a unique equation, never choose among alternative writers.
+    Subscription freshness assumptions are not admitted in this context.
+    """
+
+    observation_resolver: Optional[Callable[[str, Optional[float]], Optional[DAGValueResult]]] = None
+    pending_vertices: frozenset[str] = frozenset()
+    forbidden_signals: frozenset[str] = frozenset()
+    conditional_equations: bool = False
 
 
 @dataclass(frozen=True)
@@ -161,12 +198,14 @@ class DAGValueProgram:
         parameter_values: Optional[dict[str, Any]] = None,
         enum_values: Optional[dict[str, Any]] = None,
         sample_resolver: Optional[SampleResolver] = None,
+        context: Optional[DAGValueContext] = None,
     ) -> "DAGValueSession":
         return DAGValueSession(
             self,
             parameter_values=parameter_values,
             enum_values=enum_values,
             sample_resolver=sample_resolver,
+            context=context,
         )
 
     def logged_signals_for(self, vertex_id: str) -> tuple[str, ...]:
@@ -202,6 +241,8 @@ class DAGValueProgram:
             source_id = pending.popleft()
             source_signals = signals[source_id]
             for target_id in dependents.get(source_id, ()):
+                if target_id not in signals:
+                    continue
                 before = len(signals[target_id])
                 signals[target_id].update(source_signals)
                 if len(signals[target_id]) != before:
@@ -255,6 +296,7 @@ class DAGValueSession:
         parameter_values: Optional[dict[str, Any]] = None,
         enum_values: Optional[dict[str, Any]] = None,
         sample_resolver: Optional[SampleResolver] = None,
+        context: Optional[DAGValueContext] = None,
     ) -> None:
         self.program = program
         self.parameters = MappingProxyType(
@@ -265,15 +307,21 @@ class DAGValueSession:
         )
         self.enums = MappingProxyType(dict(enum_values or {}))
         self.sample_resolver = sample_resolver
+        self.context = context
         self._value_cache: dict[
             tuple[str, Optional[float]], DAGValueResult
         ] = {}
         self._sample_cache: dict[tuple[str, float], Optional[Any]] = {}
+        self._conditional_cache: dict[tuple[str, Optional[float]], DAGValueResult] = {}
+        self._activity_results: dict[tuple[str, Optional[float]], DAGValueResult] = {}
 
     def evaluate(
         self, vertex_id: str, timestamp: Optional[float]
     ) -> DAGValueResult:
-        return self._evaluate_vertex(vertex_id, timestamp, frozenset())
+        return self._evaluate_vertex(
+            vertex_id, timestamp, frozenset(),
+            conditional=bool(self.context and self.context.conditional_equations),
+        )
 
     def evaluate_many(
         self, vertex_ids: list[str] | tuple[str, ...], timestamp: Optional[float]
@@ -291,43 +339,81 @@ class DAGValueSession:
         """
         self._value_cache = {key: value for key, value in self._value_cache.items() if key[1] is None}
         self._sample_cache.clear()
+        self._conditional_cache = {key: value for key, value in self._conditional_cache.items() if key[1] is None}
+        self._activity_results = {key: value for key, value in self._activity_results.items() if key[1] is None}
+
+    @staticmethod
+    def _unresolved(kind: str, vertex_id: str, reason: str, *,
+                    operand: str = "", producers: tuple[str, ...] = ()) -> DAGValueResult:
+        return DAGValueResult(
+            "unresolved", reason=reason,
+            issues=(DAGValueIssue(kind, vertex_id, operand, producers, reason),),
+        )
 
     def _evaluate_vertex(
         self,
         vertex_id: str,
         timestamp: Optional[float],
         active: frozenset[str],
+        *,
+        conditional: bool = False,
     ) -> DAGValueResult:
         cache_key = (vertex_id, timestamp)
-        cached = self._value_cache.get(cache_key)
+        cache = self._conditional_cache if conditional else self._value_cache
+        cached = cache.get(cache_key)
         if cached is not None:
             return cached
         if vertex_id in active:
             return DAGValueResult("unresolved", reason="cyclic value dependency")
         vertex = self.program.vertices.get(vertex_id)
         if vertex is None:
-            return DAGValueResult("unresolved", reason="missing DAG vertex")
+            return self._unresolved("source_linkage", vertex_id, "missing DAG vertex")
         next_active = active | {vertex_id}
 
+        if self.context is not None:
+            resolver = self.context.observation_resolver
+            observed = resolver(vertex_id, timestamp) if resolver is not None else None
+            if observed is not None:
+                cache[cache_key] = observed
+                return observed
+            if vertex_id in self.context.pending_vertices:
+                result = self._unresolved("construction", vertex_id, "local value dependencies have not been materialized")
+                cache[cache_key] = result
+                return result
+            metadata = vertex.metadata or {}
+            if (metadata.get("synthetic_boundary_transfer")
+                    and metadata.get("boundary_direction") == "subscribe"
+                    and (self.program.controls_by_target.get(vertex_id)
+                         or metadata.get("reachability", {}).get("all_of"))):
+                result = self._unresolved("state_alignment", vertex_id,
+                                          "conditional input transfer requires receiver-state and transfer-time evidence")
+                cache[cache_key] = result
+                return result
+
         if vertex.kind == "evidence":
-            result = self._evaluate_evidence(vertex, timestamp, next_active)
+            result = self._evaluate_evidence(vertex, timestamp, next_active, conditional=conditional)
         elif vertex.kind == "operation":
             activity = self._operation_activity(vertex_id, timestamp, next_active)
+            activity_result = self._activity_results[cache_key]
             if activity == "inactive":
-                result = DAGValueResult("inactive", reason="writer is inactive")
-            elif activity == "unknown":
-                result = DAGValueResult(
-                    "unresolved", reason="writer reachability is unresolved"
-                )
+                result = activity_result
+            elif activity == "unknown" and not (
+                conditional and (vertex.metadata or {}).get("reachability", {}).get("exact")
+            ):
+                result = activity_result
             else:
                 result = self._evaluate_expression_vertex(
-                    vertex, timestamp, next_active
+                    vertex, timestamp, next_active, conditional=conditional,
                 )
+                if activity == "unknown":
+                    result = replace(result, conditional_writer_ids=result.conditional_writer_ids | {vertex_id})
+                else:
+                    result = result.with_dependencies(activity_result)
         elif vertex.kind == "branch":
             result = self._evaluate_branch(vertex, timestamp, next_active)
         else:
             result = DAGValueResult("unresolved", reason="unsupported vertex kind")
-        self._value_cache[cache_key] = result
+        cache[cache_key] = result
         return result
 
     def _evaluate_evidence(
@@ -335,9 +421,17 @@ class DAGValueSession:
         vertex: Any,
         timestamp: Optional[float],
         active: frozenset[str],
+        *,
+        conditional: bool = False,
     ) -> DAGValueResult:
         metadata = vertex.metadata or {}
         if vertex.sub_kind == "logged_signal" and vertex.signal_name:
+            if self.context is not None:
+                if vertex.signal_name in self.context.forbidden_signals:
+                    return DAGValueResult("unresolved", reason="comparison output is also an input")
+                if (metadata.get("observation", "observed") != "observed"
+                        or metadata.get("grounded_via") == "declared_type"):
+                    return self._unresolved("observation_binding", vertex.id, "input observation lacks proven runtime binding")
             if timestamp is None or self.sample_resolver is None:
                 return DAGValueResult(
                     "unresolved", reason="logged value requires a timestamp"
@@ -372,11 +466,9 @@ class DAGValueSession:
             incoming = self.program.data_by_target.get(vertex.id, ())
             if incoming:
                 return self._select_producer(
-                    [edge.source_id for edge in incoming], timestamp, active
+                    [edge.source_id for edge in incoming], timestamp, active, conditional=conditional,
                 )
-        return DAGValueResult(
-            "unresolved", reason=f"unresolved evidence {name or vertex.id}"
-        )
+        return self._unresolved("source_linkage", vertex.id, f"unresolved evidence {name or vertex.id}")
 
     def _evaluate_branch(
         self,
@@ -384,6 +476,14 @@ class DAGValueSession:
         timestamp: Optional[float],
         active: frozenset[str],
     ) -> DAGValueResult:
+        if self.context is not None and (vertex.metadata or {}).get("static_evaluation", {}).get("assumed"):
+            return self._unresolved("control_flow", vertex.id, "gate verdict depends on an assumption")
+        domain = (vertex.metadata or {}).get("evaluation_domain") or []
+        if self.context is not None and (
+            (domain and (timestamp is None or not float(domain[0]) <= timestamp <= float(domain[1])))
+            or (vertex.metadata or {}).get("evaluation_failures")
+        ):
+            return self._evaluate_expression_vertex(vertex, timestamp, active)
         if vertex.feasibility_verdict == "always_true":
             return DAGValueResult("value", value=True)
         if vertex.feasibility_verdict == "always_false":
@@ -403,6 +503,10 @@ class DAGValueSession:
         active: frozenset[str],
     ) -> ActivityStatus:
         metadata = self.program.vertices[vertex_id].metadata or {}
+        key = (vertex_id, timestamp)
+        proof = self._activity_results.get(key)
+        if proof is not None:
+            return "active" if proof.status == "value" else "inactive" if proof.status == "inactive" else "unknown"
         if (
             metadata.get("synthetic_boundary_transfer")
             and metadata.get("boundary_direction") == "subscribe"
@@ -412,16 +516,29 @@ class DAGValueSession:
             # the whole timeline (hold-last between samples), so the source-code
             # control flow around the copy statement does not gate the
             # observation — the log records what the member held regardless.
-            return "active"
+            proof = (DAGValueResult("value", value=True)
+                     if self.context is None or metadata.get("reachability", {}).get("exact")
+                     else self._unresolved("control_flow", vertex_id, "input transfer reachability is unresolved"))
+            self._activity_results[key] = proof
+            return "active" if proof.status == "value" else "unknown"
         unknown = not bool(
             (metadata.get("reachability") or {}).get("exact", False)
         )
+        dependencies: list[DAGValueResult] = []
+        if (self.context is not None and metadata.get("reachability", {}).get("all_of")
+                and not self.program.controls_by_target.get(vertex_id)):
+            unknown = True
         for branch_id in self.program.controls_by_target.get(vertex_id, ()):
             result = self._evaluate_vertex(branch_id, timestamp, active)
+            dependencies.append(result)
             if result.status != "value":
                 unknown = True
             elif not bool(result.value):
+                self._activity_results[key] = DAGValueResult("inactive", reason="writer is inactive").with_dependencies(result)
                 return "inactive"
+        proof = (self._unresolved("control_flow", vertex_id, "writer reachability is unresolved")
+                 if unknown else DAGValueResult("value", value=True))
+        self._activity_results[key] = proof.with_dependencies(*dependencies)
         return "unknown" if unknown else "active"
 
     def _evaluate_expression_vertex(
@@ -429,45 +546,63 @@ class DAGValueSession:
         vertex: Any,
         timestamp: Optional[float],
         active: frozenset[str],
+        *,
+        conditional: bool = False,
     ) -> DAGValueResult:
         local = self.program.compiled_vertices.get(vertex.id)
         if local is None or local.expression is None or not local.exact:
-            return DAGValueResult(
-                "unresolved",
-                reason=(local.compile_error if local is not None else "vertex has no expression"),
-            )
+            return self._unresolved("expression", vertex.id,
+                                    local.compile_error if local is not None else "vertex has no expression")
         producers = dict(local.producers_by_operand)
+        dependencies: list[DAGValueResult] = []
 
         def resolve_operand(role: str) -> Any:
             producer_ids = list(producers.get(role, ()))
             if not producer_ids:
+                dependencies.append(self._unresolved("source_linkage", vertex.id, "missing DAG operand", operand=role))
                 raise SourceExpressionError(f"missing DAG operand {role}")
-            selected = self._select_producer(producer_ids, timestamp, active)
+            selected = self._select_producer(producer_ids, timestamp, active, conditional=conditional)
+            dependencies.append(selected)
             if selected.status != "value":
+                if len(producer_ids) > 1:
+                    dependencies.append(self._unresolved(
+                        "writer_coverage", vertex.id, selected.reason,
+                        operand=role, producers=tuple(producer_ids),
+                    ))
                 raise SourceExpressionError(
                     f"{role}: {selected.reason or selected.status}"
                 )
             return selected.value
 
         try:
-            return DAGValueResult("value", value=local.expression.evaluate(resolve_operand))
-        except (SourceExpressionError, TypeError, ValueError, ZeroDivisionError) as exc:
-            return DAGValueResult("unresolved", reason=str(exc))
+            result = DAGValueResult("value", value=local.expression.evaluate(resolve_operand))
+        except (SourceExpressionError, TypeError, ValueError, ArithmeticError) as exc:
+            result = (DAGValueResult("unresolved", reason=str(exc))
+                      if any(r.status != "value" for r in dependencies)
+                      else self._unresolved("expression", vertex.id, str(exc)))
+        return result.with_dependencies(*dependencies)
 
     def _select_producer(
         self,
         producer_ids: list[str],
         timestamp: Optional[float],
         active: frozenset[str],
+        *,
+        conditional: bool = False,
     ) -> DAGValueResult:
         candidates: list[tuple[str, DAGValueResult]] = []
-        for producer_id in dict.fromkeys(producer_ids):
+        unique_ids = tuple(dict.fromkeys(producer_ids))
+        for producer_id in unique_ids:
             if producer_id not in self.program.vertices:
+                candidates.append((producer_id, self._unresolved("source_linkage", producer_id, "missing DAG producer")))
                 continue
             candidates.append(
                 (
                     producer_id,
-                    self._evaluate_vertex(producer_id, timestamp, active),
+                    self._evaluate_vertex(
+                        producer_id, timestamp, active,
+                        conditional=conditional and len(unique_ids) == 1,
+                    ),
                 )
             )
 
@@ -481,7 +616,7 @@ class DAGValueSession:
             if unknown_ids:
                 return DAGValueResult(
                     "unresolved", reason="all reaching producers are unresolved"
-                )
+                ).with_dependencies(*(result for _, result in candidates))
             return DAGValueResult("inactive", reason="no reaching producer is active")
         if len(active_values) == 1 and not unknown_ids:
             return active_values[0][1]
@@ -491,10 +626,10 @@ class DAGValueSession:
             return selected
         values = {repr(item[1].value) for item in active_values}
         if len(values) == 1 and not unknown_ids:
-            return active_values[0][1]
+            return active_values[0][1].with_dependencies(*(r for _, r in active_values[1:]))
         return DAGValueResult(
             "unresolved", reason="multiple reaching producers remain possible"
-        )
+        ).with_dependencies(*(result for _, result in candidates))
 
     def _latest_ordered_producer(
         self,
@@ -502,6 +637,8 @@ class DAGValueSession:
         unknown_ids: list[str],
     ) -> Optional[DAGValueResult]:
         all_ids = [item[0] for item in active_values] + unknown_ids
+        if any(vertex_id not in self.program.vertices for vertex_id in all_ids):
+            return None
         operations = [self.program.vertices[vertex_id] for vertex_id in all_ids]
         if not operations or any(vertex.kind != "operation" for vertex in operations):
             return None
@@ -512,7 +649,8 @@ class DAGValueSession:
             )
             for vertex in operations
         }
-        if len(scopes) != 1 or any(vertex.line is None for vertex in operations):
+        if (len(scopes) != 1 or any(not file or not scope for file, scope in scopes)
+                or any(vertex.line is None for vertex in operations)):
             return None
         latest_active = max(
             active_values,
@@ -520,11 +658,14 @@ class DAGValueSession:
         )
         latest_order = self._producer_order(latest_active[0])
         if any(
-            self._producer_order(vertex_id) > latest_order
+            self._producer_order(vertex_id) >= latest_order
             for vertex_id in unknown_ids
         ):
             return None
-        return latest_active[1]
+        tied = [result for vertex_id, result in active_values if self._producer_order(vertex_id) == latest_order]
+        if len({repr(result.value) for result in tied}) != 1:
+            return None
+        return latest_active[1].with_dependencies(*tied)
 
     def _producer_order(self, vertex_id: str) -> tuple[int, int]:
         vertex = self.program.vertices[vertex_id]

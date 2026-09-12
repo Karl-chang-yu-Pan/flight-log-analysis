@@ -481,6 +481,91 @@ frontier mixing, then on rejecting a conditional helper expression. All three
 were repaired without weakening final verification. Full discovery and live
 question-to-report runs have not been repeated for this follow-up.
 
+## Evaluation Consolidation (2026-09-12)
+
+The local-input demand repair and deferred graph-compaction recommendation
+are committed as `615467e`. This follow-up removes the separate recursive
+local-equation evaluator. Local observations now enter `DAGValueSession`
+through an explicit context; expression compilation, operand edges, producer
+selection, parameter evaluation and prepared signal sampling use the shared
+implementation. Publication-copy correspondence discovery is unchanged.
+
+The context preserves the distinction between a conditional equation check
+and a verified mechanism. A unique equation may be checked with an unknown
+guard, with that condition recorded. Competing writers require source-backed
+control and ordering evidence, never selection by agreement with the output.
+Conditional results have separate session-local memoization so they cannot
+leak into strict writer selection. Conditional subscriptions still require
+receiver-state and transfer-time evidence; a topic sample alone is not that
+evidence. Ordinary subscription semantics are not repaired by this change.
+
+Shared producer selection also now retains missing candidate vertices and
+rejects ambiguous source-order ties. A known later writer can supersede an
+earlier unresolved writer only within the same proven callable/file order.
+Structured dependency issues preserve the failing vertex, operand, producers
+and nested failure reason. Selected values retain their observed guard inputs;
+discarded writers do not contribute spurious construction requests.
+
+The same graph fixtures and assertions exercise ordinary and local contexts.
+Existing compile-once, parameter-normalization and evaluation-sharing tests
+also run against both. Source-to-observation regressions cover piecewise
+writers and unresolved alternatives. Focused command:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_dag_value_context.py tests/test_mechanism_discovery.py tests/test_mechanism_dag.py tests/test_dag_checkpoint.py tests/test_dag_pipeline.py tests/test_source_expression.py tests/test_tree_sitter_source.py tests/test_mechanism_source_profiler.py tests/test_mechanism_judge.py
+```
+
+Result: **560 passed, 3 expected legacy-parser failures**, 6.06 seconds.
+The tests exposed and then covered ambiguous writer ties and a missing-vertex
+dependency-index failure during this implementation. This is not a full-suite
+result or evidence that all real-flight observations are evaluable.
+
+### Fresh Airspeed Probe
+
+Artifacts are under
+`outputs/evaluation_consolidation_final_audit_20260912/airspeed-first-round-staged/`.
+The original temporary harness files were absent, so the probe reused the
+supervisor and child source embedded in
+`outputs/local_input_demand_audit_20260911/metadata-first-round.json`.
+The new audit metadata records that harness, inputs and source hashes. It
+retains the one-CPU, reduced-priority, 600-second and 450-MiB sustained-PSS
+guards, emergency RSS/host-memory checks and network prohibition. These are
+test-only resource guards, not production discovery limits.
+
+The fresh first-round probe exited normally: **36.77 s wall, 17.60 s main
+Python CPU, 149.21 MiB peak tree PSS**, with no resource guard triggered.
+Its one builder produced 90 vertices and 168 edges, with 26 pending operations.
+Construction, including embedded checkpoint passes, took 21.71 s wall and
+13.94 s main-process CPU. Individual feasibility passes were below 0.09 s;
+this probe did not stall in feasibility. The earlier local-input-demand probe
+was 27.70 s and 148.29 MiB PSS, so this is not a demonstrated speed improvement.
+
+All 13 local checks remain unevaluable. They are separate call instances of
+the same published conversion, `_eas2tas * equivalent_airspeed_sp`, not 13
+independent explanations or checks of the bank-angle minimum. The shared
+evaluator now reaches the actual writer/guard obligations rather than
+rejecting every operand with multiple producers unconditionally.
+
+The immediate failure is the gate in `airspeed_poll`:
+
+```cpp
+(_param_fw_arsp_mode.get() == 0) && _airspeed_validated_sub.update(&airspeed_validated)
+```
+
+`FW_ARSP_MODE` is present as a parameter leaf. The update call has a source
+call-site identity, but no graph-bound return-value operand; compiling this
+gate reports `invalid expression syntax`. The two guarded `_eas2tas` writes
+therefore remain unresolved alongside its header initializer. This is a
+call-result linkage gap, not evidence that parameter access failed again.
+The subsequent diagnostic-only addition of nested issue reasons is covered
+by the final pytest run; the resource artifact predates that addition.
+
+No RTL/TECS observation-path repair, graph compaction, judge change, persistent
+analysis cache, paid API call or full-discovery run is included. Consolidating
+the evaluator is implemented, but the real-flight acceptance case is not yet
+verified. The next repair needs to trace the existing call-result/transfer
+machinery before changing extraction or adding any new evaluator behavior.
+
 ## Remaining Work
 
 Before treating the general constructor as complete:

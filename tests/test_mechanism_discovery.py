@@ -4231,7 +4231,7 @@ def test_source_admission_revalidates_late_caller_without_stale_producers(tmp_pa
 
 def _published_observation_probe(tmp_path, backend="tree_sitter", *, result_expression="measured * 2.f",
                                  output_copy="result", observed_instances=(0,), guard=None,
-                                 construction_checkpoint=None):
+                                 construction_checkpoint=None, calculation=""):
     source = """
 class Probe {
     uORB::Publication<diagnostic_s> pub{ORB_ID(diagnostic)};
@@ -4245,6 +4245,7 @@ class Probe {
     }
 };
 """.replace("measured * 2.f", result_expression).replace("packet.result = result;", f"packet.result = {output_copy};")
+    source = source.replace("float result =", calculation + "\n        float result =")
     if guard is not None:
         source = source.replace("void run(float input) {", f"void run(float input) {{ if ({guard}) {{")
         source = source.replace("pub.publish(packet);", "pub.publish(packet); }")
@@ -4348,6 +4349,33 @@ def test_local_equation_discovers_its_helper_before_unknown_guard(tmp_path):
     assert "gain.cpp" in result.files_loaded
     assert any(c["status"] == "matched" for d in decisions for c in d.summary["local_equation_checks"])
     assert result.checkpoint.action != "verified"
+
+
+@pytest.mark.parametrize("predicate,status", [("measured > 0", "matched"), ("permit()", "unevaluable")])
+def test_local_equation_selects_source_writers_without_guessing(tmp_path, predicate, status):
+    from flight_log_agent.analysis.dag_observation import evaluate_local_observed_equations
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+
+    dag, _ = _published_observation_probe(
+        tmp_path, result_expression="measured * factor",
+        calculation=f"float factor; if ({predicate}) {{ factor = 2.f; }} else {{ factor = 3.f; }}",
+    )
+    samples = {"diagnostic[0].input": [(0., 3.), (1., -3.)],
+               "diagnostic[0].result": [(0., 6.), (1., -9.)]}
+    checks = evaluate_local_observed_equations(
+        dag, DAGValueProgram(dag), signal_samples=samples, parameter_values={},
+        signal_policies={s: {"method": "linear"} for s in samples}, scope=None,
+        relevant_ids={v.id for v in dag.vertices},
+    )
+    root = next(v.id for v in dag.vertices if v.variable == "result")
+    check = next(c for c in checks if c["root_vertex_id"] == root)
+    assert check["status"] == status, check
+    if status == "matched":
+        assert check["sample_count"] == 2
+        assert not check["input_requirements"]
+    else:
+        assert any(n["kind"] == "writer_coverage" for n in check["input_requirements"])
+    assert not check["authorizes_discovery_stop"]
 
 
 @pytest.mark.parametrize("backend", [

@@ -118,6 +118,7 @@ def evaluate_checkpoint_round(
     local_equations = evaluate_local_observed_equations(
         view, program, signal_samples=samples, parameter_values=parameter_values,
         signal_policies=signal_policies, scope=scope, relevant_ids=target_dependencies,
+        prepared_signal_series=prepared,
     )
     selected = next(iter(checkpoints.values())) if len(checkpoints) == 1 else None
     verified = bool(
