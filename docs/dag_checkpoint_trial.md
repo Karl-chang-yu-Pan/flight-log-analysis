@@ -429,6 +429,58 @@ but efficient construction and useful real-flight conditional evaluation are
 not finished. Broader full-discovery runs were not launched after this
 staged result exposed those remaining gaps.
 
+## Local Input Demand Repair (2026-09-12)
+
+The preceding implementation and audit are committed as `dd8ca3c`. The
+follow-up connects local equation failures to structured `input_requirements`:
+consumer vertex, operand, producer identities and existing typed source
+requests. The controller may request these value dependencies before unrelated
+guard-source discovery. This does not declare any guard satisfied or change
+the final verification contract. Exact inactivity still prevents construction.
+
+Source requests are selected using parser-proven value-call sites and operand
+provenance, not all frontier records attached to the operation. The distinction
+matters because guard and value calls can share a consumer origin. Observed
+intermediate copies remain local input boundaries; a conditional match need
+not reconstruct their histories. Missing/misaligned observations do not become
+source-discovery requests. Alternative writers remain explicit requirements,
+not an invitation to choose whichever expression matches.
+
+New source-to-controller regressions demonstrate:
+
+- A local equation resumes and matches while its guard remains unresolved.
+- Its observed intermediate's history can remain pending at that match.
+- A source-proven false guard still prevents value materialization.
+- An unavailable value helper is discovered before the unknown guard helper,
+  through its exact source call site; the local match cannot verify the question.
+- Missing sample alignment does not authorize unrelated source work.
+
+Fresh first-round probes used the existing one-CPU, reduced-priority supervisor
+with 600-second/450-MiB sustained-PSS guards and no APIs or persistent caches:
+
+```bash
+.venv/bin/python /tmp/checkpoint_demand_audit.py --output outputs/local_input_demand_audit_20260911 --scope first-round --cases rtl airspeed
+```
+
+RTL completed in 17.60 s (104.17 MiB peak tree PSS), retaining its existing
+guard-source requirement because no usable local observation is available.
+Airspeed completed in 27.70 s (148.29 MiB peak tree PSS). Its next action changed
+from `guard_source` to `local_calculation_source`: the local inputs were
+materialized and the controller requested `_eas2tas` writer coverage. Its 13
+checks remain unevaluable due to alternative writers, rather than the original
+unmaterialized root. There are 31 pending operations across the larger partial
+graph; that count is not itself a completion metric. Neither probe verifies
+the flight explanation. These artifacts precede the final observation-error
+routing refinement, which is covered by the subsequent regression run.
+The same eight-file focused regression command recorded above passed:
+**531 passed, 3 expected legacy-parser failures**, 7.61 seconds.
+`git diff --check` passed. This is not a full-repository test result.
+
+The initial helper regression failed on guard-first routing, then on guard/value
+frontier mixing, then on rejecting a conditional helper expression. All three
+were repaired without weakening final verification. Full discovery and live
+question-to-report runs have not been repeated for this follow-up.
+
 ## Remaining Work
 
 Before treating the general constructor as complete:

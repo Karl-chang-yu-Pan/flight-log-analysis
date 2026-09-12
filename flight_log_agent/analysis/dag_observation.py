@@ -86,16 +86,44 @@ def evaluate_local_observed_equations(
     duplicate_times = {signal for signal in needed_signals
                        if len(series[signal]) != len(signal_samples.get(signal, ()))}
     checks: list[dict[str, Any]] = []
+    pending = set(dag.pending_construction)
 
     for output in correspondences:
         root = output["value_id"]
         local = program.compiled_vertices.get(root)
-        if (root not in relevant_ids or local is None or local.expression is None
-                or not local.exact or isinstance(local.expression.tree.body, ast.Name)):
+        if root not in relevant_ids or local is None or not local.exact:
+            continue
+        vertex = program.vertices[root]
+        direct_copy = vertex.metadata.get("source_expression_ref", {}).get("direct_storage")
+        # Observed intermediate copies are input cut points, not requests to
+        # reconstruct their histories. A pending terminal copy may still need
+        # one value step to expose the actual equation behind its output.
+        if direct_copy and not vertex.metadata.get("is_terminal"):
+            continue
+        if root not in pending and local.expression is not None and isinstance(local.expression.tree.body, ast.Name):
             continue
         used: dict[str, dict[str, Any]] = {}
         errors: set[str] = set()
         comparisons: list[tuple[float, float, float]] = []
+        needs: dict[tuple[str, str, str], dict[str, Any]] = {}
+        conditional_writers: set[str] = set()
+
+        def require(kind: str, vertex_id: str, operand: str = "", producers: tuple[str, ...] = ()) -> None:
+            # Frontier provenance, not a new symbol search or control-ancestor
+            # walk, identifies source needed by this particular value operand.
+            vertex = program.vertices.get(vertex_id)
+            expression_ref = (vertex.metadata.get("source_expression_ref") or {}) if vertex else {}
+            symbols = {operand} if operand else set(expression_ref.get("input_symbols") or ())
+            call_sites = {item["call_source_site_id"] for item in expression_ref.get("call_results", ())
+                          if item.get("call_source_site_id")}
+            references = [r.model_dump(mode="json") for r in dag.unresolved_references
+                          if vertex_id in r.origin_vertex_ids
+                          and (r.source_site_id in call_sites if r.kind == "callable"
+                               else bool(symbols.intersection(r.origin_operands)))]
+            needs[(kind, vertex_id, operand)] = {
+                "kind": kind, "vertex_id": vertex_id, "operand": operand,
+                "producer_ids": list(producers), "source_requests": references,
+            }
         samples = signal_samples.get(output["signal"], [])
         valid_scope = scope is None or bool(scope.windows and not scope.error and not scope.assumptions)
         if not valid_scope:
@@ -108,7 +136,8 @@ def evaluate_local_observed_equations(
         if output["signal"] in duplicate_times:
             errors.add("publication has duplicate sample timestamps")
 
-        def value(vertex_id: str, timestamp: float, visiting: frozenset[str]) -> Any:
+        def value(vertex_id: str, timestamp: float, visiting: frozenset[str],
+                  consumer: str, operand: str) -> Any:
             if vertex_id == root or vertex_id in visiting:
                 raise SourceExpressionError("circular local equation")
             observations = by_value.get(vertex_id, [])
@@ -130,29 +159,51 @@ def evaluate_local_observed_equations(
                 return measured
             if observations:
                 raise SourceExpressionError("observation is circular, ambiguous, or requires cross-publication alignment")
+            if vertex_id in pending:
+                require("construction", vertex_id)
+                raise SourceExpressionError("local value dependencies have not been materialized")
             static = session.evaluate(vertex_id, None)
             if static.status == "value":
                 return static.value
             producer = program.vertices.get(vertex_id)
             reachability = producer.metadata.get("reachability", {}) if producer else {}
-            if (producer is None or producer.kind != "operation" or not reachability.get("exact")
-                    or reachability.get("all_of")):
-                raise SourceExpressionError("input has no aligned observation or unconditional source calculation")
+            if producer is None or producer.kind != "operation" or not reachability.get("exact"):
+                require("source_linkage", consumer, operand, (vertex_id,))
+                raise SourceExpressionError("input has no aligned observation or exact source calculation")
             return equation(vertex_id, timestamp, visiting | {vertex_id})
 
         def equation(vertex_id: str, timestamp: float, visiting: frozenset[str]) -> Any:
+            vertex = program.vertices.get(vertex_id)
+            if vertex and vertex.metadata.get("reachability", {}).get("all_of"):
+                conditional_writers.add(vertex_id)
+            if vertex_id in pending:
+                require("construction", vertex_id)
+                raise SourceExpressionError("local value dependencies have not been materialized")
             compiled = program.compiled_vertices.get(vertex_id)
             if compiled is None or compiled.expression is None or not compiled.exact:
+                require("expression", vertex_id)
                 raise SourceExpressionError("local source expression is not evaluable")
             operands = dict(compiled.producers_by_operand)
+            operand_failed = False
 
             def resolve(role: str) -> Any:
+                nonlocal operand_failed
                 producers = operands.get(role, ())
                 if len(producers) != 1:
+                    require("writer_coverage" if producers else "source_linkage", vertex_id, role, producers)
                     raise SourceExpressionError("local operand has missing or alternative writers")
-                return value(producers[0], timestamp, visiting)
+                try:
+                    return value(producers[0], timestamp, visiting, vertex_id, role)
+                except SourceExpressionError:
+                    operand_failed = True
+                    raise
 
-            return compiled.expression.evaluate(resolve)
+            try:
+                return compiled.expression.evaluate(resolve)
+            except SourceExpressionError:
+                if not needs and not operand_failed:
+                    require("expression", vertex_id)
+                raise
 
         for timestamp, observed in samples:
             try:
@@ -163,6 +214,10 @@ def evaluate_local_observed_equations(
                 comparisons.append((timestamp, predicted, measured))
             except (SourceExpressionError, ValueError, TypeError, ArithmeticError) as exc:
                 errors.add(str(exc))
+                if needs:
+                    # Structural prerequisites cannot change at later sample
+                    # timestamps. Let construction satisfy them before replay.
+                    break
         tolerance = _replay_tolerance(samples, signal_policies.get(output["signal"]))
         matched = sum(abs(predicted - measured) <= tolerance for _, predicted, measured in comparisons)
         complete = bool(samples) and len(comparisons) == len(samples) and not errors
@@ -174,6 +229,8 @@ def evaluate_local_observed_equations(
             "matched_sample_count": matched, "tolerance": tolerance,
             "max_absolute_error": max((abs(p - y) for _, p, y in comparisons), default=None),
             "observed_inputs": list(used.values()), "requirements": sorted(errors),
+            "input_requirements": list(needs.values()),
+            "conditional_writer_ids": sorted(conditional_writers),
             "scope": scope.as_payload() if scope is not None else None,
             "authorizes_discovery_stop": False, "applicability_verified": False,
             "writer_coverage_verified": False, "upstream_obligations_retained": True,

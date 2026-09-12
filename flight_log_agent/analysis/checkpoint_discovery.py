@@ -147,10 +147,27 @@ def evaluate_checkpoint_round(
     gate_requests = [reference for reference in searchable
                      if gate_inputs.intersection(reference.origin_vertex_ids)]
     gate_work = required & gate_inputs
+    local_needs = [need for check in local_equations
+                   for need in check.get("input_requirements", [])]
+    local_work = {need["vertex_id"] for need in local_needs if need["kind"] == "construction"}
+    local_work &= set(dag.pending_construction) - inactive
+    local_keys = {UnresolvedSourceReference.model_validate(raw).visit_key()
+                  for need in local_needs for raw in need["source_requests"]
+                  if need["vertex_id"] not in inactive}
+    local_requests = [reference for reference in dag.unresolved_references
+                      if reference.visit_key() in local_keys
+                      and reference.visit_key() not in dag.exhausted_source_requests]
     # A missing guard helper is source work, not permission to expand its
     # guarded values. If that exact search is exhausted, retain the unknown
     # obligation but allow other useful work to proceed.
-    if gate_work:
+    # Conditional equation construction is not an applicability decision.
+    # Its exact value prerequisites may proceed while unrelated guard source
+    # is unknown. Only proven inactivity can discharge either kind of work.
+    if local_work:
+        materialize, next_references, kind = local_work, [], "local_calculation_construction"
+    elif local_requests:
+        materialize, next_references, kind = set(), local_requests, "local_calculation_source"
+    elif gate_work:
         materialize, next_references, kind = gate_work, [], "guard_construction"
     elif gate_requests:
         materialize, next_references, kind = set(), gate_requests, "guard_source"

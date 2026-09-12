@@ -4230,7 +4230,8 @@ def test_source_admission_revalidates_late_caller_without_stale_producers(tmp_pa
 
 
 def _published_observation_probe(tmp_path, backend="tree_sitter", *, result_expression="measured * 2.f",
-                                 output_copy="result", observed_instances=(0,)):
+                                 output_copy="result", observed_instances=(0,), guard=None,
+                                 construction_checkpoint=None):
     source = """
 class Probe {
     uORB::Publication<diagnostic_s> pub{ORB_ID(diagnostic)};
@@ -4244,6 +4245,9 @@ class Probe {
     }
 };
 """.replace("measured * 2.f", result_expression).replace("packet.result = result;", f"packet.result = {output_copy};")
+    if guard is not None:
+        source = source.replace("void run(float input) {", f"void run(float input) {{ if ({guard}) {{")
+        source = source.replace("pub.publish(packet);", "pub.publish(packet); }")
     profiler = _mini_tree(tmp_path, {"sample.cpp": source}, backend=backend)
     inputs = dag_inputs_from_facts(load_facts(profiler, tmp_path / "cache", ["sample.cpp"], "hash"))
     samples = {f"diagnostic[{instance}].{field}": [(0., value), (1., value)]
@@ -4252,9 +4256,98 @@ class Probe {
         inputs.bindings, "result", terminal_file="sample.cpp", source_structure=inputs.structure,
         call_statements=inputs.call_statements, boundary_bindings=inputs.boundary_bindings,
         helper_expressions=inputs.helper_expressions, logged_signals=set(samples),
-        construction_checkpoint=lambda _: set(),
+        construction_checkpoint=(lambda dag: construction_checkpoint(dag, samples))
+        if construction_checkpoint is not None else lambda _: set(),
     )
     return dag, samples
+
+
+@pytest.mark.parametrize("guard", ["permit()", "false"])
+def test_local_input_demand_resumes_without_resolving_guard(tmp_path, guard):
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+
+    snapshots = []
+
+    def checkpoint(dag, samples):
+        result = evaluate_checkpoint_round(
+            dag, parameter_values={}, observed_signals=set(samples),
+            signal_policies={s: {"method": "linear"} for s in samples},
+            load_samples=lambda *_: samples,
+        )
+        snapshots.append((dag, result))
+        return result.construction
+
+    dag, _ = _published_observation_probe(tmp_path, guard=guard, construction_checkpoint=checkpoint)
+    root = next(v.id for v in dag.vertices if v.variable == "result")
+    if guard == "false":
+        assert all(root not in result.construction.materialize for _, result in snapshots)
+    else:
+        assert any(result.summary["next_analysis"]["kind"] == "local_calculation_construction"
+                   and root in result.construction.materialize for _, result in snapshots)
+        assert any(check["root_vertex_id"] == root and check["status"] == "matched"
+                   for _, result in snapshots for check in result.summary["local_equation_checks"])
+        matched_dag, _ = next((snapshot, result) for snapshot, result in snapshots
+                              if any(c["root_vertex_id"] == root and c["status"] == "matched"
+                                     for c in result.summary["local_equation_checks"]))
+        measured = next(v.id for v in matched_dag.vertices if v.variable == "measured")
+        assert measured in matched_dag.pending_construction
+        assert any(r.symbol == "permit" for r in dag.unresolved_references)
+    assert all(result.action != "verified" for _, result in snapshots)
+    assert all(not check["applicability_verified"] and not check["authorizes_discovery_stop"]
+               for _, result in snapshots for check in result.summary["local_equation_checks"])
+
+
+def test_local_equation_discovers_its_helper_before_unknown_guard(tmp_path):
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+
+    profiler = _mini_tree(tmp_path, {
+        "probe.hpp": """class Probe {
+            uORB::Publication<diagnostic_s> pub{ORB_ID(diagnostic)};
+            bool permit(); float gain(); void run(float input);
+        };""",
+        "run.cpp": """#include "probe.hpp"
+        void Probe::run(float input) {
+            if (permit()) {
+                float measured = input;
+                float result = measured * gain();
+                diagnostic_s packet{};
+                packet.input = measured;
+                packet.result = result;
+                pub.publish(packet);
+            }
+        }""",
+        "gain.cpp": '#include "probe.hpp"\nfloat Probe::gain() { return 2.f; }',
+    }, backend="tree_sitter")
+    samples = {"diagnostic[0].input": [(0., 3.), (1., 3.)],
+               "diagnostic[0].result": [(0., 6.), (1., 6.)]}
+    decisions = []
+
+    def checkpoint(dag, index):
+        result = evaluate_checkpoint_round(
+            dag, parameter_values={}, observed_signals=set(samples),
+            signal_policies={s: {"method": "linear"} for s in samples},
+            load_samples=lambda *_: samples,
+        )
+        decisions.append(result)
+        return result
+
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=[], terminal="result", terminal_file="run.cpp",
+        source_hash="hash", logged_signals=set(samples),
+        construction_evaluator=checkpoint, checkpoint_evaluator=checkpoint,
+    )
+    source_decisions = [d for d in decisions if d.references]
+    assert source_decisions[0].summary["next_analysis"]["kind"] == "local_calculation_source", [
+        (d.summary["next_analysis"]["kind"], [
+            (c["requirements"], [(n["kind"], n["operand"], [r["symbol"] for r in n["source_requests"]])
+                                    for n in c["input_requirements"]])
+            for c in d.summary["local_equation_checks"]]) for d in decisions
+    ]
+    assert {r.symbol for r in source_decisions[0].references} == {"gain"}
+    assert "gain.cpp" in result.files_loaded
+    assert any(c["status"] == "matched" for d in decisions for c in d.summary["local_equation_checks"])
+    assert result.checkpoint.action != "verified"
 
 
 @pytest.mark.parametrize("backend", [
@@ -4336,6 +4429,10 @@ def test_local_observation_scope_and_alignment(tmp_path, problem):
     check = next(c for c in result if c["root_vertex_id"] == root)
     assert check["status"] == ("matched" if problem == "outside_scope" else "mismatched" if problem == "mismatch" else "unevaluable")
     assert check["authorizes_discovery_stop"] is False
+    if problem in {"unaligned", "duplicate", "different_publication", "different_callable"}:
+        assert check["input_requirements"] == []
+    if problem == "circular":
+        assert not any(n["source_requests"] for n in check["input_requirements"])
 
 
 @pytest.mark.parametrize("name,formula,rows", [
