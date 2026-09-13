@@ -28,6 +28,25 @@ def test_source_expression_rejects_unsupported_helper_calls():
         evaluate_source_expression("stateful_helper(value)", {"value": 1.0})
 
 
+def test_parser_proven_address_calls_compile_as_distinct_graph_operands():
+    from flight_log_agent.analysis.source_expression import compile_source_expression
+
+    expression = compile_source_expression(
+        "receiver.update( &payload ) && receiver.update(&payload)", [],
+        occurrence_operands=[("first", "receiver.update(&payload)"),
+                             ("second", "receiver.update(&payload)")],
+    )
+    accessed = []
+    assert expression.evaluate(lambda operand: accessed.append(operand) or operand == "first") is False
+    assert accessed == ["first", "second"]
+    accessed.clear()
+    assert expression.evaluate(lambda operand: accessed.append(operand) or False) is False
+    assert accessed == ["first"]
+    with pytest.raises(SourceExpressionError):
+        compile_source_expression("other.receiver.update(&payload)", [],
+                                  occurrence_operands=[("first", "receiver.update(&payload)")])
+
+
 def test_alias_dotted_names_substitutes_longest_first():
     expr, aliases = alias_dotted_names(
         "tecs_status.true_airspeed_sp - tecs_status.equivalent_airspeed_sp",

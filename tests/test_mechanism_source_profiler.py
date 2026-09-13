@@ -2543,6 +2543,10 @@ void Modes::update()
     assert by_target["exact_out"].control_predicates == ["mode == 2"]
 
 
+@pytest.mark.parametrize("source_backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="legacy lacks exact expression operands for deterministic evaluation; retire after contract parity")),
+    "tree_sitter",
+])
 def test_guard_clause_return_gates_the_remainder(tmp_path, source_backend):
     """A top-level return in an arm gates everything after the arm with
     the arm's negation — braced and brace-less guards, including a
@@ -2554,6 +2558,10 @@ def test_guard_clause_return_gates_the_remainder(tmp_path, source_backend):
         """
 void Guards::update()
 {
+    bool valid = true;
+    bool busy = false;
+    float a = 2.0f;
+    float b = 3.0f;
     if (!valid) {
         return;
     }
@@ -2580,6 +2588,21 @@ void Guards::update()
     braceless = by_target["braceless_out"]
     assert braceless.control_predicates == ["!(!valid)", "!(busy)"]
     assert braceless.reachability_exact is True
+
+    from flight_log_agent.analysis.mechanism_discovery import binding_from_assignment
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+
+    dag = build_mechanism_dag(
+        [binding_from_assignment(a) for a in assignments], "braceless_out",
+        terminal_file="src/modules/example/guards.cpp",
+    )
+    root = next(v for v in dag.vertices if v.variable == "braceless_out")
+    branches = [v for v in dag.vertices if v.kind == "branch"]
+    assert len(branches) == 2
+    assert all(any(e.kind == "data" and e.target_id == v.id for e in dag.edges) for v in branches)
+    result = DAGValueProgram(dag).bind().evaluate(root.id, None)
+    assert result.status == "value" and result.value == 5.0, result
 
 
 def test_conditionally_nested_return_marks_remainder_inexact(tmp_path):

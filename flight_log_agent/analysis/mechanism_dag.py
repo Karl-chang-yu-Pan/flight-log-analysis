@@ -4063,6 +4063,18 @@ class _DAGBuilder:
         for branch in self._binding_branches(binding):
             self._add_edge(self._emit_branch(**branch), op_id, kind="control")
 
+        if binding.get("synthetic_boundary_transfer") and binding.get("boundary_direction") == "subscribe":
+            site = str(binding.get("projection_source_site_id") or binding.get("source_site_id") or "")
+            record = self._calls_by_source_site_id.get(site)
+            if record is not None:
+                scope = self._binding_control_scope(binding)[1]
+                result_id, transfer_id = self._boundary_event(record, scope)
+                self._add_edge(transfer_id, op_id, kind="control", role="transfer_occurred", via=site)
+                self.vertices[op_id].metadata.update(
+                    boundary_result_id=result_id, boundary_transfer_event_id=transfer_id,
+                    payload_state_policy="requires receiver history and transfer-time alignment",
+                )
+
         if controls_only:
             return
 
@@ -4236,6 +4248,81 @@ class _DAGBuilder:
         }
         metadata["source_call_roles"] = call_roles
         vertex.metadata = metadata
+
+    def _boundary_event(self, record: dict[str, Any], scope_function: str) -> tuple[str, str]:
+        """Keep execution, returned value and payload transfer distinct.
+
+        Runtime outcome leaves do not imply an API-specific success convention.
+        They require evidence for this invocation, not a topic's latest sample.
+        The selection relationship records shared provenance, not equality.
+        """
+        site = self._call_site_id(record)
+        event_key = (site, scope_function)
+        result_id = self._make_id("boundary_result", event_key)
+        transfer_id = self._make_id("boundary_transfer", event_key)
+        if result_id in self.vertices:
+            return result_id, transfer_id
+        file, line = str(record.get("file") or ""), int(record.get("line") or 0)
+        predicates = list(record.get("control_predicates") or [])
+        common = {"source_site_id": site, "function": scope_function,
+                  "boundary_event": site, "receiver": record.get("receiver"),
+                  "expression_inputs_exact": True}
+        self.vertices[result_id] = DAGVertex(
+            id=result_id, kind="operation", sub_kind="boundary_result", file=file, line=line,
+            expression="boundary_return_value",
+            metadata={**common, "reachability": {"exact": bool(record.get("reachability_exact", False)),
+                                                 "all_of": predicates}},
+        )
+        self.vertices[transfer_id] = DAGVertex(
+            id=transfer_id, kind="branch", sub_kind="boundary_transfer", file=file, line=line,
+            predicate_raw="boundary_transfer_occurred", metadata=dict(common),
+        )
+        for target, operand, requirement in (
+            (result_id, "boundary_return_value", "boundary_result"),
+            (transfer_id, "boundary_transfer_occurred", "state_alignment"),
+        ):
+            leaf = self._emit_evidence(
+                "runtime_obligation", self._make_id(requirement, event_key), file=file, line=line,
+                metadata={**common, "requirement": requirement,
+                          "reason": "requires invocation-aligned runtime evidence"},
+            )
+            self._add_edge(leaf, target, kind="data", role=operand, via=site)
+        self._add_edge(result_id, transfer_id, kind="selection", role="same_invocation_result", via=site)
+        # Use the existing source control adapter; binding identity is only
+        # needed here to recover per-predicate source scope and site.
+        controls = {**record, "target_symbol": "boundary_return_value", "source_symbol": "true",
+                    "assignment_path": [{"file": file, "line": line}],
+                    "function": scope_function, "callable_id": scope_function}
+        for branch in self._binding_branches(controls):
+            branch_id = self._emit_branch(**branch)
+            self._add_edge(branch_id, result_id, kind="control")
+            # A transfer is false when execution is disproven; represent the
+            # conjunction in the expression so normal short-circuit evaluation
+            # does not request runtime evidence for a skipped invocation.
+            operand = f"execution_guard_{len(self.vertices[transfer_id].metadata.get('execution_guards', []))}"
+            self._add_edge(branch_id, transfer_id, kind="data", role=operand)
+            self.vertices[transfer_id].metadata.setdefault("execution_guards", []).append(branch_id)
+        guards = self.vertices[transfer_id].metadata.get("execution_guards", [])
+        self.vertices[transfer_id].predicate_raw = " && ".join(
+            [*(f"execution_guard_{index}" for index in range(len(guards))), "boundary_transfer_occurred"]
+        )
+        return result_id, transfer_id
+
+    def _wire_boundary_result(self, record: dict[str, Any], target_id: str, scope_function: str,
+                              result_path: str = "") -> None:
+        if target_id not in self.vertices:
+            return
+        result_id, _ = self._boundary_event(record, scope_function)
+        receiver = str(record.get("receiver") or "")
+        name = str(record.get("name") or "")
+        args = tuple(str(a) for a in record.get("args") or [])
+        text = str(record.get("call_text") or "") or f"{receiver + '.' if receiver else ''}{name}({', '.join(args)})"
+        site = self._call_site_id(record)
+        invocation = _ExpressionCall(name=name, receiver=receiver, args=args, argument_expressions=(),
+                                     offset=0, source_site_id=site, call_text=text,
+                                     result_text=f"{text}.{result_path}" if result_path else text)
+        self._record_call_grounding_roles(target_id, invocation)
+        self._add_edge(result_id, target_id, kind="data", role=f"call:{name}", via=site)
 
     def _visible_reaching_producers(
         self,
@@ -4466,17 +4553,6 @@ class _DAGBuilder:
         identity = self._reference_identity(
             symbol_raw, file, scope_function, line
         )
-        if identity.declaration_proven and identity.kind in {"member", "global"}:
-            self._record_unresolved(
-                identity.root,
-                kind="storage_writers",
-                file=file,
-                line=line,
-                scope_function=scope_function,
-                source_expression=source_expression,
-                origin_vertex_id=origin_vertex_id,
-                origin_operand=origin_operand,
-            )
         producers = self._visible_reaching_producers(
             self._producers_matching(symbol_norm),
             symbol_raw,
@@ -4486,6 +4562,20 @@ class _DAGBuilder:
             source_order,
             excluded_call_effect_site=excluded_call_effect_site,
         )
+        enum_value = self._source_constant_value(symbol_norm, identity, scope_function)
+        parameter_alias = self._match_parameter(
+            symbol_raw, file=file, scope_function=scope_function, line=line,
+        )
+        # Resolving an external parameter read is not a request for writers of
+        # its wrapper. Actual source producers still require mutable coverage;
+        # finding one writer never establishes that all writers are known.
+        if (identity.declaration_proven and identity.kind in {"member", "global"}
+                and enum_value is None and (producers or parameter_alias is None)):
+            self._record_unresolved(
+                identity.root, kind="storage_writers", file=file, line=line,
+                scope_function=scope_function, source_expression=source_expression,
+                origin_vertex_id=origin_vertex_id, origin_operand=origin_operand,
+            )
         if len(producers) == 1:
             return producers
         # A member whose declared type is a logged uORB topic, whose source
@@ -4499,9 +4589,6 @@ class _DAGBuilder:
             return producers
 
         # 2. Source enum / #define resolution.
-        enum_value = self._source_constant_value(
-            symbol_norm, identity, scope_function
-        )
         if enum_value is not None:
             return [self._emit_evidence(
                 "constant",
@@ -4546,12 +4633,6 @@ class _DAGBuilder:
             )]
 
         # 4. Parameter accessor resolved from source-scoped declarations.
-        parameter_alias = self._match_parameter(
-            symbol_raw,
-            file=file,
-            scope_function=scope_function,
-            line=line,
-        )
         if parameter_alias is not None:
             return [self._emit_evidence("parameter", parameter_alias, file=None, line=None)]
 
@@ -5052,9 +5133,7 @@ class _DAGBuilder:
                 self._boundary_bindings,
                 self._source_structure,
             ):
-                # The source-site transfer operation already owns this call.
-                # Treating the same syntax as an unresolved helper would add
-                # a second, non-value-flow expansion frontier.
+                self._wire_boundary_result(source_record, origin_vertex_id, scope_function)
                 continue
             helper_key = self._pick_helper_key(
                 candidate,
@@ -5221,6 +5300,7 @@ class _DAGBuilder:
             self._boundary_bindings,
             self._source_structure,
         ):
+            self._wire_boundary_result(source_record, origin_vertex_id, scope_function, result_path)
             return None
         helper_key = self._pick_helper_key(
             candidate,
@@ -6065,6 +6145,10 @@ def evaluate_feasibility(
 
 def prune_infeasible_operations(dag: MechanismDAG) -> MechanismDAG:
     """Apply existing conjunction pruning without reevaluating the graph."""
+    persisted_receivers = {
+        vertex.id for vertex in dag.vertices
+        if vertex.metadata.get("boundary_transfer_event_id")
+    }
     dead_branches = {
         vertex.id for vertex in dag.vertices
         if vertex.kind == "branch" and vertex.feasibility_verdict == "always_false"
@@ -6073,7 +6157,16 @@ def prune_infeasible_operations(dag: MechanismDAG) -> MechanismDAG:
     dead_operations = {
         edge.target_id for edge in dag.edges
         if edge.kind == "control" and edge.source_id in dead_branches
+        and edge.target_id not in persisted_receivers
     }
+    # A false gate disproves a transfer in the evaluated domain, not values
+    # retained from earlier invocations. Keep its receiver-state definition
+    # and false gate so replay/checkpoints cannot silently select an initializer.
+    retained_gates = {
+        edge.source_id for edge in dag.edges
+        if edge.kind == "control" and edge.target_id in persisted_receivers
+    }
+    dead_branches -= retained_gates
     kept = {vertex.id for vertex in dag.vertices} - dead_branches - dead_operations
     return dag.model_copy(update={
         "vertices": [vertex for vertex in dag.vertices if vertex.id in kept],

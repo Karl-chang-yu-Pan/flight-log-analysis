@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import cache
 import math
 import re
+import io
+import tokenize
 from collections.abc import Callable, Mapping
 from typing import Any, Iterable
 
@@ -239,6 +241,47 @@ def compile_source_expression(
 ) -> CompiledSourceExpression:
     """Compile one source expression against parser/DAG-proven operands."""
     normalized = normalize_source_expression(expression)
+    occurrences = list(occurrence_operands)
+    # A graph-bound C++ call may contain syntax Python cannot parse (such as
+    # an address argument). Tokenize these exact, parser-proven occurrences
+    # before AST parsing; never reinterpret the address as a numeric value.
+    opaque: dict[tuple[tuple[int, str], ...], deque[tuple[str, str]]] = defaultdict(deque)
+    remaining = []
+    occurrence_aliases: dict[str, str] = {}
+
+    def tokens(text: str) -> list[tuple[int, str]]:
+        try:
+            return [(t.type, t.string) for t in tokenize.generate_tokens(io.StringIO(text).readline)
+                    if t.type not in {tokenize.NEWLINE, tokenize.NL, tokenize.ENDMARKER}]
+        except (tokenize.TokenError, IndentationError) as exc:
+            raise SourceExpressionError("invalid parser-proven call operand") from exc
+
+    for index, (operand_id, operand_expression) in enumerate(occurrences):
+        spelling = normalize_source_expression(operand_expression)
+        try:
+            ast.parse(spelling, mode="eval")
+        except SyntaxError:
+            opaque[tuple(tokens(spelling))].append((f"__source_opaque_call_{index}", operand_id))
+        else:
+            remaining.append((operand_id, operand_expression))
+    if opaque:
+        source_tokens = tokens(normalized)
+        lowered = []
+        position = 0
+        patterns = sorted(opaque, key=len, reverse=True)
+        while position < len(source_tokens):
+            match = next((pattern for pattern in patterns if pattern and opaque[pattern]
+                          and tuple(source_tokens[position:position + len(pattern)]) == pattern
+                          and (position == 0 or source_tokens[position - 1][1] != ".")), None)
+            if match is None:
+                lowered.append(source_tokens[position])
+                position += 1
+            else:
+                token, operand_id = opaque[match].popleft()
+                lowered.append((tokenize.NAME, token))
+                occurrence_aliases[token] = operand_id
+                position += len(match)
+        normalized = tokenize.untokenize(lowered).strip()
     try:
         source_tree = ast.parse(normalized, mode="eval")
     except SyntaxError as exc:
@@ -246,7 +289,7 @@ def compile_source_expression(
 
     occurrence_queues: dict[str, deque[tuple[str, str]]] = defaultdict(deque)
     for index, (operand_id, operand_expression) in enumerate(
-        occurrence_operands
+        remaining
     ):
         try:
             operand_tree = ast.parse(
@@ -260,8 +303,6 @@ def compile_source_expression(
         occurrence_queues[
             ast.dump(operand_tree.body, include_attributes=False)
         ].append((token, operand_id))
-
-    occurrence_aliases: dict[str, str] = {}
 
     class ReplaceOccurrenceOperands(ast.NodeTransformer):
         def visit(self, node: ast.AST) -> ast.AST:

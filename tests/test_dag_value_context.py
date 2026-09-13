@@ -184,3 +184,22 @@ def test_shared_nested_compile_failure_keeps_its_site_and_reason(session_for):
     assert result.status == "unresolved"
     issue = next(i for i in result.issues if i.vertex_id == branch.id and i.kind == "expression")
     assert issue.reason == "invalid expression syntax"
+
+
+@pytest.mark.parametrize("pruned", [False, True])
+def test_skipped_transfer_does_not_prove_persisted_receiver_equals_initializer(session_for, pruned):
+    dag = graph(guarded=True)
+    first = next(v for v in dag.vertices if v.id == "first")
+    second = next(v for v in dag.vertices if v.id == "second")
+    first.metadata["reachability"] = {"exact": True, "all_of": []}
+    dag.edges = [e for e in dag.edges if not (e.target_id == "first" and e.kind == "control")]
+    second.metadata.update(synthetic_boundary_transfer=True, boundary_direction="subscribe",
+                           boundary_transfer_event_id="gate-second")
+    if pruned:
+        from flight_log_agent.analysis.mechanism_dag import prune_infeasible_operations
+        next(v for v in dag.vertices if v.id == "gate-second").feasibility_verdict = "always_false"
+        dag = prune_infeasible_operations(dag)
+    # mode=0 disproves a transfer at this timestamp, not at all prior calls.
+    result = session_for(dag, samples={("packet.input", 0.): 3., ("packet.mode", 0.): 0}).evaluate("root", 0.)
+    assert result.status == "unresolved"
+    assert any(issue.kind == "state_alignment" for issue in result.issues)

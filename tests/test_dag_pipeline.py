@@ -1330,17 +1330,11 @@ def test_checkpoint_trial_does_not_change_discovery_or_judge(tmp_path, monkeypat
     _run_checkpoint_trial(tmp_path, monkeypatch, backend)
 
 
-@pytest.mark.parametrize("backend", [
-    pytest.param("legacy", marks=pytest.mark.xfail(
-        strict=True,
-        reason="Legacy assignments declare expression dependencies inexact; numerical retirement parity remains open",
-    )),
-    "tree_sitter",
-])
-def test_checkpoint_source_replay_matches_observation(tmp_path, monkeypatch, backend):
+@pytest.mark.parametrize("backend", ["legacy", "tree_sitter"])
+def test_checkpoint_source_replay_requires_receiver_evidence(tmp_path, monkeypatch, backend):
     checkpoint = _run_checkpoint_trial(tmp_path, monkeypatch, backend)
-    assert checkpoint["status"] == "matched", str(checkpoint)
-    assert checkpoint["analysis_requirements"] == []
+    assert checkpoint["status"] == "not_attempted", str(checkpoint)
+    assert checkpoint["analysis_requirements"]
     assert checkpoint["authorizes_discovery_stop"] is False
 
 
@@ -1359,14 +1353,11 @@ def test_checkpoint_control_uses_shared_source_pipeline(tmp_path, monkeypatch, b
     _run_checkpoint_trial(tmp_path, monkeypatch, backend, checkpoint_control=True)
 
 
-@pytest.mark.parametrize("backend", [
-    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="Legacy numerical extraction dependencies remain inexact")),
-    "tree_sitter",
-])
-def test_checkpoint_control_shared_numerical_contract(tmp_path, monkeypatch, backend):
+@pytest.mark.parametrize("backend", ["legacy", "tree_sitter"])
+def test_checkpoint_control_cannot_verify_from_topic_presence(tmp_path, monkeypatch, backend):
     checkpoint = _run_checkpoint_trial(tmp_path, monkeypatch, backend, checkpoint_control=True)
-    assert checkpoint["status"] == "matched"
-    assert checkpoint["authorizes_discovery_stop"] is True
+    assert checkpoint["status"] == "not_attempted"
+    assert checkpoint["authorizes_discovery_stop"] is False
 
 
 def test_validation_downgrade_resynchronizes_confirmation_lists():

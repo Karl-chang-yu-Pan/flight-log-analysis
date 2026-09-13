@@ -192,6 +192,7 @@ def assess_checkpoint(
         "source_expression_ref", "expression_inputs_exact", "source_call_roles",
         "reachability", "target_scope", "source_identity", "value",
         "synthetic_boundary_transfer", "boundary_direction", "external_target_signal",
+        "boundary_event", "boundary_transfer_event_id", "requirement", "reason",
     )
     for vertex_id in relevant & vertices.keys():
         expected = source_vertices.get(vertex_id)
@@ -261,7 +262,10 @@ def assess_checkpoint(
             require("construction", "source value dependencies have not been materialized", vertex_id)
             continue
         if vertex.kind == "evidence":
-            if vertex.sub_kind == "parameter":
+            if vertex.sub_kind == "runtime_obligation":
+                require(str(metadata.get("requirement") or "state_alignment"),
+                        str(metadata.get("reason") or "runtime evidence is unavailable"), vertex_id)
+            elif vertex.sub_kind == "parameter":
                 if metadata.get("value") is None and parameters.get(str(vertex.signal_name or "").upper()) is None:
                     require("parameter_data", "required parameter value is unavailable", vertex_id, parameter=vertex.signal_name)
             elif vertex.sub_kind == "logged_signal":

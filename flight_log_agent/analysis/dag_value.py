@@ -390,6 +390,17 @@ class DAGValueSession:
                 cache[cache_key] = result
                 return result
 
+        if (vertex.metadata or {}).get("boundary_transfer_event_id"):
+            # This vertex is also a reaching definition of persisted receiver
+            # storage. A failed/skipped transfer now does not prove that the
+            # initializer is still current: an earlier invocation may have
+            # changed it. An independent receiver observation above can supply
+            # the value; otherwise retain the temporal obligation.
+            result = self._unresolved("state_alignment", vertex_id,
+                                      "receiver history and transfer-time alignment are unavailable")
+            cache[cache_key] = result
+            return result
+
         if vertex.kind == "evidence":
             result = self._evaluate_evidence(vertex, timestamp, next_active, conditional=conditional)
         elif vertex.kind == "operation":
@@ -425,6 +436,11 @@ class DAGValueSession:
         conditional: bool = False,
     ) -> DAGValueResult:
         metadata = vertex.metadata or {}
+        if vertex.sub_kind == "runtime_obligation":
+            return self._unresolved(
+                str(metadata.get("requirement") or "state_alignment"), vertex.id,
+                str(metadata.get("reason") or "runtime evidence is unavailable"),
+            )
         if vertex.sub_kind == "logged_signal" and vertex.signal_name:
             if self.context is not None:
                 if vertex.signal_name in self.context.forbidden_signals:
@@ -510,6 +526,7 @@ class DAGValueSession:
         if (
             metadata.get("synthetic_boundary_transfer")
             and metadata.get("boundary_direction") == "subscribe"
+            and not metadata.get("boundary_transfer_event_id")
         ):
             # An input boundary transfer reads the member's value from the
             # logged topic. The logged signal already observes that value over

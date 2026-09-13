@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
 from flight_log_agent.analysis.mechanism_discovery import dag_inputs_from_facts
 from flight_log_agent.px4.mechanism_source_profiler import MechanismSourceProfiler
@@ -57,7 +59,8 @@ def test_admission_parses_one_file_without_retaining_rejected_ast(tmp_path):
     assert profiler._text_cache == {}
 
 
-def test_reference_alias_preserves_source_variable_and_resolved_callee(tmp_path):
+@pytest.mark.parametrize("initializer", ["= *_navigator->get_position()", "{*_navigator->get_position()}"])
+def test_reference_alias_preserves_source_variable_and_resolved_callee(tmp_path, initializer):
     root = tmp_path / "PX4-Autopilot"
     module = root / "src" / "modules" / "example"
     module.mkdir(parents=True)
@@ -83,11 +86,11 @@ class Mode {
 };
 void Mode::run()
 {
-    const Position &first = *_navigator->get_position();
+    const Position &first INITIALIZER;
     const Position &position = first;
     output = position.alt;
 }
-""",
+""".replace("INITIALIZER", initializer),
         encoding="utf-8",
     )
     profiler = MechanismSourceProfiler(
@@ -112,6 +115,34 @@ void Mode::run()
     assert output.expression_ref.lowered_text == "position.alt"
     assert output.expression_ref.input_symbols == ["position.alt"]
     assert output.expression_ref.call_results == []
+
+
+def test_reference_list_binding_does_not_make_value_construction_an_alias(tmp_path):
+    facts = _facts(tmp_path, """
+struct Status {};
+class Source { public: const Status &get(); };
+void run(Source &object) {
+    const Status &reference{object.get()};
+    Status value{object.get()};
+}
+""")
+    assignments = {a.target: a for a in facts.source_assignments}
+    assert assignments["reference"].expression_ref.direct_call_result is not None
+    assert assignments["value"].expression_ref.direct_call_result is None
+
+
+def test_class_logical_operator_does_not_invent_short_circuit_controls(tmp_path):
+    facts = _facts(tmp_path, """
+struct Flag { bool operator&&(bool value); };
+bool effect();
+void run() {
+    Flag flag;
+    (flag && effect());
+}
+""")
+    call = next(c for c in facts.function_calls if c.name == "effect")
+    assert not call.control_predicates
+    assert call.reachability_exact is False
 
 
 def test_branch_condition_ref_preserves_projected_call_result(tmp_path):

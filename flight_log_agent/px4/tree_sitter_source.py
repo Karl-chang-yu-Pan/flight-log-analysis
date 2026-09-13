@@ -167,6 +167,7 @@ class _SourceContext:
     global_declarations: dict[str, list[SourceDeclarationRef]] = field(
         default_factory=dict
     )
+    declarations_by_id: dict[str, SourceDeclarationRef] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for unit in self.units:
@@ -178,6 +179,7 @@ class _SourceContext:
                 self.callables[item.callable_id] = item
         for unit in self.units:
             for item in unit.declarations:
+                self.declarations_by_id[item.identity.declaration_id] = item
                 if item.identity.kind != "global":
                     continue
                 owner, separator, member_name = item.qualified_name.rpartition(
@@ -1979,13 +1981,14 @@ class TreeSitterSourceExtractor:
                 exit_context=exit_context,
             )
             if exit_context == "switch":
-                termination, termination_exact = self._switch_exit_for_statement(
-                    state.unit, statement
+                termination_ref = self._switch_exit_for_statement(
+                    state, statement
                 )
             else:
-                termination, termination_exact = self._termination_expression(
-                    state.unit, statement
+                termination_ref = self._termination_expression(
+                    state, statement
                 )
+            termination, termination_exact = termination_ref.text, termination_ref.exact
             if termination == "true":
                 break
             if termination != "false":
@@ -1996,11 +1999,9 @@ class TreeSitterSourceExtractor:
                         line=state.unit.line(statement),
                         site_id=state.unit.site_id(statement),
                         source_order=statement.start_byte,
-                        # Negating an expression adds no inputs, so the
-                        # extractor's exactness verdict for the termination
-                        # carries over. Dropping it here left every
-                        # guard-clause remainder predicate inexact, which the
-                        # value engine fails closed on.
+                        input_symbols=tuple(termination_ref.input_symbols),
+                        input_identities=tuple(termination_ref.input_identities.items()),
+                        call_results=tuple(termination_ref.call_results),
                         inputs_exact=termination_exact,
                     ),
                 ]
@@ -2353,9 +2354,10 @@ class TreeSitterSourceExtractor:
                 exact=exact and not fallthrough_alias_ambiguous,
                 exit_context="switch",
             )
-            exit_expression, exit_exact = self._switch_exit_expression(
-                unit, statements
+            exit_ref = self._switch_exit_expression(
+                state, statements
             )
+            exit_expression, exit_exact = exit_ref.text, exit_ref.exact
             if (
                 exit_expression != "true"
                 and (
@@ -2442,93 +2444,129 @@ class TreeSitterSourceExtractor:
             unit.text(value if value is not None else node)
         )
 
+    @staticmethod
+    def _literal_ref(text: str, exact: bool = True) -> SourceExpressionRef:
+        return SourceExpressionRef(text=text, lowered_text=text, exact=exact)
+
+    @staticmethod
+    def _composed_ref(text: str, operands: Sequence[SourceExpressionRef]) -> SourceExpressionRef:
+        return SourceExpressionRef(
+            text=text, lowered_text=text,
+            input_symbols=list(dict.fromkeys(s for r in operands for s in r.input_symbols)),
+            input_identities={s: identity for r in operands for s, identity in r.input_identities.items()},
+            call_results=list({(c.call_source_site_id, c.result_path): c
+                               for r in operands for c in r.call_results}.values()),
+            exact=all(r.exact for r in operands),
+        )
+
+    @classmethod
+    def _boolean_ref(
+        cls, operator: str, *operands: SourceExpressionRef
+    ) -> SourceExpressionRef:
+        """Compose predicates without losing source operand and call identities."""
+        texts = [operand.text for operand in operands]
+        text = (_not(texts[0]) if operator == "!" else
+                _and(*texts) if operator == "&&" else _or(*texts))
+        relevant = [] if text in {"true", "false"} else list(operands)
+        # Boolean simplification can remove a complete operand, including its
+        # otherwise unevaluable call. Keep only the surviving expression then.
+        surviving = next((operand for operand in operands if operand.text == text), None)
+        if surviving is not None and operator != "!":
+            relevant = [surviving]
+        return cls._composed_ref(text, relevant).model_copy(
+            update={"exact": all(r.exact for r in operands)}
+        )
+
+    def _condition_ref(self, state: _ExtractionState, node: Optional[Node]) -> SourceExpressionRef:
+        return self._expression_ref(state, node, text=self._condition_text(state.unit, node))
+
     def _termination_expression(
-        self, unit: _ParsedUnit, node: Node
-    ) -> tuple[str, bool]:
+        self, state: _ExtractionState, node: Node
+    ) -> SourceExpressionRef:
+        unit = state.unit
+        literal = self._literal_ref
+        combine = self._boolean_ref
         if node.type in {"return_statement", "co_return_statement", "throw_statement"}:
-            return "true", not node.has_error
+            return literal("true", not node.has_error)
         if node.type == "compound_statement":
-            result = "false"
-            exact = not node.has_error
+            result = literal("false", not node.has_error)
             for child in node.named_children:
-                child_result, child_exact = self._termination_expression(unit, child)
-                result = _or(result, child_result)
-                exact = exact and child_exact
-                if result == "true":
+                result = combine("||", result, self._termination_expression(state, child))
+                if result.text == "true":
                     break
-            return result, exact
+            return result
         if node.type == "if_statement":
-            condition = self._condition_text(unit, node.child_by_field_name("condition"))
+            condition = self._condition_ref(state, node.child_by_field_name("condition"))
             consequence = node.child_by_field_name("consequence")
-            then_result, then_exact = (
-                self._termination_expression(unit, consequence)
+            then_result = (
+                self._termination_expression(state, consequence)
                 if consequence is not None
-                else ("false", True)
+                else literal("false")
             )
             alternative = node.child_by_field_name("alternative")
             if alternative is not None and alternative.type == "else_clause" and alternative.named_children:
                 alternative = alternative.named_children[0]
-            else_result, else_exact = (
-                self._termination_expression(unit, alternative)
+            else_result = (
+                self._termination_expression(state, alternative)
                 if alternative is not None
-                else ("false", True)
+                else literal("false")
             )
-            return (
-                _or(_and(condition, then_result), _and(_not(condition), else_result)),
-                then_exact and else_exact and not node.has_error,
+            return combine("||",
+                combine("&&", condition, then_result),
+                combine("&&", combine("!", condition), else_result),
             )
         if node.type == "switch_statement":
-            discriminant = self._condition_text(
-                unit, node.child_by_field_name("condition")
-            )
+            discriminant = self._condition_ref(state, node.child_by_field_name("condition"))
             sections = self._switch_sections(unit, node.child_by_field_name("body"))
-            labels = [label for label, _site, _body in sections if label is not None]
-            no_match = " && ".join(
-                f"!({discriminant} == {label})" for label in labels
-            ) or "true"
-            result = "false"
-            fallthrough = "false"
-            exact = not node.has_error
-            for label, _site, statements in sections:
-                entry = no_match if label is None else f"{discriminant} == {label}"
-                active = _or(entry, fallthrough)
-                section_result = "false"
+            entries = {}
+            no_match = literal("true")
+            for label, site, _body in sections:
+                if label is None:
+                    continue
+                label_ref = self._expression_ref(state, site.child_by_field_name("value"), text=label)
+                entry = self._composed_ref(f"{discriminant.text} == {label}", [discriminant, label_ref])
+                entries[site.start_byte] = entry
+                no_match = combine("&&", no_match, combine("!", entry))
+            result = literal("false", not node.has_error)
+            fallthrough = literal("false")
+            for label, site, statements in sections:
+                entry = no_match if label is None else entries[site.start_byte]
+                active = combine("||", entry, fallthrough)
+                section_result = literal("false")
                 for statement in statements:
-                    child_result, child_exact = self._termination_expression(unit, statement)
-                    section_result = _or(section_result, child_result)
-                    exact = exact and child_exact
-                result = _or(result, _and(active, section_result))
-                exit_result, exit_exact = self._switch_exit_expression(unit, statements)
-                fallthrough = _and(active, _not(exit_result))
-                exact = exact and exit_exact
-            return result, exact
+                    section_result = combine("||", section_result, self._termination_expression(state, statement))
+                result = combine("||", result, combine("&&", active, section_result))
+                exit_result = self._switch_exit_expression(state, statements)
+                fallthrough = combine("&&", active, combine("!", exit_result))
+                result = result.model_copy(update={"exact": result.exact and exit_result.exact})
+            return result
         if node.type in {"while_statement", "for_statement", "do_statement"}:
             body = node.child_by_field_name("body")
-            body_result, _ = (
-                self._termination_expression(unit, body)
+            body_result = (
+                self._termination_expression(state, body)
                 if body is not None
-                else ("false", False)
+                else literal("false", False)
             )
-            condition = self._condition_text(unit, node.child_by_field_name("condition")) or "true"
-            return _and(condition, body_result), False
-        return "false", not node.has_error
+            condition_node = node.child_by_field_name("condition")
+            condition = self._condition_ref(state, condition_node) if condition_node else literal("true")
+            return combine("&&", condition, body_result).model_copy(update={"exact": False})
+        return literal("false", not node.has_error)
 
     def _switch_exit_expression(
-        self, unit: _ParsedUnit, statements: Sequence[Node]
-    ) -> tuple[str, bool]:
-        result = "false"
-        exact = True
+        self, state: _ExtractionState, statements: Sequence[Node]
+    ) -> SourceExpressionRef:
+        result = SourceExpressionRef(text="false", lowered_text="false", exact=True)
         for statement in statements:
-            current, current_exact = self._switch_exit_for_statement(unit, statement)
-            result = _or(result, current)
-            exact = exact and current_exact
-            if result == "true":
+            current = self._switch_exit_for_statement(state, statement)
+            result = self._boolean_ref("||", result, current)
+            if result.text == "true":
                 break
-        return result, exact
+        return result
 
     def _switch_exit_for_statement(
-        self, unit: _ParsedUnit, node: Node
-    ) -> tuple[str, bool]:
+        self, state: _ExtractionState, node: Node
+    ) -> SourceExpressionRef:
+        literal = self._literal_ref
         if node.type in {
             "break_statement",
             "continue_statement",
@@ -2536,34 +2574,34 @@ class TreeSitterSourceExtractor:
             "co_return_statement",
             "throw_statement",
         }:
-            return "true", not node.has_error
+            return literal("true", not node.has_error)
         if node.type == "compound_statement":
-            return self._switch_exit_expression(unit, node.named_children)
+            return self._switch_exit_expression(state, node.named_children)
         if node.type == "if_statement":
-            condition = self._condition_text(unit, node.child_by_field_name("condition"))
+            condition = self._condition_ref(state, node.child_by_field_name("condition"))
             consequence = node.child_by_field_name("consequence")
-            then_result, then_exact = (
-                self._switch_exit_for_statement(unit, consequence)
+            then_result = (
+                self._switch_exit_for_statement(state, consequence)
                 if consequence is not None
-                else ("false", True)
+                else literal("false")
             )
             alternative = node.child_by_field_name("alternative")
             if alternative is not None and alternative.type == "else_clause" and alternative.named_children:
                 alternative = alternative.named_children[0]
-            else_result, else_exact = (
-                self._switch_exit_for_statement(unit, alternative)
+            else_result = (
+                self._switch_exit_for_statement(state, alternative)
                 if alternative is not None
-                else ("false", True)
+                else literal("false")
             )
-            return (
-                _or(_and(condition, then_result), _and(_not(condition), else_result)),
-                then_exact and else_exact and not node.has_error,
+            return self._boolean_ref("||",
+                self._boolean_ref("&&", condition, then_result),
+                self._boolean_ref("&&", self._boolean_ref("!", condition), else_result),
             )
         if node.type in {"switch_statement", "for_statement", "while_statement", "do_statement"}:
-            return "false", False
+            return literal("false", False)
         if node.type == "goto_statement":
-            return "false", False
-        return "false", not node.has_error
+            return literal("false", False)
+        return literal("false", not node.has_error)
 
     def _collect_operations(
         self,
@@ -2575,33 +2613,90 @@ class TreeSitterSourceExtractor:
     ) -> None:
         if node is None:
             return
-        for candidate in _walk_operations(node):
+        def controlled(current: Node, negate: bool = False) -> _ControlTerm:
+            ref = self._expression_ref(state, current)
+            return _ControlTerm(
+                expression=_not(ref.text) if negate else ref.text,
+                line=state.unit.line(current), site_id=state.unit.site_id(current),
+                source_order=current.start_byte,
+                input_symbols=tuple(ref.input_symbols),
+                input_identities=tuple(ref.input_identities.items()),
+                call_results=tuple(ref.call_results), inputs_exact=ref.exact,
+            )
+
+        def class_operand(current: Node) -> bool:
+            if current.type == "parenthesized_expression" and current.named_children:
+                return class_operand(current.named_children[0])
+            declared_type = ""
+            if current.type in {"identifier", "field_expression"}:
+                identity = self._storage_identity(state.unit.text(current), current, state=state)
+                declaration = state.context.declarations_by_id.get(identity.declaration_id)
+                declared_type = str(declaration.type or "") if declaration else ""
+            elif current.type == "call_expression":
+                call = self._call_ref(state, current, controls=[], exact=exact)
+                resolved = state.context.callables.get(call.resolved_callable_id or "") if call else None
+                declared_type = str(resolved.return_type or "") if resolved else ""
+            return bool(state.context.resolve_class_name(declared_type, state.callable.owner))
+
+        def walk(current: Node, inherited: list[_ControlTerm], current_exact: bool):
+            if current.type == "lambda_expression":
+                return
+            yield current, inherited, current_exact
+            if current.type == "binary_expression":
+                operator = state.unit.text(current.child_by_field_name("operator"))
+                left = current.child_by_field_name("left")
+                right = current.child_by_field_name("right")
+                if operator in {"&&", "||"} and left is not None and right is not None:
+                    if class_operand(left) or class_operand(right):
+                        # Class operands may select overloaded operators, whose
+                        # arguments are evaluated eagerly. Until overload
+                        # resolution proves the operator, never prune its RHS.
+                        yield from walk(left, inherited, False)
+                        yield from walk(right, inherited, False)
+                        return
+                    yield from walk(left, inherited, current_exact)
+                    yield from walk(right, [*inherited, controlled(left, operator == "||")], current_exact)
+                    return
+            if current.type == "conditional_expression":
+                condition = current.child_by_field_name("condition")
+                consequence = current.child_by_field_name("consequence")
+                alternative = current.child_by_field_name("alternative")
+                if condition is not None and alternative is not None:
+                    yield from walk(condition, inherited, current_exact)
+                    if consequence is not None:
+                        yield from walk(consequence, [*inherited, controlled(condition)], current_exact)
+                    yield from walk(alternative, [*inherited, controlled(condition, True)], current_exact)
+                    return
+            for child in current.named_children:
+                yield from walk(child, inherited, current_exact)
+
+        for candidate, candidate_controls, candidate_exact in walk(node, controls, exact):
             site = (candidate.start_byte, candidate.end_byte)
             if candidate.type == "assignment_expression" and site not in state.seen_assignments:
                 state.seen_assignments.add(site)
                 assignment = self._assignment_ref(
-                    state, candidate, controls=controls, exact=exact
+                    state, candidate, controls=candidate_controls, exact=candidate_exact
                 )
                 if assignment is not None:
                     state.assignments.append(assignment)
             elif candidate.type == "update_expression" and site not in state.seen_assignments:
                 state.seen_assignments.add(site)
                 assignment = self._update_ref(
-                    state, candidate, controls=controls, exact=exact
+                    state, candidate, controls=candidate_controls, exact=candidate_exact
                 )
                 if assignment is not None:
                     state.assignments.append(assignment)
             elif candidate.type == "init_declarator" and site not in state.seen_assignments:
                 state.seen_assignments.add(site)
                 assignment = self._initializer_ref(
-                    state, candidate, controls=controls, exact=exact
+                    state, candidate, controls=candidate_controls, exact=candidate_exact
                 )
                 if assignment is not None:
                     state.assignments.append(assignment)
             elif candidate.type == "call_expression" and site not in state.seen_calls:
                 state.seen_calls.add(site)
                 call = self._call_ref(
-                    state, candidate, controls=controls, exact=exact
+                    state, candidate, controls=candidate_controls, exact=candidate_exact
                 )
                 if call is not None:
                     state.calls.append(call)
@@ -2718,7 +2813,7 @@ class TreeSitterSourceExtractor:
     ) -> Optional[SourceAssignmentRef]:
         unit = state.unit
         declarator = node.child_by_field_name("declarator")
-        value = node.child_by_field_name("value")
+        value = self._reference_initializer(node)
         name_node = _declarator_identifier(declarator)
         target = unit.text(name_node).strip()
         if not target or value is None:
@@ -4024,6 +4119,18 @@ class TreeSitterSourceExtractor:
             )
         return assigned, read
 
+    @staticmethod
+    def _reference_initializer(declarator: Node) -> Optional[Node]:
+        value = declarator.child_by_field_name("value")
+        declared = declarator.child_by_field_name("declarator")
+        if (value is not None and value.type == "initializer_list"
+                and declared is not None
+                and any(n.type == "reference_declarator" for n in _walk(declared))):
+            elements = [n for n in value.named_children if n.type != "comment"]
+            if len(elements) == 1:
+                return elements[0]
+        return value
+
     def _register_storage_aliases(
         self, state: _ExtractionState, declaration: Node
     ) -> None:
@@ -4041,7 +4148,7 @@ class TreeSitterSourceExtractor:
             if node.type == "init_declarator"
         ):
             declared = declarator.child_by_field_name("declarator")
-            value = declarator.child_by_field_name("value")
+            value = self._reference_initializer(declarator)
             if declared is None:
                 continue
             is_alias_capable = any(

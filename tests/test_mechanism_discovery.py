@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from flight_log_agent.analysis.dag_value import DAGValueProgram
+from flight_log_agent.analysis.dag_value import DAGValueContext, DAGValueProgram, DAGValueResult
 from flight_log_agent.analysis.mechanism_dag import (
     build_mechanism_dag,
     evaluate_dag_vertex_series,
@@ -44,6 +44,131 @@ def _assignment(**overrides) -> SourceAssignmentRef:
     )
     base.update(overrides)
     return SourceAssignmentRef(**base)
+
+
+def _source_contract_dag(tmp_path, backend, source, terminal="output"):
+    source_file = "src/modules/example/contract.cpp"
+    profiler = _mini_tree(tmp_path, {source_file: source}, backend=backend)
+    inputs = dag_inputs_from_facts(load_facts(profiler, tmp_path / "cache", [source_file], "hash"))
+    dag = build_mechanism_dag(
+        inputs.bindings, terminal, terminal_file=source_file,
+        call_statements=inputs.call_statements, helper_expressions=inputs.helper_expressions,
+        parameter_bindings=inputs.parameter_bindings, boundary_bindings=inputs.boundary_bindings,
+        source_structure=inputs.structure,
+    )
+    return inputs, dag
+
+
+def _receiver_observation_session(dag, receiver_samples, *, parameters=None):
+    """Fixture evidence explicitly records receiver storage, not topic presence.
+
+    This permits a conditional numerical check without claiming that the
+    subscription returned success or that its execution history is known.
+    """
+    program = DAGValueProgram(dag)
+    def observe(vertex_id, timestamp):
+        vertex = program.vertices[vertex_id]
+        samples = receiver_samples.get(vertex.variable, {})
+        if vertex.metadata.get("synthetic_boundary_transfer") and timestamp in samples:
+            return DAGValueResult("value", value=samples[timestamp],
+                                  observed_vertex_ids=frozenset({vertex_id}))
+        return None
+    return program.bind(parameter_values=parameters, context=DAGValueContext(observation_resolver=observe))
+
+
+@pytest.mark.parametrize("source_backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="legacy lacks exact expression-effect reachability; retire after contract parity")),
+    "tree_sitter",
+])
+@pytest.mark.parametrize("expression,status", [
+    ("enabled && (output = 7)", "inactive"),
+    ("enabled || (output = 7)", "value"),
+    ("enabled ? (output = 7) : 0", "inactive"),
+    ("enabled ? 0 : (output = 7)", "value"),
+    ("enabled || (true && (output = 7))", "value"),
+])
+def test_expression_effects_use_source_execution_conditions(tmp_path, source_backend, expression, status):
+    _, dag = _source_contract_dag(tmp_path, source_backend, """
+class Probe { int output; void run() {
+    bool enabled = false;
+    EFFECT;
+} };
+""".replace("EFFECT", expression))
+    root = next(v for v in dag.vertices if v.variable == "output")
+    result = DAGValueProgram(dag).bind().evaluate(root.id, None)
+    assert result.status == status, result
+    if status == "value":
+        assert result.value == 7
+    assert any(e.kind == "control" and e.target_id == root.id for e in dag.edges)
+
+
+@pytest.mark.parametrize("source_backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="legacy lacks authoritative member declarations for coverage; retire after contract parity")),
+    "tree_sitter",
+])
+def test_resolved_parameter_does_not_discharge_mutable_writer_coverage(tmp_path, source_backend):
+    _, dag = _source_contract_dag(tmp_path, source_backend, """
+class Probe {
+    DEFINE_PARAMETERS((ParamInt<px4::params::SYNTHETIC_MODE>) _setting)
+    int mutable_value;
+    int output;
+    void other() { mutable_value = 2; }
+    void run() { output = _setting.get() + mutable_value; }
+};
+""")
+    assert any(v.sub_kind == "parameter" and v.signal_name == "SYNTHETIC_MODE" for v in dag.vertices)
+    requests = [r for r in dag.unresolved_references if r.kind == "storage_writers"]
+    assert not any(r.symbol == "_setting" for r in requests)
+    assert any(r.symbol == "mutable_value" for r in requests)
+
+
+@pytest.mark.parametrize("source_backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="legacy lacks exact call-result predicates; retire after contract parity")),
+    "tree_sitter",
+])
+def test_early_return_preserves_helper_and_parameter_operands(tmp_path, source_backend):
+    _, dag = _source_contract_dag(tmp_path, source_backend, """
+class Probe {
+    DEFINE_PARAMETERS((ParamInt<px4::params::SYNTHETIC_MODE>) _setting)
+    int output;
+    bool ready() { return true; }
+    void run() {
+        if (_setting.get() != 2 || !ready()) return;
+        output = 7;
+    }
+};
+""")
+    root = next(v for v in dag.vertices if v.variable == "output")
+    program = DAGValueProgram(dag)
+    assert program.bind(parameter_values={"SYNTHETIC_MODE": 2}).evaluate(root.id, None).value == 7
+    assert program.bind(parameter_values={"SYNTHETIC_MODE": 1}).evaluate(root.id, None).status == "inactive"
+    assert any(e.role.startswith("call:") for e in dag.edges)
+
+
+@pytest.mark.parametrize("source_backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="legacy lacks exact reference-result projections; retire after contract parity")),
+    "tree_sitter",
+])
+@pytest.mark.parametrize("initializer", ["= getStatus()", "{getStatus()}"])
+def test_reference_initialization_projects_nested_call_result(tmp_path, source_backend, initializer):
+    _, dag = _source_contract_dag(tmp_path, source_backend, """
+struct Control { float rate; };
+struct Status { Control control; };
+class Probe {
+    Status state;
+    float output;
+    const Status &getStatus() { return state; }
+    void run() {
+        state.control.rate = 4;
+        const Status &alias INITIALIZER;
+        output = alias.control.rate;
+    }
+};
+""".replace("INITIALIZER", initializer))
+    root = next(v for v in dag.vertices if v.variable == "output")
+    result = DAGValueProgram(dag).bind().evaluate(root.id, None)
+    assert result.status == "value" and result.value == 4, result
+    assert any(e.role == "call-result:control.rate" for e in dag.edges)
 
 
 def test_binding_from_assignment_maps_all_fields():
@@ -449,7 +574,15 @@ class Publisher {
     assert {"status.value", "_status.value"} <= targets
 
 
-def test_boundary_call_in_predicate_is_not_a_helper_gap(tmp_path, source_backend):
+@pytest.mark.parametrize("condition", ["CALL", "false && CALL", "true || CALL", "false && (unknown && CALL)"])
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("api", ["object", "c_api"])
+@pytest.mark.parametrize("source_backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="legacy lacks exact predicate operands; retire after source-to-evaluation parity")),
+    "tree_sitter",
+])
+def test_boundary_call_in_predicate_is_not_a_helper_gap(tmp_path, source_backend, condition, staged, api):
+    call_text = "_status_sub.update(&_status)" if api == "object" else "orb_copy(ORB_ID(status), fd, &_status)"
     profiler = _mini_tree(
         tmp_path,
         {
@@ -468,7 +601,7 @@ class Reader {
         }
     }
 };
-""",
+""".replace("if (_status_sub.update(&_status))", "if (" + condition.replace("CALL", call_text) + ")"),
         },
         backend=source_backend,
     )
@@ -490,6 +623,7 @@ class Reader {
         call_statements=inputs.call_statements,
         boundary_bindings=inputs.boundary_bindings,
         source_structure=inputs.structure,
+        construction_checkpoint=(lambda _: set()) if staged else None,
     )
 
     assert any(
@@ -499,9 +633,44 @@ class Reader {
     )
     assert not any(
         reference.kind == "callable"
-        and reference.symbol.rsplit(".", 1)[-1] == "update"
+        and reference.symbol.rsplit(".", 1)[-1] in {"update", "orb_copy"}
         for reference in dag.unresolved_references
     )
+
+    from flight_log_agent.analysis.dag_value import DAGValueContext, DAGValueResult
+
+    branch = next(v for v in dag.vertices if v.kind == "branch" and call_text in (v.predicate_raw or ""))
+    program = DAGValueProgram(dag)
+    assert not program.compiled_vertices[branch.id].compile_error
+    results = [v for v in dag.vertices if v.sub_kind == "boundary_result"]
+    assert len(results) == 1
+    assert any(e.source_id == results[0].id and e.target_id == branch.id and e.role.startswith("call:") for e in dag.edges)
+    evaluated = program.bind().evaluate(branch.id, 0.)
+    if condition == "CALL":
+        assert evaluated.status == "unresolved"
+        assert any(i.kind == "boundary_result" for i in evaluated.issues)
+        for value in (False, True):
+            session = program.bind(context=DAGValueContext(observation_resolver=lambda vertex_id, _t: (
+                DAGValueResult("value", value=value)
+                if program.vertices[vertex_id].sub_kind == "runtime_obligation"
+                and program.vertices[vertex_id].metadata.get("requirement") == "boundary_result" else None
+            )))
+            assert session.evaluate(branch.id, 0.).value is value
+    else:
+        assert evaluated.status == "value"
+        assert evaluated.value is (condition == "true || CALL")
+        assert program.bind().evaluate(results[0].id, 0.).status == "inactive"
+    # Knowing the returned Boolean does not fabricate a successful payload copy.
+    transfer = next(v for v in dag.vertices if v.sub_kind == "boundary_transfer")
+    copies = [v for v in dag.vertices if v.metadata.get("synthetic_boundary_transfer")]
+    assert copies
+    for copy in copies:
+        assert copy.metadata.get("boundary_transfer_event_id") == transfer.id
+        assert any(e.source_id == transfer.id and e.target_id == copy.id and e.kind == "control" for e in dag.edges)
+    if condition == "CALL":
+        assert program.bind().evaluate(transfer.id, 0.).status == "unresolved"
+    else:
+        assert program.bind().evaluate(transfer.id, 0.).value is False
 
 
 def test_c_api_copy_field_grounds_branch_and_feasibility(
@@ -606,17 +775,21 @@ class Reader {
             "reason": "source expression dependencies are not parser-exact",
         }
         return
-    assert evaluated_branch.active_windows == [(10.0, 20.0)]
+    assert evaluated_branch.active_windows == []
+    assert evaluated_branch.metadata["evaluation_failures"]
+    observed_receiver = evaluate_feasibility(
+        dag, signal_samples={"topic_a.value": [(0., 0.), (10., 1.), (20., 0.)]},
+        signal_policies={"topic_a.value": {"method": "discrete_hold"}},
+        value_session=_receiver_observation_session(dag, {"sample.value": {0.: 0., 10.: 1., 20.: 0.}}),
+        prune_dead=False,
+    )
+    assert next(v for v in observed_receiver.vertices if v.id == branch.id).active_windows == [(10., 20.)]
 
 
 def test_control_flow_governed_boundary_transfer_stays_grounded(
     tmp_path, source_backend
 ):
-    """A subscription copy inside control flow still grounds a gating branch.
-
-    The logged topic observes the member's value over the whole timeline, so
-    the source-code guard around the copy does not gate the observation.
-    """
+    """A source transfer remains linked, but topic samples do not prove receiver state."""
     profiler = _mini_tree(
         tmp_path,
         {
@@ -680,7 +853,15 @@ class Reader {
     if source_backend == "legacy":
         assert evaluated.active_windows == []
         return
-    assert evaluated.active_windows == [(10.0, 20.0)]
+    assert evaluated.active_windows == []
+    assert evaluated.feasibility_verdict == "unknown"
+    observed_receiver = evaluate_feasibility(
+        dag, signal_samples={"vehicle_status.nav_state": [(0., 0.), (10., 1.), (20., 0.)]},
+        signal_policies={"vehicle_status.nav_state": {"method": "discrete_hold"}},
+        value_session=_receiver_observation_session(dag, {"_status.nav_state": {0.: 0., 10.: 1., 20.: 0.}}),
+        prune_dead=False,
+    )
+    assert next(v for v in observed_receiver.vertices if v.id == branch.id).active_windows == [(10., 20.)]
 
 
 def test_conditional_publication_operations_remain_explicit(tmp_path):
@@ -2315,9 +2496,12 @@ void Control::run()
         construction_checkpoint=(lambda _: set()) if staged else None,
     )
 
+    receiver_samples = {"destination_state.value": {0.: 100., 1.: 100.},
+                        "vehicle_status.vehicle_type": {0.: 1, 1.: 1}}
     annotated = evaluate_feasibility(
         dag,
         parameter_values={"ACCEPT_RADIUS": 10.0},
+        value_session=_receiver_observation_session(dag, receiver_samples, parameters={"ACCEPT_RADIUS": 10.}),
         signal_samples={
             "destination.value": [(0.0, 100.0), (1.0, 100.0)],
             "status.vehicle_type": [(0.0, 1), (1.0, 1)],
@@ -2356,6 +2540,7 @@ void Control::run()
         annotated,
         terminal.id,
         parameter_values={"ACCEPT_RADIUS": 10.0},
+        value_session=_receiver_observation_session(annotated, receiver_samples, parameters={"ACCEPT_RADIUS": 10.}),
         signal_samples={
             "destination.value": [(0.0, 100.0), (1.0, 100.0)],
             "status.vehicle_type": [(0.0, 1), (1.0, 1)],
@@ -2588,7 +2773,12 @@ float adjust(float value, bool enabled)
     )
 
 
-def test_dereferenced_reference_alias_reaches_source_proven_log_boundary(tmp_path):
+@pytest.mark.parametrize("initializer", ["= *_navigator->get_global_position()", "{*_navigator->get_global_position()}"])
+@pytest.mark.parametrize("source_backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(strict=True, reason="legacy lacks call-result reference projection; retire after contract parity")),
+    "tree_sitter",
+])
+def test_dereferenced_reference_alias_reaches_source_proven_log_boundary(tmp_path, source_backend, initializer):
     source_file = "src/modules/mode/mode.cpp"
     profiler = _mini_tree(
         tmp_path,
@@ -2628,9 +2818,9 @@ void Mode::run()
     const vehicle_global_position_s &global_position = *_navigator->get_global_position();
     output = global_position.alt;
 }
-""",
+""".replace("= *_navigator->get_global_position()", initializer),
         },
-        backend="tree_sitter",
+        backend=source_backend,
     )
     facts = load_facts(
         profiler,
@@ -2820,6 +3010,14 @@ void Mode::run()
         },
         timestamps=[0.0],
         evaluation_windows=[(0.0, 0.0)],
+    )
+    assert reconstructed.complete is False
+    reconstructed = evaluate_dag_vertex_series(
+        dag, terminal.id,
+        signal_samples={"vehicle_global_position.alt": [(0., 125.)]},
+        signal_policies={"vehicle_global_position.alt": {"method": "linear"}},
+        timestamps=[0.], evaluation_windows=[(0., 0.)],
+        value_session=_receiver_observation_session(dag, {"_global_position.alt": {0.: 125.}}),
     )
     assert reconstructed.complete is True
     assert reconstructed.samples == ((0.0, 125.0),)
