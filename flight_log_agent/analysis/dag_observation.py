@@ -103,7 +103,13 @@ def evaluate_local_observed_equations(
         if direct_copy and not vertex.metadata.get("is_terminal"):
             continue
         if root not in pending and local.expression is not None and isinstance(local.expression.tree.body, ast.Name):
-            continue
+            operand = dict(local.expression.alias_to_operand).get(local.expression.tree.body.id)
+            # A compiled call-result operand forwards a value, not completion
+            # of its dependencies. Let the shared evaluator demand that work;
+            # do not propagate the output observation into its own producer.
+            call_results = vertex.metadata.get("source_expression_ref", {}).get("call_results", [])
+            if not call_results or not operand or not operand.startswith("call-site:"):
+                continue
         used: dict[str, dict[str, Any]] = {}
         errors: set[str] = set()
         comparisons: list[tuple[float, float, float]] = []

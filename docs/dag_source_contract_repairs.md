@@ -354,3 +354,50 @@ analysis caches are used.
 No ADR is created yet: these are repairs to existing contracts, and no new
 architectural trade-off has been settled. Production edits require a completed
 pre-implementation brief and user approval.
+
+## Follow-Up: Forwarded Calculation Demand
+
+The user approved retaining local-calculation demand after getter resolution,
+staged acceptance tests, and recording this repair here. Existing evidence,
+alignment, writer-coverage, and verification restrictions remain unchanged.
+
+### Pre-Implementation Brief
+
+The existing `dag_observation.evaluate_local_observed_equations()` skips a
+non-pending root whose compiled expression is a single operand. That avoids
+checking trivial copies, but also skips a resolved call-result operand while
+its return dependencies remain pending. `checkpoint_discovery` prioritizes
+local construction only when evaluation supplies those requirements.
+
+Reuse `DAGValueSession` traversal, pending-construction diagnostics, and the
+existing checkpoint priority order. Retain candidates whose single compiled
+operand is a graph-bound call result supported by extracted call metadata.
+Do not propagate the output observation into that producer, alter ordinary
+copy filtering, or create a second resolver. The original publication and
+comparison domain remain attached to the check.
+
+### Implementation and Acceptance
+
+- Extended the existing staged helper-discovery test with a forwarding call.
+  Before the repair, source discovery succeeded but no numerical check matched.
+  Afterward, the controller explicitly requests the pending helper return as
+  local-calculation construction and reaches a conditional match despite an
+  unresolved unrelated guard.
+- The same staged contract runs against both extraction backends. Legacy
+  remains a strict expected failure for missing exact local-equation operands;
+  this is not completed retirement parity.
+- Extended observation-safety tests to forwarding calls: ambiguous producers,
+  cyclic dependencies, circular output evidence, sample alignment, publication
+  identity, comparison scope, and numerical mismatch retain their safeguards.
+  Initial negative fixtures changed an unused raw-input edge; they were corrected
+  to change the consumed call-result edge before accepting these assertions.
+- Focused suite: **604 passed, 31 xfailed in 12.12 seconds**. A subsequently
+  strengthened pending-return assertion passed its targeted rerun:
+  **2 passed, 2 xfailed**.
+
+No real-flight construction was rerun for this follow-up. The earlier flight
+artifacts still describe the pre-fix selector; flight acceptance remains pending.
+Receiver-state evidence and runtime boundary outcomes are outside this repair.
+No glossary term or architectural decision was added: this restores the existing
+conditional-equation and construction contracts rather than introducing a new
+domain concept.

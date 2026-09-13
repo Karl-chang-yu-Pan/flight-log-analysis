@@ -4429,7 +4429,7 @@ def test_source_admission_revalidates_late_caller_without_stale_producers(tmp_pa
 
 def _published_observation_probe(tmp_path, backend="tree_sitter", *, result_expression="measured * 2.f",
                                  output_copy="result", observed_instances=(0,), guard=None,
-                                 construction_checkpoint=None, calculation=""):
+                                 construction_checkpoint=None, calculation="", helper_source=""):
     source = """
 class Probe {
     uORB::Publication<diagnostic_s> pub{ORB_ID(diagnostic)};
@@ -4443,6 +4443,7 @@ class Probe {
     }
 };
 """.replace("measured * 2.f", result_expression).replace("packet.result = result;", f"packet.result = {output_copy};")
+    source = source.replace("class Probe {", "class Probe {\n" + helper_source)
     source = source.replace("float result =", calculation + "\n        float result =")
     if guard is not None:
         source = source.replace("void run(float input) {", f"void run(float input) {{ if ({guard}) {{")
@@ -4496,14 +4497,20 @@ def test_local_input_demand_resumes_without_resolving_guard(tmp_path, guard):
                for _, result in snapshots for check in result.summary["local_equation_checks"])
 
 
-def test_local_equation_discovers_its_helper_before_unknown_guard(tmp_path):
+@pytest.mark.parametrize("forwarding", [False, True])
+@pytest.mark.parametrize("source_backend", [
+    pytest.param("legacy", marks=pytest.mark.xfail(
+        strict=True, reason="legacy lacks exact local-equation operands; retire after staged contract parity")),
+    "tree_sitter",
+])
+def test_local_equation_discovers_its_helper_before_unknown_guard(tmp_path, forwarding, source_backend):
     from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
     from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
 
     profiler = _mini_tree(tmp_path, {
         "probe.hpp": """class Probe {
             uORB::Publication<diagnostic_s> pub{ORB_ID(diagnostic)};
-            bool permit(); float gain(); void run(float input);
+            bool permit(); float gain(); float calculated(float measured); void run(float input);
         };""",
         "run.cpp": """#include "probe.hpp"
         void Probe::run(float input) {
@@ -4515,9 +4522,10 @@ def test_local_equation_discovers_its_helper_before_unknown_guard(tmp_path):
                 packet.result = result;
                 pub.publish(packet);
             }
-        }""",
+        }""".replace("measured * gain()", "calculated(measured)" if forwarding else "measured * gain()"),
         "gain.cpp": '#include "probe.hpp"\nfloat Probe::gain() { return 2.f; }',
-    }, backend="tree_sitter")
+        "calculated.cpp": '#include "probe.hpp"\nfloat Probe::calculated(float measured) { return measured * 2.f; }',
+    }, backend=source_backend)
     samples = {"diagnostic[0].input": [(0., 3.), (1., 3.)],
                "diagnostic[0].result": [(0., 6.), (1., 6.)]}
     decisions = []
@@ -4543,8 +4551,16 @@ def test_local_equation_discovers_its_helper_before_unknown_guard(tmp_path):
                                     for n in c["input_requirements"]])
             for c in d.summary["local_equation_checks"]]) for d in decisions
     ]
-    assert {r.symbol for r in source_decisions[0].references} == {"gain"}
-    assert "gain.cpp" in result.files_loaded
+    assert {r.symbol for r in source_decisions[0].references} == {"calculated" if forwarding else "gain"}
+    assert ("calculated.cpp" if forwarding else "gain.cpp") in result.files_loaded
+    if forwarding:
+        assert any(d.summary["next_analysis"]["kind"] == "local_calculation_construction"
+                   and any(v.id in d.construction.materialize
+                           and v.variable.startswith("__return__")
+                           for v in d.annotated.vertices)
+                   for d in decisions)
+        assert all(not c["authorizes_discovery_stop"] for d in decisions
+                   for c in d.summary["local_equation_checks"])
     assert any(c["status"] == "matched" for d in decisions for c in d.summary["local_equation_checks"])
     assert result.checkpoint.action != "verified"
 
@@ -4617,14 +4633,18 @@ def test_observation_does_not_guess_topic_instance(tmp_path):
 
 @pytest.mark.parametrize("problem", [
     "unaligned", "duplicate", "outside_scope", "mismatch", "circular",
-    "different_publication", "different_callable", "alternative_writer",
+    "different_publication", "different_callable", "alternative_writer", "cycle",
 ])
-def test_local_observation_scope_and_alignment(tmp_path, problem):
+@pytest.mark.parametrize("forwarding", [False, True])
+def test_local_observation_scope_and_alignment(tmp_path, problem, forwarding):
     from flight_log_agent.analysis.dag_observation import evaluate_local_observed_equations
     from flight_log_agent.analysis.dag_replay import EvaluationScope
     from flight_log_agent.analysis.dag_value import DAGValueProgram
 
-    dag, samples = _published_observation_probe(tmp_path)
+    dag, samples = _published_observation_probe(
+        tmp_path, result_expression="calculate(measured)" if forwarding else "measured * 2.f",
+        helper_source="float calculate(float value) { return value * 2.f; }" if forwarding else "",
+    )
     if problem == "unaligned":
         samples["diagnostic[0].input"] = [(0.1, 3.), (1.1, 3.)]
     elif problem == "duplicate":
@@ -4639,11 +4659,19 @@ def test_local_observation_scope_and_alignment(tmp_path, problem):
         witness[key] += ":different"
     elif problem == "alternative_writer":
         root = next(v.id for v in dag.vertices if v.variable == "result")
-        edge = next(e for e in dag.edges if e.target_id == root and e.kind == "data")
+        edge = next(e for e in dag.edges if e.target_id == root and e.kind == "data"
+                    and (not forwarding or e.role.startswith("call:")))
         original = next(v for v in dag.vertices if v.id == edge.source_id)
         alternate = original.model_copy(update={"id": original.id + "_alternative"})
         dag.vertices.append(alternate)
+        if forwarding:
+            dag.pending_construction.append(alternate.id)
         dag.edges.append(edge.model_copy(update={"id": edge.id + "_alternative", "source_id": alternate.id}))
+    elif problem == "cycle":
+        root = next(v.id for v in dag.vertices if v.variable == "result")
+        edge = next(e for e in dag.edges if e.target_id == root and e.kind == "data"
+                    and (not forwarding or e.role.startswith("call:")))
+        edge.source_id = root
     program = DAGValueProgram(dag)
     result = evaluate_local_observed_equations(
         dag, program, signal_samples=samples, parameter_values={},
