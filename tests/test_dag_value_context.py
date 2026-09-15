@@ -245,3 +245,101 @@ def test_shared_parameter_leaf_still_resolves(session_for):
     result = session_for(dag, parameter_values={"SYNTH_LIMIT": 4.}).evaluate("total", None)
     assert result.status == "value"
     assert result.value == 5.
+
+
+def _cyclic_pair_dag():
+    return MechanismDAG(
+        dag_id="value-cycle", terminal="a",
+        vertices=[operation("a", "bval + 1", 10), operation("b", "aval + 1", 20)],
+        edges=[edge("b", "a", "bval"), edge("a", "b", "aval")],
+    )
+
+
+def test_direct_value_cycle_stays_unresolved_without_value():
+    """A → B → A must terminate without inventing a value. The cyclic
+    detection itself carries no issue payload, so the wrapped parents
+    surface producer-unresolved reasons and no cyclic-labeled issue."""
+    dag = _cyclic_pair_dag()
+    result = DAGValueProgram(dag).bind().evaluate("a", 0.)
+    assert result.status == "unresolved"
+    assert result.value is None
+    assert result.reason == "bval: all reaching producers are unresolved"
+    assert result.issues == ()
+
+
+def test_inactive_operation_skips_unresolvable_operand():
+    """A falsy control gate renders the operation inactive before expression
+    evaluation, so an operand with no producer must not surface."""
+    dag = graph(guarded=True)
+    gated = next(v for v in dag.vertices if v.id == "first")
+    gated.metadata["expression_inputs_exact"] = True
+    gated.expression = "ghost + 1"
+    result = DAGValueProgram(dag).bind(
+        sample_resolver=lambda signal, timestamp: {(f"packet.{field}", timestamp): value
+                                                   for field, value in [("input", 3.), ("mode", 1.)]
+                                                   }.get((signal, timestamp)),
+    ).evaluate("first", 0.)
+    assert result.status == "inactive"
+    assert not [issue for issue in result.issues if issue.kind == "source_linkage"]
+
+
+def test_first_missing_producer_determines_failure():
+    """Operands resolve in expression traversal order: the first operand
+    whose producers are all missing fails the vertex with a role-prefixed
+    reason, and later operands stay untouched (no issue for bbb)."""
+    dag = MechanismDAG(
+        dag_id="first-failure", terminal="total",
+        vertices=[operation("total", "aaa + bbb", 10)],
+        edges=[edge("ghost_a", "total", "aaa"), edge("ghost_b", "total", "bbb")],
+    )
+    result = DAGValueProgram(dag).bind().evaluate("total", 0.)
+    assert result.status == "unresolved"
+    assert result.reason == "aaa: all reaching producers are unresolved"
+    assert [(i.kind, i.vertex_id, i.operand) for i in result.issues] == [
+        ("source_linkage", "ghost_a", "")]
+
+
+def test_repeated_operand_resolves_once_with_correct_value():
+    """A repeated operand keeps one resolver fetch per signal while each
+    occurrence still contributes to the value."""
+    dag = MechanismDAG(
+        dag_id="repeated-operand", terminal="total",
+        vertices=[
+            DAGVertex(id="signal", kind="evidence", sub_kind="logged_signal",
+                      signal_name="packet.input"),
+            operation("total", "reading + reading", 10),
+        ],
+        edges=[edge("signal", "total", "reading")],
+    )
+    fetches = []
+    session = DAGValueProgram(dag).bind(
+        sample_resolver=lambda signal, timestamp: (
+            fetches.append((signal, timestamp)) or 3.),
+    )
+    result = session.evaluate("total", 0.)
+    assert result.status == "value"
+    assert result.value == 6.
+    assert fetches == [("packet.input", 0.)]
+
+
+def test_shared_unresolved_child_produces_single_issue():
+    """One shared unresolved dependency reached through two parents must not
+    duplicate its semantic issue."""
+    dag = MechanismDAG(
+        dag_id="shared-unresolved", terminal="top",
+        vertices=[
+            operation("shared", "aaa + 1", 5),
+            operation("left", "shared + 1", 10),
+            operation("right", "shared + 2", 20),
+            operation("top", "left + right", 30),
+        ],
+        edges=[
+            edge("ghost_v", "shared", "aaa"),
+            edge("shared", "left", "shared"), edge("shared", "right", "shared"),
+            edge("left", "top", "left"), edge("right", "top", "right"),
+        ],
+    )
+    result = DAGValueProgram(dag).bind().evaluate("top", 0.)
+    assert result.status == "unresolved"
+    linkage = [issue for issue in result.issues if issue.kind == "source_linkage"]
+    assert [(issue.vertex_id, issue.operand) for issue in linkage] == [("ghost_v", "")]
