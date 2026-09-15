@@ -343,3 +343,80 @@ def test_shared_unresolved_child_produces_single_issue():
     assert result.status == "unresolved"
     linkage = [issue for issue in result.issues if issue.kind == "source_linkage"]
     assert [(issue.vertex_id, issue.operand) for issue in linkage] == [("ghost_v", "")]
+
+
+def _deep_chain_dag(depth):
+    vertices = [DAGVertex(id="c0", kind="evidence", sub_kind="constant",
+                          signal_name="base", metadata={"value": 0.0})]
+    edges = []
+    for level in range(1, depth + 1):
+        vertices.append(operation(f"c{level}", "prev + 1", level))
+        edges.append(edge(f"c{level - 1}", f"c{level}", "prev"))
+    return MechanismDAG(dag_id="deep-chain", terminal=f"c{depth}",
+                        vertices=vertices, edges=edges)
+
+
+def test_deep_acyclic_chain_evaluates_without_recursion_limit():
+    """A chain far deeper than the old recursive limit must evaluate to the
+    exact semantic value: stack depth is not a correctness limit."""
+    depth = 500
+    result = DAGValueProgram(_deep_chain_dag(depth)).bind().evaluate(
+        f"c{depth}", None)
+    assert result.status == "value"
+    assert result.value == float(depth)
+
+
+def _deep_diamond_dag(depth, width=2):
+    vertices = [DAGVertex(id="leaf", kind="evidence", sub_kind="constant",
+                          signal_name="base", metadata={"value": 1.0})]
+    edges = []
+    level = ["leaf"]
+    for layer in range(depth):
+        current = []
+        for slot in range(width):
+            name = f"n{layer}_{slot}"
+            vertices.append(operation(
+                name, " + ".join(f"p{index}" for index in range(len(level))),
+                layer))
+            current.append(name)
+        for node in current:
+            for index, parent in enumerate(level):
+                edges.append(edge(parent, node, f"p{index}"))
+        level = current
+    vertices.append(operation(
+        "top", " + ".join(f"q{index}" for index in range(len(level))), depth))
+    for index, parent in enumerate(level):
+        edges.append(edge(parent, "top", f"q{index}"))
+    return MechanismDAG(dag_id="deep-diamond", terminal="top",
+                        vertices=vertices, edges=edges)
+
+
+def test_deep_shared_diamond_evaluates_exact_result():
+    """Depth plus true sharing (each node feeds two children) must produce
+    the exact deterministic value with no duplicate semantic work."""
+    depth = 150
+    result = DAGValueProgram(_deep_diamond_dag(depth)).bind().evaluate(
+        "top", None)
+    assert result.status == "value"
+    assert result.value == 2.0 ** depth
+
+
+def test_computation_error_keeps_expression_issue():
+    """An expression that fails after valued operands resolve keeps an
+    expression issue rather than dropping the failure."""
+    dag = MechanismDAG(
+        dag_id="computation-error", terminal="total",
+        vertices=[
+            DAGVertex(id="one", kind="evidence", sub_kind="constant",
+                      signal_name="one", metadata={"value": 1.0}),
+            DAGVertex(id="zero", kind="evidence", sub_kind="constant",
+                      signal_name="zero", metadata={"value": 0.0}),
+            operation("total", "num / den", 10),
+        ],
+        edges=[edge("one", "total", "num"), edge("zero", "total", "den")],
+    )
+    result = DAGValueProgram(dag).bind().evaluate("total", None)
+    assert result.status == "unresolved"
+    assert result.reason == "division by zero"
+    assert [(i.kind, i.vertex_id) for i in result.issues] == [
+        ("expression", "total")]

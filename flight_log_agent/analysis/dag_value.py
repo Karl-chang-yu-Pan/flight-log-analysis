@@ -409,10 +409,7 @@ class DAGValueSession:
     def evaluate(
         self, vertex_id: str, timestamp: Optional[float]
     ) -> DAGValueResult:
-        return self._evaluate_vertex(
-            vertex_id, timestamp, frozenset(),
-            conditional=bool(self.context and self.context.conditional_equations),
-        )
+        return self._evaluate_with_worklist(vertex_id, timestamp)
 
     def evaluate_many(
         self, vertex_ids: list[str] | tuple[str, ...], timestamp: Optional[float]
@@ -440,83 +437,6 @@ class DAGValueSession:
             "unresolved", reason=reason,
             issues=(DAGValueIssue(kind, vertex_id, operand, producers, reason),),
         )
-
-    def _evaluate_vertex(
-        self,
-        vertex_id: str,
-        timestamp: Optional[float],
-        active: frozenset[str],
-        *,
-        conditional: bool = False,
-    ) -> DAGValueResult:
-        cache_key = (vertex_id, timestamp)
-        cache = self._conditional_cache if conditional else self._value_cache
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-        if vertex_id in active:
-            return DAGValueResult("unresolved", reason="cyclic value dependency")
-        vertex = self.program.vertices.get(vertex_id)
-        if vertex is None:
-            return self._unresolved("source_linkage", vertex_id, "missing DAG vertex")
-        next_active = active | {vertex_id}
-
-        if self.context is not None:
-            resolver = self.context.observation_resolver
-            observed = resolver(vertex_id, timestamp) if resolver is not None else None
-            if observed is not None:
-                cache[cache_key] = observed
-                return observed
-            if vertex_id in self.context.pending_vertices:
-                result = self._unresolved("construction", vertex_id, "local value dependencies have not been materialized")
-                cache[cache_key] = result
-                return result
-            metadata = vertex.metadata or {}
-            if (metadata.get("synthetic_boundary_transfer")
-                    and metadata.get("boundary_direction") == "subscribe"
-                    and (self.program.controls_by_target.get(vertex_id)
-                         or metadata.get("reachability", {}).get("all_of"))):
-                result = self._unresolved("state_alignment", vertex_id,
-                                          "conditional input transfer requires receiver-state and transfer-time evidence")
-                cache[cache_key] = result
-                return result
-
-        if (vertex.metadata or {}).get("boundary_transfer_event_id"):
-            # This vertex is also a reaching definition of persisted receiver
-            # storage. A failed/skipped transfer now does not prove that the
-            # initializer is still current: an earlier invocation may have
-            # changed it. An independent receiver observation above can supply
-            # the value; otherwise retain the temporal obligation.
-            result = self._unresolved("state_alignment", vertex_id,
-                                      "receiver history and transfer-time alignment are unavailable")
-            cache[cache_key] = result
-            return result
-
-        if vertex.kind == "evidence":
-            result = self._evaluate_evidence(vertex, timestamp, next_active, conditional=conditional)
-        elif vertex.kind == "operation":
-            activity = self._operation_activity(vertex_id, timestamp, next_active)
-            activity_result = self._activity_results[cache_key]
-            if activity == "inactive":
-                result = activity_result
-            elif activity == "unknown" and not (
-                conditional and (vertex.metadata or {}).get("reachability", {}).get("exact")
-            ):
-                result = activity_result
-            else:
-                result = self._evaluate_expression_vertex(
-                    vertex, timestamp, next_active, conditional=conditional,
-                )
-                if activity == "unknown":
-                    result = replace(result, conditional_writer_ids=result.conditional_writer_ids | {vertex_id})
-                else:
-                    result = result.with_dependencies(activity_result)
-        elif vertex.kind == "branch":
-            result = self._evaluate_branch(vertex, timestamp, next_active)
-        else:
-            result = DAGValueResult("unresolved", reason="unsupported vertex kind")
-        cache[cache_key] = result
-        return result
 
     def _evaluate_evidence(
         self,
@@ -575,151 +495,9 @@ class DAGValueSession:
                 return DAGValueResult(
                     "value", value=self.parameters[parameter_name]
                 )
-        if vertex.sub_kind == "helper_parameter":
-            incoming = self.program.data_by_target.get(vertex.id, ())
-            if incoming:
-                return self._select_producer(
-                    [edge.source_id for edge in incoming], timestamp, active, conditional=conditional,
-                )
+        # NOTE: helper_parameter vertices with incoming edges are routed to
+        # producer selection by the iterative driver before reaching here.
         return self._unresolved("source_linkage", vertex.id, f"unresolved evidence {name or vertex.id}")
-
-    def _evaluate_branch(
-        self,
-        vertex: Any,
-        timestamp: Optional[float],
-        active: frozenset[str],
-    ) -> DAGValueResult:
-        if self.context is not None and (vertex.metadata or {}).get("static_evaluation", {}).get("assumed"):
-            return self._unresolved("control_flow", vertex.id, "gate verdict depends on an assumption")
-        domain = (vertex.metadata or {}).get("evaluation_domain") or []
-        if self.context is not None and (
-            (domain and (timestamp is None or not float(domain[0]) <= timestamp <= float(domain[1])))
-            or (vertex.metadata or {}).get("evaluation_failures")
-        ):
-            return self._evaluate_expression_vertex(vertex, timestamp, active)
-        if vertex.feasibility_verdict == "always_true":
-            return DAGValueResult("value", value=True)
-        if vertex.feasibility_verdict == "always_false":
-            return DAGValueResult("value", value=False)
-        if timestamp is not None and vertex.active_windows:
-            if any(start <= timestamp <= end for start, end in vertex.active_windows):
-                return DAGValueResult("value", value=True)
-            domain = (vertex.metadata or {}).get("evaluation_domain") or []
-            if len(domain) == 2 and float(domain[0]) <= timestamp <= float(domain[1]):
-                return DAGValueResult("value", value=False)
-        return self._evaluate_expression_vertex(vertex, timestamp, active)
-
-    def _operation_activity(
-        self,
-        vertex_id: str,
-        timestamp: Optional[float],
-        active: frozenset[str],
-    ) -> ActivityStatus:
-        metadata = self.program.vertices[vertex_id].metadata or {}
-        key = (vertex_id, timestamp)
-        proof = self._activity_results.get(key)
-        if proof is not None:
-            return "active" if proof.status == "value" else "inactive" if proof.status == "inactive" else "unknown"
-        if (
-            metadata.get("synthetic_boundary_transfer")
-            and metadata.get("boundary_direction") == "subscribe"
-            and not metadata.get("boundary_transfer_event_id")
-        ):
-            # An input boundary transfer reads the member's value from the
-            # logged topic. The logged signal already observes that value over
-            # the whole timeline (hold-last between samples), so the source-code
-            # control flow around the copy statement does not gate the
-            # observation — the log records what the member held regardless.
-            proof = (DAGValueResult("value", value=True)
-                     if self.context is None or metadata.get("reachability", {}).get("exact")
-                     else self._unresolved("control_flow", vertex_id, "input transfer reachability is unresolved"))
-            self._activity_results[key] = proof
-            return "active" if proof.status == "value" else "unknown"
-        unknown = not bool(
-            (metadata.get("reachability") or {}).get("exact", False)
-        )
-        dependencies: list[DAGValueResult] = []
-        if (self.context is not None and metadata.get("reachability", {}).get("all_of")
-                and not self.program.controls_by_target.get(vertex_id)):
-            unknown = True
-        for branch_id in self.program.controls_by_target.get(vertex_id, ()):
-            result = self._evaluate_vertex(branch_id, timestamp, active)
-            dependencies.append(result)
-            if result.status != "value":
-                unknown = True
-            elif not bool(result.value):
-                self._activity_results[key] = DAGValueResult("inactive", reason="writer is inactive").with_dependencies(result)
-                return "inactive"
-        proof = (self._unresolved("control_flow", vertex_id, "writer reachability is unresolved")
-                 if unknown else DAGValueResult("value", value=True))
-        self._activity_results[key] = proof.with_dependencies(*dependencies)
-        return "unknown" if unknown else "active"
-
-    def _evaluate_expression_vertex(
-        self,
-        vertex: Any,
-        timestamp: Optional[float],
-        active: frozenset[str],
-        *,
-        conditional: bool = False,
-    ) -> DAGValueResult:
-        local = self.program.compiled_vertices.get(vertex.id)
-        if local is None or local.expression is None or not local.exact:
-            return self._unresolved("expression", vertex.id,
-                                    local.compile_error if local is not None else "vertex has no expression")
-        producers = dict(local.producers_by_operand)
-        dependencies: list[DAGValueResult] = []
-
-        def resolve_operand(role: str) -> Any:
-            producer_ids = list(producers.get(role, ()))
-            if not producer_ids:
-                dependencies.append(self._unresolved("source_linkage", vertex.id, "missing DAG operand", operand=role))
-                raise SourceExpressionError(f"missing DAG operand {role}")
-            selected = self._select_producer(producer_ids, timestamp, active, conditional=conditional)
-            dependencies.append(selected)
-            if selected.status != "value":
-                if len(producer_ids) > 1:
-                    dependencies.append(self._unresolved(
-                        "writer_coverage", vertex.id, selected.reason,
-                        operand=role, producers=tuple(producer_ids),
-                    ))
-                raise SourceExpressionError(
-                    f"{role}: {selected.reason or selected.status}"
-                )
-            return selected.value
-
-        try:
-            result = DAGValueResult("value", value=local.expression.evaluate(resolve_operand))
-        except (SourceExpressionError, TypeError, ValueError, ArithmeticError) as exc:
-            result = (DAGValueResult("unresolved", reason=str(exc))
-                      if any(r.status != "value" for r in dependencies)
-                      else self._unresolved("expression", vertex.id, str(exc)))
-        return result.with_dependencies(*dependencies)
-
-    def _select_producer(
-        self,
-        producer_ids: list[str],
-        timestamp: Optional[float],
-        active: frozenset[str],
-        *,
-        conditional: bool = False,
-    ) -> DAGValueResult:
-        candidates: list[tuple[str, DAGValueResult]] = []
-        unique_ids = tuple(dict.fromkeys(producer_ids))
-        for producer_id in unique_ids:
-            if producer_id not in self.program.vertices:
-                candidates.append((producer_id, self._unresolved("source_linkage", producer_id, "missing DAG producer")))
-                continue
-            candidates.append(
-                (
-                    producer_id,
-                    self._evaluate_vertex(
-                        producer_id, timestamp, active,
-                        conditional=conditional and len(unique_ids) == 1,
-                    ),
-                )
-            )
-        return self._decide_producer_selection(candidates)
 
     def _decide_producer_selection(
         self,
@@ -727,8 +505,8 @@ class DAGValueSession:
     ) -> DAGValueResult:
         """Pure final selection over fully evaluated producer candidates.
 
-        Shared by the recursive `_select_producer` tail and the iterative
-        engine so both apply one selection ladder to the same inputs.
+        Single shared implementation of the producer-selection ladder used
+        when all candidates for one role have been evaluated.
         """
         active_values = [item for item in candidates if item[1].status == "value"]
         unknown_ids = [
@@ -800,15 +578,15 @@ class DAGValueSession:
             int(target_scope.get("source_order") or metadata.get("source_order") or 0),
         )
 
-    def _evaluate_iterative(
+    def _evaluate_with_worklist(
         self, vertex_id: str, timestamp: Optional[float]
     ) -> DAGValueResult:
-        """Temporary T3 seam: iterative evaluation for differential testing.
+        """Authoritative evaluation engine: explicit worklist, no recursion.
 
         Same bound session, vertex, timestamp, and conditional context as
-        :meth:`evaluate`, computed without Python recursion. Not for
-        production callers: T4 owns the differential harness that may invoke
-        it (with fresh session state per engine), and T5 owns cutover.
+        callers previously received through recursive evaluation, computed
+        with an explicit frame stack so Python call-stack depth is never a
+        correctness limit.
         """
         conditional = bool(self.context and self.context.conditional_equations)
         stack = [

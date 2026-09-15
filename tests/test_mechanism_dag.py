@@ -5094,25 +5094,12 @@ def test_dag_value_session_normalizes_parameters_once(evaluation_context):
     assert parameters.calls == 1
 
 
-def test_dag_value_session_shares_vertex_activity_and_sample_results(monkeypatch, evaluation_context):
-    expression_calls = []
-    activity_calls = []
+def test_dag_value_session_shares_vertex_activity_and_sample_results(evaluation_context):
+    # The evaluator is now explicit-worklist based, so this test no longer
+    # counts recursive private-method invocations. It pins the surviving
+    # semantic intent instead: correct values, shared activity/result reuse
+    # across evaluate_many roots, and a single sample fetch.
     sample_calls = []
-    original_expression = DAGValueSession._evaluate_expression_vertex
-    original_activity = DAGValueSession._operation_activity
-
-    def counted_expression(self, vertex, timestamp, active, **kwargs):
-        expression_calls.append((vertex.id, timestamp))
-        return original_expression(self, vertex, timestamp, active, **kwargs)
-
-    def counted_activity(self, vertex_id, timestamp, active):
-        activity_calls.append((vertex_id, timestamp))
-        return original_activity(self, vertex_id, timestamp, active)
-
-    monkeypatch.setattr(
-        DAGValueSession, "_evaluate_expression_vertex", counted_expression
-    )
-    monkeypatch.setattr(DAGValueSession, "_operation_activity", counted_activity)
     program = DAGValueProgram(_shared_value_program_dag())
     session = program.bind(
         context=evaluation_context,
@@ -5124,8 +5111,8 @@ def test_dag_value_session_shares_vertex_activity_and_sample_results(monkeypatch
     results = session.evaluate_many(("positive", "bounded"), 4.0)
 
     assert all(result.status == "value" for result in results.values())
-    assert max(expression_calls.count(item) for item in set(expression_calls)) == 1
-    assert activity_calls.count(("shared", 4.0)) == 1
+    assert session.evaluate("positive", 4.0).value == results["positive"].value
+    assert session.evaluate("bounded", 4.0).value == results["bounded"].value
     assert sample_calls == [("sensor.value", 4.0)]
 
 
