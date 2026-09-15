@@ -9,7 +9,7 @@ text; every non-local value still comes through a DAG edge.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import re
 from types import MappingProxyType
 from typing import Any, Callable, Literal, Optional
@@ -63,6 +63,61 @@ def observation_validity_issue(
 _PARAMETER_ACCESSOR = re.compile(
     r"^_param_(?P<name>[A-Za-z0-9_]+)\.get(?:\(\))?$"
 )
+
+
+class _Suspend(Exception):
+    """Private control flow for the iterative evaluator (temporary T3 seam).
+
+    Raised by the table-backed operand resolver when producer work for a
+    role has not completed. Plain ``Exception`` by contract: it must never
+    subclass ``SourceExpressionError``/``ValueError``/``TypeError``/
+    ``ArithmeticError``, which the evaluation-failure path catches. Only
+    the iterative driver catches it.
+    """
+
+    def __init__(self, role: str, producer_ids: tuple[str, ...]) -> None:
+        super().__init__(role)
+        self.role = role
+        self.producer_ids = tuple(producer_ids)
+
+
+@dataclass
+class _IterativeFrame:
+    """One explicit work item for the iterative DAG evaluator (T3).
+
+    Frames form one state machine (kind is one of ``enter``, ``activity``,
+    ``op_dispatch``, ``producers``, ``expression``); the driver schedules
+    strictly depth-first, so at most one child is outstanding per frame and
+    ``pending`` holds no more than one delivered child result. Completion is
+    a driver action, not a frame type.
+    """
+
+    kind: str
+    vertex_id: str
+    timestamp: Optional[float]
+    conditional: bool
+    pending: Any = None
+    stage: str = "start"
+    path_pushed: bool = False
+    skip_memo: bool = False
+    # Activity gathering.
+    branch_ids: tuple[str, ...] = ()
+    branch_index: int = 0
+    unknown: bool = False
+    activity_deps: list = field(default_factory=list)
+    # Post-activity dispatch.
+    activity: str = ""
+    activity_result: Optional["DAGValueResult"] = None
+    # Producer selection.
+    producer_ids: tuple[str, ...] = ()
+    producer_index: int = 0
+    candidates: list = field(default_factory=list)
+    narrow_conditional: bool = False
+    # Expression resume.
+    table: dict = field(default_factory=dict)
+    expression_deps: list = field(default_factory=list)
+    awaiting_role: str = ""
+    awaiting_producers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -664,7 +719,17 @@ class DAGValueSession:
                     ),
                 )
             )
+        return self._decide_producer_selection(candidates)
 
+    def _decide_producer_selection(
+        self,
+        candidates: list[tuple[str, DAGValueResult]],
+    ) -> DAGValueResult:
+        """Pure final selection over fully evaluated producer candidates.
+
+        Shared by the recursive `_select_producer` tail and the iterative
+        engine so both apply one selection ladder to the same inputs.
+        """
         active_values = [item for item in candidates if item[1].status == "value"]
         unknown_ids = [
             producer_id
@@ -734,6 +799,420 @@ class DAGValueSession:
             int(target_scope.get("line") or vertex.line or 0),
             int(target_scope.get("source_order") or metadata.get("source_order") or 0),
         )
+
+    def _evaluate_iterative(
+        self, vertex_id: str, timestamp: Optional[float]
+    ) -> DAGValueResult:
+        """Temporary T3 seam: iterative evaluation for differential testing.
+
+        Same bound session, vertex, timestamp, and conditional context as
+        :meth:`evaluate`, computed without Python recursion. Not for
+        production callers: T4 owns the differential harness that may invoke
+        it (with fresh session state per engine), and T5 owns cutover.
+        """
+        conditional = bool(self.context and self.context.conditional_equations)
+        stack = [
+            _IterativeFrame(
+                kind="enter", vertex_id=vertex_id,
+                timestamp=timestamp, conditional=conditional,
+            )
+        ]
+        path: list[str] = []
+        in_path: set[str] = set()
+        while True:
+            frame = stack[-1]
+            pushed = self._step_iterative_frame(frame, stack, path, in_path)
+            if pushed is not None:
+                stack.append(pushed)
+                continue
+            result = self._complete_iterative_frame(frame)
+            stack.pop()
+            if frame.path_pushed:
+                path.pop()
+                in_path.discard(frame.vertex_id)
+            if not stack:
+                return result
+            stack[-1].pending = result
+
+    def _step_iterative_frame(
+        self,
+        frame: _IterativeFrame,
+        stack: list[_IterativeFrame],
+        path: list[str],
+        in_path: set[str],
+    ) -> Optional[_IterativeFrame]:
+        """Advance one frame: return a child frame to schedule, else None.
+
+        A frame returning None is complete; the driver finalizes it via
+        `_complete_iterative_frame`. Every activation schedules at most one
+        child, preserving strict depth-first order.
+        """
+        if frame.kind == "enter":
+            return self._step_enter_frame(frame, path, in_path)
+        if frame.kind == "activity":
+            return self._step_activity_frame(frame)
+        if frame.kind == "op_dispatch":
+            return self._step_op_dispatch_frame(frame)
+        if frame.kind == "producers":
+            return self._step_producers_frame(frame)
+        return self._step_expression_frame(frame)
+
+    def _complete_iterative_frame(self, frame: _IterativeFrame) -> DAGValueResult:
+        """Finalize a frame that scheduled no further child work."""
+        if frame.kind == "enter":
+            result = frame.pending
+            cache = (self._conditional_cache if frame.conditional
+                     else self._value_cache)
+            if not frame.skip_memo:
+                cache[(frame.vertex_id, frame.timestamp)] = result
+            return result
+        if frame.kind == "activity":
+            return frame.pending
+        if frame.kind == "op_dispatch":
+            return frame.pending
+        if frame.kind == "producers":
+            return self._decide_producer_selection(frame.candidates)
+        return frame.pending
+
+    def _step_enter_frame(
+        self,
+        frame: _IterativeFrame,
+        path: list[str],
+        in_path: set[str],
+    ) -> Optional[_IterativeFrame]:
+        if frame.pending is not None:
+            delivered = frame.pending
+            frame.pending = None
+            if frame.stage == "await_activity":
+                proof = delivered
+                activity = ("active" if proof.status == "value"
+                            else "inactive" if proof.status == "inactive"
+                            else "unknown")
+                frame.stage = "await_dispatch"
+                return _IterativeFrame(
+                    kind="op_dispatch", vertex_id=frame.vertex_id,
+                    timestamp=frame.timestamp, conditional=frame.conditional,
+                    activity=activity, activity_result=proof,
+                )
+            frame.pending = delivered
+            return None
+        cache_key = (frame.vertex_id, frame.timestamp)
+        cache = (self._conditional_cache if frame.conditional
+                 else self._value_cache)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            frame.pending = cached
+            return None
+        if frame.vertex_id in in_path:
+            frame.skip_memo = True
+            frame.pending = DAGValueResult(
+                "unresolved", reason="cyclic value dependency")
+            return None
+        vertex = self.program.vertices.get(frame.vertex_id)
+        if vertex is None:
+            frame.skip_memo = True
+            frame.pending = self._unresolved(
+                "source_linkage", frame.vertex_id, "missing DAG vertex")
+            return None
+        path.append(frame.vertex_id)
+        in_path.add(frame.vertex_id)
+        frame.path_pushed = True
+        if self.context is not None:
+            resolver = self.context.observation_resolver
+            observed = (resolver(frame.vertex_id, frame.timestamp)
+                        if resolver is not None else None)
+            if observed is not None:
+                frame.pending = observed
+                return None
+            if frame.vertex_id in self.context.pending_vertices:
+                frame.pending = self._unresolved(
+                    "construction", frame.vertex_id,
+                    "local value dependencies have not been materialized")
+                return None
+            metadata = vertex.metadata or {}
+            if (metadata.get("synthetic_boundary_transfer")
+                    and metadata.get("boundary_direction") == "subscribe"
+                    and (self.program.controls_by_target.get(frame.vertex_id)
+                         or metadata.get("reachability", {}).get("all_of"))):
+                frame.pending = self._unresolved(
+                    "state_alignment", frame.vertex_id,
+                    "conditional input transfer requires receiver-state and "
+                    "transfer-time evidence")
+                return None
+        if (vertex.metadata or {}).get("boundary_transfer_event_id"):
+            frame.pending = self._unresolved(
+                "state_alignment", frame.vertex_id,
+                "receiver history and transfer-time alignment are unavailable")
+            return None
+        if vertex.kind == "evidence":
+            incoming = (
+                self.program.data_by_target.get(vertex.id, ())
+                if vertex.sub_kind == "helper_parameter" else ()
+            )
+            if vertex.sub_kind == "helper_parameter" and incoming:
+                frame.stage = "await_producers"
+                return _IterativeFrame(
+                    kind="producers", vertex_id=frame.vertex_id,
+                    timestamp=frame.timestamp, conditional=frame.conditional,
+                    producer_ids=tuple(
+                        edge.source_id for edge in incoming),
+                )
+            frame.pending = self._evaluate_evidence(
+                vertex, frame.timestamp, frozenset(in_path),
+                conditional=frame.conditional,
+            )
+            return None
+        if vertex.kind == "operation":
+            frame.stage = "await_activity"
+            return _IterativeFrame(
+                kind="activity", vertex_id=frame.vertex_id,
+                timestamp=frame.timestamp, conditional=frame.conditional,
+                branch_ids=tuple(
+                    self.program.controls_by_target.get(frame.vertex_id, ())),
+            )
+        if vertex.kind == "branch":
+            if self._enter_branch_frame(frame, vertex):
+                return self._step_expression_frame(frame)
+            return None
+        frame.pending = DAGValueResult(
+            "unresolved", reason="unsupported vertex kind")
+        return None
+
+    def _enter_branch_frame(
+        self, frame: _IterativeFrame, vertex: Any
+    ) -> bool:
+        """Run inline branch checks; True converts the frame to EXPRESSION.
+
+        Tail-transition for predicate fallback (the recursive code returns
+        the expression result unwrapped): the same stack slot continues as
+        an expression frame for the same vertex with conditional disabled.
+        """
+        if self.context is not None and (vertex.metadata or {}).get(
+                "static_evaluation", {}).get("assumed"):
+            frame.pending = self._unresolved(
+                "control_flow", vertex.id, "gate verdict depends on an assumption")
+            return False
+        domain = (vertex.metadata or {}).get("evaluation_domain") or []
+        if self.context is not None and (
+            (domain and (frame.timestamp is None
+                         or not float(domain[0]) <= frame.timestamp <= float(domain[1])))
+            or (vertex.metadata or {}).get("evaluation_failures")
+        ):
+            frame.kind = "expression"
+            frame.conditional = False
+            return True
+        if vertex.feasibility_verdict == "always_true":
+            frame.pending = DAGValueResult("value", value=True)
+            return False
+        if vertex.feasibility_verdict == "always_false":
+            frame.pending = DAGValueResult("value", value=False)
+            return False
+        if frame.timestamp is not None and vertex.active_windows:
+            if any(start <= frame.timestamp <= end
+                   for start, end in vertex.active_windows):
+                frame.pending = DAGValueResult("value", value=True)
+                return False
+            domain = (vertex.metadata or {}).get("evaluation_domain") or []
+            if (len(domain) == 2
+                    and float(domain[0]) <= frame.timestamp <= float(domain[1])):
+                frame.pending = DAGValueResult("value", value=False)
+                return False
+        frame.kind = "expression"
+        frame.conditional = False
+        return True
+
+    def _step_activity_frame(
+        self, frame: _IterativeFrame
+    ) -> Optional[_IterativeFrame]:
+        key = (frame.vertex_id, frame.timestamp)
+        if frame.stage == "start":
+            frame.stage = "loop"
+            proof = self._activity_results.get(key)
+            if proof is not None:
+                frame.pending = proof
+                return None
+            metadata = self.program.vertices[frame.vertex_id].metadata or {}
+            frame.unknown = not bool(
+                (metadata.get("reachability") or {}).get("exact", False)
+            )
+            if (metadata.get("synthetic_boundary_transfer")
+                    and metadata.get("boundary_direction") == "subscribe"
+                    and not metadata.get("boundary_transfer_event_id")):
+                if self.context is None or metadata.get(
+                        "reachability", {}).get("exact"):
+                    proof = DAGValueResult("value", value=True)
+                else:
+                    proof = self._unresolved(
+                        "control_flow", frame.vertex_id,
+                        "input transfer reachability is unresolved")
+                self._activity_results[key] = proof
+                frame.pending = proof
+                return None
+            if (self.context is not None
+                    and metadata.get("reachability", {}).get("all_of")
+                    and not self.program.controls_by_target.get(frame.vertex_id)):
+                frame.unknown = True
+        else:
+            delivered = frame.pending
+            frame.pending = None
+            frame.activity_deps.append(delivered)
+            if delivered.status != "value":
+                frame.unknown = True
+            elif not bool(delivered.value):
+                proof = DAGValueResult(
+                    "inactive",
+                    reason="writer is inactive").with_dependencies(delivered)
+                self._activity_results[key] = proof
+                frame.pending = proof
+                return None
+            frame.branch_index += 1
+        while frame.branch_index < len(frame.branch_ids):
+            branch_id = frame.branch_ids[frame.branch_index]
+            return _IterativeFrame(
+                kind="enter", vertex_id=branch_id,
+                timestamp=frame.timestamp, conditional=False,
+            )
+        if frame.unknown:
+            proof = self._unresolved(
+                "control_flow", frame.vertex_id,
+                "writer reachability is unresolved")
+        else:
+            proof = DAGValueResult("value", value=True)
+        proof = proof.with_dependencies(*frame.activity_deps)
+        self._activity_results[key] = proof
+        frame.pending = proof
+        return None
+
+    def _step_op_dispatch_frame(
+        self, frame: _IterativeFrame
+    ) -> Optional[_IterativeFrame]:
+        if frame.pending is not None:
+            delivered = frame.pending
+            frame.pending = None
+            if frame.activity == "unknown":
+                result = delivered
+            else:
+                result = delivered.with_dependencies(frame.activity_result)
+            if frame.activity == "unknown":
+                result = replace(
+                    result,
+                    conditional_writer_ids=(
+                        result.conditional_writer_ids | {frame.vertex_id}),
+                )
+            frame.pending = result
+            return None
+        if frame.activity == "inactive":
+            frame.pending = frame.activity_result
+            return None
+        vertex = self.program.vertices[frame.vertex_id]
+        if frame.activity == "unknown" and not (
+            frame.conditional
+            and (vertex.metadata or {}).get("reachability", {}).get("exact")
+        ):
+            frame.pending = frame.activity_result
+            return None
+        return _IterativeFrame(
+            kind="expression", vertex_id=frame.vertex_id,
+            timestamp=frame.timestamp, conditional=frame.conditional,
+        )
+
+    def _step_producers_frame(
+        self, frame: _IterativeFrame
+    ) -> Optional[_IterativeFrame]:
+        if frame.stage == "start":
+            frame.stage = "loop"
+            frame.producer_ids = tuple(dict.fromkeys(frame.producer_ids))
+            frame.narrow_conditional = (
+                frame.conditional and len(frame.producer_ids) == 1)
+        if frame.pending is not None:
+            delivered = frame.pending
+            frame.pending = None
+            frame.candidates.append(
+                (frame.producer_ids[frame.producer_index], delivered))
+            frame.producer_index += 1
+        while frame.producer_index < len(frame.producer_ids):
+            producer_id = frame.producer_ids[frame.producer_index]
+            if producer_id not in self.program.vertices:
+                frame.candidates.append(
+                    (producer_id, self._unresolved(
+                        "source_linkage", producer_id, "missing DAG producer")))
+                frame.producer_index += 1
+                continue
+            return _IterativeFrame(
+                kind="enter", vertex_id=producer_id,
+                timestamp=frame.timestamp,
+                conditional=frame.narrow_conditional,
+            )
+        return None
+
+    def _step_expression_frame(
+        self, frame: _IterativeFrame
+    ) -> Optional[_IterativeFrame]:
+        if frame.pending is not None:
+            delivered = frame.pending
+            frame.pending = None
+            role = frame.awaiting_role
+            awaiting_producers = frame.awaiting_producers
+            frame.awaiting_role = ""
+            frame.awaiting_producers = ()
+            frame.expression_deps.append(delivered)
+            if delivered.status != "value":
+                if len(awaiting_producers) > 1:
+                    frame.expression_deps.append(self._unresolved(
+                        "writer_coverage", frame.vertex_id, delivered.reason,
+                        operand=role,
+                        producers=tuple(awaiting_producers),
+                    ))
+                frame.pending = DAGValueResult(
+                    "unresolved",
+                    reason=f"{role}: {delivered.reason or delivered.status}"
+                ).with_dependencies(*frame.expression_deps)
+                return None
+            frame.table[role] = delivered.value
+        vertex = self.program.vertices[frame.vertex_id]
+        local = self.program.compiled_vertices.get(vertex.id)
+        if local is None or local.expression is None or not local.exact:
+            frame.pending = self._unresolved(
+                "expression", vertex.id,
+                local.compile_error if local is not None else "vertex has no expression")
+            return None
+        producers = dict(local.producers_by_operand)
+
+        def resolver(role: str) -> Any:
+            producer_ids = list(producers.get(role, ()))
+            if not producer_ids:
+                issue = self._unresolved(
+                    "source_linkage", vertex.id, "missing DAG operand", operand=role)
+                frame.expression_deps.append(issue)
+                raise SourceExpressionError(f"missing DAG operand {role}")
+            if role in frame.table:
+                return frame.table[role]
+            raise _Suspend(role, tuple(producer_ids))
+
+        try:
+            value = local.expression.evaluate(resolver)
+        except _Suspend as suspended:
+            frame.awaiting_role = suspended.role
+            frame.awaiting_producers = suspended.producer_ids
+            return _IterativeFrame(
+                kind="producers", vertex_id=frame.vertex_id,
+                timestamp=frame.timestamp, conditional=frame.conditional,
+                producer_ids=suspended.producer_ids,
+            )
+        except (SourceExpressionError, TypeError, ValueError,
+                ArithmeticError) as exc:
+            if any(r.status != "value" for r in frame.expression_deps):
+                frame.pending = DAGValueResult(
+                    "unresolved", reason=str(exc)).with_dependencies(
+                        *frame.expression_deps)
+            else:
+                frame.pending = self._unresolved(
+                    "expression", vertex.id, str(exc)).with_dependencies(
+                        *frame.expression_deps)
+            return None
+        frame.pending = DAGValueResult(
+            "value", value=value).with_dependencies(*frame.expression_deps)
+        return None
 
 
 class DAGValuePlan:
