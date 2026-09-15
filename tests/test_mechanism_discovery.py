@@ -4805,6 +4805,40 @@ def test_opaque_leaf_need_ignores_unrelated_declaration(tmp_path):
                     == leaf_declaration)
 
 
+def test_declaration_linked_need_drives_local_calculation_scheduling(tmp_path):
+    """A Step-D declaration-linked need must reach checkpoint discovery
+    scheduling as local-calculation source work: linkage alone is not the
+    goal, selection of the same semantic obligation is. Scheduling changes
+    nothing about evidence, coverage, or stop authority."""
+    from flight_log_agent.analysis.checkpoint_discovery import evaluate_checkpoint_round
+
+    source = _UNRESOLVED_MEMBER_SOURCE
+    dag, samples = _unresolved_member_dag(tmp_path, source)
+    expected = set()
+    for reference in dag.unresolved_references:
+        if reference.kind != "storage_writers" or reference.identity is None:
+            continue
+        assert reference.identity.declaration_proven is True
+        expected.add(reference.identity.declaration_id)
+    assert len(expected) == 1
+
+    decision = evaluate_checkpoint_round(
+        dag, parameter_values={}, observed_signals=set(samples),
+        signal_policies={s: {"method": "linear"} for s in samples},
+        load_samples=lambda *_: samples,
+    )
+    assert decision.summary["next_analysis"]["kind"] == "local_calculation_source"
+    selected = {r.identity.declaration_id for r in decision.references
+                if r.identity is not None}
+    assert expected <= selected
+    assert selected <= expected, "no unrelated declaration may be scheduled"
+    assert decision.action != "verified"
+    assert all(not c["authorizes_discovery_stop"]
+               for c in decision.summary["local_equation_checks"])
+    assert all(c["status"] != "matched"
+               for c in decision.summary["local_equation_checks"])
+
+
 @pytest.mark.parametrize("name,formula,rows", [
     ("rtl_floor", "std::max(a, b * 2.f)", [(10., 10., 0., 20.)]),
     ("airspeed_bank", "a * sqrtf(1.f / cosf(b))", [(19., 0.8726646259971648, 0., 23.698446)]),
