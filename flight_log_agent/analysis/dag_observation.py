@@ -128,6 +128,25 @@ def evaluate_local_observed_equations(
                           if vertex_id in r.origin_vertex_ids
                           and (r.source_site_id in call_sites if r.kind == "callable"
                                else bool(symbols.intersection(r.origin_operands)))]
+            if vertex is not None and vertex.kind == "evidence" and vertex.sub_kind == "opaque_symbol":
+                # Narrow opaque-leaf path: the leaf is the unfulfilled demand
+                # for one proven declaration, so attach requests sharing that
+                # exact proven declaration identity (the frontier's own
+                # equality, never spelling). Origin/operand matching above is
+                # unchanged and remains the primary path.
+                leaf_identity = (vertex.metadata or {}).get("source_identity") or {}
+                leaf_kind = leaf_identity.get("kind")
+                leaf_declaration = leaf_identity.get("declaration_id")
+                if leaf_identity.get("declaration_proven") and leaf_kind and leaf_declaration:
+                    for candidate in dag.unresolved_references:
+                        candidate_identity = candidate.identity
+                        if (candidate_identity is not None
+                                and candidate_identity.declaration_proven
+                                and candidate_identity.kind == leaf_kind
+                                and candidate_identity.declaration_id == leaf_declaration):
+                            dumped = candidate.model_dump(mode="json")
+                            if dumped not in references:
+                                references.append(dumped)
             needs[(kind, vertex_id, operand)] = {
                 "kind": kind, "vertex_id": vertex_id, "operand": operand,
                 "producer_ids": list(producers), "source_requests": references, "reason": reason,

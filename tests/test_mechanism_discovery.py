@@ -4689,6 +4689,122 @@ def test_local_observation_scope_and_alignment(tmp_path, problem, forwarding):
         assert not any(n["source_requests"] for n in check["input_requirements"])
 
 
+_UNRESOLVED_MEMBER_SOURCE = """
+class Cfg {
+public:
+    float factor{};
+};
+class Probe {
+    uORB::Publication<diagnostic_s> pub{ORB_ID(diagnostic)};
+    Cfg config{};
+    void run(float input) {
+        float measured = input;
+        float result = measured * config.factor;
+        diagnostic_s packet{};
+        packet.input = measured;
+        packet.result = result;
+        pub.publish(packet);
+    }
+};
+"""
+
+
+def _unresolved_member_dag(tmp_path, source):
+    profiler = _mini_tree(tmp_path, {"sample.cpp": source}, backend="tree_sitter")
+    inputs = dag_inputs_from_facts(
+        load_facts(profiler, tmp_path / "cache", ["sample.cpp"], "hash"))
+    samples = {"diagnostic[0].input": [(0., 3.), (1., 3.)],
+               "diagnostic[0].result": [(0., 6.), (1., 6.)]}
+    dag = build_mechanism_dag(
+        inputs.bindings, "result", terminal_file="sample.cpp",
+        source_structure=inputs.structure,
+        call_statements=inputs.call_statements,
+        boundary_bindings=inputs.boundary_bindings,
+        helper_expressions=inputs.helper_expressions,
+        logged_signals=set(samples),
+        construction_checkpoint=lambda _: set(),
+    )
+    return dag, samples
+
+
+def _local_checks_for(dag, samples):
+    from flight_log_agent.analysis.dag_observation import evaluate_local_observed_equations
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+    return evaluate_local_observed_equations(
+        dag, DAGValueProgram(dag), signal_samples=samples, parameter_values={},
+        signal_policies={s: {"method": "linear"} for s in samples}, scope=None,
+        relevant_ids={v.id for v in dag.vertices},
+    )
+
+
+def test_opaque_leaf_need_links_proven_declaration_request(tmp_path):
+    """An opaque-leaf local need associates the unresolved request sharing
+    its proven declaration — the same storage obligation, not a spelling
+    coincidence. The context-free ordinary path already rejects the leaf;
+    this pins the requirement linkage that must carry the exact request."""
+    from flight_log_agent.analysis.dag_value import DAGValueProgram
+
+    dag, samples = _unresolved_member_dag(tmp_path, _UNRESOLVED_MEMBER_SOURCE)
+    request = next(r for r in dag.unresolved_references
+                   if r.kind == "storage_writers" and r.symbol == "config")
+    assert request.identity is not None
+    assert request.identity.declaration_proven is True
+    assert request.identity.symbol == "config.factor"
+    leaf = next(v for v in dag.vertices
+                if v.kind == "evidence" and v.sub_kind == "opaque_symbol"
+                and v.signal_name == "config.factor")
+    leaf_identity = (leaf.metadata or {}).get("source_identity") or {}
+    assert leaf_identity.get("declaration_proven") is True
+    assert (leaf_identity.get("declaration_id")
+            == request.identity.declaration_id)
+
+    checks = _local_checks_for(dag, samples)
+    check = next(c for c in checks
+                 if c["root_vertex_id"] == next(
+                     v.id for v in dag.vertices
+                     if v.kind == "operation" and v.variable == "result"))
+    need = next(n for n in check["input_requirements"]
+                if n["vertex_id"] == leaf.id)
+    assert any(s["symbol"] == request.symbol
+               and (s.get("identity") or {}).get("declaration_id")
+               == request.identity.declaration_id
+               for s in need["source_requests"])
+
+
+def test_opaque_leaf_need_ignores_unrelated_declaration(tmp_path):
+    """Same member spelling under an unrelated declaration must not satisfy
+    an opaque-leaf need: association is by proven declaration, never by
+    spelling. Each need links only its own declaration's request."""
+    source = _UNRESOLVED_MEMBER_SOURCE.replace(
+        "    Cfg config{};",
+        "    Cfg config{};\n    Other other{};").replace(
+        "class Probe {",
+        "class Other {\npublic:\n    float factor{};\n};\nclass Probe {").replace(
+        "measured * config.factor",
+        "measured * config.factor + other.factor")
+    dag, samples = _unresolved_member_dag(tmp_path, source)
+    by_declaration = {}
+    for reference in dag.unresolved_references:
+        if reference.kind != "storage_writers" or reference.identity is None:
+            continue
+        assert reference.identity.declaration_proven is True
+        by_declaration.setdefault(reference.identity.declaration_id, reference)
+    assert len(by_declaration) == 2
+
+    checks = _local_checks_for(dag, samples)
+    linked = [n for c in checks for n in c["input_requirements"]
+              if n["source_requests"]]
+    assert linked, "expected declaration-linked needs"
+    for need in linked:
+        leaf = next(v for v in dag.vertices if v.id == need["vertex_id"])
+        leaf_declaration = ((leaf.metadata or {}).get("source_identity") or {}
+                            ).get("declaration_id")
+        assert leaf_declaration, "need must come from a proven leaf"
+        for attached in need["source_requests"]:
+            assert ((attached.get("identity") or {}).get("declaration_id")
+                    == leaf_declaration)
+
+
 @pytest.mark.parametrize("name,formula,rows", [
     ("rtl_floor", "std::max(a, b * 2.f)", [(10., 10., 0., 20.)]),
     ("airspeed_bank", "a * sqrtf(1.f / cosf(b))", [(19., 0.8726646259971648, 0., 23.698446)]),
