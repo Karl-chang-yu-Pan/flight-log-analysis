@@ -137,3 +137,45 @@ _Avoid_: exhausted search
 **Exhaustion**:
 Scheduling state recording that a search found nothing. It releases priority
 only and never proves coverage.
+
+## Coverage Proof
+
+**Writer obligation**:
+An unresolved requirement to account for the writers of one storage or
+declaration identity. Multiple consuming origins may share it.
+
+**Search attempt**:
+One use of one search strategy against one obligation, identified by request,
+strategy, examined domain, and index state. An attempt alone proves nothing
+complete.
+
+**Searched domain**:
+The files, owners, declarations, and query universe a strategy actually
+examined. Only the examined domain counts, never the intended one.
+
+**Admission verdict**:
+The recorded outcome for one examined candidate: admitted writer, wrong
+declaration or owner, non-writer, ambiguous, or search-unavailable. The
+miss reason is part of the verdict.
+
+**Coverage evidence**:
+Facts supporting sufficiency of search: strategies, examined domains,
+candidates, verdicts, limits. Input to a coverage decision, not the decision.
+
+**Coverage certificate**:
+A positive statement binding one obligation to one declared search boundary
+whose examination leaves no unaccounted writer possibilities inside it.
+Valid only for the index snapshot it derives from. Never established by
+exhaustion alone, one found writer, topic presence, or visited state.
+_Avoid_: exhausted search, visited state
+
+**Applicability proof**:
+Evidence that a covered writer could actually govern the use: control,
+invocation, receiver, order, and conditions. Coverage lists writers;
+applicability qualifies them.
+_Avoid_: writer coverage
+
+**Stop authority**:
+The checkpoint verdict permitting discovery to stop: no unresolved
+requirements, satisfied coverage and applicability where required, and
+complete replay. Zero pending work alone is never authority.
