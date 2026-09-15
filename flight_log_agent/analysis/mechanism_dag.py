@@ -3475,11 +3475,16 @@ class _DAGBuilder:
         source_site_id: str = "",
         origin_vertex_id: str = "",
         origin_operand: str = "",
+        proven_identity: Any = None,
     ) -> tuple[Any, ...]:
         identity = (
-            self._reference_identity(symbol, file, scope_function, line)
-            if kind in {"symbol", "member_writers", "storage_writers"}
-            else None
+            proven_identity
+            if proven_identity is not None
+            else (
+                self._reference_identity(symbol, file, scope_function, line)
+                if kind in {"symbol", "member_writers", "storage_writers"}
+                else None
+            )
         )
         owner = self._source_structure.callable_owner(
             _base_callable_scope(scope_function)
@@ -4578,6 +4583,7 @@ class _DAGBuilder:
                 identity.root, kind="storage_writers", file=file, line=line,
                 scope_function=scope_function, source_expression=source_expression,
                 origin_vertex_id=origin_vertex_id, origin_operand=origin_operand,
+                proven_identity=identity,
             )
         if len(producers) == 1:
             return producers

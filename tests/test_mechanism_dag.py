@@ -19,7 +19,13 @@ from flight_log_agent.analysis.mechanism_dag import (
     split_by_terminal,
     write_dag_to_cache,
 )
-from flight_log_agent.analysis.source_expansion import SourceStructureIndex
+from flight_log_agent.analysis.source_expansion import (
+    SourceStructureIndex,
+    SourceSymbolIdentity,
+    _AdmissionAssignment,
+    _AdmissionIndex,
+    SourceExpansionResolver,
+)
 from flight_log_agent.analysis.source_expression import (
     normalize_source_expression,
     source_expression_names,
@@ -2928,6 +2934,269 @@ def test_parameter_member_not_resolved_without_source_binding():
         if v.kind == "evidence" and v.sub_kind == "parameter"
     }
     assert "RTL_CONE_ANG" not in params
+
+
+_COMPOSITE_DECLARATION = "decl-sensor::subobject::decl-value"
+
+
+def _composite_identity_build(*, members, reference_identities,
+                              expression="sensor._value"):
+    """Builder seam for proven-identity carry-through: the binding reads a
+    member through a source-proven composite identity with no local producer,
+    so an unresolved storage-writer request is emitted."""
+    structure = SourceStructureIndex(members=dict(members))
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1",
+        target="answer",
+        expression=expression,
+        file="ctl.cpp",
+        line=20,
+        function="Controller::step",
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    binding["reference_identities"] = dict(reference_identities)
+    return build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+
+
+def _composite_sensor_identity():
+    return {
+        "kind": "member", "symbol": "sensor._value", "root": "sensor",
+        "file": "ctl.cpp", "callable_id": "ctl.cpp:1:Controller::step",
+        "class_owner": "Controller", "declaring_class": "Sensor",
+        "declaration_id": _COMPOSITE_DECLARATION,
+        "declaration_proven": True,
+    }
+
+
+def _sensor_members():
+    return {
+        ("Controller", "sensor"): {
+            "owner": "Controller", "name": "sensor",
+            "file": "ctl.cpp", "line": 4, "type": "Sensor"},
+        ("Sensor", "_value"): {
+            "owner": "Sensor", "name": "_value",
+            "file": "sensor.h", "line": 6},
+    }
+
+
+def _storage_writer_for(dag, symbol):
+    matches = [r for r in dag.unresolved_references
+               if r.kind == "storage_writers" and r.symbol == symbol]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_proven_composite_identity_survives_unresolved_recording():
+    """A proven receiver/member composite must reach the frontier intact:
+    re-deriving it from the bare storage root loses the member path and the
+    composite declaration."""
+    dag = _composite_identity_build(
+        members=_sensor_members(),
+        reference_identities={"sensor._value": _composite_sensor_identity()},
+    )
+    reference = _storage_writer_for(dag, "sensor")
+    assert reference.identity is not None
+    assert reference.identity.symbol == "sensor._value"
+    assert reference.identity.declaring_class == "Sensor"
+    assert reference.identity.declaration_id == _COMPOSITE_DECLARATION
+    assert reference.identity.declaration_proven is True
+
+
+def test_projected_member_identity_survives_unresolved_recording():
+    """A multi-segment projected identity (aggregate.member.submember) keeps
+    its full path and composite declaration instead of collapsing to the
+    aggregate root."""
+    projected = {
+        "kind": "member", "symbol": "controller.state.rate",
+        "root": "controller", "file": "ctl.cpp",
+        "callable_id": "ctl.cpp:1:Controller::step",
+        "class_owner": "Controller", "declaring_class": "Snapshot",
+        "declaration_id": "decl-dev::subobject::decl-rate",
+        "declaration_proven": True,
+    }
+    structure = SourceStructureIndex(members={
+        ("Controller", "controller"): {
+            "owner": "Controller", "name": "controller",
+            "file": "ctl.cpp", "line": 3, "type": "Device"},
+        ("Device", "state"): {
+            "owner": "Device", "name": "state",
+            "file": "dev.h", "line": 4, "type": "Snapshot"},
+        ("Snapshot", "rate"): {
+            "owner": "Snapshot", "name": "rate",
+            "file": "snap.h", "line": 5},
+    })
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1", target="answer", expression="controller.state.rate",
+        file="ctl.cpp", line=20, function="Controller::step",
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    binding["reference_identities"] = {"controller.state.rate": projected}
+    dag = build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+    reference = _storage_writer_for(dag, "controller")
+    assert reference.identity is not None
+    assert reference.identity.symbol == "controller.state.rate"
+    assert reference.identity.declaring_class == "Snapshot"
+    assert reference.identity.declaration_id == "decl-dev::subobject::decl-rate"
+
+
+def test_same_spelling_in_unrelated_storage_stays_distinct():
+    """Identical member spellings under different declarations must not
+    collapse into one semantic obligation."""
+    members = {
+        ("Controller", "sensor"): {
+            "owner": "Controller", "name": "sensor",
+            "file": "ctl.cpp", "line": 4, "type": "Sensor"},
+    }
+    structure = SourceStructureIndex(members=members)
+    structure.authoritative_declarations = True
+
+    def composite(symbol, root, declaring, declaration):
+        return {
+            "kind": "member", "symbol": symbol, "root": root,
+            "file": "ctl.cpp", "callable_id": "ctl.cpp:1:Controller::step",
+            "class_owner": "Controller", "declaring_class": declaring,
+            "declaration_id": declaration, "declaration_proven": True,
+        }
+
+    binding = _fake_binding(
+        binding_id="b1", target="answer", expression="sensor._value + backup._value",
+        file="ctl.cpp", line=20, function="Controller::step",
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    binding["reference_identities"] = {
+        "sensor._value": composite(
+            "sensor._value", "sensor", "Sensor", "decl-a::subobject::decl-v"),
+        "backup._value": composite(
+            "backup._value", "backup", "Other", "decl-b::subobject::decl-v"),
+    }
+    dag = build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+    by_symbol = {r.symbol: r for r in dag.unresolved_references
+                 if r.kind == "storage_writers"}
+    assert set(by_symbol) == {"sensor", "backup"}
+    assert by_symbol["sensor"].identity.declaration_id == "decl-a::subobject::decl-v"
+    assert by_symbol["backup"].identity.declaration_id == "decl-b::subobject::decl-v"
+
+
+def test_shared_storage_obligation_dedupes_with_accumulated_origins():
+    """Two consumers of one proven storage obligation share a single frontier
+    item; both consuming origins are retained on that item instead of
+    duplicating discovery work."""
+    structure = SourceStructureIndex(members=_sensor_members())
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1", target="answer", expression="sensor._value",
+        file="ctl.cpp", line=20, function="Controller::step",
+        control_predicates=["sensor._value > 0"],
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    binding["reference_identities"] = {
+        "sensor._value": _composite_sensor_identity()
+    }
+    dag = build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+    reference = _storage_writer_for(dag, "sensor")
+    assert len(reference.origin_vertex_ids) == 2
+    assert reference.origin_operands == ["sensor._value"]
+    assert reference.identity is not None
+    assert reference.identity.symbol == "sensor._value"
+    assert reference.identity.declaration_id == _COMPOSITE_DECLARATION
+
+
+def test_proven_identity_coexists_with_bare_root_demand():
+    """A proven composite request and a bare-root demand of the same storage
+    name remain distinct obligations: the proven identity is not downgraded
+    by the weaker fallback, nor does it swallow the separate demand."""
+    structure = SourceStructureIndex(members=_sensor_members())
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1", target="answer", expression="sensor._value + sensor",
+        file="ctl.cpp", line=20, function="Controller::step",
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    binding["reference_identities"] = {
+        "sensor._value": _composite_sensor_identity()
+    }
+    dag = build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+    by_declaration = {}
+    for reference in dag.unresolved_references:
+        if reference.kind != "storage_writers" or reference.identity is None:
+            continue
+        by_declaration.setdefault(reference.identity.declaration_id, reference)
+    assert _COMPOSITE_DECLARATION in by_declaration
+    composite = by_declaration[_COMPOSITE_DECLARATION]
+    assert composite.identity.symbol == "sensor._value"
+    assert composite.identity.declaration_proven is True
+    assert len(by_declaration) == 2
+
+
+def _admission_for(writer_target, writer_identity, *, owner="Sensor"):
+    return _AdmissionIndex(
+        classes=frozenset(),
+        callables=(),
+        assignments=(
+            _AdmissionAssignment(
+                target=writer_target,
+                callable_id="sensor.h:1:Sensor::set",
+                owner=owner,
+                declaration_kind="",
+                source_site_id="sensor-set-site",
+                identity=SourceSymbolIdentity.model_validate(writer_identity),
+            ),
+        ),
+        calls=(),
+    )
+
+
+def test_composite_request_admission_against_bare_member_writer():
+    """A Step-C composite request (receiver-specific storage) must not admit
+    a bare member writer through declaration equality: different declaration
+    entities stay distinct (fail-closed). The same request still admits a
+    writer presenting the identical composite declaration, so legitimate
+    receiver-composed matching keeps working."""
+    structure = SourceStructureIndex(members=_sensor_members())
+    structure.authoritative_declarations = True
+    dag = _composite_identity_build(
+        members=_sensor_members(),
+        reference_identities={"sensor._value": _composite_sensor_identity()},
+    )
+    request = _storage_writer_for(dag, "sensor")
+    assert request.identity.declaration_id == _COMPOSITE_DECLARATION
+
+    bare_writer = {
+        "kind": "member", "symbol": "_value", "root": "_value",
+        "file": "sensor.h", "callable_id": "sensor.h:1:Sensor::set",
+        "class_owner": "Sensor", "declaring_class": "Sensor",
+        "declaration_id": "sensor.h:6:member:_value",
+        "declaration_proven": True,
+    }
+    assert structure.same_declaration_entity(
+        request.identity,
+        SourceSymbolIdentity.model_validate(bare_writer),
+    ) is False
+    assert SourceExpansionResolver._storage_writer_index_match(
+        request,
+        _admission_for("_value", bare_writer),
+        structure,
+    ) == ""
+
+    assert SourceExpansionResolver._storage_writer_index_match(
+        request,
+        _admission_for(
+            "sensor._value", _composite_sensor_identity(), owner="Controller",
+        ),
+        structure,
+    ) == "sensor-set-site"
 
 
 def _caller_scope_build(*, members, parameter_bindings, call_line=10,
