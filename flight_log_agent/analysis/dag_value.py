@@ -24,6 +24,42 @@ from flight_log_agent.analysis.source_expression import (
 ValueStatus = Literal["value", "inactive", "unresolved"]
 ActivityStatus = Literal["active", "inactive", "unknown"]
 SampleResolver = Callable[[str, float], Optional[Any]]
+#: Issue kinds returned by :func:`observation_validity_issue`.
+_FORBIDDEN_OBSERVATION = "forbidden"
+_OBSERVATION_BINDING = "observation_binding"
+
+
+def observation_validity_issue(
+    *,
+    sub_kind: Optional[str],
+    signal_name: Optional[str],
+    metadata: Optional[dict[str, Any]],
+    forbidden_signals: frozenset[str] = frozenset(),
+) -> Optional[tuple[str, str]]:
+    """Shared observation-validity clause for logged-signal candidates.
+
+    Pure with respect to observation validity: it answers whether one
+    observation candidate may be used, from sub-kind, signal name, observation
+    metadata, and forbidden signals only. It takes no samples, parameters,
+    enums, domains, policies, completion, requirements, or discovery state.
+
+    Returns ``(issue_kind, reason)`` with kind ``"forbidden"`` when the signal
+    is a forbidden comparison output, or ``"observation_binding"`` when the
+    candidate lacks proven runtime binding (unobserved, or grounded only via
+    ``declared_type``). Returns ``None`` when the candidate is usable as an
+    observation. Non-``logged_signal`` evidence is out of scope and always
+    yields ``None``; parameter, constant, and other kinds keep their own
+    rules.
+    """
+    if sub_kind != "logged_signal" or not signal_name:
+        return None
+    if signal_name in forbidden_signals:
+        return (_FORBIDDEN_OBSERVATION, "comparison output is also an input")
+    observed = (metadata or {}).get("observation", "observed")
+    grounded_via = (metadata or {}).get("grounded_via")
+    if observed != "observed" or grounded_via == "declared_type":
+        return (_OBSERVATION_BINDING, "input observation lacks proven runtime binding")
+    return None
 _PARAMETER_ACCESSOR = re.compile(
     r"^_param_(?P<name>[A-Za-z0-9_]+)\.get(?:\(\))?$"
 )
@@ -442,12 +478,18 @@ class DAGValueSession:
                 str(metadata.get("reason") or "runtime evidence is unavailable"),
             )
         if vertex.sub_kind == "logged_signal" and vertex.signal_name:
-            if self.context is not None:
-                if vertex.signal_name in self.context.forbidden_signals:
-                    return DAGValueResult("unresolved", reason="comparison output is also an input")
-                if (metadata.get("observation", "observed") != "observed"
-                        or metadata.get("grounded_via") == "declared_type"):
-                    return self._unresolved("observation_binding", vertex.id, "input observation lacks proven runtime binding")
+            forbidden = self.context.forbidden_signals if self.context is not None else frozenset()
+            validity = observation_validity_issue(
+                sub_kind=vertex.sub_kind,
+                signal_name=str(vertex.signal_name),
+                metadata=metadata,
+                forbidden_signals=forbidden,
+            )
+            if validity is not None:
+                kind, reason = validity
+                if kind == _FORBIDDEN_OBSERVATION:
+                    return DAGValueResult("unresolved", reason=reason)
+                return self._unresolved("observation_binding", vertex.id, reason)
             if timestamp is None or self.sample_resolver is None:
                 return DAGValueResult(
                     "unresolved", reason="logged value requires a timestamp"

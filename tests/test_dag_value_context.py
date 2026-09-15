@@ -203,3 +203,45 @@ def test_skipped_transfer_does_not_prove_persisted_receiver_equals_initializer(s
     result = session_for(dag, samples={("packet.input", 0.): 3., ("packet.mode", 0.): 0}).evaluate("root", 0.)
     assert result.status == "unresolved"
     assert any(issue.kind == "state_alignment" for issue in result.issues)
+
+
+def single_input_graph(*, leaf_metadata):
+    leaf = DAGVertex(id="reading", kind="evidence", sub_kind="logged_signal",
+                     signal_name="data.value", metadata=dict(leaf_metadata))
+    return MechanismDAG(
+        dag_id="observation-validity", terminal="total",
+        vertices=[leaf, operation("total", "reading + 1", 10)],
+        edges=[edge("reading", "total", "reading")],
+    )
+
+
+def test_shared_type_only_observation_is_not_usable_evidence(session_for):
+    """grounded_via=declared_type stays a candidate in every evaluation context.
+
+    The context-free ordinary case is the pre-fix RED regression (it promoted
+    the leaf to a value); the local-context case already rejected before the
+    fix and is parity/contract coverage.
+    """
+    dag = single_input_graph(leaf_metadata={"observation": "observed", "grounded_via": "declared_type"})
+    result = session_for(dag, samples={("data.value", 0.): 10.}).evaluate("total", 0.)
+    assert result.status == "unresolved"
+    assert any(issue.kind == "observation_binding" for issue in result.issues)
+
+
+def test_shared_proven_observation_remains_usable(session_for):
+    dag = single_input_graph(leaf_metadata={"observation": "observed"})
+    result = session_for(dag, samples={("data.value", 0.): 10.}).evaluate("total", 0.)
+    assert result.status == "value"
+    assert result.value == 11.
+
+
+def test_shared_parameter_leaf_still_resolves(session_for):
+    leaf = DAGVertex(id="limit", kind="evidence", sub_kind="parameter", signal_name="SYNTH_LIMIT")
+    dag = MechanismDAG(
+        dag_id="observation-validity-param", terminal="total",
+        vertices=[leaf, operation("total", "limit + 1", 10)],
+        edges=[edge("limit", "total", "limit")],
+    )
+    result = session_for(dag, parameter_values={"SYNTH_LIMIT": 4.}).evaluate("total", None)
+    assert result.status == "value"
+    assert result.value == 5.
