@@ -2930,6 +2930,150 @@ def test_parameter_member_not_resolved_without_source_binding():
     assert "RTL_CONE_ANG" not in params
 
 
+def _caller_scope_build(*, members, parameter_bindings, call_line=10,
+                        expression="_param_limit", binding_line=20,
+                        caller="Controller", receiver="_param_limit",
+                        bases=None):
+    """Builder seam for call-effect parameter discovery: one caller scope,
+    one accessor call site, one read of the member."""
+    structure = SourceStructureIndex(members=dict(members), direct_bases=dict(bases or {}))
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1",
+        target="answer",
+        expression=expression,
+        file="ctl.cpp",
+        line=binding_line,
+        function=f"{caller}::step",
+    )
+    binding["callable_id"] = f"ctl.cpp:1:{caller}::step"
+    return build_mechanism_dag(
+        [binding],
+        "answer",
+        parameter_names={item["name"] for item in parameter_bindings},
+        parameter_bindings=list(parameter_bindings),
+        source_structure=structure,
+        call_statements=[
+            {
+                "name": "get",
+                "receiver": receiver,
+                "args": [],
+                "file": "ctl.cpp",
+                "line": call_line,
+                "function": f"{caller}::step",
+                "callable_id": f"ctl.cpp:1:{caller}::step",
+            }
+        ],
+    )
+
+
+def _parameter_leaves(dag):
+    return {
+        v.signal_name for v in dag.vertices
+        if v.kind == "evidence" and v.sub_kind == "parameter"
+    }
+
+
+def _degraded_accessor_requests(dag):
+    return [
+        r for r in dag.unresolved_references
+        if r.kind == "callable" and r.symbol == "get"
+    ]
+
+
+def test_call_effect_parameter_accessor_uses_caller_scope():
+    """A parameter accessor call resolves through caller scope instead of
+    leaving a degraded callable request: same spelling != same identity."""
+    dag = _caller_scope_build(
+        members={("Controller", "_param_limit"): {
+            "owner": "Controller", "name": "_param_limit",
+            "file": "ctl.cpp", "line": 5}},
+        parameter_bindings=[
+            {"member": "_param_limit", "name": "LIMIT",
+             "owner": "Controller", "file": "ctl.cpp"},
+        ],
+    )
+    assert "LIMIT" in _parameter_leaves(dag)
+    assert _degraded_accessor_requests(dag) == []
+
+
+def test_call_effect_unknown_accessor_keeps_exact_scoped_request():
+    """A genuinely unknown accessor still yields an exact scoped request:
+    the fix must not silence discovery or invent a match."""
+    dag = _caller_scope_build(
+        members={("Controller", "_param_limit"): {
+            "owner": "Controller", "name": "_param_limit",
+            "file": "ctl.cpp", "line": 5}},
+        parameter_bindings=[],
+    )
+    assert _parameter_leaves(dag) == set()
+    degraded = _degraded_accessor_requests(dag)
+    assert len(degraded) == 1
+    request = degraded[0]
+    assert request.file == "ctl.cpp"
+    assert request.callable_id == "ctl.cpp:1:Controller::step"
+    assert request.origin_operands == ["_param_limit"]
+
+
+def test_call_effect_same_member_name_in_unrelated_scope_stays_distinct():
+    """Same spelling under an unrelated owner must not become visible through
+    the caller's scope: the scoped lookup narrows to one owner."""
+    members = {
+        ("Controller", "_param_limit"): {
+            "owner": "Controller", "name": "_param_limit",
+            "file": "ctl.cpp", "line": 5},
+        ("Other", "_param_limit"): {
+            "owner": "Other", "name": "_param_limit",
+            "file": "other.cpp", "line": 7},
+    }
+    dag = _caller_scope_build(
+        members=members,
+        parameter_bindings=[
+            {"member": "_param_limit", "name": "LIMIT",
+             "owner": "Controller", "file": "ctl.cpp"},
+            {"member": "_param_limit", "name": "OTHER_LIMIT",
+             "owner": "Other", "file": "other.cpp"},
+        ],
+    )
+    leaves = _parameter_leaves(dag)
+    assert "LIMIT" in leaves
+    assert "OTHER_LIMIT" not in leaves
+    assert _degraded_accessor_requests(dag) == []
+
+
+def test_call_effect_parameter_accessor_resolves_through_base_class():
+    """Caller scope in a derived class resolves a member declared on its base:
+    scope threading must preserve existing lineage behavior."""
+    dag = _caller_scope_build(
+        members={("Base", "_param_limit"): {
+            "owner": "Base", "name": "_param_limit",
+            "file": "base.h", "line": 3}},
+        parameter_bindings=[
+            {"member": "_param_limit", "name": "LIMIT",
+             "owner": "Base", "file": "base.h"},
+        ],
+        caller="Derived",
+        bases={"Derived": {"Base"}},
+    )
+    assert "LIMIT" in _parameter_leaves(dag)
+    assert _degraded_accessor_requests(dag) == []
+
+
+@pytest.mark.parametrize("call_line,expect_request", [(10, True), (30, False)])
+def test_call_effect_later_call_stays_inadmissible(call_line, expect_request):
+    """Line/order filtering is independent of parameter matching: a call after
+    the use cannot become a writer even though scope now flows through."""
+    dag = _caller_scope_build(
+        members={},
+        parameter_bindings=[],
+        call_line=call_line,
+        expression="_param_unknown",
+        receiver="_param_unknown",
+    )
+    degraded = [r for r in _degraded_accessor_requests(dag) if r.line == call_line]
+    assert (degraded != []) == expect_request
+
+
 def test_cpp_predicate_symbols_are_extracted_for_alias_and_chain():
     """A C++ branch predicate with `&&`, `->`, `::` and a cast must still
     yield its symbols: the aliased parameter resolves and the accessor

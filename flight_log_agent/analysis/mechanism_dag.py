@@ -2027,7 +2027,10 @@ class _DAGBuilder:
                 continue
             receiver = exact_symbol(str(source_call.get("receiver") or ""))
             if receiver and self._match_parameter(
-                f"{receiver}.{name.rsplit('::', 1)[-1]}"
+                f"{receiver}.{name.rsplit('::', 1)[-1]}",
+                file=scope_file,
+                scope_function=scope_callable,
+                line=scope_line,
             ) is not None:
                 continue
             args = [str(arg).strip() for arg in (source_call.get("args") or [])]
