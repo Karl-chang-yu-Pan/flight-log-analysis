@@ -401,3 +401,241 @@ Receiver-state evidence and runtime boundary outcomes are outside this repair.
 No glossary term or architectural decision was added: this restores the existing
 conditional-equation and construction contracts rather than introducing a new
 domain concept.
+
+## Repository Review: Remaining Failures
+
+Review date: 2026-09-15. Reviewed revision: `f388ab9`.
+Status: findings and proposed repairs, not implemented fixes.
+
+The review traced current code, relevant commits, shared and implementation-specific
+tests, saved flight artifacts, and small isolated reproductions. The main gaps are
+composition between existing source, graph, discovery, and evaluation mechanisms;
+they are not all missing tree-sitter extraction features.
+
+### Latest Flight Evidence
+
+After the forwarding repair, all four fixed-terminal cases were run at first-round
+and two-round scope. This supersedes the earlier follow-up's statement that flight
+probes had not yet been repeated. The run preceded the commit, so its metadata
+records `da31d87` plus working-tree source hashes; the forwarding changes were then
+committed as `f388ab9`.
+
+Artifacts: `outputs/forwarding_demand_audit_20260913/`, including `metadata.json`,
+`audit.json`, per-run graphs, frontier requests, checkpoint summaries, resource
+samples, and stderr. These are generated local artifacts, not committed fixtures.
+
+| Case | First-round wall seconds | Two-round wall seconds | Two-round peak tree PSS MiB | Outcome |
+| --- | ---: | ---: | ---: | --- |
+| RTL | 10.57 | 19.63 | 149.31 | Five pending operations; no local comparisons |
+| Airspeed | 33.75 | 77.09 | 196.53 | Thirteen unevaluable local checks; zero comparisons |
+| TECS height rate | 24.69 | 58.46 | 177.65 | Thirteen local checks retained; 41 pending operations; zero comparisons |
+| Takeoff altitude | 41.26 | 332.74 | 339.49 | First round completed; second round aborted with stack overflow |
+
+No resource guard triggered. These were bounded construction probes with no
+LLM/API calls, not full discovery or question-to-report verification. Successful
+process exit did not establish a flight mechanism. The review itself did not
+rerun these expensive probes.
+
+### 1. Inconsistent Observation Provenance
+
+**Confirmed defect.** `_member_observation_leaf()` in
+`analysis/mechanism_dag.py` converts a declared message-struct type into a logged
+leaf without proving a transfer or publication relationship. Producer resolution
+can prefer that leaf over ambiguous source writers. `dag_checkpoint.assess_checkpoint()`
+rejects `grounded_via="declared_type"`, while ordinary value evaluation accepts it.
+
+A small source fixture with a message-typed member and no boundary operation
+evaluated `data.value + 1` as 11 from a topic sample of 10. This demonstrates the
+builder/evaluator mismatch independently of the flight cases. Saved RTL, airspeed,
+and TECS graphs contain such type-only leaves.
+
+Proposed repair: retain a type match as an observation candidate, not usable
+evidence. Keep source producers until an actual source/observation relationship
+justifies using the recorded value. Apply the same provenance contract to ordinary
+evaluation, feasibility, conditional checks, and checkpoint validation. Do not
+make checkpoints accept the unsupported inference merely to achieve parity.
+
+### 2. Evaluator Depth and the Takeoff Crash
+
+**Confirmed depth defect; exact takeoff crash cause remains unproven.**
+`DAGValueSession._evaluate_vertex()` and `_select_producer()` recursively evaluate
+dependencies. Cycle detection does not protect deep acyclic graphs.
+
+Separate resource-limited processes evaluated simple acyclic `x + 1` chains:
+
+| Vertices, including constant leaf | Result |
+| ---: | --- |
+| 17 | Value 17 |
+| 65 | Value 65 |
+| 129 | `RecursionError` |
+| 257 | `RecursionError` |
+
+Each probe used under 50 MiB process RSS, a five-second CPU limit, a ten-second
+parent timeout, and disabled core dumps. These diagnostics used the repository
+virtual environment and did not alter the interpreter recursion limit. The
+thresholds are observations of this runtime and expression shape, not proposed
+production limits.
+
+Takeoff separately aborted with `_Py_CheckRecursiveCall: Cannot recover from stack
+overflow`. Its last completed event was checkpoint assessment during resumed
+construction, before the next feasibility-start event. The traceback contains
+asyncio frames but does not identify the recursive application call. Approximately
+118 seconds elapsed between expansion start and resumed construction, followed by
+175 seconds of resumed construction/checkpoint work. Pending operations reached
+833 after source admission. Neither graph size alone nor the last completed event
+proves the fatal call site.
+
+Proposed repair: replace dependency recursion with explicit evaluation frames or
+a worklist, preserving short-circuiting, writer selection, cycle diagnostics,
+observation boundaries, and shared memoization. Independently capture the last
+construction snapshot and application stack in a supervised takeoff reproduction.
+Do not raise recursion limits, cap graph depth, or declare the crash fixed solely
+because the small chain test passes.
+
+### 3. Receiver Identity Lost Through Aggregate Projection
+
+**Confirmed TECS defect, reproduced without a ULog.** A synthetic receiver updated
+before a scalar getter returns the expected value 7. Returning the same state as
+an aggregate and then projecting its field becomes unresolved.
+
+The relevant composition is:
+
+```text
+receiver storage identity
+  -> call-instance member identity
+  -> aggregate helper return
+  -> demanded field projection
+  -> producer lookup / source-discovery request
+```
+
+`_identity_in_call_scope()` constructs a receiver-qualified subobject identity.
+`_project_identity()` then preserves the composite declaration but replaces its
+symbol with the callee-local spelling. `_resolve_symbol_producers()` requests
+writers using the receiver root, and `_record_unresolved()` re-resolves that name
+inside the callee scope rather than retaining the already-proven identity.
+
+In TECS, `_debug_status.control.altitude_rate_control` consequently becomes opaque
+while a writer request asks for `_tecs` in `TECS::getStatus`, where `_tecs` is
+unknown. This corrects the earlier shorthand that no request exists: a request
+exists in the raw frontier, but its identity/scope is degraded.
+
+There is a second association defect. Local evaluation reports the opaque leaf;
+the request's origin is its consuming helper-return operation. The local-check
+`require()` function matches origins and operands only at the reported vertex,
+so the request is absent from the local input requirement. The controller returns
+to guard discovery even though the unresolved value has a source-discovery need.
+
+Proposed repair: compose field projections with the existing storage identity,
+keeping receiver instance, declaration ownership, and member path coherent and
+distinct from source spelling. Pass that identity to discovery without rebuilding
+it from a bare name. Preserve consuming vertex/operand provenance when propagating
+unresolved-value diagnostics so the exact request reaches the controller. Do not
+introduce a second resolver or broaden the search to compensate for lost scope.
+
+The forwarding-demand repair itself works: all 13 TECS local candidates now
+survive getter resolution and the pending return definitions are materialized.
+That exposes this next defect; it does not complete flight verification.
+
+### 4. Missing Parameter Scope in Call-Effect Discovery
+
+**Confirmed RTL-related defect.** `_writers_from_relevant_calls()` calls
+`_match_parameter()` without file, callable, or source-site context. The resolver
+requires ownership when source declarations are authoritative. A small probe
+returned `None` without scope and `CUSTOM_MODE` for the same accessor with scope.
+The saved RTL frontier contains six parameter `get` requests.
+
+Proposed repair: use the existing scoped parameter classification consistently
+at call-effect discovery, including the actual caller's context. Assert both
+positive parameter resolution and absence of redundant callable requests. Do not
+weaken ownership checks or infer parameter identity from spelling.
+
+This is not all of RTL's unfinished work. Navigator storage and clock dependencies
+remain, the cone/max-altitude calculations are pending, and the internal `_rtl_alt`
+terminal lacks a source-proven publication binding in the bounded graph. Further
+discovery and output-observation investigation are still needed.
+
+### 5. Runtime Evidence and Mutable-Writer Coverage
+
+**Confirmed production capability gap; recording insufficiency is not established.**
+Airspeed has the initializer, default assignment, constrained-ratio assignment,
+and boundary relationships for `_eas2tas`. Selecting the retained value depends
+on invocation outcomes and receiver history that the current production path
+does not supply. `DAGValueSession` intentionally returns unresolved for those
+obligations unless an independent observation supplies the required value.
+
+The publication directly records equivalent airspeed, but not `_eas2tas` itself.
+Deriving that factor from the true-airspeed output being compared would make the
+check circular. More source may reveal valid observations, exclude dependencies,
+or establish needed relationships; it cannot be assumed either sufficient or
+useless before those paths are investigated.
+
+Mutable-writer coverage has a separate completion gap. `storage_writers` requests
+are retained as obligations; exhausted searches release scheduling priority but
+do not certify coverage. No positive production path was demonstrated that closes
+these retained obligations from a source-backed coverage result. An unsuccessful
+search must remain distinct from proof that all relevant writers were considered.
+
+Proposed repair: establish independent source-linked observations or temporal
+relationships where evidence permits, and represent justified writer coverage
+separately from search exhaustion. Reuse the existing graph and checkpoint
+contracts. Retain unresolved status when evidence genuinely cannot establish the
+value. Neither fabricated call success nor unrestricted source expansion is a fix.
+
+### History and Coverage Gaps
+
+| Commit(s) | What the work covered | Missing composition or acceptance boundary |
+| --- | --- | --- |
+| `558c849` | Receiver-object state and call order | Scalar getter tests assert graph reachability, not aggregate projection through numerical evaluation and discovery |
+| `208641e` | Graph-native source flow, projection, and scoped identities | Receiver-qualified identity surviving field projection into producer lookup and frontier requests |
+| `0536788` followed by `208641e` | Parameter-call filtering, then stricter ownership | The older call-effect caller still omits the context needed by the stricter resolver |
+| `5f0ec4d`, `c79e13f`, `a60fca9` | Alias-cycle protection, shared evaluation, memoization, and local/ordinary parity | Deep acyclic graph evaluation; cycle termination and compile/sample counts do not cover stack depth |
+| `684b57d` | Type-based observation fallback | No accompanying tests; later checkpoint rejection does not constrain builder or ordinary evaluator behavior |
+| `da31d87` | Boundary obligations and rejection of unsupported receiver evidence | Positive numerical fixtures inject receiver observations, not a production evidence-acquisition path |
+| `615467e`, `f388ab9` | Local-demand priority and call-result forwarding | The combination with aggregate receiver state and source-request propagation remains uncovered |
+
+Relevant examples include `test_receiver_getter_reads_state_written_by_prior_call_site`,
+`test_helper_call_instance_reaches_member_writer_in_sibling_method`,
+`test_source_projection_respects_scope_and_terminates_cycles`,
+`test_reference_initialization_projects_nested_call_result`, and
+`test_local_equation_discovers_its_helper_before_unknown_guard`.
+
+The existing tests are useful but often exercise one axis: scalar receiver state,
+same-owner reference projection, static fake bindings, or a manually constructed
+checkpoint graph. Shared backend tests can still miss the same downstream
+composition on both paths. A numerical value can also coexist with redundant or
+mis-scoped requests that prevent checkpoint completion.
+
+The boundary repair intentionally changed earlier topic-only success assertions
+into rejection assertions. That is correct under the approved evidence contract,
+but successful rejection is not positive end-to-end capability. Likewise,
+`requested_rounds_complete` in a bounded harness is not mechanism verification.
+Previously reported pytest counts must not be used as proof of those missing
+production paths.
+
+### Proposed Repair and Acceptance Order
+
+1. Extend existing shared contracts through identity, projection, request creation,
+   source admission, numerical evaluation, and checkpoint scheduling. Cover scalar
+   versus aggregate returns, nested fields, local/member receivers, pointer/reference
+   forms, same-named storage in unrelated classes, and eager/staged construction.
+   Keep genuine missing evidence as an explicit negative case, not a universal
+   expected failure that hides loss of positive capability.
+2. Repair TECS identity/request propagation and RTL's omitted parameter scope.
+   A fully source-resolvable synthetic case must reach the expected value without
+   an opaque substitute or redundant blocker. A missing writer must yield the
+   exact scoped request that allows construction to resume.
+3. Repair evaluator depth handling and isolate the takeoff abort. Cover deep
+   acyclic graphs, cycles, short-circuit branches, multiple writers, and ordinary
+   versus conditional evaluation without introducing production depth budgets.
+4. Unify observation provenance and add positive production-path evidence and
+   writer-coverage tests, alongside the existing fail-closed checks. Type alone
+   cannot prove receiver state; an empty search cannot prove coverage.
+5. Rerun all four cases with resource supervision and explicit assertions for
+   numerical progress, pending work, source-request identity, and justified
+   unresolved outcomes. Do not label bounded-run completion as a verified answer.
+
+This review made no production changes and did not rerun the full pytest suite or
+the flight probes. The new small diagnostics used the repository virtual environment,
+no paid APIs, and no persistent analysis caches. Repair implementation requires a
+completed pre-implementation brief and user approval; documenting these findings
+does not authorize changing evidence policy or judge/report behavior.
