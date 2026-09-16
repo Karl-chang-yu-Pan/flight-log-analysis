@@ -5180,3 +5180,274 @@ def test_compatible_clause_mirror_matches_compatible():
                     reference, producer, structure) is None))
         assert (SourceExpansionResolver._incompatible_clause(
             reference, producer, structure) == expected)
+
+
+# --- T2: search-universe version, retry, invalidation (scheduling only) ---
+
+def _derived_gain_fixture(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _mini_tree(tmp_path, {
+        "src/main.cpp": """
+struct Cfg { float gain; };
+float tweak(float v);
+struct Ctrl {
+    Cfg cfg;
+    float out;
+    void run() { out = cfg.gain * tweak(1.0f); }
+};
+""",
+        "src/help.cpp": """
+float tweak(float v) { return v; }
+struct Derived : Cfg {};
+void Derived::apply(float v) { gain = v; }
+void Cfg::other() {}
+""",
+    }, backend="tree_sitter")
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["run"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp")
+    assert {f for _, files in [(r.index, r.new_files) for r in result.rounds]
+            for f in files} >= {"src/main.cpp", "src/help.cpp"}
+    return result
+
+
+def test_cross_version_retry_reopens_suppressed_request(tmp_path, monkeypatch):
+    """Scheduling-only retry: a request suppressed as visited must be
+    re-examined after new source extends the searchable universe.
+
+    This asserts scheduling (re-examination, evidence preserved,
+    fail-closed retention), not admission: admitting help.cpp's `gain`
+    field writer for the `cfg` struct obligation needs member-path
+    semantic matching, which is deferred to a later ticket. Here the
+    obligation must stay open and be retried, never dropped or falsely
+    satisfied."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    # Pin the production invalidation: count discovery-loop resolutions of
+    # the cfg obligation. Round 0 resolves it once and marks it visited;
+    # the post-extension round must resolve it AGAIN. Without version
+    # invalidation (visited.clear on universe extension) the second call
+    # never happens, so this count fails.
+    resolve_calls: list = []
+    original_resolve = SourceExpansionResolver.resolve
+
+    def counting_resolve(self, reference, structure):
+        if (reference.kind == "storage_writers"
+                and reference.symbol == "cfg"):
+            resolve_calls.append(reference.visit_key())
+        return original_resolve(self, reference, structure)
+
+    monkeypatch.setattr(
+        SourceExpansionResolver, "resolve", counting_resolve)
+    result = _derived_gain_fixture(tmp_path)
+    assert result.dag is not None
+    assert len(resolve_calls) == 2, (
+        "expected the cfg obligation to be resolved once per universe "
+        f"version (round 0 + post-extension retry), got {resolve_calls}")
+    # The universe extended across versions: both files loaded.
+    assert len(result.rounds) >= 2
+    assert result.rounds[1].new_files == ["src/help.cpp"]
+    # The frontier request was re-examined after extension, not
+    # permanently suppressed by same-version visited state.
+    assert "cfg.gain" in result.rounds[1].unresolved_symbols
+    # Fail-closed: the struct obligation is retained, not dropped.
+    assert [r for r in result.dag.unresolved_references
+            if r.kind == "storage_writers" and r.symbol == "cfg"], (
+        "expected the cfg storage obligation to be retained open")
+    # Resolver-level re-eligibility: resolving twice records evidence
+    # both times with identical candidates (retry corrupts nothing).
+    from flight_log_agent.analysis.mechanism_discovery import load_facts
+    from flight_log_agent.analysis.mechanism_discovery import (
+        dag_inputs_from_facts,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    reference = next(
+        r for r in result.dag.unresolved_references
+        if r.kind == "storage_writers" and r.symbol == "cfg")
+    profiler = _mini_tree(tmp_path, {
+        "src/main.cpp": """
+struct Cfg { float gain; };
+float tweak(float v);
+struct Ctrl {
+    Cfg cfg;
+    float out;
+    void run() { out = cfg.gain * tweak(1.0f); }
+};
+""",
+        "src/help.cpp": """
+float tweak(float v) { return v; }
+struct Derived : Cfg {};
+void Derived::apply(float v) { gain = v; }
+void Cfg::other() {}
+""",
+    }, backend="tree_sitter")
+    facts = load_facts(
+        profiler, tmp_path / "cache",
+        ["src/main.cpp", "src/help.cpp"], "hash")
+    expanded = dag_inputs_from_facts(facts)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    first_sink: list = []
+    first_candidates, first_evidence = resolver.resolve_with_evidence(
+        reference, expanded.structure, first_sink)
+    second_sink: list = []
+    second_candidates, second_evidence = resolver.resolve_with_evidence(
+        reference, expanded.structure, second_sink)
+    assert [(c.file, c.matched_kind) for c in first_candidates] == [
+        (c.file, c.matched_kind) for c in second_candidates]
+    assert first_evidence.attempts, "expected recorded attempts"
+    assert second_evidence.attempts, "expected retry to re-record attempts"
+
+
+def test_stage_cursor_resumes_after_ambiguity(tmp_path, monkeypatch):
+    """Record suppression after ambiguity: revisiting with already-recorded
+    stages suppressed records only the remaining stages and then settles,
+    while the underlying search still executes authoritatively and
+    candidates stay identical.
+
+    `skip_stages` suppresses duplicate SearchAttempt records only; it never
+    skips search execution. A suppressed record means "already recorded",
+    never "this stage did not run"."""
+    from flight_log_agent.analysis.coverage import attempt_stage
+    from flight_log_agent.analysis.source_expansion import planned_stages
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/over.cpp": "void tune(int x) {} void tune(float x) {}",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="tune", kind="callable", file="src/lib/over.cpp",
+        argument_count=1)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    planned = planned_stages(reference, inputs.structure)
+    assert planned, "expected a non-empty stage plan"
+    first_sink: list = []
+    first_candidates, first_evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, first_sink)
+    assert first_candidates == []
+    done = {attempt_stage(a.strategy, a.details)
+            for a in first_evidence.attempts}
+    assert done, "expected recorded stages from the first pass"
+    remaining = [stage for stage in planned if stage not in done]
+    assert remaining, "expected untried stages after ambiguity"
+    # The suppressed pass still executes the underlying search: the
+    # query-group search runs even though its record is suppressed.
+    searches: list = []
+    original_search = profiler.search_related_source_files
+
+    def counting_search(queries, **kwargs):
+        searches.append(tuple(queries))
+        return original_search(queries, **kwargs)
+
+    monkeypatch.setattr(
+        profiler, "search_related_source_files", counting_search)
+    second_sink: list = []
+    second_candidates, second_evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, second_sink,
+        skip_stages=frozenset(done))
+    assert searches, (
+        "suppressed stages must still execute their underlying search")
+    assert [(c.file, c.matched_kind) for c in second_candidates] == [
+        (c.file, c.matched_kind) for c in first_candidates], (
+        "record suppression must not change candidates")
+    rerun_stages = {attempt_stage(a.strategy, a.details)
+                    for a in second_evidence.attempts}
+    assert rerun_stages.isdisjoint(done), (
+        "already-recorded stages must not be recorded again")
+    assert rerun_stages <= set(remaining)
+    third_sink: list = []
+    third_candidates, third_evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, third_sink,
+        skip_stages=frozenset(done | rerun_stages))
+    assert third_candidates == []
+    assert third_evidence.attempts == []
+
+
+def test_version_bump_clears_suppression(tmp_path):
+    """Visited and exhausted suppression is scoped to a search-universe
+    version: advancing the version reopens eligibility and prunes old
+    progress, while repeat work in an unchanged version settles."""
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    state = CoverageSearchState()
+    assert state.version == 0
+    state.record_stages("obligation-a", {"owner-files"})
+    state.mark_exhausted("visit-key-a")
+    assert not state.eligible("obligation-a", ["owner-files", "query-group"])
+    state.advance_version()
+    assert state.version == 1
+    assert state.eligible("obligation-a", ["owner-files", "query-group"])
+    assert state.exhausted_keys() == set()
+    state.record_stages("obligation-a", {"owner-files", "query-group"})
+    assert not state.eligible("obligation-a", ["owner-files", "query-group"])
+    # Empty-plan kinds still resolve once: unseen keys are always eligible.
+    assert state.eligible("fresh-obligation", [])
+
+
+def test_planned_stages_matches_internal_linkage_path(tmp_path):
+    """`planned_stages()` must describe the resolver's actual stages: an
+    internal-linkage global is searched via the internal-only stage, never
+    via declaration-files or assignment-query stages."""
+    from flight_log_agent.analysis.coverage import (
+        attempt_stage,
+        stage_id,
+        CoverageSearchState,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        planned_stages,
+        STRATEGY_STORAGE_INTERNAL_ONLY,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/g.cpp": (
+            "static float kgain = 1.0f;\nvoid run() { kgain = 2.0f; }\n"
+        ),
+    })
+    identity = inputs.structure.symbol_identity(
+        "kgain", file="src/lib/g.cpp",
+        callable_id="run", function_name="run")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/lib/g.cpp",
+        callable_id="run", identity=identity)
+    planned = planned_stages(reference, inputs.structure)
+    assert planned == [stage_id(STRATEGY_STORAGE_INTERNAL_ONLY)], (
+        f"internal-linkage plan must be exactly the internal-only stage: {planned}")
+    # Cross-fidelity: every stage the resolver can record here is planned.
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    candidates, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink)
+    assert [item.file for item in candidates] == ["src/lib/g.cpp"]
+    recorded = {attempt_stage(a.strategy, a.details)
+                for a in evidence.attempts}
+    assert recorded <= set(planned), (
+        f"resolver recorded unplanned stages: {recorded - set(planned)}")
+    # The plan is progress state, not proof: recording it settles nothing
+    # beyond scheduling eligibility.
+    state = CoverageSearchState()
+    assert state.eligible(reference.visit_key(), planned)
+
+
+def test_evidence_carries_search_version_when_provided(tmp_path):
+    """Version stamping is observational only: attempts record the universe
+    version they ran under, and omitting the version keeps the exact T1
+    evidence shape."""
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/plain.cpp": "float output; void run() { output = 2; }",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="output", file="src/lib/plain.cpp")
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    candidates, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=3)
+    assert [item.file for item in candidates] == ["src/lib/plain.cpp"]
+    assert evidence.universe_ref.get("search_version") == 3
+    assert sink, "expected recorded attempts"
+    assert all(a.universe_ref.get("search_version") == 3 for a in sink)
+    legacy_sink: list = []
+    _, legacy_evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, legacy_sink)
+    assert "search_version" not in legacy_evidence.universe_ref, (
+        "omitted version must preserve the exact T1 evidence shape")

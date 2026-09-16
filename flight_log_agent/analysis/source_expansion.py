@@ -43,6 +43,8 @@ from flight_log_agent.analysis.coverage import (
     STRATEGY_UNIQUE_ENTITY_FILTER,
     CoverageEvidence,
     SearchAttempt,
+    attempt_stage,
+    stage_id,
 )
 from flight_log_agent.px4.mechanism_source_profiler import (
     MechanismSourceProfiler,
@@ -938,6 +940,22 @@ def source_reference_resolution_key(
     return reference.visit_key()
 
 
+def _is_internal_linkage(
+    identity: SourceSymbolIdentity,
+    structure: SourceStructureIndex,
+) -> bool:
+    """Single predicate for the resolver's internal-linkage branch.
+
+    Shared by `_resolve_storage_writers` and `planned_stages` so the
+    static plan can never drift from the stage the resolver records.
+    """
+    declaration = structure.declaration_for_identity(identity)
+    return bool(
+        (declaration and declaration.get("linkage") == "internal")
+        or identity.declaration_id.startswith("global:internal:")
+    )
+
+
 def reference_receiver_is_source_boundary(
     reference: UnresolvedSourceReference,
     boundary_bindings: Sequence[dict[str, Any]],
@@ -951,6 +969,77 @@ def reference_receiver_is_source_boundary(
         and str(item.get("source_site_id") or "") == reference.source_site_id
         for item in boundary_bindings
     )
+
+
+def planned_stages(
+    reference: UnresolvedSourceReference,
+    structure: SourceStructureIndex,
+) -> list[str]:
+    """Static stage plan for one reference, without running any search.
+
+    Scheduling only: enumerates the strategies `_resolve_inner` could
+    record for this reference kind/dispatch, so a retry can skip completed
+    stages. Carries no coverage meaning and never influences admission.
+    """
+    kind = reference.kind
+    if kind in {"member_writers", "storage_writers"}:
+        identity = reference.identity
+        if identity is None or not identity.declaration_proven:
+            return [stage_id(STRATEGY_STORAGE_OWNER_FILES)]
+        if identity.kind == "local":
+            return [stage_id(STRATEGY_LOCAL_SHORTCIRCUIT)]
+        if identity.kind == "member":
+            return [stage_id(STRATEGY_STORAGE_OWNER_FILES)]
+        if identity.kind != "global":
+            return [stage_id(STRATEGY_STORAGE_OWNER_FILES)]
+        if _is_internal_linkage(identity, structure):
+            return [stage_id(STRATEGY_STORAGE_INTERNAL_ONLY)]
+        return [
+            stage_id(STRATEGY_STORAGE_DECLARATION_FILES),
+            stage_id(STRATEGY_STORAGE_ASSIGNMENT_QUERY),
+        ]
+    if (
+        kind == "symbol"
+        and reference.identity is not None
+        and (
+            reference.identity.kind == "local"
+            or (
+                structure.authoritative_declarations
+                and reference.identity.kind == "unknown"
+            )
+        )
+    ):
+        return [stage_id(STRATEGY_LOCAL_SHORTCIRCUIT)]
+    if kind == "callable" and reference.receiver:
+        receiver_type = reference.receiver_type or structure.member_receiver_type(
+            reference.class_owner, reference.receiver
+        )
+        if not receiver_type:
+            return [stage_id(STRATEGY_CALLABLE_OWNER_FILES)]
+    if kind == "callable":
+        stages = [
+            stage_id(STRATEGY_CALLABLE_OWNER_FILES),
+            stage_id(STRATEGY_CALLABLE_DEFINITION_SEARCH),
+        ]
+        for index, _group in enumerate(
+            SourceExpansionResolver._callable_query_groups(
+                reference, structure)
+        ):
+            stages.append(
+                stage_id(STRATEGY_CALLABLE_QUERY_GROUP, index))
+        # The unique-entity filter only records when candidates exist, so an
+        # ambiguous empty-candidates pass leaves it untried: retry stays open.
+        stages.append(stage_id(STRATEGY_UNIQUE_ENTITY_FILTER))
+        return stages
+    queries = SourceExpansionResolver._queries(reference)
+    if not queries:
+        return [stage_id(STRATEGY_QUERY_GROUP)]
+    if kind == "symbol" and len(queries) > 1:
+        return [
+            stage_id(STRATEGY_QUERY_GROUP_ASSIGNMENT, 0),
+            stage_id(STRATEGY_QUERY_GROUP_BARE, 1),
+        ]
+    return [stage_id(STRATEGY_QUERY_GROUP, 0)]
 
 
 @dataclass
@@ -1017,11 +1106,13 @@ class _EvidenceRecorder:
         structure: "SourceStructureIndex",
         universe_ref: dict,
         sink: list,
+        skip_stages: Any = None,
     ) -> None:
         self.reference = reference
         self.structure = structure
         self.universe_ref = dict(universe_ref)
         self.sink = sink
+        self.skip_stages = frozenset(skip_stages or ())
         self.attempts: list = []
         self.obligation_key = source_reference_resolution_key(
             reference, structure)
@@ -1039,7 +1130,15 @@ class _EvidenceRecorder:
         intended: str = "",
         examined: Optional[dict] = None,
         details: Optional[dict] = None,
-    ) -> SearchAttempt:
+    ) -> Optional[SearchAttempt]:
+        details = dict(details or {})
+        if attempt_stage(strategy, details) in self.skip_stages:
+            # Record suppression only: the underlying search still executes
+            # so candidates stay identical to resolve(). A suppressed record
+            # means "already recorded for this version", never "this stage
+            # did not run" — T3 must derive completeness from recorded
+            # attempt semantics, not from cursor assumptions.
+            return None
         attempt = SearchAttempt(
             obligation_key=self.obligation_key,
             scheduling_key=self.scheduling_key,
@@ -1185,12 +1284,23 @@ class SourceExpansionResolver:
         reference: UnresolvedSourceReference,
         structure: SourceStructureIndex,
         sink: list,
+        skip_stages: Any = None,
+        universe_version: Any = None,
     ) -> tuple[list[ExpansionCandidate], CoverageEvidence]:
         """Resolve exactly like :meth:`resolve` while recording evidence.
 
         `sink` is required (no default): a coverage-enabled search cannot
         run without producing its attempt records. The returned candidates
         are identical to `resolve()`; the evidence carries no authority.
+        `skip_stages` holds already-recorded stage ids: those stages are
+        not recorded again, but their underlying search still executes, so
+        candidates stay identical. A suppressed record means "already
+        recorded", never "this stage did not run".
+        `universe_version` is observational only: when provided it is
+        stamped onto the evidence's `universe_ref` (and each attempt copy)
+        so attempts can be attributed to the version they ran under. It
+        never influences admission and carries no coverage meaning. When
+        omitted the evidence keeps its exact prior shape.
         """
         universe_ref = {
             "source_hash": self.source_hash,
@@ -1199,7 +1309,12 @@ class SourceExpansionResolver:
             "backend": str(
                 getattr(self.profiler, "source_parser_backend", "legacy")),
         }
-        recorder = _EvidenceRecorder(reference, structure, universe_ref, sink)
+        if universe_version is not None:
+            universe_ref["search_version"] = universe_version
+        recorder = _EvidenceRecorder(
+            reference, structure, universe_ref, sink,
+            skip_stages=skip_stages,
+        )
         candidates = self._resolve_inner(reference, structure, recorder)
         evidence = CoverageEvidence(
             obligation_key=recorder.obligation_key,
@@ -1408,7 +1523,6 @@ class SourceExpansionResolver:
                 )
             return []
 
-        declaration = structure.declaration_for_identity(identity)
         declarations = structure.declarations_by_id.get(
             identity.declaration_id, []
         )
@@ -1420,11 +1534,7 @@ class SourceExpansionResolver:
         ]
         if not direct_files and identity.file:
             direct_files = [identity.file]
-        internal = bool(
-            (declaration and declaration.get("linkage") == "internal")
-            or identity.declaration_id.startswith("global:internal:")
-        )
-        if internal:
+        if _is_internal_linkage(identity, structure):
             return self._admit_files(
                 reference, structure, direct_files, recorder=recorder,
                 strategy=STRATEGY_STORAGE_INTERNAL_ONLY,

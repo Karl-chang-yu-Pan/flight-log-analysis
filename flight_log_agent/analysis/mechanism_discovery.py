@@ -30,6 +30,7 @@ from flight_log_agent.analysis.source_expansion import (
     UnresolvedSourceReference,
     reference_receiver_is_source_boundary,
 )
+from flight_log_agent.analysis.coverage import CoverageSearchState
 from flight_log_agent.analysis.checkpoint_discovery import CheckpointRound
 from flight_log_agent.analysis.mechanism_dag import (
     DAGConstructionSession,
@@ -1454,6 +1455,7 @@ def make_helper_body_provider(
     structure: Optional[SourceStructureIndex] = None,
     resolver: Optional[SourceExpansionResolver] = None,
     attempt_sink: Optional[list] = None,
+    universe_version: Any = None,
 ) -> Callable[..., Any]:
     """Load exact callable definitions without admitting ranked hit files.
 
@@ -1463,7 +1465,8 @@ def make_helper_body_provider(
 
     When `attempt_sink` is provided, helper-driven resolution records its
     search attempts there via the evidence-producing path; otherwise the
-    legacy behavior is unchanged.
+    legacy behavior is unchanged. `universe_version` is passed through for
+    observational stamping only.
     """
     source_structure = structure or SourceStructureIndex()
     source_resolver = resolver or SourceExpansionResolver(profiler, "provider")
@@ -1479,7 +1482,8 @@ def make_helper_body_provider(
         resolved: list[Any] = []
         if attempt_sink is not None:
             candidates, _evidence = source_resolver.resolve_with_evidence(
-                call_reference, source_structure, attempt_sink
+                call_reference, source_structure, attempt_sink,
+                universe_version=universe_version,
             )
         else:
             candidates = source_resolver.resolve(
@@ -1661,7 +1665,19 @@ def discover_mechanism_dag(
     dag: Optional[MechanismDAG] = None
     inputs = DAGInputs()
     validation: Optional[TerminalValidation] = None
-    visited: set[tuple[Any, ...]] = set()
+    # Single session-owned search-universe state (T2, scheduling only):
+    # visited suppression is scoped to the currently loaded source
+    # universe. Admitting new files advances the version and reopens
+    # eligibility so previously suppressed requests retry against the
+    # extended index. No coverage certificate, no stop-authority change:
+    # a retry that finds nothing still settles.
+    #
+    # Same-version retry is unnecessary by construction: the resolver runs
+    # all applicable stages in one call (ambiguity/empty never blocks a
+    # later stage; only successful admission short-circuits), and no
+    # within-version event provides new information that would reopen
+    # later groups. Revisit happens only on universe extension.
+    search_state = CoverageSearchState()
     checkpoint: Optional[CheckpointRound] = None
     stop_reason = "frontier_exhausted"
     construction_session = DAGConstructionSession() if construction_evaluator is not None else None
@@ -1756,6 +1772,12 @@ def discover_mechanism_dag(
             facts = resolver.facts_for(file_path)
             facts_by_file[file_path] = facts
             loaded.append(file_path)
+        if new_files:
+            # The searchable universe extended: open a new version and
+            # release same-version visited suppression so frontier requests
+            # retry against the fuller index. Retries that admit nothing
+            # produce no further files and the loop still settles.
+            search_state.advance_version()
 
         if new_files or not local_resume:
             inputs = dag_inputs_from_facts(facts_by_file.values())
@@ -1799,6 +1821,7 @@ def discover_mechanism_dag(
             fetched_files,
             structure=inputs.structure,
             resolver=resolver,
+            universe_version=search_state.version,
         )
 
         def construction_checkpoint(snapshot: MechanismDAG):
@@ -1898,9 +1921,9 @@ def discover_mechanism_dag(
             ):
                 continue
             key = resolver.resolution_key(reference, inputs.structure)
-            if key in visited:
+            if search_state.was_visited(key):
                 continue
-            visited.add(key)
+            search_state.mark_visited(key)
             for candidate in resolver.resolve(reference, inputs.structure):
                 next_files.extend(declared_source_files(candidate.file))
         for file_path in fetched_files:
