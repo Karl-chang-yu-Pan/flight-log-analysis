@@ -7896,3 +7896,191 @@ def test_retirement_behavioral_differential(tmp_path, monkeypatch):
     assert counts["valid"] == 0
     assert counts["stale"] >= 1
     assert counts["unrelated"] >= 1
+
+
+def _opaque_member_obligation(tmp_path):
+    """Opaque-leaf member fixture plus its proven config obligation,
+    unevaluated: callers detach origins then run the round."""
+    dag, samples = _unresolved_member_dag(tmp_path, _UNRESOLVED_MEMBER_SOURCE)
+    reference = next(r for r in dag.unresolved_references
+                     if r.kind == "storage_writers" and r.symbol == "config")
+    return dag, samples, reference
+
+
+def _run_proof_round(dag, samples):
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        evaluate_checkpoint_round,
+    )
+    return evaluate_checkpoint_round(
+        dag, parameter_values={}, observed_signals=set(samples),
+        signal_policies={s: {"method": "linear"} for s in samples},
+        load_samples=lambda *_: samples)
+
+
+def test_local_only_obligation_enters_proof_relevance(tmp_path):
+    """A (T4 F1): an obligation attached to local scheduling through
+    exact declaration identity — while outside the ordinary checkpoint
+    closure — must appear in proof relevance. It is scheduled
+    (local-calculation source work) yet pre-fix invisible to proof."""
+    dag, samples, reference = _opaque_member_obligation(tmp_path)
+    reference.origin_vertex_ids = ["elsewhere-outside-closure"]
+    result = _run_proof_round(dag, samples)
+    key = reference.visit_key()
+    assert result.summary["next_analysis"]["kind"] == (
+        "local_calculation_source")
+    assert key in [item.visit_key() for item in result.references], (
+        "local-scheduled obligation must exist in round references")
+    observation = result.proof_observation
+    assert observation is not None
+    assert key in observation.relevant_obligation_keys, (
+        "local-only obligation missing from proof relevance")
+    assert key in observation.uncovered_obligation_keys
+
+
+def test_origin_less_local_obligation_enters_proof_relevance(tmp_path):
+    """B (T4 F1): an origin-less reference attached to local scheduling
+    through exact declaration identity must appear in proof relevance.
+    Assess records a source-linkage requirement for it (pre-existing
+    behavior, unchanged); relevance must still include it."""
+    dag, samples, reference = _opaque_member_obligation(tmp_path)
+    reference.origin_vertex_ids = []
+    result = _run_proof_round(dag, samples)
+    key = reference.visit_key()
+    assert result.summary["next_analysis"]["kind"] == (
+        "local_calculation_source")
+    assert key in [item.visit_key() for item in result.references]
+    kinds = {item["kind"] for item in
+             result.summary.get("selected_checkpoint", {}).get(
+                 "analysis_requirements", [])}
+    assert "source_linkage" in kinds, (
+        "origin-less references keep their pre-existing requirement")
+    observation = result.proof_observation
+    assert observation is not None
+    assert key in observation.relevant_obligation_keys, (
+        "origin-less local obligation missing from proof relevance")
+    assert key in observation.uncovered_obligation_keys
+
+
+def test_ordinary_and_local_duplicate_dedupes(tmp_path):
+    """E (T4 F1): one obligation reachable through both ordinary
+    checkpoint references and local needs appears exactly once in
+    relevance, with correct covered/uncovered accounting."""
+    dag, samples, reference = _opaque_member_obligation(tmp_path)
+    result = _run_proof_round(dag, samples)
+    key = reference.visit_key()
+    observation = result.proof_observation
+    assert observation is not None
+    relevant = list(observation.relevant_obligation_keys)
+    assert relevant.count(key) == 1
+    assert key in observation.uncovered_obligation_keys
+    assert key not in observation.covered_obligation_keys
+
+
+def test_local_matching_certificate_covers(tmp_path):
+    """C (T4 F1): a current certificate whose scheduling key matches a
+    local-sourced obligation covers it — association is scheduling-key
+    equality over a real derived certificate, not origin matching."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    cert = _derive_for(profiler, inputs, reference, version=0)
+    local = reference.model_copy(update={"origin_vertex_ids": []})
+    assert local.visit_key() == reference.visit_key()
+    key = local.visit_key()
+    observation = observe_checkpoint_coverage(
+        [local], certificates=[cert], proof_version=0,
+        searchable_keys={key})
+    assert observation.relevant_obligation_keys == (key,)
+    assert observation.covered_obligation_keys == (key,)
+    assert observation.covered_semantic_keys == (cert.obligation_key,)
+    assert observation.uncovered_obligation_keys == ()
+
+
+def test_local_cross_declaration_isolation(tmp_path):
+    """D (T4 F1): same-spelling local obligations under different proven
+    declarations stay isolated — a certificate for one never covers the
+    other."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    profiler, inputs, reference_a = _internal_gain_fixture(tmp_path)
+    _other_profiler, _other_inputs, reference_b = _internal_h_certificate(
+        tmp_path)
+    assert (reference_b.identity.declaration_id
+            != reference_a.identity.declaration_id)
+    cert_a = _derive_for(profiler, inputs, reference_a, version=0)
+    local_a = reference_a.model_copy(update={"origin_vertex_ids": []})
+    local_b = reference_b.model_copy(update={"origin_vertex_ids": []})
+    key_a, key_b = local_a.visit_key(), local_b.visit_key()
+    assert key_a != key_b
+    observation = observe_checkpoint_coverage(
+        [local_a, local_b], certificates=[cert_a], proof_version=0,
+        searchable_keys={key_a, key_b})
+    assert set(observation.relevant_obligation_keys) == {key_a, key_b}
+    assert observation.covered_obligation_keys == (key_a,)
+    assert observation.uncovered_obligation_keys == (key_b,)
+
+
+def test_local_filtered_union_semantics(tmp_path):
+    """Filtered means omitted from every current scheduling pool:
+    a local obligation scheduled through the local path is relevant
+    but not filtered; one scheduled nowhere is both relevant and
+    filtered."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    local = reference.model_copy(update={"origin_vertex_ids": []})
+    key = local.visit_key()
+    scheduled = observe_checkpoint_coverage(
+        [local], certificates=[], proof_version=0,
+        searchable_keys={key})
+    assert scheduled.filtered_obligation_keys == ()
+    assert scheduled.uncovered_obligation_keys == (key,)
+    unscheduled = observe_checkpoint_coverage(
+        [local], certificates=[], proof_version=0,
+        searchable_keys=set())
+    assert unscheduled.filtered_obligation_keys == (key,)
+    assert unscheduled.uncovered_obligation_keys == (key,)
+
+
+def test_exhausted_local_obligation_stays_relevant(tmp_path):
+    """F-analog (T4 F1): scheduler suppression (exhausted, the only
+    suppression a checkpoint round can see — T6A retirement is
+    invisible here by design) never erases relevance. The obligation
+    stays relevant, filtered, and uncovered."""
+    dag, samples, reference = _opaque_member_obligation(tmp_path)
+    reference.origin_vertex_ids = ["elsewhere-outside-closure"]
+    key = reference.visit_key()
+    dag.exhausted_source_requests.add(key)
+    result = _run_proof_round(dag, samples)
+    observation = result.proof_observation
+    assert observation is not None
+    assert key in observation.relevant_obligation_keys
+    assert key in observation.filtered_obligation_keys
+    assert key in observation.uncovered_obligation_keys
+    assert key not in [item.visit_key() for item in result.references]
+    assert result.summary.get("selected_checkpoint", {}).get(
+        "authorizes_discovery_stop", False) is False
+
+
+def test_vacuity_flip_keeps_behavior(tmp_path):
+    """G-integration (T4 F1): local-only relevance turns a previously
+    false-empty relevance set non-empty diagnostically, while action,
+    next analysis, requirements, flags, and stop stay exactly as the
+    round computes them."""
+    dag, samples, reference = _opaque_member_obligation(tmp_path)
+    reference.origin_vertex_ids = ["elsewhere-outside-closure"]
+    result = _run_proof_round(dag, samples)
+    observation = result.proof_observation
+    assert observation is not None
+    assert observation.relevant_empty is False
+    assert observation.scope_degenerate is False
+    assert observation.covered_obligation_keys == ()
+    assert result.summary["next_analysis"]["kind"] == (
+        "local_calculation_source")
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("authorizes_discovery_stop", False) is False
+    assert selected.get("writer_coverage_verified", False) is False
+    assert selected.get("applicability_verified", False) is False

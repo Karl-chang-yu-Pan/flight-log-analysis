@@ -65,10 +65,18 @@ def observe_checkpoint_coverage(
     Pure function over explicit inputs: the pre-filter relevance base
     (references entering the round, before exhausted/queue filtering),
     the certificates to consider, the current proof version, and the
-    visit keys still schedulable. Reads no session, scheduler, or
-    checkpoint state. Never authorizes, retires, or filters.
+    visit keys schedulable through any current path (ordinary searchable
+    plus local-request scheduling). Reads no session, scheduler, or
+    checkpoint state. Never authorizes, retires, or filters. Relevance
+    entries are deduplicated by visit key, references first.
     """
-    relevant = [reference.visit_key() for reference in references or ()]
+    seen: set = set()
+    relevant: list = []
+    for reference in references or ():
+        key = reference.visit_key()
+        if key not in seen:
+            seen.add(key)
+            relevant.append(key)
     relevant_set = set(relevant)
     if searchable_keys is None:
         searchable = set(relevant)
@@ -290,16 +298,30 @@ def evaluate_checkpoint_round(
         inactive=frozenset(inactive),
     )
     action = "verified" if verified else "continue" if next_references or materialize else "unresolved"
-    # Record-only proof observation (T4): relevance comes from the
-    # pre-filter `references` base above — never from the exhausted- or
-    # queue-filtered views — so filtering cannot erase relevance. Reads
-    # only; scheduling, requirements, flags, and stop are already decided
-    # and untouched below.
+    # Record-only proof observation (T4 F1): relevance comes from the
+    # pre-filter `references` base above UNION the active local-request
+    # obligations below — never from the exhausted- or queue-filtered
+    # views — so filtering cannot erase relevance. Local needs attach
+    # obligations (e.g. by exact declaration identity) that the
+    # checkpoint-wanted set may omit; those obligations still
+    # participate in this round's analysis and must stay visible to
+    # proof. Reads only; scheduling, requirements, flags, and stop are
+    # already decided and untouched below.
+    relevance_references = list(references)
+    relevance_keys = {reference.visit_key() for reference in references}
+    for reference in dag.unresolved_references:
+        if (reference.visit_key() in local_keys
+                and reference.visit_key() not in relevance_keys):
+            relevance_keys.add(reference.visit_key())
+            relevance_references.append(reference)
     proof_observation = observe_checkpoint_coverage(
-        references,
+        relevance_references,
         certificates=coverage_certificates,
         proof_version=proof_version,
-        searchable_keys={reference.visit_key() for reference in searchable},
+        searchable_keys=(
+            {reference.visit_key() for reference in searchable}
+            | {reference.visit_key() for reference in local_requests}
+        ),
         scope_degenerate=not roots,
     )
     updates = {v.id: v for v in annotated_view.vertices}
