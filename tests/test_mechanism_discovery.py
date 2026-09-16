@@ -7054,3 +7054,845 @@ def test_writer_census_isolates_same_spelling_declarations(tmp_path):
     assert seen["src/lib/g.cpp"] != seen["src/lib/h.cpp"]
     assert all("h.cpp" not in site for site in seen["src/lib/g.cpp"])
     assert all("g.cpp" not in site for site in seen["src/lib/h.cpp"])
+
+
+# --- T6A: safe retirement of covered source-search obligations ---
+
+def _retirement_cert(obligation_key, version=0, writers=("w:1",)):
+    """Hand-built certificate with controlled identity: isolates state
+    semantics from derivation for D1 unit tests."""
+    from flight_log_agent.analysis.coverage import WriterCoverageCertificate
+    scheduling = ("sched",) + tuple(obligation_key[1:])
+    return WriterCoverageCertificate(
+        obligation_key=tuple(obligation_key),
+        scheduling_key=tuple(scheduling),
+        declaration=(obligation_key[1], obligation_key[2], "gain"),
+        receiver_context=("", "", ""),
+        strategy="storage-internal-only",
+        boundary=("src/lib/sg.cpp",),
+        examined=("src/lib/sg.cpp",),
+        version=version,
+        assumptions=("file-linkage-closed",
+                     "writer-syntax-enumerated"),
+        writers=tuple(writers),
+    )
+
+
+_KEY_A = ("storage_writers", "global", "global:internal:a.cpp:gain")
+_KEY_B = ("storage_writers", "global", "global:internal:b.cpp:gain")
+
+
+def test_retirement_is_per_obligation_and_version_scoped(tmp_path):
+    """D1: retiring A never affects B; retirement lives under its
+    version; re-applying is idempotent (single record)."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+    )
+    _ = tmp_path
+    state = CoverageSearchState()
+    assert state.version == 0
+    assert apply_writer_coverage_retirement(
+        state, _retirement_cert(_KEY_A), 0) is True
+    assert state.is_proof_retired(_KEY_A) is True
+    assert state.is_proof_retired(_KEY_B) is False
+    record = state.proof_retirement(_KEY_A)
+    assert record is not None
+    assert record.resolution_key == _KEY_A
+    assert record.version == 0
+    assert record.writers == ("w:1",)
+    assert state.proof_retirement(_KEY_B) is None
+    assert apply_writer_coverage_retirement(
+        state, _retirement_cert(_KEY_A), 0) is True
+    assert len(state.retired) == 1
+    state.advance_version()
+    assert state.version == 1
+    assert state.is_proof_retired(_KEY_A) is False
+    assert state.proof_retirement(_KEY_A) is None
+
+
+def test_retirement_ignores_scheduler_exhaustion_state(tmp_path):
+    """D1/K-unit: visited/exhausted/completed scheduler state neither
+    creates retirement without a certificate nor disturbs retirement
+    with one. Proof retirement and scheduler exhaustion stay distinct."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+    )
+    _ = tmp_path
+    state = CoverageSearchState()
+    state.mark_visited(_KEY_A)
+    state.mark_exhausted("visit-key-a")
+    state.mark_exhausted("visit-key-b")
+    state.record_stages("obligation-a", {"owner-files"})
+    assert state.is_proof_retired(_KEY_A) is False
+    assert state.proof_retirement(_KEY_A) is None
+    assert apply_writer_coverage_retirement(
+        state, _retirement_cert(_KEY_A), 0) is True
+    assert state.is_proof_retired(_KEY_A) is True
+    assert state.is_proof_retired(_KEY_B) is False
+
+
+def test_retirement_refuses_stale_and_malformed(tmp_path):
+    """D/J-unit: stale-version and malformed certificates retire
+    nothing and record nothing."""
+    from dataclasses import replace
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+    )
+    _ = tmp_path
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(
+        state, _retirement_cert(_KEY_A, version=0), 1) is False
+    assert state.is_proof_retired(_KEY_A) is False
+    assert apply_writer_coverage_retirement(state, None, 0) is False
+    empty_key = replace(_retirement_cert(_KEY_A), obligation_key=())
+    assert apply_writer_coverage_retirement(
+        state, empty_key, 0) is False
+    empty_boundary = replace(_retirement_cert(_KEY_A), boundary=())
+    assert apply_writer_coverage_retirement(
+        state, empty_boundary, 0) is False
+    assert state.retired == {}
+
+
+def _retire_tree(tmp_path):
+    """Single-file tree: two certifiable storage obligations (gain and
+    bias), both schedulable in one discovery run."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    files = {
+        "src/main.cpp": (
+            "static int gain = 1;\n"
+            "static int bias = 10;\n"
+            "void update() { gain = 5; bias = 7; }\n"
+            "float out;\n"
+            "void run() { out = gain * bias; }\n"
+        ),
+    }
+    profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
+    return profiler, files
+
+
+def _spy_resolution_keys(monkeypatch):
+    """Count discovery-loop resolutions keyed by resolution key."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    calls: list = []
+    original = SourceExpansionResolver.resolve
+
+    def spy(self, reference, structure):
+        calls.append((reference.kind, reference.symbol,
+                      self.resolution_key(reference, structure)))
+        return original(self, reference, structure)
+
+    monkeypatch.setattr(SourceExpansionResolver, "resolve", spy)
+    return calls
+
+
+def _run_retire_tree(tmp_path, monkeypatch, **discover_kwargs):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler, files = _retire_tree(tmp_path)
+    calls = _spy_resolution_keys(monkeypatch)
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["run"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp",
+        **discover_kwargs)
+    assert result.dag is not None
+    return profiler, files, calls, result
+
+
+def _gain_key_and_cert(tmp_path, profiler, files, loop_gain_key):
+    """Real T3 certificate for the tree's gain obligation, pinned to the
+    exact resolution key the discovery loop computed (spy-captured)."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+        UnresolvedSourceReference,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        dag_inputs_from_facts, load_facts,
+    )
+    facts = load_facts(
+        profiler, tmp_path / "cache", list(files), "hash")
+    structure = dag_inputs_from_facts(facts).structure
+    callable_id = next(
+        key for key, item in structure.callables_by_id.items()
+        if item.get("name") == "run")
+    identity = structure.symbol_identity(
+        "gain", file="src/main.cpp", callable_id=callable_id,
+        function_name="run")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="gain", kind="storage_writers", file="src/main.cpp",
+        callable_id=callable_id, identity=identity)
+    cert = _derive_use_certificate(
+        profiler, structure, reference, version=0)
+    assert tuple(cert.obligation_key) == tuple(loop_gain_key), (
+        "certificate obligation must equal the loop resolution key")
+    return reference, cert
+
+
+def test_retired_obligation_leaves_scheduling(tmp_path, monkeypatch):
+    """A: a current-version retired obligation is omitted from
+    source-search scheduling while its provenance record is retained;
+    DAG, files, rounds, and stop are otherwise identical."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+    )
+    profiler, files, calls, result = _run_retire_tree(tmp_path, monkeypatch)
+    gain_key = next(key for _kind, symbol, key in calls
+                    if symbol == "gain")
+    assert any(symbol == "bias" for _kind, symbol, _key in calls)
+    _, cert = _gain_key_and_cert(tmp_path, profiler, files, gain_key)
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(state, cert, 0) is True
+    profiler2, _files2, calls2, result2 = _run_retire_tree(
+        tmp_path, monkeypatch, search_state=state)
+    assert [symbol for _kind, symbol, _key in calls2
+            if symbol == "gain"] == []
+    assert any(symbol == "bias" for _kind, symbol, _key in calls2)
+    record = state.proof_retirement(gain_key)
+    assert record is not None
+    assert record.writers == tuple(cert.writers) != ()
+    assert record.version == 0
+    assert result2.files_loaded == result.files_loaded
+    assert result2.rounds == result.rounds
+    assert result2.dag.model_dump() == result.dag.model_dump()
+    assert result2.stop_reason == result.stop_reason
+
+
+def test_retirement_preserves_unrelated_scheduling(tmp_path, monkeypatch):
+    """B: retiring gain leaves the independent bias obligation fully
+    schedulable — per-obligation independence at the loop level."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+    )
+    profiler, files, calls, result = _run_retire_tree(
+        tmp_path, monkeypatch)
+    gain_key = next(key for _kind, symbol, key in calls
+                    if symbol == "gain")
+    _, cert = _gain_key_and_cert(tmp_path, profiler, files, gain_key)
+    bias_key = next(key for _kind, symbol, key in calls
+                    if symbol == "bias")
+    assert bias_key != gain_key
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(state, cert, 0) is True
+    assert state.is_proof_retired(bias_key) is False
+    assert state.proof_retirement(bias_key) is None
+    _p2, _f2, calls2, _r2 = _run_retire_tree(
+        tmp_path, monkeypatch, search_state=state)
+    assert any(symbol == "bias" for _kind, symbol, _key in calls2)
+    assert not any(symbol == "gain" for _kind, symbol, _key in calls2)
+
+def test_retirement_isolates_same_spelling_obligations(tmp_path,
+                                                        monkeypatch):
+    """C: same spelling `run` demanded through two receivers of
+    unrelated classes resolves under distinct scheduling keys in one
+    version; retiring the A key never suppresses the B key."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        WriterCoverageCertificate,
+        apply_writer_coverage_retirement,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    files = {
+        "src/main.cpp": (
+            "struct A { float run(); };\n"
+            "struct B { float run(); };\n"
+            "A a;\n"
+            "B b;\n"
+            "float out;\n"
+            "void go() { out = a.run() + b.run(); }\n"
+        ),
+    }
+    profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
+    calls = _spy_resolution_keys(monkeypatch)
+    first = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["go"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp")
+    assert first.dag is not None
+    run_keys = {(symbol, key) for _kind, symbol, key in calls
+                if symbol in {"run", "a.run", "b.run"}}
+    assert len({key for _symbol, key in run_keys}) >= 2, (
+        f"expected two distinct scheduling keys, got {run_keys}")
+    retired_key = sorted(key for _symbol, key in run_keys)[0]
+    other_keys = {key for _symbol, key in run_keys} - {retired_key}
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(state, WriterCoverageCertificate(
+        obligation_key=tuple(retired_key),
+        scheduling_key=("sched", "run-a"),
+        declaration=("callable", "run-a", "run"),
+        receiver_context=("", "", ""),
+        strategy="callable-owner-files",
+        boundary=("src/main.cpp",),
+        examined=("src/main.cpp",),
+        version=0,
+        assumptions=(),
+        writers=("src/main.cpp:0:0:run-a"),
+    ), 0) is True
+    profiler2 = _mini_tree(tmp_path, files, backend="tree_sitter")
+    second = discover_mechanism_dag(
+        profiler2, tmp_path / "cache", seeds=["go"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp",
+        search_state=state)
+    assert second.dag is not None
+    assert second.dag.model_dump() == first.dag.model_dump()
+    # Loop-level proof: the retired key was never marked visited (the
+    # loop schedules only what it marks), while the sibling key was.
+    # NOTE: helper-body loading during graph construction resolves
+    # callable symbols through a separate construction path that
+    # intentionally bypasses both visited and retired suppression —
+    # suppressing it would degrade the built DAG. Retirement governs
+    # frontier source-search scheduling only.
+    assert retired_key not in state.visited
+    assert other_keys <= state.visited
+    assert second.stop_reason == first.stop_reason
+
+
+def _two_file_gain_tree(tmp_path):
+    """Two-file tree where the gain storage obligation is first
+    suppressed, then must retry after the universe extends via an
+    independent callable path."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    files = {
+        "src/main.cpp": (
+            "struct Cfg { float gain; };\n"
+            "float tweak(float v);\n"
+            "struct Ctrl {\n"
+            "    Cfg cfg;\n"
+            "    float out;\n"
+            "    void run() { out = cfg.gain * tweak(1.0f); }\n"
+            "};\n"
+        ),
+        "src/help.cpp": (
+            "float tweak(float v) { return v; }\n"
+            "struct Derived : Cfg {};\n"
+            "void Derived::apply(float v) { gain = v; }\n"
+            "void Cfg::other() {}\n"
+        ),
+    }
+    profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
+    return profiler, files
+
+
+def _discover_gain_tree(tmp_path, monkeypatch, files, **kwargs):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
+    calls: list = []
+    original = SourceExpansionResolver.resolve
+
+    def spy(self, reference, structure):
+        calls.append((reference.kind, reference.symbol,
+                      self.resolution_key(reference, structure)))
+        return original(self, reference, structure)
+
+    monkeypatch.setattr(SourceExpansionResolver, "resolve", spy)
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["run"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp", **kwargs)
+    assert result.dag is not None
+    return calls, result
+
+
+def test_version_advance_reactivates_retirement(tmp_path, monkeypatch):
+    """E: retirement is version-scoped, not sticky. Pre-retired at
+    version 0, the obligation is suppressed in round 0; after new
+    source extends the universe (version 1), the stale retirement no
+    longer suppresses it and it resolves exactly once.
+
+    Exactly-one-total is airtight here: round 0 must suppress (record
+    is current), and round 1 cannot suppress (visited was cleared by
+    the advance and no version-1 retirement exists)."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        WriterCoverageCertificate,
+        apply_writer_coverage_retirement,
+    )
+    profiler, files = _two_file_gain_tree(tmp_path)
+    calls, _first = _discover_gain_tree(tmp_path, monkeypatch, files)
+    cfg_key = next(key for _kind, symbol, key in calls if symbol == "cfg")
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(state, WriterCoverageCertificate(
+        obligation_key=tuple(cfg_key),
+        scheduling_key=("sched", "cfg"),
+        declaration=("member", "cfg", "cfg"),
+        receiver_context=("", "", ""),
+        strategy="storage-owner-files",
+        boundary=("src/main.cpp",),
+        examined=("src/main.cpp",),
+        version=0,
+        assumptions=(),
+        writers=("src/main.cpp:0:0:cfg",),
+    ), 0) is True
+    calls2, second = _discover_gain_tree(
+        tmp_path, monkeypatch, files, search_state=state)
+    cfg_calls2 = [key for _kind, symbol, key in calls2
+                  if symbol == "cfg"]
+    assert len(cfg_calls2) == 1
+    assert {f for _, files in [(r.index, r.new_files)
+                               for r in second.rounds]
+            for f in files} >= {"src/main.cpp", "src/help.cpp"}
+    assert len(second.rounds) >= 2
+    assert state.version == 1
+    assert state.proof_retirement(cfg_key) is None
+
+
+def test_retired_obligation_stays_stable(tmp_path, monkeypatch):
+    """F: within one immutable universe version, a pre-retired
+    obligation never re-enters scheduling across repeated runs sharing
+    the session state: no resolve calls, exactly one record, normal
+    completion for everything else."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+    )
+    profiler, files = _retire_tree(tmp_path)
+    _, _, calls, _first = _run_retire_tree(tmp_path, monkeypatch)
+    gain_key = next(key for _kind, symbol, key in calls
+                    if symbol == "gain")
+    _, cert = _gain_key_and_cert(tmp_path, profiler, files, gain_key)
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(state, cert, 0) is True
+    first_calls, first_result = _spy_run(tmp_path, monkeypatch, state)
+    assert not any(symbol == "gain"
+                   for _kind, symbol, _key in first_calls)
+    assert any(symbol == "bias" for _kind, symbol, _key in first_calls)
+    assert first_result.stop_reason == "frontier_exhausted"
+    # A second run sharing the session state stays stable: gain is
+    # still retired (record intact), bias is now merely visited — two
+    # distinct suppression reasons, both without re-resolution.
+    second_calls, second_result = _spy_run(tmp_path, monkeypatch, state)
+    assert not any(symbol == "gain"
+                   for _kind, symbol, _key in second_calls)
+    assert not any(symbol == "bias"
+                   for _kind, symbol, _key in second_calls)
+    assert second_result.stop_reason == "frontier_exhausted"
+    assert len(state.retired) == 1
+    assert state.proof_retirement(gain_key) is not None
+
+
+def _spy_run(tmp_path, monkeypatch, state):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler, files = _retire_tree(tmp_path)
+    calls = _spy_resolution_keys(monkeypatch)
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["run"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp",
+        search_state=state)
+    assert result.dag is not None
+    return calls, result
+
+
+def _closed_empty_consumer_tree(tmp_path):
+    """Writerless internal global with a straight-line consumer: the
+    obligation stays open (evidence placeholder) while T3 certifies
+    genuine absence."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    files = {
+        "src/main.cpp": (
+            "static float kzero;\n"
+            "float out;\n"
+            "void use() { out = kzero * 3.0f; }\n"
+        ),
+    }
+    profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
+    return profiler, files
+
+
+def test_closed_empty_certificate_retires_without_invention(tmp_path,
+                                                            monkeypatch):
+    """G: a valid closed-empty certificate retires its exact obligation —
+    retained writer tuple stays empty, nothing is invented, and the
+    discovery outcome is otherwise identical."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        dag_inputs_from_facts,
+        discover_mechanism_dag,
+        load_facts,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+        UnresolvedSourceReference,
+    )
+    profiler, files = _closed_empty_consumer_tree(tmp_path)
+    calls: list = []
+    original = SourceExpansionResolver.resolve
+
+    def spy(self, reference, structure):
+        calls.append((reference.kind, reference.symbol,
+                      self.resolution_key(reference, structure)))
+        return original(self, reference, structure)
+
+    monkeypatch.setattr(SourceExpansionResolver, "resolve", spy)
+    baseline = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["use"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp")
+    assert baseline.dag is not None
+    key = next(key for _kind, symbol, key in calls if symbol == "kzero")
+    facts = load_facts(
+        profiler, tmp_path / "cache", list(files), "hash")
+    structure = dag_inputs_from_facts(facts).structure
+    callable_id = next(
+        key for key, item in structure.callables_by_id.items()
+        if item.get("name") == "use")
+    identity = structure.symbol_identity(
+        "kzero", file="src/main.cpp", callable_id=callable_id,
+        function_name="use")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="kzero", kind="storage_writers", file="src/main.cpp",
+        callable_id=callable_id, identity=identity)
+    cert = _derive_use_certificate(
+        profiler, structure, reference, version=0)
+    assert cert.writers == ()
+    assert tuple(cert.obligation_key) == tuple(key)
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(state, cert, 0) is True
+    assert state.proof_retirement(key) is not None
+    assert state.proof_retirement(key).writers == ()
+    profiler2, _files2 = _closed_empty_consumer_tree(tmp_path)
+    calls2: list = []
+
+    def spy2(self, reference, structure):
+        calls2.append((reference.kind, reference.symbol,
+                       self.resolution_key(reference, structure)))
+        return original(self, reference, structure)
+
+    monkeypatch.setattr(SourceExpansionResolver, "resolve", spy2)
+    retired = discover_mechanism_dag(
+        profiler2, tmp_path / "cache", seeds=["use"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp",
+        search_state=state)
+    assert retired.dag is not None
+    assert not any(symbol == "kzero" for _kind, symbol, _key in calls2)
+    assert retired.stop_reason == baseline.stop_reason
+    assert retired.dag.model_dump() == baseline.dag.model_dump()
+
+
+def _guarded_gain_tree(tmp_path, terminal="out_a", seeds=("usea",)):
+    """Internal global with one writer, consumed once straight and once
+    behind a branch: coverage is shared, applicability splits."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    files = {
+        "src/main.cpp": (
+            "static float kgain = 1.0f;\n"
+            "float out_a;\n"
+            "float out_b;\n"
+            "int cond;\n"
+            "void usea() { out_a = kgain * 3.0f; }\n"
+            "void useb() { if (cond) { out_b = kgain * 3.0f; } }\n"
+        ),
+    }
+    profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
+    result = discover_mechanism_dag(
+        profiler, tmp_path / f"cache_{terminal}", seeds=list(seeds),
+        terminal=terminal, source_hash="hash",
+        terminal_file="src/main.cpp")
+    assert result.dag is not None
+    return profiler, files, result
+
+
+def test_coverage_retires_while_applicability_refuses(tmp_path,
+                                                      monkeypatch):
+    """H: valid coverage retires source search while T5 still refuses
+    applicability for the guarded use — separation pinned end to end."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+        derive_writer_applicability,
+    )
+    profiler, files, result = _guarded_gain_tree(
+        tmp_path, terminal="out_b", seeds=("useb",))
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out_b"
+               and vertex.kind == "operation")
+    assert any(edge.kind == "control" and edge.target_id == use.id
+               for edge in dag.edges), (
+        "guarded use must be control-gated")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, result.inputs.structure, reference, version=0)
+    guarded_outcome = derive_writer_applicability(
+        reference, use.id, "kgain", cert, dag, 0,
+        conditional_writer_ids=())
+    assert guarded_outcome.proof is None
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(state, cert, 0) is True
+    key = tuple(cert.obligation_key)
+    calls, retired = _discover_guarded_tree_at_version(
+        tmp_path, monkeypatch, state)
+    assert not any(symbol == "kgain" for _kind, symbol, _key in calls)
+    assert retired.stop_reason == result.stop_reason
+    assert derive_writer_applicability(
+        reference, use.id, "kgain", cert, dag, 0,
+        conditional_writer_ids=()) == guarded_outcome
+
+
+def _discover_guarded_tree_at_version(tmp_path, monkeypatch, state):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler, _files = _guarded_gain_tree(
+        tmp_path, terminal="out_b", seeds=("useb",))[:2]
+    calls = _spy_resolution_keys(monkeypatch)
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache_out_b", seeds=["useb"],
+        terminal="out_b", source_hash="hash",
+        terminal_file="src/main.cpp", search_state=state)
+    assert result.dag is not None
+    return calls, result
+
+
+def test_missing_certificate_retires_nothing(tmp_path, monkeypatch):
+    """I: without proof nothing retires — and nothing auto-retires
+    during discovery: the retired map stays empty while scheduling
+    proceeds normally."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+    )
+    assert apply_writer_coverage_retirement(
+        CoverageSearchState(), None, 0) is False
+    state = CoverageSearchState()
+    calls, result = _spy_run(tmp_path, monkeypatch, state)
+    assert any(symbol == "gain" for _kind, symbol, _key in calls)
+    assert state.retired == {}
+
+
+def test_malformed_certificate_leaves_scheduling_unchanged(tmp_path,
+                                                           monkeypatch):
+    """J: malformed certificates refuse without recording, and the
+    subsequent discovery schedules exactly as the unretired baseline."""
+    from dataclasses import replace
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+    )
+    profiler, files, calls, result = _run_retire_tree(
+        tmp_path, monkeypatch)
+    gain_key = next(key for _kind, symbol, key in calls
+                    if symbol == "gain")
+    _, cert = _gain_key_and_cert(tmp_path, profiler, files, gain_key)
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(
+        state, replace(cert, obligation_key=()), 0) is False
+    assert apply_writer_coverage_retirement(
+        state, replace(cert, boundary=()), 0) is False
+    assert apply_writer_coverage_retirement(
+        state, replace(cert, version=99), 0) is False
+    assert state.retired == {}
+    calls2, result2 = _spy_run(tmp_path, monkeypatch, state)
+    assert any(symbol == "gain" for _kind, symbol, _key in calls2)
+    assert result2.stop_reason == result.stop_reason
+
+
+def test_visited_suppression_has_no_retirement_record(tmp_path,
+                                                      monkeypatch):
+    """K: the scheduling distinguisher — a visited-suppressed
+    obligation resolves zero times with NO retirement record, while a
+    proof-retired obligation resolves zero times WITH one."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        WriterCoverageCertificate,
+        apply_writer_coverage_retirement,
+    )
+    profiler, files, calls, _result = _run_retire_tree(
+        tmp_path, monkeypatch)
+    gain_key = next(key for _kind, symbol, key in calls
+                    if symbol == "gain")
+    bias_key = next(key for _kind, symbol, key in calls
+                    if symbol == "bias")
+    state = CoverageSearchState()
+    state.mark_visited(gain_key)
+    assert apply_writer_coverage_retirement(state, WriterCoverageCertificate(
+        obligation_key=tuple(bias_key),
+        scheduling_key=("sched", "bias"),
+        declaration=("global", "bias", "bias"),
+        receiver_context=("", "", ""),
+        strategy="storage-internal-only",
+        boundary=("src/main.cpp",),
+        examined=("src/main.cpp",),
+        version=0,
+        assumptions=(),
+        writers=("src/main.cpp:0:0:bias",),
+    ), 0) is True
+    calls2, _result2 = _spy_run(tmp_path, monkeypatch, state)
+    resolved2 = {key for _kind, _symbol, key in calls2}
+    assert gain_key not in resolved2
+    assert bias_key not in resolved2
+    assert state.proof_retirement(gain_key) is None
+    assert state.proof_retirement(bias_key) is not None
+    assert state.proof_retirement(bias_key).writers == (
+        "src/main.cpp:0:0:bias",)
+
+
+def test_multi_writer_provenance_is_complete(tmp_path):
+    """L: retirement of a multi-writer certificate retains the complete
+    writer tuple for later diagnostic lookup — no first-writer
+    collapse."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        apply_writer_coverage_retirement,
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/tw.cpp": (
+            "static int gain = 1;\nvoid update() { gain = 5; }\n"
+        ),
+    })
+    identity = inputs.structure.symbol_identity(
+        "gain", file="src/lib/tw.cpp",
+        callable_id=next(key for key, item in
+                         inputs.structure.callables_by_id.items()
+                         if item.get("name") == "update"),
+        function_name="update")
+    reference = UnresolvedSourceReference(
+        symbol="gain", kind="storage_writers", file="src/lib/tw.cpp",
+        callable_id=identity.callable_id, identity=identity)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.certificate is not None, result.refusal
+    assert len(result.certificate.writers) == 2
+    state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(
+        state, result.certificate, 0) is True
+    record = state.proof_retirement(result.certificate.obligation_key)
+    assert record is not None
+    assert record.writers == tuple(result.certificate.writers)
+    assert len(record.writers) == 2
+
+
+def test_retirement_behavioral_differential(tmp_path, monkeypatch):
+    """Differential matrix: plain / valid-retired / stale-attempted /
+    unrelated-retired. Only valid retirement moves gain scheduling;
+    stop, files, rounds, and DAG stay identical everywhere."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        WriterCoverageCertificate,
+        apply_writer_coverage_retirement,
+    )
+    profiler, files, calls, baseline = _run_retire_tree(
+        tmp_path, monkeypatch)
+    gain_key = next(key for _kind, symbol, key in calls
+                    if symbol == "gain")
+    bias_key = next(key for _kind, symbol, key in calls
+                    if symbol == "bias")
+    _, cert = _gain_key_and_cert(tmp_path, profiler, files, gain_key)
+
+    def surface(result, run_calls):
+        return {
+            "stop": result.stop_reason,
+            "files": list(result.files_loaded),
+            "rounds": [(item.index, list(item.new_files))
+                       for item in result.rounds],
+            "dag": result.dag.model_dump(),
+            "gain_calls": sum(1 for _kind, symbol, _key in run_calls
+                              if symbol == "gain"),
+            "bias_calls": sum(1 for _kind, symbol, _key in run_calls
+                              if symbol == "bias"),
+        }
+
+    scenarios = {}
+    plain_state = CoverageSearchState()
+    _, plain_result = _spy_run(tmp_path, monkeypatch, plain_state)
+    scenarios["plain"] = (plain_result, None)
+    valid_state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(valid_state, cert, 0) is True
+    _, valid_result = _spy_run(tmp_path, monkeypatch, valid_state)
+    scenarios["valid"] = (valid_result, None)
+    stale_state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(stale_state, cert, 1) is False
+    _, stale_result = _spy_run(tmp_path, monkeypatch, stale_state)
+    scenarios["stale"] = (stale_result, None)
+    unrelated_state = CoverageSearchState()
+    assert apply_writer_coverage_retirement(unrelated_state,
+                                            WriterCoverageCertificate(
+        obligation_key=tuple(bias_key),
+        scheduling_key=("sched", "bias"),
+        declaration=("global", "bias", "bias"),
+        receiver_context=("", "", ""),
+        strategy="storage-internal-only",
+        boundary=("src/main.cpp",),
+        examined=("src/main.cpp",),
+        version=0,
+        assumptions=(),
+        writers=("src/main.cpp:0:0:bias",),
+    ), 0) is True
+    _, unrelated_result = _spy_run(tmp_path, monkeypatch, unrelated_state)
+    scenarios["unrelated"] = (unrelated_result, None)
+    assert baseline.dag.model_dump() == scenarios["plain"][0].dag.model_dump()
+    for name in ("valid", "stale", "unrelated"):
+        result = scenarios[name][0]
+        assert result.stop_reason == baseline.stop_reason, name
+        assert result.files_loaded == baseline.files_loaded, name
+        assert result.dag.model_dump() == baseline.dag.model_dump(), name
+    # Re-run with spies for call counts (states are single-use per run
+    # above only for results; counts come from dedicated runs below).
+    counts = {}
+    for name, maker in (
+            ("plain", CoverageSearchState),
+            ("stale", CoverageSearchState)):
+        state = maker()
+        run_calls, _ = _spy_run(tmp_path, monkeypatch, state)
+        counts[name] = sum(1 for _kind, symbol, _key in run_calls
+                           if symbol == "gain")
+    valid_state2 = CoverageSearchState()
+    assert apply_writer_coverage_retirement(valid_state2, cert, 0) is True
+    valid_calls, _ = _spy_run(tmp_path, monkeypatch, valid_state2)
+    counts["valid"] = sum(1 for _kind, symbol, _key in valid_calls
+                          if symbol == "gain")
+    unrelated_state2 = CoverageSearchState()
+    assert apply_writer_coverage_retirement(unrelated_state2,
+                                            WriterCoverageCertificate(
+        obligation_key=tuple(bias_key),
+        scheduling_key=("sched", "bias"),
+        declaration=("global", "bias", "bias"),
+        receiver_context=("", "", ""),
+        strategy="storage-internal-only",
+        boundary=("src/main.cpp",),
+        examined=("src/main.cpp",),
+        version=0,
+        assumptions=(),
+        writers=("src/main.cpp:0:0:bias",),
+    ), 0) is True
+    unrelated_calls, _ = _spy_run(tmp_path, monkeypatch, unrelated_state2)
+    counts["unrelated"] = sum(1 for _kind, symbol, _key in unrelated_calls
+                              if symbol == "gain")
+    assert counts["plain"] >= 1
+    assert counts["valid"] == 0
+    assert counts["stale"] >= 1
+    assert counts["unrelated"] >= 1

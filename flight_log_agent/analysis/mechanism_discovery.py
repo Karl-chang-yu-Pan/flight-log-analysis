@@ -1600,6 +1600,7 @@ def discover_mechanism_dag(
     round_observer: Optional[Callable[[MechanismDAG, MechanismDAG, int], None]] = None,
     checkpoint_evaluator: Optional[Callable[[MechanismDAG, int], CheckpointRound]] = None,
     construction_evaluator: Optional[Callable[[MechanismDAG, int], CheckpointRound]] = None,
+    search_state: Optional[CoverageSearchState] = None,
 ) -> DiscoveryResult:
     """Build a DAG by exact, provenance-checked fixed-point expansion.
 
@@ -1677,7 +1678,12 @@ def discover_mechanism_dag(
     # later stage; only successful admission short-circuits), and no
     # within-version event provides new information that would reopen
     # later groups. Revisit happens only on universe extension.
-    search_state = CoverageSearchState()
+    #
+    # Proof retirement (T6A) suppresses only obligations retired under
+    # the current version by a current certificate; the injected state
+    # defaults to fresh so default discovery behavior is unchanged.
+    if search_state is None:
+        search_state = CoverageSearchState()
     checkpoint: Optional[CheckpointRound] = None
     stop_reason = "frontier_exhausted"
     construction_session = DAGConstructionSession() if construction_evaluator is not None else None
@@ -1767,12 +1773,20 @@ def discover_mechanism_dag(
         local_resume = resume_construction
         resume_construction = False
         new_files = [file_path for file_path in pending if file_path not in facts_by_file]
+        # Only a non-empty established universe can be extended: the
+        # initial load establishes version 0's universe rather than
+        # invalidating anything (nothing is suppressed yet). Later
+        # arrivals genuinely extend it. This keeps version 0 stable as
+        # the initial universe so externally prepared version-0 proof
+        # state (e.g. pre-retired obligations) lines up with the first
+        # round's scheduling without coordination.
+        universe_extended = bool(facts_by_file) and bool(new_files)
         pending = []
         for file_path in new_files:
             facts = resolver.facts_for(file_path)
             facts_by_file[file_path] = facts
             loaded.append(file_path)
-        if new_files:
+        if universe_extended:
             # The searchable universe extended: open a new version and
             # release same-version visited suppression so frontier requests
             # retry against the fuller index. Retries that admit nothing
@@ -1922,6 +1936,13 @@ def discover_mechanism_dag(
                 continue
             key = resolver.resolution_key(reference, inputs.structure)
             if search_state.was_visited(key):
+                continue
+            if search_state.is_proof_retired(key):
+                # Current-version proof retirement: a valid certificate
+                # already proved this exact obligation's closed boundary,
+                # so no further source expansion is scheduled for it.
+                # Distinct from visited/exhausted suppression, which record
+                # attempted or deprioritized work, not proof.
                 continue
             search_state.mark_visited(key)
             for candidate in resolver.resolve(reference, inputs.structure):

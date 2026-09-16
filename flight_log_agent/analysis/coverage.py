@@ -111,6 +111,29 @@ def attempt_stage(strategy: str, details: Optional[dict] = None) -> str:
     return stage_id(strategy, group_index)
 
 
+@dataclass(frozen=True)
+class WriterCoverageRetirement:
+    """Proof-retirement of one exact search obligation under one version.
+
+    Records that a current T3 certificate proved the obligation's closed
+    writer boundary complete, and retains the exhaustive supported writer
+    provenance downstream logic still needs. Immutable value; scheduling
+    suppression only, never stop authority. Keyed by (version,
+    resolution key) so old versions go stale without clearing and one
+    obligation's retirement can never affect another.
+    """
+
+    resolution_key: tuple
+    scheduling_key: tuple
+    obligation_key: tuple
+    declaration: tuple
+    version: int
+    boundary: tuple
+    assumptions: tuple
+    writers: tuple
+    reason: str = "proof-retired"
+
+
 @dataclass
 class CoverageSearchState:
     """Session-owned scheduling progress for one search universe version.
@@ -133,12 +156,36 @@ class CoverageSearchState:
     _completed: dict = field(default_factory=dict, repr=False)
     _exhausted: set = field(default_factory=set, repr=False)
     visited: set = field(default_factory=set, repr=False)
+    # Proof retirements keyed by (version, resolution key). Version
+    # scoping (not clearing) invalidates old retirements: advancing the
+    # version simply stops matching them. Per-key storage keeps
+    # unrelated obligations independent by construction — unlike the
+    # inert global `_exhausted`/`eligible()` scheduling helpers above,
+    # which proof logic must never consume.
+    retired: dict = field(default_factory=dict, repr=False)
 
     def mark_visited(self, resolution_key: Any) -> None:
         self.visited.add(resolution_key)
 
     def was_visited(self, resolution_key: Any) -> bool:
         return resolution_key in self.visited
+
+    def is_proof_retired(self, resolution_key: Any) -> bool:
+        """Whether this obligation retired under the current version."""
+        try:
+            key = (self.version, tuple(resolution_key))
+        except TypeError:
+            return False
+        return key in self.retired
+
+    def proof_retirement(self, resolution_key: Any) -> Optional[
+            WriterCoverageRetirement]:
+        """The current-version retirement record, if one exists."""
+        try:
+            key = (self.version, tuple(resolution_key))
+        except TypeError:
+            return None
+        return self.retired.get(key)
 
     def record_stages(self, obligation_key: Any, stages: Any) -> None:
         entry = self._completed.setdefault(obligation_key, set())
@@ -174,6 +221,51 @@ class CoverageSearchState:
             # until the universe version advances.
             return False
         return True
+
+
+def apply_writer_coverage_retirement(
+    search_state: CoverageSearchState,
+    certificate: Any,
+    current_version: int,
+) -> bool:
+    """Retire one obligation on current proof, or refuse explicitly.
+
+    Consumes a T3 certificate's bound fields without re-deriving
+    coverage: the certificate must be current (its version equals the
+    supplied current version) and well-formed (non-empty obligation and
+    boundary identity). Records an immutable retirement under
+    (version, resolution key) and returns True. Stale or malformed
+    certificates record nothing and return False. Never touches
+    visited/exhausted/completion state, scheduling, or stop authority.
+    """
+    if certificate is None:
+        return False
+    if getattr(certificate, "version", None) != current_version:
+        return False
+    obligation_key = tuple(getattr(certificate, "obligation_key", None)
+                           or ())
+    if not obligation_key:
+        return False
+    boundary = tuple(getattr(certificate, "boundary", None) or ())
+    if not boundary:
+        return False
+    try:
+        record_key = (current_version, tuple(obligation_key))
+    except TypeError:
+        return False
+    search_state.retired[record_key] = WriterCoverageRetirement(
+        resolution_key=tuple(obligation_key),
+        scheduling_key=tuple(
+            getattr(certificate, "scheduling_key", None) or ()),
+        obligation_key=tuple(obligation_key),
+        declaration=tuple(getattr(certificate, "declaration", None) or ()),
+        version=current_version,
+        boundary=boundary,
+        assumptions=tuple(
+            getattr(certificate, "assumptions", None) or ()),
+        writers=tuple(getattr(certificate, "writers", None) or ()),
+    )
+    return True
 
 
 # --- T3: pure coverage-certificate derivation (unconsumed data) ---
