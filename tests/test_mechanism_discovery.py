@@ -5841,7 +5841,17 @@ def test_certificate_internal_linkage_positive(tmp_path):
     assert cert.strategy == "storage-internal-only"
     assert cert.boundary == ("src/lib/g.cpp",)
     assert cert.examined == ("src/lib/g.cpp",)
-    assert len(cert.writers) == 1
+    assert list(cert.writers) == ["src/lib/g.cpp:13:25:init_declarator"]
+    # Per-file verdicts record the first admitted site: this file holds a
+    # second same-declaration writer (the function-body assignment) that
+    # the verdict list does not enumerate. Writer-list exhaustiveness
+    # remains a T6A-consumption gate; the certificate stays valid for the
+    # boundary it accounts for, never as a writer census.
+    from flight_log_agent.analysis.mechanism_discovery import load_facts
+    check_facts = load_facts(
+        profiler, tmp_path / "cache_b", ["src/lib/g.cpp"], "hash")
+    assert sum(1 for item in check_facts[0].source_assignments
+               if item.target == "kgain") == 2
     assert "file-linkage-closed" in cert.assumptions
     assert cert.obligation_key == evidence.obligation_key
     assert cert.scheduling_key == evidence.scheduling_key
@@ -6775,3 +6785,92 @@ def test_applicability_leaves_stop_unchanged(tmp_path):
         conditional_writer_ids=())
     assert positive.proof is not None
     assert surface(run_round()) == before
+
+
+# --- Pre-T6A: internal-linkage global admission identity correction ---
+
+def _static_gain_update_tree(tmp_path):
+    """File-static global written only by a function body: the admission
+    census must mint the same proven identity as full extraction."""
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/sg.cpp": "static int gain;\nvoid update() { gain = 5; }\n",
+    })
+    identity = inputs.structure.symbol_identity(
+        "gain", file="src/lib/sg.cpp",
+        callable_id=next(key for key, item in
+                         inputs.structure.callables_by_id.items()
+                         if item.get("name") == "update"),
+        function_name="update")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="gain", kind="storage_writers", file="src/lib/sg.cpp",
+        callable_id=identity.callable_id, identity=identity)
+    return profiler, inputs, reference
+
+
+def test_admission_identity_matches_full_extraction(tmp_path):
+    """RED1: the admission-time declaration identity for a file-static
+    global must equal the full-extraction identity — same proven
+    declaration entity, including the translation-unit component."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs, reference = _static_gain_update_tree(tmp_path)
+    facts = load_facts(
+        profiler, tmp_path / "cache", ["src/lib/sg.cpp"], "hash")
+    full_identity = facts[0].source_assignments[0].target_identity
+    assert full_identity.declaration_proven
+    assert full_identity.kind == "global"
+    resolver = SourceExpansionResolver(profiler, "hash")
+    admission_index = resolver._admission_index_for("src/lib/sg.cpp")
+    admission_identity = next(
+        item.identity for item in admission_index.assignments
+        if item.target == "gain")
+    assert admission_identity is not None
+    assert admission_identity.declaration_proven
+    assert admission_identity.kind == "global"
+    assert (admission_identity.declaration_id
+            == full_identity.declaration_id)
+    assert (admission_identity.declaration_id
+            == "global:internal:src/lib/sg.cpp:gain")
+
+
+def test_function_body_static_writer_is_admitted(tmp_path):
+    """RED2: the function-body write must index-match as a writer of the
+    exact internal-linkage global — admitted on identity, never via a
+    bare-name fallback."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs, reference = _static_gain_update_tree(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    candidates, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    assert [item.file for item in candidates] == ["src/lib/sg.cpp"]
+    assert [attempt.strategy for attempt in evidence.attempts] == [
+        "storage-internal-only"]
+    assert all(attempt.outcome == "admitted"
+               for attempt in evidence.attempts)
+
+
+def test_no_false_closed_empty_for_function_body_writer(tmp_path):
+    """RED3 (T6A safety): where the only writer is the function-body
+    write, the T3 certificate must list that real writer — never an
+    empty writer set produced by an identity mismatch hiding it."""
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs, reference = _static_gain_update_tree(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.refusal == "", result.refusal
+    assert result.certificate is not None
+    assert result.certificate.writers != (), (
+        "closed-empty must not certify while a real writer exists")

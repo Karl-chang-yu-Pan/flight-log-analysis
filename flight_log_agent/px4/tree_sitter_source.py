@@ -891,7 +891,9 @@ class TreeSitterSourceExtractor:
     def _admission_state(
         self, unit: _ParsedUnit, callable_item: _Callable
     ) -> _ExtractionState:
-        context = _SourceContext([unit])
+        context = _SourceContext(
+            [unit], translation_unit_file=unit.file
+        )
         self._index_parameter_members(context)
         return _ExtractionState(
             unit=unit,
