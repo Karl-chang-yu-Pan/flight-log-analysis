@@ -470,3 +470,258 @@ def derive_writer_coverage_certificate(
         refusal="",
         refusal_detail={},
     )
+
+
+# --- T5: positive per-use applicability proofs (no stop activation) ---
+#
+# Applicability answers, for one concrete use, whether a current proven
+# writer-coverage set positively applies to that use. It is downstream of
+# coverage, per use (one origin vertex plus one operand — never a whole
+# declaration), positive-evidence-only, and fail-closed. Like T3
+# certificates it is unconsumed data: derivation is pure, reads no
+# scheduling/checkpoint state, and changes nothing downstream.
+#
+# The single supported basis is one exactly ordered producer: the use's
+# dataflow shows exactly one operation producer for the operand, that
+# producer is exactly the covered writer, and neither use nor producer
+# carries control/conditional uncertainty. Ordering here is dataflow
+# role-edge order (producer value flows into the use operand) — never
+# source text order, declaration order, or search result order, which
+# prove nothing about runtime applicability. Guard-specific reasoning
+# and transfer-execution engines are refused: no exact guard-to-use
+# binding machinery exists, and transfer vertices qualify only through
+# this same structural rule where exact and unconditional.
+
+# The one positive basis T5 can prove with existing graph facts.
+APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER = "single-exact-producer"
+
+# Explicit refusal reasons. Deterministic strings for TDD/debugging.
+APPLICABILITY_NO_POSITIVE_BASIS = "no-positive-basis"
+APPLICABILITY_CONDITIONAL_WRITER = "conditional-writer-present"
+APPLICABILITY_UNRESOLVED_CONTROL = "unresolved-control"
+APPLICABILITY_WRITER_SET_MISMATCH = "writer-set-mismatch"
+APPLICABILITY_STALE_COVERAGE = "stale-coverage"
+APPLICABILITY_USE_IDENTITY_MISMATCH = "use-identity-mismatch"
+APPLICABILITY_NO_COVERED_PRODUCER = "no-covered-producer"
+
+
+@dataclass(frozen=True)
+class WriterApplicabilityProof:
+    """Positive proof that a covered writer set applies to one use.
+
+    Binds the concrete use (origin vertex plus operand), the scheduling
+    and semantic obligation identity, the covered writer set, the basis,
+    the exact supporting graph facts (use, producer, and edge IDs), the
+    proof version, and the receiver context. Immutable value; carries no
+    authority by itself and never implies discovery stop.
+    """
+
+    use_key: tuple
+    scheduling_key: tuple
+    obligation_key: tuple
+    declaration: tuple
+    writers: tuple
+    producer_vertex: str
+    basis: str
+    supporting_facts: tuple
+    version: int
+    receiver_context: tuple
+
+
+@dataclass
+class ApplicabilityDerivationResult:
+    """A proof or an explicit refusal. `refusal` is "" on success."""
+
+    proof: Optional[WriterApplicabilityProof] = None
+    refusal: str = ""
+    refusal_detail: dict = field(default_factory=dict)
+
+
+def _refuse_applicability(code: str, **detail: Any
+                          ) -> ApplicabilityDerivationResult:
+    return ApplicabilityDerivationResult(
+        proof=None, refusal=code, refusal_detail=dict(detail))
+
+
+def _reachability_exact(vertex: Any) -> Optional[bool]:
+    """The builder's exactness verdict for one vertex, if recorded."""
+    metadata = getattr(vertex, "metadata", None) or {}
+    reachability = metadata.get("reachability") or {}
+    if not isinstance(reachability, dict):
+        return None
+    exact = reachability.get("exact")
+    conditions = reachability.get("all_of") or []
+    if exact is True and not conditions:
+        return True
+    if exact is False or conditions:
+        return False
+    return None
+
+
+def derive_writer_applicability(
+    reference: Any,
+    origin_vertex_id: str,
+    operand: str,
+    certificate: Any,
+    dag: Any,
+    current_version: int,
+    *,
+    conditional_writer_ids: Any = (),
+) -> ApplicabilityDerivationResult:
+    """Derive per-use applicability purely, or refuse explicitly.
+
+    Inputs are the obligation reference carrying the concrete use, the
+    use's origin vertex and operand, the T3 coverage certificate, the
+    mechanism DAG (read-only: vertices and data/control edges), the
+    current proof version, and the caller-scoped conditional writer IDs
+    (operations whose execution the evaluation left unresolved, e.g. the
+    union over the terminal's local equation checks). Reads nothing
+    else: no scheduling state, no checkpoint state, no source. Returns
+    a proof or a deterministic refusal reason; never None, never a side
+    effect, never stop authority.
+    """
+    use_key = (origin_vertex_id, operand)
+    origins = list(getattr(reference, "origin_vertex_ids", None) or ())
+    operands = list(getattr(reference, "origin_operands", None) or ())
+    if origins and origin_vertex_id not in origins:
+        return _refuse_applicability(
+            APPLICABILITY_USE_IDENTITY_MISMATCH, reason="origin",
+            use_key=use_key)
+    if operands and operand not in operands:
+        return _refuse_applicability(
+            APPLICABILITY_USE_IDENTITY_MISMATCH, reason="operand",
+            use_key=use_key)
+    # Semantic obligation binding: the certificate's proven obligation
+    # must equal the use's obligation recomputed without structure.
+    # Scheduling keys deliberately do NOT bind here — visit identity
+    # carries use-site context (consumer callable), so two concrete uses
+    # of one declaration have different visits by design while sharing
+    # one coverage certificate. Coverage may be shared; applicability
+    # may not. Cross-declaration reuse still refuses: declaration ids
+    # differ.
+    try:
+        use_visit = tuple(reference.visit_key())
+    except (AttributeError, TypeError, ValueError):
+        return _refuse_applicability(
+            APPLICABILITY_USE_IDENTITY_MISMATCH, reason="scheduling-key",
+            use_key=use_key)
+    expected_key = _obligation_identity_fields(reference)
+    if expected_key is None or (
+            tuple(getattr(certificate, "obligation_key", None) or ())
+            != tuple(expected_key)):
+        return _refuse_applicability(
+            APPLICABILITY_USE_IDENTITY_MISMATCH, reason="obligation-key",
+            use_key=use_key)
+    certificate_receiver = tuple(
+        getattr(certificate, "receiver_context", None) or ())
+    reference_receiver = (
+        str(getattr(reference, "receiver", "") or ""),
+        str(getattr(reference, "receiver_type", "") or ""),
+        str(getattr(reference, "class_owner", "") or ""),
+    )
+    if certificate_receiver != reference_receiver:
+        return _refuse_applicability(
+            APPLICABILITY_USE_IDENTITY_MISMATCH, reason="receiver-context",
+            use_key=use_key)
+    if getattr(certificate, "version", None) != current_version:
+        return _refuse_applicability(
+            APPLICABILITY_STALE_COVERAGE, current_version=current_version,
+            use_key=use_key)
+    covered = [str(writer) for writer in
+               (getattr(certificate, "writers", None) or ())]
+    if not covered:
+        # An absence certificate proves no writer exists in the closed
+        # boundary; a use that needs a value therefore has nothing whose
+        # applicability could be proven.
+        return _refuse_applicability(
+            APPLICABILITY_NO_COVERED_PRODUCER, use_key=use_key)
+
+    vertices = {vertex.id: vertex
+                for vertex in (getattr(dag, "vertices", None) or ())}
+    use = vertices.get(origin_vertex_id)
+    if use is None or getattr(use, "kind", "") != "operation":
+        return _refuse_applicability(
+            APPLICABILITY_NO_POSITIVE_BASIS, reason="use-unknown",
+            use_key=use_key)
+    role_edges = [
+        edge for edge in (getattr(dag, "edges", None) or ())
+        if getattr(edge, "target_id", "") == origin_vertex_id
+        and getattr(edge, "kind", "") == "data"
+        and getattr(edge, "role", "") == operand
+    ]
+    if any(getattr(vertices.get(edge.source_id), "kind", "")
+           == "evidence" for edge in role_edges):
+        # An unresolved placeholder feeds this operand: an unaccounted
+        # alternative writer may govern the use.
+        return _refuse_applicability(
+            APPLICABILITY_NO_POSITIVE_BASIS, reason="competitor-unknown",
+            use_key=use_key)
+    producers = [
+        vertices[edge.source_id] for edge in role_edges
+        if edge.source_id in vertices
+        and getattr(vertices[edge.source_id], "kind", "") == "operation"
+        and edge.source_id != origin_vertex_id
+    ]
+    if not producers:
+        return _refuse_applicability(
+            APPLICABILITY_NO_POSITIVE_BASIS, reason="no-producer",
+            use_key=use_key)
+    if len(producers) != 1:
+        # Several structural producers with unknown runtime order:
+        # source text order across invocations proves nothing.
+        return _refuse_applicability(
+            APPLICABILITY_NO_POSITIVE_BASIS, reason="multiple-producers",
+            use_key=use_key)
+    producer = producers[0]
+    producer_site = str(
+        (getattr(producer, "metadata", None) or {}).get(
+            "source_site_id") or "")
+    if set([producer_site]) != set(covered):
+        # The use's flow shows a different writer set than the covered
+        # set, in either direction: a competitor is unaccounted for, or
+        # the covered writer does not feed this use.
+        return _refuse_applicability(
+            APPLICABILITY_WRITER_SET_MISMATCH,
+            structural=[producer_site], covered=sorted(set(covered)),
+            use_key=use_key)
+    conditional = set(conditional_writer_ids or ())
+    if producer.id in conditional or origin_vertex_id in conditional:
+        return _refuse_applicability(
+            APPLICABILITY_CONDITIONAL_WRITER,
+            use_key=use_key)
+    for vertex in (use, producer):
+        if any(getattr(edge, "kind", "") == "control"
+               and getattr(edge, "target_id", "") == vertex.id
+               for edge in (getattr(dag, "edges", None) or ())):
+            # Control-gated use or producer (loops, branches, guarded
+            # regions, including statically-always-taken gates, which T5
+            # does not attempt to prove taken): ordering and invocation
+            # need history reasoning T5 does not perform.
+            return _refuse_applicability(
+                APPLICABILITY_UNRESOLVED_CONTROL,
+                vertex_id=vertex.id, use_key=use_key)
+        if _reachability_exact(vertex) is not True:
+            return _refuse_applicability(
+                APPLICABILITY_UNRESOLVED_CONTROL,
+                reason="reachability-unproven", vertex_id=vertex.id,
+                use_key=use_key)
+    return ApplicabilityDerivationResult(
+        proof=WriterApplicabilityProof(
+            use_key=use_key,
+            scheduling_key=use_visit,
+            obligation_key=tuple(certificate.obligation_key),
+            declaration=tuple(certificate.declaration),
+            writers=tuple(sorted(set(covered))),
+            producer_vertex=producer.id,
+            basis=APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER,
+            supporting_facts=tuple(
+                sorted({"use:" + origin_vertex_id,
+                        "producer:" + producer.id}
+                       | {"edge:" + edge.id for edge in role_edges
+                          if getattr(edge, "id", "")})),
+            version=current_version,
+            receiver_context=tuple(certificate.receiver_context),
+        ),
+        refusal="",
+        refusal_detail={},
+    )

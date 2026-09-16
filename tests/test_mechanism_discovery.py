@@ -6219,3 +6219,559 @@ def test_round_differential_across_proof_shapes(tmp_path):
     assert threaded_vacuous.proof_observation.covered_obligation_keys == ()
     assert (_behavior_surface(threaded_vacuous)
             == _behavior_surface(plain_vacuous))
+
+
+# --- T5: positive per-use applicability without stop activation ---
+
+def _single_writer_use_tree(tmp_path):
+    """Internal global with exactly one writer (its initializer) plus one
+    straight-line consumer; the consumer's operand is fed by exactly
+    that writer vertex."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _mini_tree(tmp_path, {
+        "src/main.cpp": (
+            "static float kgain = 1.0f;\n"
+            "float out;\n"
+            "void use() { out = kgain * 3.0f; }\n"
+        ),
+    }, backend="tree_sitter")
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["use"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp")
+    assert result.dag is not None
+    return profiler, result
+
+
+def _use_producer_edge(dag, use_id, operand):
+    return [edge for edge in dag.edges
+            if edge.target_id == use_id and edge.kind == "data"
+            and edge.role == operand]
+
+
+def test_applicability_single_exact_producer_positive(tmp_path):
+    """A: one covered writer exactly ordered to one unconditional use,
+    with no competitor and no uncertainty, proves applicability with an
+    explicit positive basis."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER,
+        derive_writer_applicability,
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+        UnresolvedSourceReference,
+    )
+    profiler, result = _single_writer_use_tree(tmp_path)
+    dag, structure = result.dag, result.inputs.structure
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    operand = "kgain"
+    feeding = _use_producer_edge(dag, use.id, operand)
+    assert len(feeding) == 1, (
+        "fixture must feed the operand from exactly one writer")
+    producer = next(vertex for vertex in dag.vertices
+                    if vertex.id == feeding[0].source_id)
+    assert producer.kind == "operation"
+    assert not [edge for edge in dag.edges
+                if edge.target_id in {use.id, producer.id}
+                and edge.kind == "control"], (
+        "fixture use and producer must be unconditional")
+    # The live frontier reference for this obligation carries the use
+    # as its origin: the honest use+obligation bundle, not hand-built.
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    assert use.id in reference.origin_vertex_ids
+    assert operand in reference.origin_operands
+    assert reference.identity is not None
+    assert reference.identity.declaration_proven
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, structure, sink, universe_version=0)
+    coverage = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert coverage.certificate is not None, coverage.refusal
+    cert = coverage.certificate
+    assert list(cert.writers) == [
+        producer.metadata["source_site_id"]]
+    outcome = derive_writer_applicability(
+        reference, use.id, operand, cert, dag, 0,
+        conditional_writer_ids=())
+    assert outcome.refusal == "", f"unexpected refusal: {outcome.refusal}"
+    proof = outcome.proof
+    assert proof is not None
+    assert proof.basis == APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER
+    assert proof.use_key == (use.id, operand)
+    assert proof.producer_vertex == producer.id
+    assert proof.version == 0
+    assert proof.scheduling_key == reference.visit_key()
+
+
+def _two_writer_use_tree(tmp_path):
+    """Same declaration written twice (initializer plus assignment): the
+    internal certificate lists the first admitted site while the use's
+    flow shows two structural producers with unknown runtime order."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _mini_tree(tmp_path, {
+        "src/main.cpp": (
+            "static float kgain = 1.0f;\n"
+            "void run() { kgain = 2.0f; }\n"
+            "float out;\n"
+            "void use() { out = kgain * 3.0f; }\n"
+        ),
+    }, backend="tree_sitter")
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["use"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp")
+    assert result.dag is not None
+    return profiler, result
+
+
+def _derive_use_certificate(profiler, structure, reference, version=0):
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, structure, sink, universe_version=version)
+    result = derive_writer_coverage_certificate(
+        reference, evidence, version)
+    assert result.certificate is not None, result.refusal
+    return result.certificate
+
+
+def test_applicability_coverage_alone_is_insufficient(tmp_path):
+    """B: a valid certificate naming exactly one covered writer still
+    proves nothing when the use's flow shows an unresolved placeholder
+    instead of that writer — the builder itself wires no producer when
+    two same-declaration writers compete, so coverage alone cannot pick
+    a winner."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_NO_POSITIVE_BASIS,
+        derive_writer_applicability,
+    )
+    profiler, result = _two_writer_use_tree(tmp_path)
+    dag, structure = result.dag, result.inputs.structure
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    operand = "kgain"
+    feeding = _use_producer_edge(dag, use.id, operand)
+    assert len(feeding) == 1
+    feeder = next(vertex for vertex in dag.vertices
+                  if vertex.id == feeding[0].source_id)
+    assert feeder.kind == "evidence", (
+        "ambiguous same-declaration writers must leave an unresolved "
+        "placeholder, never a guessed producer")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, structure, reference, version=0)
+    assert len(cert.writers) == 1, (
+        "certificate undercounts the two real writers")
+    outcome = derive_writer_applicability(
+        reference, use.id, operand, cert, dag, 0,
+        conditional_writer_ids=())
+    assert outcome.proof is None
+    assert outcome.refusal == APPLICABILITY_NO_POSITIVE_BASIS
+
+
+def test_applicability_guarded_use_refuses(tmp_path):
+    """B/C: a control-gated use refuses even with a valid single-writer
+    certificate — and an empty conditional set changes nothing, because
+    absence of the marker is not positive evidence."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_UNRESOLVED_CONTROL,
+        derive_writer_applicability,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _mini_tree(tmp_path, {
+        "src/main.cpp": (
+            "static float kgain = 1.0f;\n"
+            "float out2;\n"
+            "int cond;\n"
+            "void use2() { if (cond) { out2 = kgain * 3.0f; } }\n"
+        ),
+    }, backend="tree_sitter")
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["use2"], terminal="out2",
+        source_hash="hash", terminal_file="src/main.cpp")
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out2" and vertex.kind == "operation")
+    operand = "kgain"
+    assert any(edge.kind == "control" and edge.target_id == use.id
+               for edge in dag.edges), "fixture use must be control-gated"
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, result.inputs.structure, reference, version=0)
+    assert len(cert.writers) == 1
+    outcome = derive_writer_applicability(
+        reference, use.id, operand, cert, dag, 0,
+        conditional_writer_ids=())
+    assert outcome.proof is None
+    assert outcome.refusal == APPLICABILITY_UNRESOLVED_CONTROL
+
+
+def test_applicability_conditional_writer_blocks(tmp_path):
+    """D: the otherwise-positive case refuses once the covered producer
+    is marked conditional by evaluation."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_CONDITIONAL_WRITER,
+        derive_writer_applicability,
+    )
+    profiler, result = _single_writer_use_tree(tmp_path)
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    operand = "kgain"
+    producer = next(vertex for vertex in dag.vertices
+                    if vertex.id == _use_producer_edge(
+                        dag, use.id, operand)[0].source_id)
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, result.inputs.structure, reference, version=0)
+    outcome = derive_writer_applicability(
+        reference, use.id, operand, cert, dag, 0,
+        conditional_writer_ids={producer.id})
+    assert outcome.proof is None
+    assert outcome.refusal == APPLICABILITY_CONDITIONAL_WRITER
+
+
+def _split_use_tree(tmp_path):
+    """One declaration, two consumers: a straight-line use and a
+    branch-guarded use of the same internal global."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    files = {
+        "src/main.cpp": (
+            "static float kgain = 1.0f;\n"
+            "float out_a;\n"
+            "float out_b;\n"
+            "int cond;\n"
+            "void usea() { out_a = kgain * 3.0f; }\n"
+            "void useb() { if (cond) { out_b = kgain * 3.0f; } }\n"
+        ),
+    }
+    profiler_a = _mini_tree(tmp_path, files, backend="tree_sitter")
+    result_a = discover_mechanism_dag(
+        profiler_a, tmp_path / "cache_a", seeds=["usea"],
+        terminal="out_a", source_hash="hash",
+        terminal_file="src/main.cpp")
+    profiler_b = _mini_tree(tmp_path, files, backend="tree_sitter")
+    result_b = discover_mechanism_dag(
+        profiler_b, tmp_path / "cache_b", seeds=["useb"],
+        terminal="out_b", source_hash="hash",
+        terminal_file="src/main.cpp")
+    assert result_a.dag is not None and result_b.dag is not None
+    return (profiler_a, result_a), (profiler_b, result_b)
+
+
+def test_applicability_splits_shared_declaration_by_use(tmp_path):
+    """E: two uses share one declaration and one coverage certificate —
+    the straight-line use proves applicable while the guarded use does
+    not. Coverage may be shared; applicability may not."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER,
+        APPLICABILITY_UNRESOLVED_CONTROL,
+        derive_writer_applicability,
+    )
+    (profiler_a, result_a), (_profiler_b, result_b) = _split_use_tree(
+        tmp_path)
+    dag_a, dag_b = result_a.dag, result_b.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    use_b = next(vertex for vertex in dag_b.vertices
+                 if vertex.variable == "out_b"
+                 and vertex.kind == "operation")
+    assert use_a.id != use_b.id
+    assert any(edge.kind == "control" and edge.target_id == use_b.id
+               for edge in dag_b.edges)
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    reference_b = next(item for item in dag_b.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    # Same semantic obligation across scheduling identities: visit keys
+    # carry use-site context (consumer callable) and therefore differ,
+    # while one shared certificate covers the declaration for both uses.
+    # Per-use splitting starts here.
+    assert reference_a.visit_key() != reference_b.visit_key()
+    assert (use_a.id, "kgain") != (use_b.id, "kgain")
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    positive = derive_writer_applicability(
+        reference_a, use_a.id, "kgain", cert, dag_a, 0,
+        conditional_writer_ids=())
+    assert positive.refusal == "", positive.refusal
+    assert positive.proof is not None
+    assert positive.proof.basis == APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER
+    refused = derive_writer_applicability(
+        reference_b, use_b.id, "kgain", cert, dag_b, 0,
+        conditional_writer_ids=())
+    assert refused.proof is None
+    assert refused.refusal == APPLICABILITY_UNRESOLVED_CONTROL
+
+
+def test_applicability_history_tainted_producer_refuses(tmp_path):
+    """F: a loop-carried producer refuses even with a well-formed
+    certificate: its control edge and inexact reachability mark ordering
+    and invocation as requiring history reasoning T5 does not perform.
+    The staged certificate is counterfactual hardening — current
+    admission cannot cover loop-body static writes, so no natural
+    certificate exists here; the co-asserted natural derivation refuses
+    without ever certifying."""
+    from dataclasses import replace
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_UNRESOLVED_CONTROL,
+        WriterCoverageCertificate,
+        derive_writer_applicability,
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler = _mini_tree(tmp_path, {
+        "src/main.cpp": (
+            "float acc;\n"
+            "float out;\n"
+            "void run() {\n"
+            "  for (int i = 0; i < 3; i++) { acc = acc + i; }\n"
+            "  out = acc * 2.0f;\n"
+            "}\n"
+        ),
+    }, backend="tree_sitter")
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["run"], terminal="out",
+        source_hash="hash", terminal_file="src/main.cpp")
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    producer = next(vertex for vertex in dag.vertices
+                    if vertex.id == _use_producer_edge(
+                        dag, use.id, "acc")[0].source_id)
+    assert any(edge.kind == "control" and edge.target_id == producer.id
+               for edge in dag.edges), (
+        "loop-carried producer must be control-gated")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "acc"
+                     and "acc" in item.origin_operands)
+    # Natural coverage is unavailable for this shape, so no valid
+    # certificate can exist to consume here.
+    natural_resolver = SourceExpansionResolver(profiler, "hash")
+    natural_sink: list = []
+    _, natural_evidence = natural_resolver.resolve_with_evidence(
+        reference, result.inputs.structure, natural_sink,
+        universe_version=0)
+    natural = derive_writer_coverage_certificate(
+        reference, natural_evidence, 0)
+    assert natural.certificate is None
+    staged = WriterCoverageCertificate(
+        obligation_key=("storage_writers", "global",
+                        "global:external:acc"),
+        scheduling_key=tuple(reference.visit_key()),
+        declaration=("global", "", "acc"),
+        receiver_context=("", "", ""),
+        strategy="storage-internal-only",
+        boundary=("src/main.cpp",),
+        examined=("src/main.cpp",),
+        version=0,
+        assumptions=("file-linkage-closed",
+                     "writer-syntax-enumerated"),
+        writers=(producer.metadata["source_site_id"],),
+    )
+    outcome = derive_writer_applicability(
+        reference, use.id, "acc", staged, dag, 0,
+        conditional_writer_ids=())
+    assert outcome.proof is None
+    assert outcome.refusal == APPLICABILITY_UNRESOLVED_CONTROL
+
+
+def test_applicability_use_mismatch_refuses(tmp_path):
+    """G: a certificate for obligation A cannot prove applicability for
+    an unrelated obligation B, even with identical spelling."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_USE_IDENTITY_MISMATCH,
+        derive_writer_applicability,
+    )
+    profiler, result = _single_writer_use_tree(tmp_path)
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, result.inputs.structure, reference, version=0)
+    _other_profiler, other_inputs = _evidence_setup(tmp_path, {
+        "src/lib/h.cpp": (
+            "static float kgain = 9.0f;\nvoid other() { kgain = 3.0f; }\n"
+        ),
+    })
+    other_identity = other_inputs.structure.symbol_identity(
+        "kgain", file="src/lib/h.cpp",
+        callable_id="other", function_name="other")
+    other_ref = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/lib/h.cpp",
+        callable_id="other", identity=other_identity)
+    assert other_ref.visit_key() != reference.visit_key()
+    outcome = derive_writer_applicability(
+        other_ref, use.id, "kgain", cert, dag, 0,
+        conditional_writer_ids=())
+    assert outcome.proof is None
+    assert outcome.refusal == APPLICABILITY_USE_IDENTITY_MISMATCH
+
+
+def test_applicability_stale_coverage_refuses(tmp_path):
+    """H: a version-0 certificate cannot prove applicability under
+    current version 1."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_STALE_COVERAGE,
+        derive_writer_applicability,
+    )
+    profiler, result = _single_writer_use_tree(tmp_path)
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, result.inputs.structure, reference, version=0)
+    outcome = derive_writer_applicability(
+        reference, use.id, "kgain", cert, dag, 1,
+        conditional_writer_ids=())
+    assert outcome.proof is None
+    assert outcome.refusal == APPLICABILITY_STALE_COVERAGE
+
+
+def test_applicability_writer_set_mismatch_refuses(tmp_path):
+    """I: applicability evidence for one writer set cannot be reused
+    when the use's flow shows another — and an absence certificate
+    proves nothing for a use that needs a value."""
+    from dataclasses import replace
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_NO_COVERED_PRODUCER,
+        APPLICABILITY_WRITER_SET_MISMATCH,
+        derive_writer_applicability,
+    )
+    profiler, result = _single_writer_use_tree(tmp_path)
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, result.inputs.structure, reference, version=0)
+    foreign = replace(
+        cert, writers=("elsewhere.cpp:1:2:assignment_expression",))
+    mismatch = derive_writer_applicability(
+        reference, use.id, "kgain", foreign, dag, 0,
+        conditional_writer_ids=())
+    assert mismatch.proof is None
+    assert mismatch.refusal == APPLICABILITY_WRITER_SET_MISMATCH
+    absent = replace(cert, writers=())
+    no_producer = derive_writer_applicability(
+        reference, use.id, "kgain", absent, dag, 0,
+        conditional_writer_ids=())
+    assert no_producer.proof is None
+    assert no_producer.refusal == APPLICABILITY_NO_COVERED_PRODUCER
+
+
+def test_applicability_ignores_scheduling_state(tmp_path):
+    """J: derivation reads use + certificate + graph facts only.
+    Polluting visited/exhausted/completed scheduler state and the DAG's
+    own exhausted set must leave the result identical."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        derive_writer_applicability,
+    )
+    profiler, result = _single_writer_use_tree(tmp_path)
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, result.inputs.structure, reference, version=0)
+    baseline = derive_writer_applicability(
+        reference, use.id, "kgain", cert, dag, 0,
+        conditional_writer_ids=())
+    assert baseline.proof is not None
+    polluted = CoverageSearchState()
+    polluted.mark_visited(reference.visit_key())
+    polluted.mark_exhausted(reference.visit_key())
+    polluted.record_stages(reference.visit_key(), {"owner-files"})
+    polluted.advance_version()
+    dag.exhausted_source_requests.add(reference.visit_key())
+    assert (derive_writer_applicability(
+        reference, use.id, "kgain", cert, dag, 0,
+        conditional_writer_ids=()) == baseline)
+
+
+def test_applicability_leaves_stop_unchanged(tmp_path):
+    """K: a positive applicability proof changes nothing downstream —
+    the checkpoint round surface is identical before and after
+    derivation runs, and stop authorization is untouched."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        evaluate_checkpoint_round,
+    )
+    from flight_log_agent.analysis.coverage import derive_writer_applicability
+    profiler, result = _single_writer_use_tree(tmp_path)
+    dag = result.dag
+    use = next(vertex for vertex in dag.vertices
+               if vertex.variable == "out" and vertex.kind == "operation")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler, result.inputs.structure, reference, version=0)
+
+    def surface(round_result):
+        selected = round_result.summary.get("selected_checkpoint") or {}
+        return {
+            "action": round_result.action,
+            "references": sorted(
+                item.visit_key() for item in round_result.references),
+            "next_analysis": round_result.summary.get("next_analysis"),
+            "stop": selected.get("authorizes_discovery_stop", False),
+            "writer_flag": selected.get(
+                "writer_coverage_verified", False),
+            "applicability_flag": selected.get(
+                "applicability_verified", False),
+        }
+
+    def run_round():
+        return evaluate_checkpoint_round(
+            dag, parameter_values={}, observed_signals=set(),
+            signal_policies={},
+            load_samples=lambda _view, _observed: {})
+
+    before = surface(run_round())
+    positive = derive_writer_applicability(
+        reference, use.id, "kgain", cert, dag, 0,
+        conditional_writer_ids=())
+    assert positive.proof is not None
+    assert surface(run_round()) == before
