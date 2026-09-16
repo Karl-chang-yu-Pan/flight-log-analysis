@@ -4899,3 +4899,284 @@ class Instrument {
     assert check["writer_coverage_verified"] is False
     assert check["upstream_obligations_retained"] is True
     assert not check["authorizes_discovery_stop"]
+
+
+# --- T1: structured search evidence (observation only, no authority) ---
+
+def _evidence_setup(tmp_path, files, backend="tree_sitter"):
+    profiler = _mini_tree(tmp_path, files, backend=backend)
+    file_list = list(files)
+    facts = load_facts(profiler, tmp_path / "cache", file_list, "hash")
+    inputs = dag_inputs_from_facts(facts)
+    return profiler, inputs
+
+
+def _resolve_with_evidence(profiler, reference, structure):
+    from flight_log_agent.analysis.coverage import CoverageEvidence
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    candidates, evidence = resolver.resolve_with_evidence(
+        reference, structure, sink)
+    assert isinstance(evidence, CoverageEvidence)
+    assert evidence.attempts == sink
+    return candidates, evidence
+
+
+def test_evidence_records_admitted_storage_writer(tmp_path):
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/widget.cpp": (
+            "struct Widget { float level; void fill() { level = 1; } };"
+        ),
+    })
+    assert inputs.structure.authoritative_declarations
+    identity = inputs.structure.symbol_identity(
+        "level", file="src/lib/widget.cpp",
+        callable_id="Widget::fill", function_name="Widget::fill")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="level", kind="storage_writers", file="src/lib/widget.cpp",
+        callable_id="Widget::fill", identity=identity)
+    candidates, evidence = _resolve_with_evidence(
+        profiler, reference, inputs.structure)
+    assert [item.file for item in candidates] == ["src/lib/widget.cpp"]
+    assert len(evidence.attempts) >= 1
+    admitted = [a for a in evidence.attempts if a.outcome == "admitted"]
+    assert len(admitted) == 1
+    assert "src/lib/widget.cpp" in admitted[0].examined_domain["files"]
+    assert admitted[0].universe_ref["authoritative_declarations"] is True
+
+
+def test_evidence_distinguishes_ambiguous_from_empty(tmp_path):
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/over.cpp": "void tune(int x) {} void tune(float x) {}",
+    })
+    overloaded = UnresolvedSourceReference(
+        symbol="tune", kind="callable", file="src/lib/over.cpp",
+        argument_count=1)
+    candidates, evidence = _resolve_with_evidence(
+        profiler, overloaded, inputs.structure)
+    assert candidates == []
+    ambiguous = [a for a in evidence.attempts if a.outcome == "ambiguous"]
+    assert len(ambiguous) >= 1
+    assert ambiguous[0].details.get("colliding_identities"), (
+        "ambiguity must retain the colliding set")
+
+    ghost = UnresolvedSourceReference(
+        symbol="NoSuchEntity", kind="class", file="src/lib/over.cpp")
+    ghost_candidates, ghost_evidence = _resolve_with_evidence(
+        profiler, ghost, inputs.structure)
+    assert ghost_candidates == []
+    ghost_outcomes = {a.outcome for a in ghost_evidence.attempts}
+    assert "ambiguous" not in ghost_outcomes
+    assert ghost_outcomes <= {"no-candidate-complete-domain",
+                              "no-candidate-partial-domain", "unavailable",
+                              "non-writer"}
+
+
+def test_evidence_records_inapplicable_local(tmp_path):
+    from flight_log_agent.analysis.source_expansion import SourceSymbolIdentity
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/local.cpp": "void run() { float temp = 1; sink(temp); }",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="temp", kind="symbol", file="src/lib/local.cpp",
+        callable_id="run",
+        identity=SourceSymbolIdentity(
+            kind="local", symbol="temp", root="temp",
+            file="src/lib/local.cpp", callable_id="run",
+            declaration_id="run:parameter:0", declaration_proven=True))
+    candidates, evidence = _resolve_with_evidence(
+        profiler, reference, inputs.structure)
+    assert candidates == []
+    assert any(a.outcome == "inapplicable" for a in evidence.attempts)
+
+
+def test_evidence_records_unavailable_receiver(tmp_path):
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/user.cpp": "void run() { helper.adjust(1); }",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="adjust", kind="callable", file="src/lib/user.cpp",
+        callable_id="run", receiver="helper", receiver_type="",
+        argument_count=1)
+    candidates, evidence = _resolve_with_evidence(
+        profiler, reference, inputs.structure)
+    assert candidates == []
+    assert any(a.outcome == "unavailable" for a in evidence.attempts)
+
+
+def test_evidence_records_no_query_issued(tmp_path):
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/empty.cpp": "void run() {}",
+    })
+    reference = UnresolvedSourceReference(symbol="", file="src/lib/empty.cpp")
+    candidates, evidence = _resolve_with_evidence(
+        profiler, reference, inputs.structure)
+    assert candidates == []
+    assert any(a.outcome == "no-query-issued" for a in evidence.attempts)
+
+
+def test_heuristic_discovery_is_not_identity_proof(tmp_path):
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/split.cpp": "float output;\nvoid run() {\noutput\n= 1;\n}",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="output", file="src/lib/split.cpp")
+    candidates, evidence = _resolve_with_evidence(
+        profiler, reference, inputs.structure)
+    assert [item.file for item in candidates] == ["src/lib/split.cpp"]
+    bare_hits = [a for a in evidence.attempts
+                 if a.outcome == "admitted" and "bare" in a.strategy]
+    assert len(bare_hits) == 1, (
+        "the bare-name fallback group must be labeled heuristic, "
+        "not an exact-shaped strategy")
+    assert bare_hits[0].strategy_class == "heuristic"
+
+
+def test_helper_provider_records_evidence(tmp_path):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        make_helper_body_provider,
+    )
+    profiler, _inputs = _evidence_setup(tmp_path, {
+        "src/lib/numeric.hpp": "float adjust(float v, bool scale = false);",
+        "src/lib/numeric.cpp": (
+            '#include "numeric.hpp"\n'
+            "float adjust(float v, bool scale) { return v; }"),
+        "src/modules/caller.cpp": (
+            '#include <src/lib/numeric.hpp>\n'
+            "void run() { float x = adjust(1); }"),
+    })
+    sink: list = []
+    provider = make_helper_body_provider(
+        profiler, [], resolver=SourceExpansionResolver(profiler, "hash"),
+        attempt_sink=sink)
+    caller_facts = load_facts(
+        profiler, tmp_path / "cache", ["src/modules/caller.cpp"], "hash")
+    reference = UnresolvedSourceReference(
+        symbol="adjust", kind="callable", file="src/modules/caller.cpp",
+        callable_id=next(
+            item.callable_id
+            for item in caller_facts[0].callables
+            if item.name == "run"
+        ),
+        argument_count=1)
+    helpers = provider("adjust", reference)
+    assert helpers, "expected the helper definition to be found"
+    assert len(sink) >= 1, "helper-driven resolution must record evidence"
+    assert all(hasattr(a, "outcome") for a in sink)
+
+
+def test_empty_examined_set_never_means_rejected(tmp_path):
+    """Zero examined candidates must fall through to the domain-class rule,
+    never to a rejection outcome: absence of examination is not rejection."""
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/empty.cpp": "void run() {}",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="NoSuchCallable", kind="callable",
+        file="src/lib/empty.cpp", argument_count=0)
+    candidates, evidence = _resolve_with_evidence(
+        profiler, reference, inputs.structure)
+    assert candidates == []
+    assert evidence.attempts, "expected recorded attempts"
+    forbidden = {"non-writer", "rejected-declaration", "rejected-owner",
+                 "ambiguous"}
+    for attempt in evidence.attempts:
+        assert attempt.outcome not in forbidden, (
+            attempt.strategy, attempt.outcome)
+    assert {a.outcome for a in evidence.attempts} <= {
+        "no-candidate-complete-domain", "no-candidate-partial-domain",
+        "unavailable", "no-query-issued"}
+
+
+def test_issued_queries_recorded_pre_normalization(tmp_path):
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/plain.cpp": "float output; void run() { output = 2; }",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="output", file="src/lib/plain.cpp")
+    _candidates, evidence = _resolve_with_evidence(
+        profiler, reference, inputs.structure)
+    issued = [q for a in evidence.attempts for q in a.queries_issued]
+    assert "output =" in issued or "output=" in issued
+    assert all(isinstance(q, str) for q in issued)
+
+
+def test_evidence_path_matches_legacy_results(tmp_path):
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/widget.cpp": (
+            "struct Widget { float level; void fill() { level = 1; } };"
+        ),
+        "src/lib/over.cpp": "void tune(int x) {} void tune(float x) {}",
+    })
+    resolver = SourceExpansionResolver(profiler, "hash")
+    identity = inputs.structure.symbol_identity(
+        "level", file="src/lib/widget.cpp",
+        callable_id="Widget::fill", function_name="Widget::fill")
+    references = [
+        UnresolvedSourceReference(symbol="level", kind="storage_writers",
+                                  file="src/lib/widget.cpp",
+                                  callable_id="Widget::fill",
+                                  identity=identity),
+        UnresolvedSourceReference(symbol="tune", kind="callable",
+                                  file="src/lib/over.cpp", argument_count=1),
+        UnresolvedSourceReference(symbol="NoSuch", kind="class",
+                                  file="src/lib/over.cpp"),
+        UnresolvedSourceReference(symbol="missing", kind="symbol",
+                                  file="src/lib/widget.cpp"),
+    ]
+    for reference in references:
+        legacy = [(c.file, c.matched_kind)
+                  for c in resolver.resolve(reference, inputs.structure)]
+        sink: list = []
+        candidates, evidence = resolver.resolve_with_evidence(
+            reference, inputs.structure, sink)
+        assert [(c.file, c.matched_kind) for c in candidates] == legacy
+        if legacy:
+            assert any(a.outcome == "admitted" for a in evidence.attempts)
+
+
+def test_compatible_clause_mirror_matches_compatible():
+    from flight_log_agent.analysis.source_expansion import SourceSymbolIdentity
+
+    structure = SourceStructureIndex(
+        direct_bases={"Derived": {"Base"}},
+        members={("Base", "value"): {"owner": "Base", "name": "value"}},
+    )
+    structure.authoritative_declarations = True
+
+    def identity(**fields):
+        base = {"kind": "member", "symbol": "value", "root": "value",
+                "file": "a.cpp", "callable_id": "A::run",
+                "class_owner": "Base", "declaring_class": "Base",
+                "declaration_id": "a.cpp:1:member:value",
+                "declaration_proven": True}
+        base.update(fields)
+        return SourceSymbolIdentity(**base)
+
+    pairs = [
+        # (reference overrides, producer overrides, expected clause or None)
+        ({}, {}, None),
+        ({"symbol": "other"}, {}, "spelling"),
+        ({"declaration_proven": False}, {}, "proven"),
+        ({"kind": "local", "callable_id": "A::run",
+          "declaration_id": "A::run:parameter:0"},
+         {"kind": "local", "callable_id": "A::run",
+          "declaration_id": "A::run:parameter:0"}, None),
+        ({"kind": "local", "callable_id": "A::run",
+          "declaration_id": "x"},
+         {"kind": "local", "callable_id": "B::run",
+          "declaration_id": "x"}, "local-scope"),
+        ({"declaring_class": "Other"}, {}, "declaration-id"),
+        ({"class_owner": "Derived"}, {}, None),
+        ({"class_owner": "Unrelated"}, {}, "owner-lineage"),
+        ({"kind": "global"}, {"kind": "member"}, "kind"),
+    ]
+    for ref_fields, prod_fields, expected in pairs:
+        reference = identity(**ref_fields)
+        producer = identity(**prod_fields)
+        assert (structure.compatible(reference, producer)
+                == (SourceExpansionResolver._incompatible_clause(
+                    reference, producer, structure) is None))
+        assert (SourceExpansionResolver._incompatible_clause(
+            reference, producer, structure) == expected)

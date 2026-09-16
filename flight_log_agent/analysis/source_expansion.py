@@ -15,6 +15,35 @@ from typing import Any, Iterable, Literal, Optional, Sequence
 from pydantic import BaseModel, Field
 
 from flight_log_agent.analysis.source_expression import source_expression_names
+from flight_log_agent.analysis.coverage import (
+    CLASS_COMPLETE,
+    CLASS_HEURISTIC,
+    CLASS_UNAVAILABLE,
+    OUTCOME_ADMITTED,
+    OUTCOME_AMBIGUOUS,
+    OUTCOME_INAPPLICABLE,
+    OUTCOME_NO_CANDIDATE_COMPLETE,
+    OUTCOME_NO_CANDIDATE_PARTIAL,
+    OUTCOME_NO_QUERY,
+    OUTCOME_NON_WRITER,
+    OUTCOME_REJECTED_DECLARATION,
+    OUTCOME_REJECTED_OWNER,
+    OUTCOME_UNAVAILABLE,
+    STRATEGY_CALLABLE_DEFINITION_SEARCH,
+    STRATEGY_CALLABLE_OWNER_FILES,
+    STRATEGY_CALLABLE_QUERY_GROUP,
+    STRATEGY_LOCAL_SHORTCIRCUIT,
+    STRATEGY_QUERY_GROUP,
+    STRATEGY_QUERY_GROUP_ASSIGNMENT,
+    STRATEGY_QUERY_GROUP_BARE,
+    STRATEGY_STORAGE_ASSIGNMENT_QUERY,
+    STRATEGY_STORAGE_DECLARATION_FILES,
+    STRATEGY_STORAGE_INTERNAL_ONLY,
+    STRATEGY_STORAGE_OWNER_FILES,
+    STRATEGY_UNIQUE_ENTITY_FILTER,
+    CoverageEvidence,
+    SearchAttempt,
+)
 from flight_log_agent.px4.mechanism_source_profiler import (
     MechanismSourceProfiler,
     SourceStorageRef,
@@ -974,6 +1003,65 @@ class _AdmissionIndex:
     calls: tuple[_AdmissionCall, ...]
 
 
+class _EvidenceRecorder:
+    """Collects SearchAttempt records for one resolve_with_evidence call.
+
+    Observation only: recording never influences which candidates resolve.
+    Every record describes what was attempted and what happened, never a
+    coverage claim.
+    """
+
+    def __init__(
+        self,
+        reference: "UnresolvedSourceReference",
+        structure: "SourceStructureIndex",
+        universe_ref: dict,
+        sink: list,
+    ) -> None:
+        self.reference = reference
+        self.structure = structure
+        self.universe_ref = dict(universe_ref)
+        self.sink = sink
+        self.attempts: list = []
+        self.obligation_key = source_reference_resolution_key(
+            reference, structure)
+        self.scheduling_key = reference.visit_key()
+
+    def record(
+        self,
+        *,
+        strategy: str,
+        strategy_class: str,
+        outcome: str,
+        dispatch: Optional[str] = None,
+        flags: Optional[dict] = None,
+        queries: tuple = (),
+        intended: str = "",
+        examined: Optional[dict] = None,
+        details: Optional[dict] = None,
+    ) -> SearchAttempt:
+        attempt = SearchAttempt(
+            obligation_key=self.obligation_key,
+            scheduling_key=self.scheduling_key,
+            strategy=strategy,
+            strategy_class=strategy_class,
+            dispatch=dispatch,
+            flags=dict(flags or {}),
+            queries_issued=tuple(queries),
+            intended_boundary=intended,
+            examined_domain=dict(examined or {}),
+            universe_ref=dict(self.universe_ref),
+            outcome=outcome,
+            details=dict(details or {}),
+        )
+        self.sink.append(attempt)
+        self.attempts.append(attempt)
+        return attempt
+
+    def backend(self) -> str:
+        return str(self.universe_ref.get("backend", "legacy"))
+
+
 class SourceExpansionResolver:
     """Resolve owners first, then admit only exact source definitions."""
 
@@ -1090,8 +1178,45 @@ class SourceExpansionResolver:
         reference: UnresolvedSourceReference,
         structure: SourceStructureIndex,
     ) -> list[ExpansionCandidate]:
+        return self._resolve_inner(reference, structure, None)
+
+    def resolve_with_evidence(
+        self,
+        reference: UnresolvedSourceReference,
+        structure: SourceStructureIndex,
+        sink: list,
+    ) -> tuple[list[ExpansionCandidate], CoverageEvidence]:
+        """Resolve exactly like :meth:`resolve` while recording evidence.
+
+        `sink` is required (no default): a coverage-enabled search cannot
+        run without producing its attempt records. The returned candidates
+        are identical to `resolve()`; the evidence carries no authority.
+        """
+        universe_ref = {
+            "source_hash": self.source_hash,
+            "authoritative_declarations": bool(
+                structure.authoritative_declarations),
+            "backend": str(
+                getattr(self.profiler, "source_parser_backend", "legacy")),
+        }
+        recorder = _EvidenceRecorder(reference, structure, universe_ref, sink)
+        candidates = self._resolve_inner(reference, structure, recorder)
+        evidence = CoverageEvidence(
+            obligation_key=recorder.obligation_key,
+            scheduling_key=recorder.scheduling_key,
+            attempts=list(recorder.attempts),
+            universe_ref=dict(universe_ref),
+        )
+        return candidates, evidence
+
+    def _resolve_inner(
+        self,
+        reference: UnresolvedSourceReference,
+        structure: SourceStructureIndex,
+        recorder: Optional[_EvidenceRecorder],
+    ) -> list[ExpansionCandidate]:
         if reference.kind in {"member_writers", "storage_writers"}:
-            return self._resolve_storage_writers(reference, structure)
+            return self._resolve_storage_writers(reference, structure, recorder)
         if (
             reference.kind == "symbol"
             and reference.identity is not None
@@ -1106,6 +1231,14 @@ class SourceExpansionResolver:
             # All producers for a local belong to the same callable, whose
             # admitted file facts have already been indexed. A tree-wide
             # spelling search cannot discover a valid local producer.
+            if recorder is not None:
+                recorder.record(
+                    strategy=STRATEGY_LOCAL_SHORTCIRCUIT,
+                    strategy_class=CLASS_COMPLETE,
+                    outcome=OUTCOME_INAPPLICABLE,
+                    intended=f"callable:{reference.identity.callable_id}",
+                    details={"reason": "local-scope-rule"},
+                )
             return []
         if reference.kind == "callable" and reference.receiver:
             receiver_type = reference.receiver_type or structure.member_receiver_type(
@@ -1114,12 +1247,24 @@ class SourceExpansionResolver:
             if not receiver_type:
                 # A method name has no source identity without the receiver's
                 # declared type. Bare-name retrieval cannot make it safer.
+                if recorder is not None:
+                    recorder.record(
+                        strategy=STRATEGY_CALLABLE_OWNER_FILES,
+                        strategy_class=CLASS_UNAVAILABLE,
+                        outcome=OUTCOME_UNAVAILABLE,
+                        details={"reason": "receiver-type-unknown"},
+                    )
                 return []
         if reference.kind == "callable":
             direct_files = self._callable_owner_files(reference, structure)
-            candidates = self._admit_files(reference, structure, direct_files)
+            candidates = self._admit_files(
+                reference, structure, direct_files, recorder=recorder,
+                strategy=STRATEGY_CALLABLE_OWNER_FILES,
+                strategy_class=CLASS_COMPLETE,
+                intended=f"owner-files:{reference.symbol}",
+            )
             if candidates:
-                return self._unique_entity(reference, candidates)
+                return self._unique_entity(reference, candidates, recorder)
             _dispatch, bare, _owners = callable_dispatch_context(
                 reference, structure
             )
@@ -1127,14 +1272,26 @@ class SourceExpansionResolver:
                 bare
             )
             candidates = self._admit_files(
-                reference, structure, definition_files
+                reference, structure, definition_files, recorder=recorder,
+                strategy=STRATEGY_CALLABLE_DEFINITION_SEARCH,
+                strategy_class=CLASS_HEURISTIC,
+                queries=(f"{bare}(",),
+                intended=f"definition-search:{bare}",
+                details={"later_groups": "query-groups"},
             )
             if candidates:
-                return self._unique_entity(reference, candidates)
+                return self._unique_entity(reference, candidates, recorder)
             query_groups = self._callable_query_groups(reference, structure)
         else:
             queries = self._queries(reference)
             if not queries:
+                if recorder is not None:
+                    recorder.record(
+                        strategy=STRATEGY_QUERY_GROUP,
+                        strategy_class=CLASS_UNAVAILABLE,
+                        outcome=OUTCOME_NO_QUERY,
+                        intended=f"symbol:{reference.symbol}",
+                    )
                 return []
             query_groups: list[list[str]]
             if reference.kind == "symbol" and len(queries) > 1:
@@ -1144,34 +1301,75 @@ class SourceExpansionResolver:
                 query_groups = [queries[:-1], queries[-1:]]
             else:
                 query_groups = [queries]
-        for query_group in query_groups:
+        for group_index, query_group in enumerate(query_groups):
             if not query_group:
                 continue
+            if reference.kind == "callable":
+                strategy = STRATEGY_CALLABLE_QUERY_GROUP
+            elif len(query_groups) > 1:
+                strategy = (STRATEGY_QUERY_GROUP_ASSIGNMENT
+                            if group_index < len(query_groups) - 1
+                            else STRATEGY_QUERY_GROUP_BARE)
+            else:
+                strategy = STRATEGY_QUERY_GROUP
             hits = self.profiler.search_related_source_files(
                 query_group,
                 max_files=None,
                 expand_query_tokens=False,
             )
             hit_files = dedupe_keep_order(hit.file for hit in hits)
-            candidates = self._admit_files(reference, structure, hit_files)
+            candidates = self._admit_files(
+                reference, structure, hit_files, recorder=recorder,
+                strategy=strategy, strategy_class=CLASS_HEURISTIC,
+                queries=tuple(query_group),
+                intended=f"query:{reference.symbol}",
+                details={"group_index": group_index,
+                         "group_count": len(query_groups),
+                         "hit_count": len(hit_files)},
+            )
             if candidates:
-                return self._unique_entity(reference, candidates)
+                return self._unique_entity(reference, candidates, recorder)
         return []
 
     def _resolve_storage_writers(
         self,
         reference: UnresolvedSourceReference,
         structure: SourceStructureIndex,
+        recorder: Optional[_EvidenceRecorder] = None,
     ) -> list[ExpansionCandidate]:
         identity = reference.identity
         if identity is None or not identity.declaration_proven:
+            if recorder is not None:
+                recorder.record(
+                    strategy=STRATEGY_STORAGE_OWNER_FILES,
+                    strategy_class=CLASS_UNAVAILABLE,
+                    outcome=OUTCOME_UNAVAILABLE,
+                    intended=f"storage:{reference.symbol}",
+                    details={"reason": "unproven-identity"},
+                )
             return []
         if identity.kind == "local":
+            if recorder is not None:
+                recorder.record(
+                    strategy=STRATEGY_LOCAL_SHORTCIRCUIT,
+                    strategy_class=CLASS_COMPLETE,
+                    outcome=OUTCOME_INAPPLICABLE,
+                    intended=f"callable:{identity.callable_id}",
+                    details={"reason": "local-scope-rule"},
+                )
             return []
         if identity.kind == "member":
             owner = identity.class_owner or identity.declaring_class
             owners = tuple(structure.lineage(owner)) or ((owner,) if owner else ())
             if not owners:
+                if recorder is not None:
+                    recorder.record(
+                        strategy=STRATEGY_STORAGE_OWNER_FILES,
+                        strategy_class=CLASS_UNAVAILABLE,
+                        outcome=OUTCOME_UNAVAILABLE,
+                        intended=f"owner-lineage:{owner}",
+                        details={"reason": "owner-unknown"},
+                    )
                 return []
             direct_files = [
                 file_path
@@ -1180,8 +1378,9 @@ class SourceExpansionResolver:
                     structure.class_files.get(candidate_owner, ())
                 )
             ]
+            owner_queries = [f"{candidate_owner}::" for candidate_owner in owners]
             hits = self.profiler.search_related_source_files(
-                [f"{candidate_owner}::" for candidate_owner in owners],
+                owner_queries,
                 max_files=None,
                 expand_query_tokens=False,
             )
@@ -1189,8 +1388,24 @@ class SourceExpansionResolver:
                 reference,
                 structure,
                 [*direct_files, *(hit.file for hit in hits)],
+                recorder=recorder,
+                strategy=STRATEGY_STORAGE_OWNER_FILES,
+                strategy_class=CLASS_COMPLETE,
+                queries=tuple(owner_queries),
+                intended=f"owner-lineage:{','.join(owners)}",
+                details={"direct_files": tuple(direct_files),
+                         "hit_count": len(hits)},
             )
         if identity.kind != "global":
+            if recorder is not None:
+                recorder.record(
+                    strategy=STRATEGY_STORAGE_OWNER_FILES,
+                    strategy_class=CLASS_UNAVAILABLE,
+                    outcome=OUTCOME_UNAVAILABLE,
+                    intended=f"storage:{reference.symbol}",
+                    details={"reason": "unknown-identity-kind",
+                             "kind": identity.kind},
+                )
             return []
 
         declaration = structure.declaration_for_identity(identity)
@@ -1210,9 +1425,20 @@ class SourceExpansionResolver:
             or identity.declaration_id.startswith("global:internal:")
         )
         if internal:
-            return self._admit_files(reference, structure, direct_files)
+            return self._admit_files(
+                reference, structure, direct_files, recorder=recorder,
+                strategy=STRATEGY_STORAGE_INTERNAL_ONLY,
+                strategy_class=CLASS_COMPLETE,
+                intended=f"internal-file:{identity.declaration_id}",
+                details={"broad_search_skipped": "internal-linkage"},
+            )
 
-        candidates = self._admit_files(reference, structure, direct_files)
+        candidates = self._admit_files(
+            reference, structure, direct_files, recorder=recorder,
+            strategy=STRATEGY_STORAGE_DECLARATION_FILES,
+            strategy_class=CLASS_COMPLETE,
+            intended=f"declaration:{identity.declaration_id}",
+        )
         if candidates:
             return candidates
         root = identity.root
@@ -1228,6 +1454,12 @@ class SourceExpansionResolver:
             reference,
             structure,
             [hit.file for hit in hits],
+            recorder=recorder,
+            strategy=STRATEGY_STORAGE_ASSIGNMENT_QUERY,
+            strategy_class=CLASS_HEURISTIC,
+            queries=tuple(queries),
+            intended=f"assignment-query:{root}",
+            details={"hit_count": len(hits)},
         )
 
     def resolution_key(
@@ -1297,20 +1529,33 @@ class SourceExpansionResolver:
         reference: UnresolvedSourceReference,
         structure: SourceStructureIndex,
         files: Iterable[str],
+        recorder: Optional[_EvidenceRecorder] = None,
+        strategy: str = STRATEGY_QUERY_GROUP,
+        strategy_class: str = CLASS_HEURISTIC,
+        queries: tuple = (),
+        intended: str = "",
+        details: Optional[dict] = None,
     ) -> list[ExpansionCandidate]:
         candidates: list[ExpansionCandidate] = []
+        examined: list[str] = []
+        file_verdicts: dict[str, str] = {}
         for file_path in dedupe_keep_order(str(value) for value in files if value):
+            examined.append(file_path)
             admission = self._admission_index_for(file_path)
             if reference.kind in {"member_writers", "storage_writers"}:
                 match = self._storage_writer_index_match(
                     reference, admission, structure
                 )
                 if not match:
+                    file_verdicts[file_path] = "index-miss"
                     continue
                 full_facts = self.facts_for(file_path)
-                match = self._exact_match(reference, full_facts, structure)
+                match, reason = self._exact_match(
+                    reference, full_facts, structure)
                 if not match:
+                    file_verdicts[file_path] = reason
                     continue
+                file_verdicts[file_path] = f"exact:{match}"
                 candidates.append(
                     ExpansionCandidate(
                         file=file_path,
@@ -1327,26 +1572,18 @@ class SourceExpansionResolver:
                     structure,
                     defaults_required=False,
                 ):
+                    file_verdicts[file_path] = "index-miss"
                     continue
-                full_facts = self.facts_for(file_path)
-                match = self._exact_match(reference, full_facts, structure)
-                if not match:
-                    continue
-                candidates.append(
-                    ExpansionCandidate(
-                        file=file_path,
-                        facts=full_facts,
-                        matched_kind=reference.kind,
-                        matched_identity=match,
-                    )
-                )
-                continue
-            if not self._admission_contains(reference, admission):
+            elif not self._admission_contains(reference, admission):
+                file_verdicts[file_path] = "index-miss"
                 continue
             full_facts = self.facts_for(file_path)
-            match = self._exact_match(reference, full_facts, structure)
+            match, reason = self._exact_match(
+                reference, full_facts, structure)
             if not match:
+                file_verdicts[file_path] = reason
                 continue
+            file_verdicts[file_path] = f"exact:{match}"
             candidates.append(
                 ExpansionCandidate(
                     file=file_path,
@@ -1355,7 +1592,61 @@ class SourceExpansionResolver:
                     matched_identity=match,
                 )
             )
+            continue
+        if recorder is not None:
+            outcome = self._admit_outcome(
+                strategy_class, candidates, file_verdicts)
+            merged_details = dict(details or {})
+            if outcome == OUTCOME_AMBIGUOUS:
+                merged_details["colliding_identities"] = sorted({
+                    part
+                    for verdict in file_verdicts.values()
+                    if verdict.startswith("multi-match:")
+                    for part in verdict.split(":", 1)[1].split(",")
+                    if part
+                })
+            recorder.record(
+                strategy=strategy,
+                strategy_class=strategy_class,
+                queries=tuple(queries),
+                intended=intended or f"files:{reference.symbol}",
+                examined={"files": tuple(examined), "backend": recorder.backend()},
+                outcome=outcome,
+                details={**merged_details,
+                         "file_verdicts": file_verdicts},
+            )
         return candidates
+
+    @staticmethod
+    def _admit_outcome(
+        strategy_class: str,
+        candidates: list[ExpansionCandidate],
+        file_verdicts: dict[str, str],
+    ) -> str:
+        if candidates:
+            return OUTCOME_ADMITTED
+        multi_match_ids: list[str] = []
+        for verdict in file_verdicts.values():
+            if verdict.startswith("multi-match:"):
+                multi_match_ids.extend(
+                    part for part in verdict.split(":", 1)[1].split(",") if part)
+        if multi_match_ids:
+            return OUTCOME_AMBIGUOUS
+        miss_reasons = {v for v in file_verdicts.values()
+                        if not v.startswith("exact:")}
+        declaration_group = {
+            "no-declaration-match", "incompatible:declaration-id",
+            "incompatible:proven", "unproven-identity",
+        }
+        if miss_reasons and miss_reasons <= declaration_group:
+            return OUTCOME_REJECTED_DECLARATION
+        if miss_reasons == {"incompatible:owner-lineage"}:
+            return OUTCOME_REJECTED_OWNER
+        if miss_reasons and miss_reasons <= {"no-bindings", "constant-filtered"}:
+            return OUTCOME_NON_WRITER
+        if strategy_class == CLASS_COMPLETE:
+            return OUTCOME_NO_CANDIDATE_COMPLETE
+        return OUTCOME_NO_CANDIDATE_PARTIAL
 
     @staticmethod
     def _admission_contains(
@@ -1464,12 +1755,25 @@ class SourceExpansionResolver:
     def _unique_entity(
         reference: UnresolvedSourceReference,
         candidates: list[ExpansionCandidate],
+        recorder: Optional[_EvidenceRecorder] = None,
     ) -> list[ExpansionCandidate]:
         if reference.kind in {"callable", "class"}:
             # Multiple exact definitions can be overloads, build variants, or
             # ambiguous base members. Source facts must disambiguate them.
             identities = {item.matched_identity for item in candidates}
-            return candidates[:1] if len(identities) == 1 else []
+            if len(identities) == 1:
+                return candidates[:1]
+            if recorder is not None:
+                recorder.record(
+                    strategy=STRATEGY_UNIQUE_ENTITY_FILTER,
+                    strategy_class=CLASS_COMPLETE,
+                    outcome=OUTCOME_AMBIGUOUS,
+                    intended=f"unique-entity:{reference.symbol}",
+                    details={"colliding_identities": sorted(identities),
+                             "candidate_files": sorted(
+                                 {item.file for item in candidates})},
+                )
+            return []
         return candidates
 
     def _candidate_facts_for(
@@ -1667,17 +1971,97 @@ class SourceExpansionResolver:
         return matches
 
     @staticmethod
+    def _incompatible_clause(
+        reference: SourceSymbolIdentity,
+        producer: SourceSymbolIdentity,
+        structure: SourceStructureIndex,
+    ) -> Optional[str]:
+        """First failing clause of `compatible()`, for evidence only.
+
+        Mirrors `compatible()` branch order exactly; used only to label why
+        an exact match failed, never to decide admission.
+        """
+        if not source_storage_produces_reference(
+            producer.symbol, reference.symbol
+        ):
+            return "spelling"
+        if structure.authoritative_declarations and not (
+            reference.declaration_proven and producer.declaration_proven
+        ):
+            return "proven"
+        if reference.kind == "local" or producer.kind == "local":
+            same_callable = (
+                reference.kind == producer.kind == "local"
+                and bool(reference.callable_id)
+                and reference.callable_id == producer.callable_id
+            )
+            if not same_callable:
+                return "local-scope"
+            if reference.declaration_proven and producer.declaration_proven:
+                if bool(reference.declaration_id) and (
+                    reference.declaration_id == producer.declaration_id
+                ):
+                    return None
+                return "declaration-id"
+            if reference.file == producer.file:
+                return None
+            return "local-scope"
+        if reference.kind == "member" or producer.kind == "member":
+            owner_compatible = (
+                not reference.class_owner
+                or producer.class_owner
+                in set(structure.lineage(reference.class_owner))
+            )
+            if not (
+                reference.kind == producer.kind == "member"
+                and bool(reference.declaring_class)
+                and reference.declaring_class == producer.declaring_class
+                and owner_compatible
+            ):
+                if reference.kind != producer.kind:
+                    return "kind"
+                if not (
+                    bool(reference.declaring_class)
+                    and reference.declaring_class == producer.declaring_class
+                ):
+                    return "declaration-id"
+                return "owner-lineage"
+            return None
+        if reference.kind == producer.kind == "global":
+            if reference.declaration_proven and producer.declaration_proven:
+                if bool(reference.declaration_id) and (
+                    reference.declaration_id == producer.declaration_id
+                ):
+                    return None
+                return "declaration-id"
+            if (
+                bool(reference.file)
+                and reference.file == producer.file
+                and reference.namespace_owner == producer.namespace_owner
+            ):
+                return None
+            return "global-scope"
+        return "kind"
+
+    @staticmethod
     def _exact_match(
         reference: UnresolvedSourceReference,
         facts: SourceFileFacts,
         structure: SourceStructureIndex,
-    ) -> str:
+    ) -> tuple[str, str]:
+        """Exact per-file match plus a machine-readable reason.
+
+        Returns `(site_or_target, reason)` where reason is `"exact"` on
+        success. Callers use only the first element for behavior; the
+        reason exists solely for search-attempt evidence.
+        """
         symbol = exact_symbol(reference.symbol)
         bare = reference.symbol.replace("->", ".").rsplit(".", 1)[-1].strip("()")
         if reference.kind == "class":
-            return next(
-                (item.name for item in facts.classes if item.name == bare), ""
-            )
+            for item in facts.classes:
+                if item.name == bare:
+                    return item.name, "exact"
+            return "", "no-bindings"
         if reference.kind == "callable":
             matches = SourceExpansionResolver._callable_matches(
                 reference,
@@ -1685,12 +2069,17 @@ class SourceExpansionResolver:
                 structure,
                 defaults_required=True,
             )
-            return matches[0].callable_id if len(matches) == 1 else ""
+            if len(matches) == 1:
+                return matches[0].callable_id, "exact"
+            if matches:
+                return "", "multi-match:" + ",".join(sorted(
+                    {str(item.callable_id) for item in matches}))
+            return "", "zero-match"
 
         if reference.kind == "storage_writers":
             identity = reference.identity
             if identity is None or not identity.declaration_proven:
-                return ""
+                return "", "unproven-identity"
             for assignment in facts.source_assignments:
                 if assignment.target_identity is not None:
                     candidate = _source_symbol_identity(
@@ -1724,7 +2113,7 @@ class SourceExpansionResolver:
                     return str(
                         assignment.source_site_id
                         or candidate.declaration_id
-                    )
+                    ), "exact"
             for call in facts.function_calls:
                 owner = structure.callable_owner(
                     str(call.callable_id or ""), str(call.function or "")
@@ -1746,8 +2135,8 @@ class SourceExpansionResolver:
                                 class_owner_hint=owner,
                             )
                         if structure.same_declaration_entity(identity, candidate):
-                            return str(call.source_site_id or call.callable_id or "")
-            return ""
+                            return str(call.source_site_id or call.callable_id or ""), "exact"
+            return "", "no-declaration-match"
 
         bindings = []
         for assignment in facts.source_assignments:
@@ -1755,22 +2144,27 @@ class SourceExpansionResolver:
             if source_storage_produces_reference(target, symbol):
                 bindings.append(assignment)
         if reference.kind == "constant":
+            pre_filtered = list(bindings)
             bindings = [
                 item
                 for item in bindings
                 if item.declaration_kind in {"enum", "define", "constexpr"}
             ]
+            if not bindings:
+                if pre_filtered:
+                    return "", "constant-filtered"
+                return "", "no-bindings"
         if not bindings:
-            return ""
+            return "", "no-bindings"
         declared_constants = [
             item
             for item in bindings
             if item.declaration_kind in {"enum", "define", "constexpr"}
         ]
         if declared_constants:
-            return exact_symbol(declared_constants[0].target)
+            return exact_symbol(declared_constants[0].target), "exact"
         if reference.identity is None:
-            return exact_symbol(bindings[0].target)
+            return exact_symbol(bindings[0].target), "admitted-unowned"
         local_structure = SourceStructureIndex.from_facts([facts])
         direct_bases = {
             key: set(value) for key, value in structure.direct_bases.items()
@@ -1824,6 +2218,7 @@ class SourceExpansionResolver:
                 or local_structure.authoritative_declarations
             ),
         )
+        first_clause: Optional[str] = None
         for assignment in bindings:
             candidate = combined.symbol_identity(
                 assignment.target,
@@ -1833,8 +2228,13 @@ class SourceExpansionResolver:
                 function_parameters=assignment.function_parameters,
             )
             if combined.compatible(reference.identity, candidate):
-                return exact_symbol(assignment.target)
-        return ""
+                return exact_symbol(assignment.target), "exact"
+            if first_clause is None:
+                first_clause = SourceExpansionResolver._incompatible_clause(
+                    reference.identity, candidate, combined)
+        if first_clause is not None:
+            return "", f"incompatible:{first_clause}"
+        return "", "no-bindings"
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

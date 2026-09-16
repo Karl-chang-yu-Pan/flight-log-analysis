@@ -1453,12 +1453,17 @@ def make_helper_body_provider(
     *,
     structure: Optional[SourceStructureIndex] = None,
     resolver: Optional[SourceExpansionResolver] = None,
+    attempt_sink: Optional[list] = None,
 ) -> Callable[..., Any]:
     """Load exact callable definitions without admitting ranked hit files.
 
     Search returns every candidate. Only files from which the profiler
     extracts a matching helper definition are retained; receiver ownership
     and arity further narrow the result when the DAG supplies call context.
+
+    When `attempt_sink` is provided, helper-driven resolution records its
+    search attempts there via the evidence-producing path; otherwise the
+    legacy behavior is unchanged.
     """
     source_structure = structure or SourceStructureIndex()
     source_resolver = resolver or SourceExpansionResolver(profiler, "provider")
@@ -1472,9 +1477,15 @@ def make_helper_body_provider(
             kind="callable",
         )
         resolved: list[Any] = []
-        for candidate in source_resolver.resolve(
-            call_reference, source_structure
-        ):
+        if attempt_sink is not None:
+            candidates, _evidence = source_resolver.resolve_with_evidence(
+                call_reference, source_structure, attempt_sink
+            )
+        else:
+            candidates = source_resolver.resolve(
+                call_reference, source_structure
+            )
+        for candidate in candidates:
             exact = [
                 helper
                 for helper in candidate.facts.helper_expressions
