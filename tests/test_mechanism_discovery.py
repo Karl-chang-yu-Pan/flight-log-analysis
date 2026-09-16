@@ -5845,3 +5845,377 @@ def test_certificate_internal_linkage_positive(tmp_path):
     assert "file-linkage-closed" in cert.assumptions
     assert cert.obligation_key == evidence.obligation_key
     assert cert.scheduling_key == evidence.scheduling_key
+
+
+# --- T4: record-only checkpoint threading (diagnostic-only) ---
+
+def _internal_h_certificate(tmp_path):
+    """Second same-spelling internal global under another declaration."""
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/h.cpp": (
+            "static float kgain = 9.0f;\nvoid other() { kgain = 3.0f; }\n"
+        ),
+    })
+    identity = inputs.structure.symbol_identity(
+        "kgain", file="src/lib/h.cpp",
+        callable_id="other", function_name="other")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/lib/h.cpp",
+        callable_id="other", identity=identity)
+    return profiler, inputs, reference
+
+
+def _derive_for(profiler, inputs, reference, version=0):
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate,
+    )
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=version)
+    result = derive_writer_coverage_certificate(
+        reference, evidence, version)
+    assert result.certificate is not None, result.refusal
+    return result.certificate
+
+
+def test_proof_observation_covers_matching_certificate(tmp_path):
+    """H: a current certificate for the exact relevant obligation is
+    observed as covered, with its semantic obligation key retained."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    cert = _derive_for(profiler, inputs, reference, version=0)
+    key = reference.visit_key()
+    observation = observe_checkpoint_coverage(
+        [reference], certificates=[cert], proof_version=0,
+        searchable_keys={key})
+    assert observation.relevant_obligation_keys == (key,)
+    assert observation.covered_obligation_keys == (key,)
+    assert observation.covered_semantic_keys == (cert.obligation_key,)
+    assert observation.uncovered_obligation_keys == ()
+    assert observation.stale_certificate_keys == ()
+    assert observation.proof_version == 0
+    assert observation.relevant_empty is False
+    assert observation.scope_degenerate is False
+
+
+def test_proof_observation_isolates_declarations(tmp_path):
+    """B: same spelling, different proven declaration — certificate A
+    covers only A; B stays uncovered."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    profiler, inputs, reference_a = _internal_gain_fixture(tmp_path)
+    other_profiler, other_inputs, reference_b = _internal_h_certificate(
+        tmp_path)
+    assert (reference_b.identity.declaration_id
+            != reference_a.identity.declaration_id)
+    cert_a = _derive_for(profiler, inputs, reference_a, version=0)
+    key_a, key_b = reference_a.visit_key(), reference_b.visit_key()
+    assert key_a != key_b
+    observation = observe_checkpoint_coverage(
+        [reference_a, reference_b], certificates=[cert_a], proof_version=0,
+        searchable_keys={key_a, key_b})
+    assert set(observation.relevant_obligation_keys) == {key_a, key_b}
+    assert observation.covered_obligation_keys == (key_a,)
+    assert observation.uncovered_obligation_keys == (key_b,)
+
+
+def test_proof_observation_excludes_unrelated_certificate(tmp_path):
+    """C: a certificate outside the relevance scope is excluded — not
+    covered, not stale, not associated."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    other_profiler, other_inputs, other_ref = _internal_h_certificate(
+        tmp_path)
+    foreign = _derive_for(
+        other_profiler, other_inputs, other_ref, version=0)
+    key = reference.visit_key()
+    observation = observe_checkpoint_coverage(
+        [reference], certificates=[foreign], proof_version=0,
+        searchable_keys={key})
+    assert observation.covered_obligation_keys == ()
+    assert observation.uncovered_obligation_keys == (key,)
+    assert observation.stale_certificate_keys == ()
+    assert foreign.scheduling_key not in (
+        observation.covered_obligation_keys)
+
+
+def test_proof_observation_ignores_stale_certificate(tmp_path):
+    """D: a version-N certificate under current version N+1 records no
+    current coverage — the obligation stays uncovered and the stale key
+    is reported diagnostically."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    cert = _derive_for(profiler, inputs, reference, version=0)
+    key = reference.visit_key()
+    observation = observe_checkpoint_coverage(
+        [reference], certificates=[cert], proof_version=1,
+        searchable_keys={key})
+    assert observation.covered_obligation_keys == ()
+    assert observation.uncovered_obligation_keys == (key,)
+    assert observation.stale_certificate_keys == (key,)
+
+
+def test_proof_observation_keeps_filtered_relevant(tmp_path):
+    """E: relevance is computed before scheduler filtering — a filtered
+    obligation stays relevant (and uncovered without a certificate, or
+    covered with one). Filtering never creates proof."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    key = reference.visit_key()
+    uncovered = observe_checkpoint_coverage(
+        [reference], certificates=[], proof_version=0, searchable_keys=set())
+    assert uncovered.relevant_obligation_keys == (key,)
+    assert uncovered.filtered_obligation_keys == (key,)
+    assert uncovered.uncovered_obligation_keys == (key,)
+    assert uncovered.covered_obligation_keys == ()
+    cert = _derive_for(profiler, inputs, reference, version=0)
+    covered = observe_checkpoint_coverage(
+        [reference], certificates=[cert], proof_version=0,
+        searchable_keys=set())
+    assert covered.relevant_obligation_keys == (key,)
+    assert covered.filtered_obligation_keys == (key,)
+    assert covered.covered_obligation_keys == (key,)
+    assert covered.uncovered_obligation_keys == ()
+
+
+def test_proof_observation_marks_vacuity(tmp_path):
+    """G: diagnostics distinguish genuinely-no-obligations from a
+    degenerate scope; neither shape certifies anything by itself."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    empty = observe_checkpoint_coverage(
+        [], certificates=[], proof_version=0, scope_degenerate=False)
+    assert empty.relevant_obligation_keys == ()
+    assert empty.covered_obligation_keys == ()
+    assert empty.relevant_empty is True
+    assert empty.scope_degenerate is False
+    degenerate = observe_checkpoint_coverage(
+        [], certificates=[], proof_version=0, scope_degenerate=True)
+    assert degenerate.relevant_empty is True
+    assert degenerate.scope_degenerate is True
+    assert degenerate.covered_obligation_keys == ()
+
+
+def test_proof_observation_marks_vacuity(tmp_path):
+    """G: diagnostics distinguish genuinely-no-obligations from a
+    degenerate scope; neither shape certifies anything by itself."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        observe_checkpoint_coverage,
+    )
+    empty = observe_checkpoint_coverage(
+        [], certificates=[], proof_version=0, scope_degenerate=False)
+    assert empty.relevant_obligation_keys == ()
+    assert empty.covered_obligation_keys == ()
+    assert empty.relevant_empty is True
+    assert empty.scope_degenerate is False
+    degenerate = observe_checkpoint_coverage(
+        [], certificates=[], proof_version=0, scope_degenerate=True)
+    assert degenerate.relevant_empty is True
+    assert degenerate.scope_degenerate is True
+    assert degenerate.covered_obligation_keys == ()
+
+
+def _round_dag_with_reference(tmp_path):
+    """Hand-built DAG mirroring the checkpoint-controller fixture, with
+    one real proven internal reference attached at the terminal root."""
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    def expression(text, *inputs):
+        return {"text": text, "lowered_text": text,
+                "input_symbols": list(inputs),
+                "input_identities": {}, "call_results": [], "exact": True}
+
+    bindings = [
+        {"target_symbol": "sample", "source_symbol": "measurement.value",
+         "external_source_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "subscribe",
+         "expression_ref": expression("measurement.value", "measurement.value"),
+         "assignment_path": [{"file": "sample.cpp", "line": 2}],
+         "function": "Controller::step"},
+        {"target_symbol": "command.value", "source_symbol": "sample * 2.0",
+         "external_target_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "publish",
+         "expression_ref": expression("sample * 2.0", "sample"),
+         "assignment_path": [{"file": "sample.cpp", "line": 3}],
+         "function": "Controller::step"},
+    ]
+    samples = {"measurement.value": [(0.0, 3.0), (10.0, 3.0)],
+               "command.value": [(0.0, 6.0), (10.0, 6.0)]}
+    policies = {signal: {"method": "linear"} for signal in samples}
+    dag = build_mechanism_dag(bindings, "command.value",
+                              logged_signals=set(samples))
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    _, _, reference = _internal_gain_fixture(tmp_path)
+    attached = reference.model_copy(
+        update={"origin_vertex_ids": [root.id]})
+    assert attached.visit_key() == reference.visit_key()
+    dag.unresolved_references.append(attached)
+    return dag, samples, policies, attached
+
+
+def _run_round(dag, samples, policies, **kwargs):
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        evaluate_checkpoint_round,
+    )
+    return evaluate_checkpoint_round(
+        dag, parameter_values={}, observed_signals=set(samples),
+        signal_policies=policies,
+        load_samples=lambda _view, _observed: samples, **kwargs)
+
+
+def _behavior_surface(result):
+    selected = result.summary.get("selected_checkpoint") or {}
+    return {
+        "action": result.action,
+        "references": sorted(r.visit_key() for r in result.references),
+        "next_analysis": {
+            key: value for key, value in
+            (result.summary.get("next_analysis") or {}).items()
+            if key != "source_requests"
+        },
+        "next_requests": sorted(
+            raw.get("symbol", "") + ":" + raw.get("kind", "")
+            for raw in (result.summary.get("next_analysis") or {}).get(
+                "source_requests", [])),
+        "stop": selected.get("authorizes_discovery_stop", False),
+        "writer_flag": selected.get("writer_coverage_verified", False),
+        "applicability_flag": selected.get(
+            "applicability_verified", False),
+        "summary_keys": sorted(result.summary.keys()),
+    }
+
+
+def test_round_observes_certificate_without_behavior_change(tmp_path):
+    """A: the round observes a current matching certificate
+    diagnostically; scheduling, requirements, flags, and stop are
+    identical with and without threading, and the DAG is unmutated."""
+    from copy import deepcopy
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    cert = _derive_for(profiler, inputs, reference, version=0)
+    dag, samples, policies, attached = _round_dag_with_reference(tmp_path)
+    key = attached.visit_key()
+    assert key == cert.scheduling_key
+    before = deepcopy(dag.model_dump())
+    plain = _run_round(dag, samples, policies)
+    assert plain.proof_observation is not None
+    assert plain.proof_observation.relevant_obligation_keys == (key,)
+    assert plain.proof_observation.covered_obligation_keys == ()
+    threaded = _run_round(
+        dag, samples, policies, coverage_certificates=[cert],
+        proof_version=0)
+    assert threaded.proof_observation.covered_obligation_keys == (key,)
+    assert (threaded.proof_observation.covered_semantic_keys
+            == (cert.obligation_key,))
+    assert threaded.proof_observation.uncovered_obligation_keys == ()
+    assert _behavior_surface(threaded) == _behavior_surface(plain)
+    assert dag.model_dump() == before
+
+
+def test_round_keeps_exhausted_relevant_without_covering(tmp_path):
+    """F: an exhausted relevant obligation stays relevant (and uncovered
+    without a current certificate) while existing scheduler filtering
+    still drops it from the search queue; stop stays false."""
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    cert = _derive_for(profiler, inputs, reference, version=0)
+    dag, samples, policies, attached = _round_dag_with_reference(tmp_path)
+    key = attached.visit_key()
+    dag.exhausted_source_requests.add(key)
+    uncovered = _run_round(dag, samples, policies)
+    assert key in uncovered.proof_observation.relevant_obligation_keys
+    assert key in uncovered.proof_observation.filtered_obligation_keys
+    assert key in uncovered.proof_observation.uncovered_obligation_keys
+    assert key not in [r.visit_key() for r in uncovered.references]
+    covered = _run_round(
+        dag, samples, policies, coverage_certificates=[cert],
+        proof_version=0)
+    assert key in covered.proof_observation.relevant_obligation_keys
+    assert key in covered.proof_observation.filtered_obligation_keys
+    assert key in covered.proof_observation.covered_obligation_keys
+    assert _behavior_surface(covered) == _behavior_surface(uncovered)
+    assert covered.summary.get("selected_checkpoint", {}).get(
+        "authorizes_discovery_stop", False) is False
+
+
+def test_round_differential_across_proof_shapes(tmp_path):
+    """I: across valid / stale / unrelated / uncovered / vacuous proof
+    threading, scheduling, requirements, flags, and stop authorization
+    are identical — only diagnostic proof observation may differ."""
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    cert = _derive_for(profiler, inputs, reference, version=0)
+    other_profiler, other_inputs, other_ref = _internal_h_certificate(
+        tmp_path)
+    foreign = _derive_for(
+        other_profiler, other_inputs, other_ref, version=0)
+    observations = {}
+    surfaces = {}
+    scenarios = {}
+    dag, samples, policies, attached = _round_dag_with_reference(tmp_path)
+    scenarios["uncovered"] = {}
+    scenarios["valid"] = {"coverage_certificates": [cert],
+                          "proof_version": 0}
+    scenarios["stale"] = {"coverage_certificates": [cert],
+                          "proof_version": 1}
+    scenarios["unrelated"] = {"coverage_certificates": [foreign],
+                              "proof_version": 0}
+    key = attached.visit_key()
+    for name, kwargs in scenarios.items():
+        result = _run_round(dag, samples, policies, **kwargs)
+        observations[name] = result.proof_observation
+        surfaces[name] = _behavior_surface(result)
+    assert observations["valid"].covered_obligation_keys == (key,)
+    assert observations["stale"].covered_obligation_keys == ()
+    assert observations["stale"].stale_certificate_keys == (key,)
+    assert observations["unrelated"].covered_obligation_keys == ()
+    assert observations["unrelated"].stale_certificate_keys == ()
+    assert observations["uncovered"].covered_obligation_keys == ()
+    assert (surfaces["valid"] == surfaces["stale"]
+            == surfaces["unrelated"] == surfaces["uncovered"])
+    # Vacuous scope: no references at all, foreign proof threaded.
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    def expression(text, *inputs):
+        return {"text": text, "lowered_text": text,
+                "input_symbols": list(inputs),
+                "input_identities": {}, "call_results": [], "exact": True}
+
+    bindings = [
+        {"target_symbol": "sample", "source_symbol": "measurement.value",
+         "external_source_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "subscribe",
+         "expression_ref": expression("measurement.value", "measurement.value"),
+         "assignment_path": [{"file": "sample.cpp", "line": 2}],
+         "function": "Controller::step"},
+        {"target_symbol": "command.value", "source_symbol": "sample * 2.0",
+         "external_target_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "publish",
+         "expression_ref": expression("sample * 2.0", "sample"),
+         "assignment_path": [{"file": "sample.cpp", "line": 3}],
+         "function": "Controller::step"},
+    ]
+    samples = {"measurement.value": [(0.0, 3.0), (10.0, 3.0)],
+               "command.value": [(0.0, 6.0), (10.0, 6.0)]}
+    policies = {signal: {"method": "linear"} for signal in samples}
+    bare = build_mechanism_dag(bindings, "command.value",
+                               logged_signals=set(samples))
+    assert bare.unresolved_references == []
+    plain_vacuous = _run_round(bare, samples, policies)
+    threaded_vacuous = _run_round(
+        bare, samples, policies, coverage_certificates=[foreign],
+        proof_version=0)
+    assert plain_vacuous.proof_observation.relevant_empty is True
+    assert threaded_vacuous.proof_observation.relevant_empty is True
+    assert threaded_vacuous.proof_observation.covered_obligation_keys == ()
+    assert (_behavior_surface(threaded_vacuous)
+            == _behavior_surface(plain_vacuous))

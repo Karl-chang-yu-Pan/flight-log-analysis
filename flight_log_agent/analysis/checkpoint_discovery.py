@@ -9,7 +9,7 @@ whether the established mechanism answers the user's question.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional, Sequence
 
 from flight_log_agent.analysis.dag_checkpoint import assess_checkpoint, dependency_view
 from flight_log_agent.analysis.dag_replay import EvaluationScope, observed_checkpoint_roots
@@ -21,6 +21,100 @@ from flight_log_agent.analysis.mechanism_dag import (
 from flight_log_agent.analysis.source_expansion import UnresolvedSourceReference
 
 
+@dataclass(frozen=True)
+class CheckpointProofObservation:
+    """Record-only coverage observation for one checkpoint round.
+
+    Diagnostic only: relevance and coverage bookkeeping with zero
+    scheduling, retirement, applicability, or stop meaning. Key
+    namespaces are visit keys (scheduling identity, computable from the
+    reference alone) except `covered_semantic_keys`, which retains the
+    proven semantic obligation keys of the covering certificates for
+    later applicability work.
+
+    A certificate is observable only when its scheduling key belongs to
+    the relevance set, its version equals the supplied proof version,
+    and its obligation/boundary fields are intact. Anything else is
+    excluded (unrelated scope) or reported as stale (present but not
+    current). Filtering never removes relevance: an obligation filtered
+    from current scheduling stays relevant and, without a current
+    certificate, uncovered.
+    """
+
+    relevant_obligation_keys: tuple = ()
+    covered_obligation_keys: tuple = ()
+    uncovered_obligation_keys: tuple = ()
+    filtered_obligation_keys: tuple = ()
+    stale_certificate_keys: tuple = ()
+    covered_semantic_keys: tuple = ()
+    proof_version: Any = None
+    scope_degenerate: bool = False
+    relevant_empty: bool = True
+
+
+def observe_checkpoint_coverage(
+    references: Any,
+    *,
+    certificates: Any = (),
+    proof_version: Any = None,
+    searchable_keys: Any = None,
+    scope_degenerate: bool = False,
+) -> CheckpointProofObservation:
+    """Observe current coverage proof without deciding anything.
+
+    Pure function over explicit inputs: the pre-filter relevance base
+    (references entering the round, before exhausted/queue filtering),
+    the certificates to consider, the current proof version, and the
+    visit keys still schedulable. Reads no session, scheduler, or
+    checkpoint state. Never authorizes, retires, or filters.
+    """
+    relevant = [reference.visit_key() for reference in references or ()]
+    relevant_set = set(relevant)
+    if searchable_keys is None:
+        searchable = set(relevant)
+    else:
+        searchable = set(searchable_keys)
+    covered: list = []
+    covered_semantic: list = []
+    stale: list = []
+    for certificate in certificates or ():
+        scheduling_key = tuple(
+            getattr(certificate, "scheduling_key", None) or ())
+        if scheduling_key not in relevant_set:
+            # Outside the relevance scope: excluded entirely, not even
+            # reported as stale. A foreign certificate must never appear
+            # associated with an unrelated obligation.
+            continue
+        intact = bool(getattr(certificate, "obligation_key", None)) and bool(
+            getattr(certificate, "boundary", None))
+        current = (
+            proof_version is not None
+            and getattr(certificate, "version", None) == proof_version
+            and intact
+        )
+        if current:
+            if scheduling_key not in covered:
+                covered.append(scheduling_key)
+                covered_semantic.append(
+                    tuple(certificate.obligation_key))
+        elif scheduling_key not in stale:
+            stale.append(scheduling_key)
+    covered_set = set(covered)
+    return CheckpointProofObservation(
+        relevant_obligation_keys=tuple(relevant),
+        covered_obligation_keys=tuple(covered),
+        uncovered_obligation_keys=tuple(
+            key for key in relevant if key not in covered_set),
+        filtered_obligation_keys=tuple(
+            key for key in relevant if key not in searchable),
+        stale_certificate_keys=tuple(stale),
+        covered_semantic_keys=tuple(covered_semantic),
+        proof_version=proof_version,
+        scope_degenerate=bool(scope_degenerate),
+        relevant_empty=not relevant,
+    )
+
+
 @dataclass
 class CheckpointRound:
     action: Literal["continue", "verified", "unresolved"]
@@ -28,6 +122,11 @@ class CheckpointRound:
     references: list[UnresolvedSourceReference]
     summary: dict[str, Any]
     construction: ConstructionDemand = ConstructionDemand()
+    # Record-only coverage observation (T4, diagnostic-only). Computed
+    # from the pre-filter relevance base on every round, with or without
+    # threaded proof state. Never influences scheduling, requirements,
+    # flags, or stop. Kept off `summary` so no report/schema field moves.
+    proof_observation: Optional[CheckpointProofObservation] = None
 
 
 def evaluate_checkpoint_round(
@@ -39,11 +138,18 @@ def evaluate_checkpoint_round(
     load_samples: Callable[[MechanismDAG, tuple[str, ...]], dict[str, list[tuple[float, Any]]]],
     scope: Optional[EvaluationScope] = None,
     question_target: Optional[str] = None,
+    coverage_certificates: Sequence[Any] = (),
+    proof_version: Any = None,
 ) -> CheckpointRound:
     """Preflight first, evaluate ready gates, replay, then select exact needs.
 
     No file/round budget, guessed binding, or numerical-only stop. An unresolved
     source-writer request remains a proof obligation even after a local match.
+
+    `coverage_certificates` with `proof_version` threads T3 proof state for
+    record-only observation: relevance and coverage bookkeeping are computed
+    diagnostically and cannot change scheduling, requirements, flags, or
+    stop. Omitting them computes the same relevance with empty coverage.
     """
     all_groups = observed_checkpoint_roots(dag)
     groups = all_groups
@@ -184,6 +290,18 @@ def evaluate_checkpoint_round(
         inactive=frozenset(inactive),
     )
     action = "verified" if verified else "continue" if next_references or materialize else "unresolved"
+    # Record-only proof observation (T4): relevance comes from the
+    # pre-filter `references` base above — never from the exhausted- or
+    # queue-filtered views — so filtering cannot erase relevance. Reads
+    # only; scheduling, requirements, flags, and stop are already decided
+    # and untouched below.
+    proof_observation = observe_checkpoint_coverage(
+        references,
+        certificates=coverage_certificates,
+        proof_version=proof_version,
+        searchable_keys={reference.visit_key() for reference in searchable},
+        scope_degenerate=not roots,
+    )
     updates = {v.id: v for v in annotated_view.vertices}
     annotated = dag.model_copy(update={"vertices": [updates.get(v.id, v) for v in dag.vertices]})
     return CheckpointRound(action, annotated, next_references, {
@@ -202,4 +320,4 @@ def evaluate_checkpoint_round(
         "dynamic_gate_count": len(ready),
         "pending_construction_count": len(dag.pending_construction),
         "reason": "source-backed checkpoint verified" if verified else "checkpoint has outstanding analysis requirements",
-    }, construction=construction)
+    }, construction=construction, proof_observation=proof_observation)
