@@ -5429,6 +5429,355 @@ def test_planned_stages_matches_internal_linkage_path(tmp_path):
     assert state.eligible(reference.visit_key(), planned)
 
 
+def test_certificate_closed_empty_positive(tmp_path):
+    """A proven-closed internal boundary, fully examined with zero writers
+    present, certifies absence within that boundary (empty writer set)."""
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/e.cpp": "static float kzero;\nvoid run() { (void)0; }\n",
+    })
+    identity = inputs.structure.symbol_identity(
+        "kzero", file="src/lib/e.cpp",
+        callable_id="run", function_name="run")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="kzero", kind="storage_writers", file="src/lib/e.cpp",
+        callable_id="run", identity=identity)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    assert evidence.attempts, "expected recorded attempts"
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.refusal == "", f"unexpected refusal: {result.refusal}"
+    cert = result.certificate
+    assert cert is not None
+    assert cert.boundary == ("src/lib/e.cpp",)
+    assert cert.writers == ()
+    assert cert.version == 0
+
+
+def test_certificate_refuses_heuristic_search(tmp_path):
+    """Heuristic search never certifies: neither one exact admitted writer
+    nor a zero-result heuristic search produces a certificate. Exact
+    admission is precision, not completeness."""
+    from flight_log_agent.analysis.coverage import (
+        REFUSAL_HEURISTIC_STRATEGY,
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/plain.cpp": "float output; void run() { output = 2; }",
+        "src/lib/empty.cpp": "void run() {}",
+    })
+    resolver = SourceExpansionResolver(profiler, "hash")
+    # One exact writer via an assignment-shape heuristic strategy.
+    admitted_ref = UnresolvedSourceReference(
+        symbol="output", file="src/lib/plain.cpp")
+    sink: list = []
+    candidates, admitted_evidence = resolver.resolve_with_evidence(
+        admitted_ref, inputs.structure, sink, universe_version=0)
+    assert [item.file for item in candidates] == ["src/lib/plain.cpp"]
+    admitted_result = derive_writer_coverage_certificate(
+        admitted_ref, admitted_evidence, 0)
+    assert admitted_result.certificate is None
+    assert admitted_result.refusal == REFUSAL_HEURISTIC_STRATEGY
+    # Zero-result heuristic search: no query can even be issued.
+    empty_ref = UnresolvedSourceReference(
+        symbol="", file="src/lib/empty.cpp")
+    empty_sink: list = []
+    _, empty_evidence = resolver.resolve_with_evidence(
+        empty_ref, inputs.structure, empty_sink, universe_version=0)
+    empty_result = derive_writer_coverage_certificate(
+        empty_ref, empty_evidence, 0)
+    assert empty_result.certificate is None
+    assert empty_result.refusal == REFUSAL_HEURISTIC_STRATEGY
+
+
+def test_certificate_refuses_unexamined_boundary_member(tmp_path):
+    """One admitted writer plus a boundary member with no admission
+    verdict does NOT certify: every examined file must be accounted for."""
+    from copy import deepcopy
+    from flight_log_agent.analysis.coverage import (
+        REFUSAL_UNEXAMINED_BOUNDARY_MEMBER,
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    assert len(evidence.attempts) == 1
+    tampered = deepcopy(evidence)
+    only = tampered.attempts[0]
+    only.examined_domain["files"] = (
+        tuple(only.examined_domain["files"]) + ("src/lib/other.cpp",))
+    result = derive_writer_coverage_certificate(reference, tampered, 0)
+    assert result.certificate is None
+    assert result.refusal == REFUSAL_UNEXAMINED_BOUNDARY_MEMBER
+
+
+def test_certificate_refuses_ambiguity(tmp_path):
+    """Ambiguous colliding identity blocks certification, reported
+    precisely even when the strategy is otherwise certifiable."""
+    from copy import deepcopy
+    from flight_log_agent.analysis.coverage import (
+        REFUSAL_AMBIGUOUS_CANDIDATES,
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    tampered = deepcopy(evidence)
+    only = tampered.attempts[0]
+    only.outcome = "ambiguous"
+    only.details["colliding_identities"] = ["id-a", "id-b"]
+    result = derive_writer_coverage_certificate(reference, tampered, 0)
+    assert result.certificate is None
+    assert result.refusal == REFUSAL_AMBIGUOUS_CANDIDATES
+    # Natural ambiguity (overload set) also refuses, never certifies.
+    over_profiler, over_inputs = _evidence_setup(tmp_path, {
+        "src/lib/over.cpp": "void tune(int x) {} void tune(float x) {}",
+    })
+    over_ref = UnresolvedSourceReference(
+        symbol="tune", kind="callable", file="src/lib/over.cpp",
+        argument_count=1)
+    over_resolver = SourceExpansionResolver(over_profiler, "hash")
+    over_sink: list = []
+    _, over_evidence = over_resolver.resolve_with_evidence(
+        over_ref, over_inputs.structure, over_sink, universe_version=0)
+    assert any(a.outcome == "ambiguous" for a in over_evidence.attempts)
+    over_result = derive_writer_coverage_certificate(
+        over_ref, over_evidence, 0)
+    assert over_result.certificate is None
+    # The evidence holds several independent blockers (partial domain on
+    # one stage, ambiguity on another); any explicit refusal is correct,
+    # and the rule order is attempt-record order.
+    assert over_result.refusal != ""
+
+
+def test_certificate_refuses_unavailable_search(tmp_path):
+    """Search that cannot meaningfully run (unproven identity) blocks
+    certification: unexamined is not absent."""
+    from flight_log_agent.analysis.coverage import (
+        REFUSAL_UNAVAILABLE_SEARCH,
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/user.cpp": "void run() { helper.adjust(1); }",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="adjust", kind="callable", file="src/lib/user.cpp",
+        callable_id="run", receiver="helper", receiver_type="",
+        argument_count=1)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    assert evidence.attempts
+    assert all(a.outcome == "unavailable" for a in evidence.attempts)
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.certificate is None
+    assert result.refusal == REFUSAL_UNAVAILABLE_SEARCH
+
+
+def test_certificate_refuses_partial_domain(tmp_path):
+    """A partial-domain result (heuristic search over an incompletely
+    enumerated hit set) blocks certification even with zero candidates."""
+    from flight_log_agent.analysis.coverage import (
+        REFUSAL_PARTIAL_DOMAIN,
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/empty.cpp": "void run() {}",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="NoSuchEntity", kind="class", file="src/lib/empty.cpp")
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    candidates, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    assert candidates == []
+    assert any(
+        a.outcome == "no-candidate-partial-domain"
+        for a in evidence.attempts), (
+        "expected a partial-domain outcome to refuse on")
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.certificate is None
+    assert result.refusal == REFUSAL_PARTIAL_DOMAIN
+
+
+def test_certificate_refuses_stale_and_unknown_versions(tmp_path):
+    """Certificates are valid only for the stamped current version:
+    newer current versions refuse as stale, and unstamped (T1-shape)
+    evidence refuses as version-unknown at any version."""
+    from flight_log_agent.analysis.coverage import (
+        REFUSAL_STALE_VERSION,
+        REFUSAL_VERSION_UNKNOWN,
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    stale = derive_writer_coverage_certificate(reference, evidence, 1)
+    assert stale.certificate is None
+    assert stale.refusal == REFUSAL_STALE_VERSION
+    unstamped_sink: list = []
+    _, unstamped = resolver.resolve_with_evidence(
+        reference, inputs.structure, unstamped_sink)
+    unknown = derive_writer_coverage_certificate(reference, unstamped, 0)
+    assert unknown.certificate is None
+    assert unknown.refusal == REFUSAL_VERSION_UNKNOWN
+
+
+def test_certificate_cross_declaration_isolation(tmp_path):
+    """Evidence for declaration A cannot satisfy obligation B, even with
+    identical spelling: identity mismatch refuses."""
+    from flight_log_agent.analysis.coverage import (
+        REFUSAL_IDENTITY_MISMATCH,
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs, reference_a = _internal_gain_fixture(tmp_path)
+    other_profiler, other_inputs = _evidence_setup(tmp_path, {
+        "src/lib/h.cpp": (
+            "static float kgain = 9.0f;\nvoid other() { kgain = 3.0f; }\n"
+        ),
+    })
+    other_identity = other_inputs.structure.symbol_identity(
+        "kgain", file="src/lib/h.cpp",
+        callable_id="other", function_name="other")
+    assert other_identity.declaration_proven
+    assert (other_identity.declaration_id
+            != reference_a.identity.declaration_id)
+    reference_b = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/lib/h.cpp",
+        callable_id="other", identity=other_identity)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence_a = resolver.resolve_with_evidence(
+        reference_a, inputs.structure, sink, universe_version=0)
+    result = derive_writer_coverage_certificate(reference_b, evidence_a, 0)
+    assert result.certificate is None
+    assert result.refusal == REFUSAL_IDENTITY_MISMATCH
+
+
+def test_certificate_ignores_unrelated_heuristic_evidence(tmp_path):
+    """Relevant exact evidence plus unrelated heuristic evidence must not
+    broaden the certificate's boundary: the boundary stays exactly the
+    closed examined set."""
+    from copy import deepcopy
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    plain_profiler, plain_inputs = _evidence_setup(tmp_path, {
+        "src/lib/plain.cpp": "float output; void run() { output = 2; }",
+    })
+    plain_ref = UnresolvedSourceReference(
+        symbol="output", file="src/lib/plain.cpp")
+    plain_resolver = SourceExpansionResolver(plain_profiler, "hash")
+    plain_sink: list = []
+    _, plain_evidence = plain_resolver.resolve_with_evidence(
+        plain_ref, plain_inputs.structure, plain_sink, universe_version=0)
+    assert any(a.outcome == "admitted" for a in plain_evidence.attempts)
+    merged = deepcopy(evidence)
+    merged.attempts.extend(deepcopy(plain_evidence.attempts))
+    result = derive_writer_coverage_certificate(reference, merged, 0)
+    assert result.refusal == "", f"unexpected refusal: {result.refusal}"
+    assert result.certificate is not None
+    assert result.certificate.boundary == ("src/lib/g.cpp",)
+    assert len(result.certificate.writers) == 1
+
+
+def test_certificate_ignores_scheduling_state(tmp_path):
+    """D1 independence: derivation reads obligation + evidence + version
+    only. Visited/exhausted/completed scheduling state — however set —
+    must not change the derivation result."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageSearchState,
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.source_expansion import planned_stages
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    baseline = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert baseline.certificate is not None
+    polluted = CoverageSearchState()
+    polluted.mark_visited(
+        resolver.resolution_key(reference, inputs.structure))
+    polluted.mark_exhausted(reference.visit_key())
+    polluted.record_stages(
+        reference.visit_key(), planned_stages(reference, inputs.structure))
+    polluted_result = derive_writer_coverage_certificate(
+        reference, evidence, 0)
+    assert polluted_result == baseline
+    # Polluted scheduling state must not flip a refusal into success
+    # either: heuristic evidence still refuses identically.
+    plain_profiler, plain_inputs = _evidence_setup(tmp_path, {
+        "src/lib/plain.cpp": "float output; void run() { output = 2; }",
+    })
+    plain_ref = UnresolvedSourceReference(
+        symbol="output", file="src/lib/plain.cpp")
+    plain_resolver = SourceExpansionResolver(plain_profiler, "hash")
+    plain_sink: list = []
+    _, plain_evidence = plain_resolver.resolve_with_evidence(
+        plain_ref, plain_inputs.structure, plain_sink, universe_version=0)
+    plain_baseline = derive_writer_coverage_certificate(
+        plain_ref, plain_evidence, 0)
+    assert plain_baseline.certificate is None
+    polluted.mark_visited(
+        plain_resolver.resolution_key(plain_ref, plain_inputs.structure))
+    assert (derive_writer_coverage_certificate(
+        plain_ref, plain_evidence, 0) == plain_baseline)
+
+
+def test_certificate_refuses_same_callable_shortcircuit(tmp_path):
+    """Same-callable local enumeration cannot certify in T3: the
+    short-circuit records no examined domain, and recording one would
+    violate evidence honesty (only examined counts) while opening the
+    file would change search behavior. Refusal, not silent admission."""
+    from flight_log_agent.analysis.coverage import (
+        REFUSAL_UNSUPPORTED_CLOSURE,
+        STRATEGY_LOCAL_SHORTCIRCUIT,
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceSymbolIdentity,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/local.cpp": "void run() { float temp = 1; sink(temp); }",
+    })
+    reference = UnresolvedSourceReference(
+        symbol="temp", kind="symbol", file="src/lib/local.cpp",
+        callable_id="run",
+        identity=SourceSymbolIdentity(
+            kind="local", symbol="temp", root="temp",
+            file="src/lib/local.cpp", callable_id="run",
+            declaration_id="run:parameter:0", declaration_proven=True))
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    assert evidence.attempts
+    assert {a.strategy for a in evidence.attempts} == {
+        STRATEGY_LOCAL_SHORTCIRCUIT}
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.certificate is None
+    assert result.refusal == REFUSAL_UNSUPPORTED_CLOSURE
+
+
 def test_evidence_carries_search_version_when_provided(tmp_path):
     """Version stamping is observational only: attempts record the universe
     version they ran under, and omitting the version keeps the exact T1
@@ -5451,3 +5800,48 @@ def test_evidence_carries_search_version_when_provided(tmp_path):
         reference, inputs.structure, legacy_sink)
     assert "search_version" not in legacy_evidence.universe_ref, (
         "omitted version must preserve the exact T1 evidence shape")
+
+
+# --- T3: pure coverage-certificate derivation (unconsumed data) ---
+
+def _internal_gain_fixture(tmp_path):
+    """One internal-linkage global with one exact writer in its file."""
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/g.cpp": (
+            "static float kgain = 1.0f;\nvoid run() { kgain = 2.0f; }\n"
+        ),
+    })
+    identity = inputs.structure.symbol_identity(
+        "kgain", file="src/lib/g.cpp",
+        callable_id="run", function_name="run")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/lib/g.cpp",
+        callable_id="run", identity=identity)
+    return profiler, inputs, reference
+
+
+def test_certificate_internal_linkage_positive(tmp_path):
+    """A single-file internal-linkage boundary, fully examined with its
+    exact writer admitted, certifies: boundary, writers, version, and
+    explicit closure assumptions are all bound."""
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate,
+    )
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.refusal == "", f"unexpected refusal: {result.refusal}"
+    cert = result.certificate
+    assert cert is not None
+    assert cert.version == 0
+    assert cert.strategy == "storage-internal-only"
+    assert cert.boundary == ("src/lib/g.cpp",)
+    assert cert.examined == ("src/lib/g.cpp",)
+    assert len(cert.writers) == 1
+    assert "file-linkage-closed" in cert.assumptions
+    assert cert.obligation_key == evidence.obligation_key
+    assert cert.scheduling_key == evidence.scheduling_key
