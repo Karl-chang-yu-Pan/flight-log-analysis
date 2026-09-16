@@ -5695,7 +5695,8 @@ def test_certificate_ignores_unrelated_heuristic_evidence(tmp_path):
     assert result.refusal == "", f"unexpected refusal: {result.refusal}"
     assert result.certificate is not None
     assert result.certificate.boundary == ("src/lib/g.cpp",)
-    assert len(result.certificate.writers) == 1
+    assert len(result.certificate.writers) == 2, (
+        "merged heuristic evidence must not narrow the exhaustive census")
 
 
 def test_certificate_ignores_scheduling_state(tmp_path):
@@ -5841,12 +5842,13 @@ def test_certificate_internal_linkage_positive(tmp_path):
     assert cert.strategy == "storage-internal-only"
     assert cert.boundary == ("src/lib/g.cpp",)
     assert cert.examined == ("src/lib/g.cpp",)
-    assert list(cert.writers) == ["src/lib/g.cpp:13:25:init_declarator"]
-    # Per-file verdicts record the first admitted site: this file holds a
-    # second same-declaration writer (the function-body assignment) that
-    # the verdict list does not enumerate. Writer-list exhaustiveness
-    # remains a T6A-consumption gate; the certificate stays valid for the
-    # boundary it accounts for, never as a writer census.
+    assert sorted(cert.writers) == [
+        "src/lib/g.cpp:13:25:init_declarator",
+        "src/lib/g.cpp:40:52:assignment_expression",
+    ]
+    # Both same-declaration writers are enumerated: the initializer and
+    # the function-body assignment. Writer-list exhaustiveness for the
+    # closed boundary is now mechanical, not first-match.
     from flight_log_agent.analysis.mechanism_discovery import load_facts
     check_facts = load_facts(
         profiler, tmp_path / "cache_b", ["src/lib/g.cpp"], "hash")
@@ -6359,11 +6361,11 @@ def _derive_use_certificate(profiler, structure, reference, version=0):
 
 
 def test_applicability_coverage_alone_is_insufficient(tmp_path):
-    """B: a valid certificate naming exactly one covered writer still
-    proves nothing when the use's flow shows an unresolved placeholder
-    instead of that writer — the builder itself wires no producer when
-    two same-declaration writers compete, so coverage alone cannot pick
-    a winner."""
+    """B: a valid, now-exhaustive certificate still proves nothing when
+    the use's flow shows an unresolved placeholder instead of a wired
+    producer — the builder itself wires no producer when two
+    same-declaration writers compete, so coverage alone cannot pick a
+    winner."""
     from flight_log_agent.analysis.coverage import (
         APPLICABILITY_NO_POSITIVE_BASIS,
         derive_writer_applicability,
@@ -6385,8 +6387,8 @@ def test_applicability_coverage_alone_is_insufficient(tmp_path):
                      and item.kind == "storage_writers")
     cert = _derive_use_certificate(
         profiler, structure, reference, version=0)
-    assert len(cert.writers) == 1, (
-        "certificate undercounts the two real writers")
+    assert len(cert.writers) == 2, (
+        "exhaustive certificate must list both real writers")
     outcome = derive_writer_applicability(
         reference, use.id, operand, cert, dag, 0,
         conditional_writer_ids=())
@@ -6874,3 +6876,181 @@ def test_no_false_closed_empty_for_function_body_writer(tmp_path):
     assert result.certificate is not None
     assert result.certificate.writers != (), (
         "closed-empty must not certify while a real writer exists")
+
+
+# --- Pre-T6A: exhaustive writer census for closed boundaries ---
+
+def _two_writer_gain_tree(tmp_path):
+    """One closed file with two proven same-declaration writers: the
+    initializer and the function-body assignment."""
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/tw.cpp": (
+            "static int gain = 1;\nvoid update() { gain = 5; }\n"
+        ),
+    })
+    identity = inputs.structure.symbol_identity(
+        "gain", file="src/lib/tw.cpp",
+        callable_id=next(key for key, item in
+                         inputs.structure.callables_by_id.items()
+                         if item.get("name") == "update"),
+        function_name="update")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="gain", kind="storage_writers", file="src/lib/tw.cpp",
+        callable_id=identity.callable_id, identity=identity)
+    return profiler, inputs, reference
+
+
+def test_writer_census_lists_all_same_declaration_sites(tmp_path):
+    """RED1: the recorded census for a closed file must enumerate every
+    proven same-declaration writer site — initializer and function-body
+    assignment alike — not just the first exact match."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs, reference = _two_writer_gain_tree(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    assert len(evidence.attempts) == 1
+    census = dict(evidence.attempts[0].details.get("writer_census") or {})
+    assert set(census.get("src/lib/tw.cpp", ())) == {
+        "src/lib/tw.cpp:11:19:init_declarator",
+        "src/lib/tw.cpp:37:45:assignment_expression",
+    }
+
+
+def test_certificate_writers_are_exhaustive_for_closed_file(tmp_path):
+    """RED2 (T6A safety contract): certificate.writers must equal all
+    proven same-declaration writer sites inside the closed file — the
+    set T6A must preserve after retiring the obligation."""
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs, reference = _two_writer_gain_tree(tmp_path)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.refusal == "", result.refusal
+    assert result.certificate is not None
+    assert set(result.certificate.writers) == {
+        "src/lib/tw.cpp:11:19:init_declarator",
+        "src/lib/tw.cpp:37:45:assignment_expression",
+    }
+    # Legacy admission still selects the file once, first match first.
+    assert [item.file for item in
+            resolver.resolve(reference, inputs.structure)] == [
+        "src/lib/tw.cpp"]
+
+
+def test_writer_census_empty_for_writerless_closed_file(tmp_path):
+    """RED3: a supported census over a closed file with zero writers is
+    empty — and must not manufacture writers. Guards the census change
+    against over-collection."""
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/e.cpp": "static float kzero;\nvoid run() { (void)0; }\n",
+    })
+    identity = inputs.structure.symbol_identity(
+        "kzero", file="src/lib/e.cpp",
+        callable_id=next(key for key, item in
+                         inputs.structure.callables_by_id.items()
+                         if item.get("name") == "run"),
+        function_name="run")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="kzero", kind="storage_writers", file="src/lib/e.cpp",
+        callable_id=identity.callable_id, identity=identity)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    census = dict(evidence.attempts[0].details.get("writer_census") or {})
+    assert census == {"src/lib/e.cpp": []}, census
+    result = derive_writer_coverage_certificate(reference, evidence, 0)
+    assert result.refusal == "", result.refusal
+    assert result.certificate is not None
+    assert result.certificate.writers == ()
+
+
+def test_writer_census_excludes_unrelated_writers(tmp_path):
+    """RED4: one file holding writes to two distinct static globals —
+    the census for `gain` must include only proven `gain` writers, never
+    a file-wide indiscriminate collection."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/two.cpp": (
+            "static int gain;\nstatic int other;\n"
+            "void update() { gain = 5; other = 7; }\n"
+        ),
+    })
+    identity = inputs.structure.symbol_identity(
+        "gain", file="src/lib/two.cpp",
+        callable_id=next(key for key, item in
+                         inputs.structure.callables_by_id.items()
+                         if item.get("name") == "update"),
+        function_name="update")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="gain", kind="storage_writers", file="src/lib/two.cpp",
+        callable_id=identity.callable_id, identity=identity)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    candidates, evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    assert [item.file for item in candidates] == ["src/lib/two.cpp"]
+    census = dict(evidence.attempts[0].details.get("writer_census") or {})
+    assert set(census) == {"src/lib/two.cpp"}
+    assert len(census["src/lib/two.cpp"]) == 1
+    assert "other" not in str(census["src/lib/two.cpp"])
+
+
+def test_writer_census_isolates_same_spelling_declarations(tmp_path):
+    """RED5: same spelling under two proven declarations in different
+    files — each obligation's census contains only its own file's
+    writers. No spelling equality anywhere."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/g.cpp": "static int gain = 1;\nvoid run() { gain = 2; }\n",
+        "src/lib/h.cpp": "static int gain = 9;\nvoid other() { gain = 3; }\n",
+    })
+    resolver = SourceExpansionResolver(profiler, "hash")
+    seen: dict = {}
+    for filename, callable_name in (("src/lib/g.cpp", "run"),
+                                    ("src/lib/h.cpp", "other")):
+        identity = inputs.structure.symbol_identity(
+            "gain", file=filename,
+            callable_id=next(key for key, item in
+                             inputs.structure.callables_by_id.items()
+                             if item.get("name") == callable_name),
+            function_name=callable_name)
+        assert identity.declaration_proven
+        reference = UnresolvedSourceReference(
+            symbol="gain", kind="storage_writers", file=filename,
+            callable_id=identity.callable_id, identity=identity)
+        sink: list = []
+        candidates, evidence = resolver.resolve_with_evidence(
+            reference, inputs.structure, sink, universe_version=0)
+        assert [item.file for item in candidates] == [filename]
+        census = dict(
+            evidence.attempts[0].details.get("writer_census") or {})
+        assert set(census) == {filename}, census
+        seen[filename] = census[filename]
+    assert seen["src/lib/g.cpp"] != seen["src/lib/h.cpp"]
+    assert all("h.cpp" not in site for site in seen["src/lib/g.cpp"])
+    assert all("g.cpp" not in site for site in seen["src/lib/h.cpp"])

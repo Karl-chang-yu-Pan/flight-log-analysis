@@ -402,15 +402,20 @@ def derive_writer_coverage_certificate(
                        strategies=sorted(strategies))
 
     # Complete accounting over the certifying attempts: every examined
-    # file needs an explicit verdict. `exact:<site>` admits a writer of
-    # the requested declaration; the absence verdicts prove no writer
-    # form in that file (see _ABSENCE_VERDICTS). Anything else leaves a
-    # boundary member unaccounted for.
+    # file needs an explicit verdict backed by an exhaustive writer
+    # census. `exact:<site>` admits a writer of the requested
+    # declaration; the absence verdicts prove no writer form in that
+    # file (see _ABSENCE_VERDICTS). The census (all proven
+    # same-declaration sites per file, recorded at resolve time from
+    # full file facts) is what makes the writer set exhaustive: verdicts
+    # alone record only the first admitted site per file. Anything else
+    # leaves a boundary member unaccounted for.
     if any(attempt.strategy_class != CLASS_COMPLETE
            for attempt in certifying):
         return _refuse(REFUSAL_PARTIAL_DOMAIN, reason="strategy-class")
     examined: list = []
     verdicts: dict = {}
+    censuses: dict = {}
     for attempt in certifying:
         if attempt.outcome not in _ACCOUNTED_OUTCOMES:
             return _refuse(REFUSAL_UNEXAMINED_BOUNDARY_MEMBER,
@@ -420,16 +425,33 @@ def derive_writer_coverage_certificate(
             if examined_file not in examined:
                 examined.append(examined_file)
         verdicts.update((attempt.details or {}).get("file_verdicts") or {})
+        censuses.update(
+            (attempt.details or {}).get("writer_census") or {})
     if not examined:
         return _refuse(REFUSAL_UNEXAMINED_BOUNDARY_MEMBER,
                        reason="empty-examined-domain")
     writers: list = []
     for examined_file in examined:
         verdict = verdicts.get(examined_file, "")
+        if examined_file not in censuses:
+            # Evidence predating writer-census recording cannot prove
+            # exhaustiveness: refuse rather than fall back to the
+            # first-match verdict alone.
+            return _refuse(REFUSAL_UNEXAMINED_BOUNDARY_MEMBER,
+                           examined_file=examined_file,
+                           reason="missing-writer-census")
+        census = [str(site) for site in censuses[examined_file]]
         if verdict.startswith("exact:"):
-            writers.append(verdict[len("exact:"):])
+            site = verdict[len("exact:"):]
+            if site not in census:
+                return _refuse(REFUSAL_UNEXAMINED_BOUNDARY_MEMBER,
+                               examined_file=examined_file,
+                               reason="verdict-census-mismatch")
         elif verdict in _ABSENCE_VERDICTS:
-            continue
+            if census:
+                return _refuse(REFUSAL_UNEXAMINED_BOUNDARY_MEMBER,
+                               examined_file=examined_file,
+                               reason="verdict-census-mismatch")
         elif "multi-match" in verdict:
             return _refuse(REFUSAL_AMBIGUOUS_CANDIDATES,
                            examined_file=examined_file)
@@ -437,6 +459,7 @@ def derive_writer_coverage_certificate(
             return _refuse(REFUSAL_UNEXAMINED_BOUNDARY_MEMBER,
                            examined_file=examined_file,
                            verdict=verdict)
+        writers.extend(census)
 
     identity = getattr(obligation, "identity", None)
     declaration = (

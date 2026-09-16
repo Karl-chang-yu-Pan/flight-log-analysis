@@ -1715,6 +1715,22 @@ class SourceExpansionResolver:
                     for part in verdict.split(":", 1)[1].split(",")
                     if part
                 })
+            if strategy == STRATEGY_STORAGE_INTERNAL_ONLY:
+                # Coverage writer census: every proven same-declaration
+                # site per examined file, including files the admission
+                # index missed (their full facts still enumerate writer
+                # forms). Recorded for evidence only; candidate selection
+                # above is unchanged (first match still admits the file).
+                merged_details["writer_census"] = {
+                    examined_file: list(
+                        self._storage_writer_census(
+                            reference,
+                            self.facts_for(examined_file),
+                            structure,
+                        )
+                    )
+                    for examined_file in examined
+                }
             recorder.record(
                 strategy=strategy,
                 strategy_class=strategy_class,
@@ -2345,6 +2361,88 @@ class SourceExpansionResolver:
         if first_clause is not None:
             return "", f"incompatible:{first_clause}"
         return "", "no-bindings"
+
+    @staticmethod
+    def _storage_writer_census(
+        reference: UnresolvedSourceReference,
+        facts: SourceFileFacts,
+        structure: SourceStructureIndex,
+    ) -> tuple[str, ...]:
+        """All proven same-declaration writer sites in one file's facts.
+
+        Mirrors the storage-writers branch of `_exact_match` (same
+        candidate resolution including structure fallbacks, same site
+        minting, same `same_declaration_entity` predicate) but collects
+        every match instead of returning the first. The two must stay in
+        sync: admission selection keeps first-match behavior while this
+        census backs coverage completeness. Empty identities and empty
+        site strings never enter the census.
+        """
+        identity = reference.identity
+        if identity is None or not identity.declaration_proven:
+            return ()
+        sites: list[str] = []
+        for assignment in facts.source_assignments:
+            if assignment.target_identity is not None:
+                candidate = _source_symbol_identity(
+                    assignment.target_identity
+                ).model_copy(
+                    update={"symbol": exact_symbol(assignment.target)}
+                )
+            else:
+                candidate = structure.symbol_identity(
+                    assignment.target,
+                    file=assignment.file,
+                    callable_id=str(
+                        assignment.callable_id or assignment.function or ""
+                    ),
+                    function_name=str(assignment.function or ""),
+                    function_parameters=assignment.function_parameters,
+                    class_owner_hint=str(assignment.owner or ""),
+                )
+            if not candidate.declaration_proven:
+                candidate = structure.symbol_identity(
+                    assignment.target,
+                    file=assignment.file,
+                    callable_id=str(
+                        assignment.callable_id or assignment.function or ""
+                    ),
+                    function_name=str(assignment.function or ""),
+                    function_parameters=assignment.function_parameters,
+                    class_owner_hint=str(assignment.owner or ""),
+                )
+            if structure.same_declaration_entity(identity, candidate):
+                site = str(
+                    assignment.source_site_id or candidate.declaration_id
+                )
+                if site and site not in sites:
+                    sites.append(site)
+        for call in facts.function_calls:
+            owner = structure.callable_owner(
+                str(call.callable_id or ""), str(call.function or "")
+            )
+            for argument_index, expression_ref in enumerate(
+                call.argument_expressions
+            ):
+                for raw_identity in expression_ref.input_identities.values():
+                    candidate = _source_symbol_identity(raw_identity)
+                    if (
+                        not candidate.declaration_proven
+                        and argument_index < len(call.args)
+                    ):
+                        candidate = structure.symbol_identity(
+                            call.args[argument_index],
+                            file=call.file,
+                            callable_id=str(call.callable_id or ""),
+                            function_name=str(call.function or ""),
+                            class_owner_hint=owner,
+                        )
+                    if structure.same_declaration_entity(identity, candidate):
+                        site = str(
+                            call.source_site_id or call.callable_id or "")
+                        if site and site not in sites:
+                            sites.append(site)
+        return tuple(sites)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
