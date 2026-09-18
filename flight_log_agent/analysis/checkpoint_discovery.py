@@ -123,6 +123,256 @@ def observe_checkpoint_coverage(
     )
 
 
+@dataclass(frozen=True)
+class ProofAuthority:
+    """Stop-authority verdict for one checkpoint round (T6B).
+
+    Pure diagnostic value computed by `evaluate_proof_authority`:
+    `authorizes_stop` conjoins the legacy verified decision (computed
+    unchanged by the round) with proof conditions. Omitted proof
+    inputs (`gate_active` false, i.e. no proof version threaded) are
+    required proof absent, never a disengaged gate: non-empty
+    relevance vetoes stop, while an empty relevance set under a
+    non-degenerate scope follows the legacy verdict (the
+    genuinely-no-work path) with both positive verifications false,
+    so legacy callers observe zero change on that path only.
+    """
+
+    gate_active: bool
+    legacy_verified: bool
+    coverage_ok: bool
+    applicability_ok: bool
+    non_vacuous_ok: bool
+    writer_coverage_verified: bool
+    applicability_verified: bool
+    authorizes_stop: bool
+    uncovered_relevant: tuple = ()
+    missing_applicability_uses: tuple = ()
+    conflicting_applicability_uses: tuple = ()
+
+
+def _is_current_proof_certificate(
+    certificate: Any,
+    proof_version: Any,
+) -> bool:
+    """Whether a certificate is well-formed and current-versioned.
+
+    Mirrors the currency/intactness rule `observe_checkpoint_coverage`
+    applies when associating coverage (same rule, pointed here rather
+    than refactored, so T4 observation behavior stays frozen): a
+    version match plus non-empty obligation and boundary identity.
+    Scheduling-key association happens at the call site.
+    """
+    return (
+        getattr(certificate, "version", None) == proof_version
+        and bool(getattr(certificate, "obligation_key", None))
+        and bool(getattr(certificate, "boundary", None))
+    )
+
+
+def collect_applicability_uses(
+    references: Any,
+    local_needs: Any,
+) -> tuple:
+    """Concrete (use, obligation) pairs for applicability matching.
+
+    A use is an (origin vertex, operand) pair; its obligation is the
+    scheduling visit key it was derived alongside. Reference origins
+    and operands accumulate independently upstream, so the pairing is
+    the conservative cartesian product (extra pairs fail closed: an
+    unprovable pair vetoes). Local needs contribute exact
+    (vertex, operand) pairs bound to each attached request. Empty
+    origins/operands contribute nothing: a use without a concrete
+    vertex and operand cannot govern a value. Order-preserving,
+    deduplicated.
+    """
+    uses: list = []
+
+    def _add(use: Any, obligation: Any) -> None:
+        entry = (tuple(use), tuple(obligation))
+        if entry not in uses:
+            uses.append(entry)
+
+    for reference in references or ():
+        try:
+            visit = tuple(reference.visit_key())
+        except (AttributeError, TypeError, ValueError):
+            continue
+        origins = list(getattr(reference, "origin_vertex_ids", None) or ())
+        operands = list(getattr(reference, "origin_operands", None) or ())
+        for origin in origins:
+            for operand in operands:
+                if origin and operand:
+                    _add((origin, operand), visit)
+    for need in local_needs or ():
+        if not isinstance(need, dict):
+            continue
+        vertex = need.get("vertex_id") or ""
+        operand = need.get("operand") or ""
+        if not vertex or not operand:
+            continue
+        for raw in need.get("source_requests", None) or ():
+            try:
+                visit = UnresolvedSourceReference.model_validate(
+                    raw).visit_key()
+            except (AttributeError, TypeError, ValueError):
+                continue
+            _add((vertex, operand), visit)
+    return tuple(uses)
+
+
+def evaluate_proof_authority(
+    *,
+    observation: Any,
+    certificates: Any = (),
+    applicability_proofs: Any = (),
+    proof_version: Any = None,
+    legacy_verified: bool = False,
+    applicability_uses: Any = (),
+) -> ProofAuthority:
+    """Decide stop authority from legacy verdict plus proof state.
+
+    Pure function: `stop = legacy AND coverage AND applicability AND
+    non-vacuity`. Coverage requires every relevant obligation
+    currently covered; applicability requires every use of a covered
+    obligation to hold a current proof bound to the same use,
+    scheduling visit, obligation, and writer set; non-vacuity requires
+    a non-empty relevance set, or an empty one only under a
+    non-degenerate scope (the genuinely-no-work path, which defers to
+    legacy). Omitted proof inputs (`proof_version` None) are required
+    proof absent, never a disengaged gate: non-empty relevance vetoes,
+    empty non-degenerate scope follows legacy, degenerate scope vetoes.
+    """
+    legacy = bool(legacy_verified)
+    gate_active = proof_version is not None
+    relevant = list(getattr(observation, "relevant_obligation_keys", None)
+                    or ())
+    observed_covered = set(
+        getattr(observation, "covered_obligation_keys", None) or ())
+    # Without a proof version no certificate can be current: coverage
+    # claims from another version never carry authority.
+    covered = observed_covered if proof_version is not None else set()
+    uncovered = [key for key in relevant if key not in covered]
+    degenerate = bool(getattr(observation, "scope_degenerate", False))
+    non_vacuous_ok = bool(relevant) or not degenerate
+    coverage_ok = not uncovered
+    writer_coverage_verified = bool(relevant) and coverage_ok
+    if proof_version is None:
+        current_certs: list = []
+        current_proofs: list = []
+    else:
+        current_certs = [
+            certificate for certificate in certificates or ()
+            if _is_current_proof_certificate(certificate, proof_version)
+        ]
+        current_proofs = [
+            proof for proof in applicability_proofs or ()
+            if getattr(proof, "version", None) == proof_version
+        ]
+
+    def _certs_for(obligation_visit: Any) -> list:
+        try:
+            wanted = tuple(obligation_visit)
+        except TypeError:
+            return []
+        return [
+            certificate for certificate in current_certs
+            if tuple(getattr(certificate, "scheduling_key", None) or ())
+            == wanted
+        ]
+
+    def _proofs_for(use: Any, obligation_visit: Any) -> list:
+        """Candidate proofs for one concrete scheduled use.
+
+        Coverage may be shared across visits; applicability may not:
+        the proof's scheduling key must equal the required visit (same
+        call scope), alongside use, version, obligation, and writer
+        bindings checked by `_matched_pairs`. Basis labels play no
+        role: distinct positive bases corroborate one claim.
+        """
+        try:
+            visit = tuple(obligation_visit)
+        except TypeError:
+            return []
+        return [
+            proof for proof in current_proofs
+            if tuple(getattr(proof, "use_key", None) or ()) == tuple(use)
+            and tuple(getattr(proof, "scheduling_key", None) or ())
+            == visit
+        ]
+
+    def _matched_pairs(use: Any, obligation_visit: Any) -> list:
+        """Distinct (obligation, writers) pairs bound to current proof.
+
+        A pair counts only when some current certificate for the visit
+        carries the same obligation with the same writer set. Proofs
+        that mismatch version, scheduling, obligation, or writers are
+        irrelevant to this claim and ignored — they neither satisfy
+        nor conflict.
+        """
+        try:
+            visit = tuple(obligation_visit)
+        except TypeError:
+            return []
+        matched: list = []
+        for proof in _proofs_for(use, visit):
+            pair = (
+                tuple(getattr(proof, "obligation_key", None) or ()),
+                tuple(getattr(proof, "writers", None) or ()),
+            )
+            if pair in matched:
+                continue
+            if any(
+                tuple(getattr(certificate, "obligation_key", None) or ())
+                == pair[0]
+                and set(getattr(certificate, "writers", None) or ())
+                == set(pair[1])
+                and tuple(
+                    getattr(certificate, "scheduling_key", None) or ())
+                == visit
+                for certificate in _certs_for(visit)
+            ):
+                matched.append(pair)
+        return matched
+
+    def _use_proven(use: Any, obligation_visit: Any) -> bool:
+        return bool(_matched_pairs(use, obligation_visit))
+
+    required = [use for use, visit in (applicability_uses or ())
+                if tuple(visit) in covered]
+    missing = [
+        use for use, visit in (applicability_uses or ())
+        if tuple(visit) in covered
+        and not _use_proven(use, visit)
+    ]
+    conflicting: list = []
+    for use, visit in (applicability_uses or ()):
+        # Only otherwise-binding proofs participate: distinct valid
+        # (obligation, writers) claims for one scheduled use are
+        # genuinely ambiguous and veto. Irrelevant proofs never reach
+        # `_matched_pairs`, and basis labels are not compared.
+        if len(_matched_pairs(use, visit)) > 1 \
+                and tuple(use) not in conflicting:
+            conflicting.append(tuple(use))
+    applicability_ok = not missing and not conflicting
+    applicability_verified = bool(required) and applicability_ok
+    authorizes_stop = bool(
+        legacy and coverage_ok and applicability_ok and non_vacuous_ok)
+    return ProofAuthority(
+        gate_active=bool(gate_active),
+        legacy_verified=legacy,
+        coverage_ok=bool(coverage_ok),
+        applicability_ok=bool(applicability_ok),
+        non_vacuous_ok=bool(non_vacuous_ok),
+        writer_coverage_verified=bool(writer_coverage_verified),
+        applicability_verified=bool(applicability_verified),
+        authorizes_stop=bool(authorizes_stop),
+        uncovered_relevant=tuple(uncovered),
+        missing_applicability_uses=tuple(missing),
+        conflicting_applicability_uses=tuple(conflicting),
+    )
+
+
 @dataclass
 class CheckpointRound:
     action: Literal["continue", "verified", "unresolved"]
@@ -135,6 +385,10 @@ class CheckpointRound:
     # threaded proof state. Never influences scheduling, requirements,
     # flags, or stop. Kept off `summary` so no report/schema field moves.
     proof_observation: Optional[CheckpointProofObservation] = None
+    # Proof-authority verdict (T6B). Always attached; kept off `summary`
+    # like proof observation. Only this field (via the gated `verified`
+    # decision) may authorize stop, and only under the full conjunction.
+    proof_authority: Optional[ProofAuthority] = None
 
 
 def evaluate_checkpoint_round(
@@ -148,6 +402,7 @@ def evaluate_checkpoint_round(
     question_target: Optional[str] = None,
     coverage_certificates: Sequence[Any] = (),
     proof_version: Any = None,
+    applicability_proofs: Sequence[Any] = (),
 ) -> CheckpointRound:
     """Preflight first, evaluate ready gates, replay, then select exact needs.
 
@@ -158,6 +413,12 @@ def evaluate_checkpoint_round(
     record-only observation: relevance and coverage bookkeeping are computed
     diagnostically and cannot change scheduling, requirements, flags, or
     stop. Omitting them computes the same relevance with empty coverage.
+    `applicability_proofs` threads T5 proofs for the stop-authority gate:
+    stop additionally requires every required concrete use to hold a
+    current proof bound to the same use, visit, obligation, and writer
+    set. Omitted proof inputs are required proof absent: non-empty
+    relevance vetoes stop, while empty non-degenerate scope follows
+    the legacy verdict.
     """
     all_groups = observed_checkpoint_roots(dag)
     groups = all_groups
@@ -235,15 +496,12 @@ def evaluate_checkpoint_round(
         prepared_signal_series=prepared,
     )
     selected = next(iter(checkpoints.values())) if len(checkpoints) == 1 else None
-    verified = bool(
+    legacy_verified = bool(
         selected and selected["observed"] and selected["status"] == "matched"
         and selected["complete"] and not selected["analysis_requirements"]
         and not selected["source_requests"]
         and not any(item["status"] == "mismatched" for item in intermediates.values())
     )
-    if verified:
-        selected["authorizes_discovery_stop"] = True
-        selected["verification_scope"] = "questioned_signal" if question_target is not None else "terminal"
     wanted = {UnresolvedSourceReference.model_validate(raw).visit_key()
               for checkpoint in checkpoints.values() for raw in checkpoint["source_requests"]}
     references = [r for r in dag.unresolved_references if r.visit_key() in wanted]
@@ -297,13 +555,13 @@ def evaluate_checkpoint_round(
         materialize=frozenset(materialize),
         inactive=frozenset(inactive),
     )
-    action = "verified" if verified else "continue" if next_references or materialize else "unresolved"
-    # Record-only proof observation (T4 F1): relevance comes from the
-    # pre-filter `references` base above UNION the active local-request
-    # obligations below — never from the exhausted- or queue-filtered
-    # views — so filtering cannot erase relevance. Local needs attach
-    # obligations (e.g. by exact declaration identity) that the
-    # checkpoint-wanted set may omit; those obligations still
+    # Record-only proof observation (T4 F1), computed here (before the
+    # stop decision) so the authority gate can consume it: relevance
+    # comes from the pre-filter `references` base above UNION the active
+    # local-request obligations below — never from the exhausted- or
+    # queue-filtered views — so filtering cannot erase relevance. Local
+    # needs attach obligations (e.g. by exact declaration identity) that
+    # the checkpoint-wanted set may omit; those obligations still
     # participate in this round's analysis and must stay visible to
     # proof. Reads only; scheduling, requirements, flags, and stop are
     # already decided and untouched below.
@@ -324,6 +582,25 @@ def evaluate_checkpoint_round(
         ),
         scope_degenerate=not roots,
     )
+    # Proof-gated stop authority (T6B): the legacy verified decision
+    # above is necessary but no longer sufficient on its own. Stop
+    # additionally requires the proof conjunction; omitted proof inputs
+    # count as required proof absent (non-empty relevance vetoes, empty
+    # non-degenerate scope follows legacy).
+    proof_authority = evaluate_proof_authority(
+        observation=proof_observation,
+        certificates=coverage_certificates,
+        applicability_proofs=applicability_proofs,
+        proof_version=proof_version,
+        legacy_verified=legacy_verified,
+        applicability_uses=collect_applicability_uses(
+            relevance_references, local_needs),
+    )
+    verified = legacy_verified and proof_authority.authorizes_stop
+    if verified:
+        selected["authorizes_discovery_stop"] = True
+        selected["verification_scope"] = "questioned_signal" if question_target is not None else "terminal"
+    action = "verified" if verified else "continue" if next_references or materialize else "unresolved"
     updates = {v.id: v for v in annotated_view.vertices}
     annotated = dag.model_copy(update={"vertices": [updates.get(v.id, v) for v in dag.vertices]})
     return CheckpointRound(action, annotated, next_references, {
@@ -342,4 +619,5 @@ def evaluate_checkpoint_round(
         "dynamic_gate_count": len(ready),
         "pending_construction_count": len(dag.pending_construction),
         "reason": "source-backed checkpoint verified" if verified else "checkpoint has outstanding analysis requirements",
-    }, construction=construction, proof_observation=proof_observation)
+    }, construction=construction, proof_observation=proof_observation,
+        proof_authority=proof_authority)

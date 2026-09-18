@@ -7907,14 +7907,14 @@ def _opaque_member_obligation(tmp_path):
     return dag, samples, reference
 
 
-def _run_proof_round(dag, samples):
+def _run_proof_round(dag, samples, **kwargs):
     from flight_log_agent.analysis.checkpoint_discovery import (
         evaluate_checkpoint_round,
     )
     return evaluate_checkpoint_round(
         dag, parameter_values={}, observed_signals=set(samples),
         signal_policies={s: {"method": "linear"} for s in samples},
-        load_samples=lambda *_: samples)
+        load_samples=lambda *_: samples, **kwargs)
 
 
 def test_local_only_obligation_enters_proof_relevance(tmp_path):
@@ -8084,3 +8084,909 @@ def test_vacuity_flip_keeps_behavior(tmp_path):
     assert selected.get("authorizes_discovery_stop", False) is False
     assert selected.get("writer_coverage_verified", False) is False
     assert selected.get("applicability_verified", False) is False
+
+
+# --- T6B: checkpoint-owned discovery stop authority ---
+
+def _proof_observation(relevant=(), covered=(), proof_version=0,
+                       degenerate=False):
+    """Hand-built observation for authority-logic pins: the T4 helper
+    contract makes these shapes producible, so the truth table tests
+    the conjunction, not the plumbing."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        CheckpointProofObservation,
+    )
+    relevant = tuple(relevant)
+    covered = tuple(k for k in covered if k in set(relevant))
+    uncovered = tuple(k for k in relevant if k not in set(covered))
+    return CheckpointProofObservation(
+        relevant_obligation_keys=relevant,
+        covered_obligation_keys=covered,
+        uncovered_obligation_keys=uncovered,
+        filtered_obligation_keys=(),
+        stale_certificate_keys=(),
+        covered_semantic_keys=tuple(("sem", k) for k in covered),
+        proof_version=proof_version,
+        scope_degenerate=bool(degenerate),
+        relevant_empty=not relevant,
+    )
+
+
+def _authority(**overrides):
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        evaluate_proof_authority,
+    )
+    arguments = dict(
+        observation=_proof_observation(),
+        certificates=(),
+        applicability_proofs=(),
+        proof_version=0,
+        legacy_verified=False,
+        applicability_uses=(),
+    )
+    arguments.update(overrides)
+    return evaluate_proof_authority(**arguments)
+
+
+def _proof_pair(use, visit, semantic, writers=("w:1",), version=0):
+    """Matching hand-built certificate + applicability proof with fully
+    consistent keys: the mechanism under test is combination logic, and
+    frozen value construction keeps every binding explicit."""
+    from flight_log_agent.analysis.coverage import (
+        WriterApplicabilityProof,
+        WriterCoverageCertificate,
+    )
+    certificate = WriterCoverageCertificate(
+        obligation_key=tuple(semantic),
+        scheduling_key=tuple(visit),
+        declaration=("global", semantic[2] if len(semantic) > 2 else "",
+                     "signal"),
+        receiver_context=("", "", ""),
+        strategy="storage-internal-only",
+        boundary=("src/lib/sg.cpp",),
+        examined=("src/lib/sg.cpp",),
+        version=version,
+        assumptions=("file-linkage-closed",
+                     "writer-syntax-enumerated"),
+        writers=tuple(writers),
+    )
+    proof = WriterApplicabilityProof(
+        use_key=tuple(use),
+        scheduling_key=tuple(visit),
+        obligation_key=tuple(semantic),
+        declaration=("global", semantic[2] if len(semantic) > 2 else "",
+                     "signal"),
+        writers=tuple(writers),
+        producer_vertex="op-producer",
+        basis="single-exact-producer",
+        supporting_facts=("use:op", "producer:op-producer"),
+        version=version,
+        receiver_context=("", "", ""),
+    )
+    return certificate, proof
+
+
+def test_proof_authority_full_conjunction_authorizes():
+    """A-logic: legacy verified + non-empty relevance + full coverage +
+    full applicability + non-degenerate scope authorizes stop. This pins
+    the gate LOGIC with explicit inputs; see the report on why no
+    natural single-round fixture satisfies it (STOP-B analysis)."""
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[proof], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.legacy_verified is True
+    assert authority.coverage_ok is True
+    assert authority.applicability_ok is True
+    assert authority.non_vacuous_ok is True
+    assert authority.writer_coverage_verified is True
+    assert authority.applicability_verified is True
+    assert authority.authorizes_stop is True
+
+
+def test_proof_authority_missing_applicability_vetoes():
+    """B-logic: full coverage with no applicability proof for the
+    required use vetoes stop while coverage stays true."""
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, _proof = _proof_pair(use, key, semantic)
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.coverage_ok is True
+    assert authority.writer_coverage_verified is True
+    assert authority.applicability_ok is False
+    assert authority.applicability_verified is False
+    assert authority.authorizes_stop is False
+
+
+def test_proof_authority_incomplete_coverage_vetoes():
+    """C-logic: applicability proofs cannot rescue missing coverage."""
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[])
+    certificate, proof = _proof_pair(use, key, semantic)
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[proof], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.coverage_ok is False
+    assert authority.writer_coverage_verified is False
+    assert authority.authorizes_stop is False
+
+
+def test_proof_authority_inactive_defers_to_legacy():
+    """Omitted proof version with empty relevance (the default
+    observation here) follows legacy exactly via the §9
+    genuinely-no-work path — proving nothing. Non-empty relevance
+    with omitted proof vetoes instead (see omitted_proof_vetoes)."""
+    for legacy in (False, True):
+        authority = _authority(proof_version=None,
+                               legacy_verified=legacy)
+        assert authority.gate_active is False
+        assert authority.writer_coverage_verified is False
+        assert authority.applicability_verified is False
+        assert authority.authorizes_stop is legacy
+
+
+def test_proof_authority_vacuous_preserves_legacy():
+    """Vacuous relevance (nothing to prove) with a non-degenerate scope
+    follows legacy: True stays True (T4 G-shape compatibility)."""
+    observation = _proof_observation(relevant=[])
+    authority = _authority(observation=observation, legacy_verified=True)
+    assert authority.coverage_ok is True
+    assert authority.non_vacuous_ok is True
+    assert authority.writer_coverage_verified is False
+    assert authority.authorizes_stop is True
+
+
+def test_proof_authority_degenerate_vetoes():
+    """Degenerate scope authorizes nothing, even with legacy verified
+    and vacuous relevance: fail closed on unknowable scope."""
+    observation = _proof_observation(relevant=[], degenerate=True)
+    authority = _authority(observation=observation, legacy_verified=True)
+    assert authority.non_vacuous_ok is False
+    assert authority.authorizes_stop is False
+    assert authority.writer_coverage_verified is False
+
+
+def test_round_degenerate_scope_vetoes_despite_proof_inputs():
+    """N: a rootless degenerate round cannot authorize stop even with
+    threaded proof state — non-vacuity fails closed."""
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    def expression(text, *inputs):
+        return {"text": text, "lowered_text": text,
+                "input_symbols": list(inputs),
+                "input_identities": {}, "call_results": [], "exact": True}
+
+    bindings = [
+        {"target_symbol": "sample", "source_symbol": "measurement.value",
+         "external_source_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "subscribe",
+         "expression_ref": expression("measurement.value", "measurement.value"),
+         "assignment_path": [{"file": "s.cpp", "line": 1}],
+         "function": "f"},
+        {"target_symbol": "orphan", "source_symbol": "sample",
+         "expression_ref": expression("sample", "sample"),
+         "assignment_path": [{"file": "s.cpp", "line": 2}],
+         "function": "f"},
+    ]
+    dag = build_mechanism_dag(bindings, "missing-terminal",
+                              logged_signals=set())
+    result = _run_proof_round(dag, {}, proof_version=0)
+    assert result.proof_observation is not None
+    assert result.proof_observation.scope_degenerate is True
+    assert result.proof_authority is not None
+    assert result.proof_authority.gate_active is True
+    assert result.proof_authority.non_vacuous_ok is False
+    assert result.proof_authority.authorizes_stop is False
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("authorizes_discovery_stop", False) is False
+
+
+def test_round_conflicting_proofs_listed_without_authority(tmp_path):
+    """Two rival VALID bindings for one scheduled use are both recorded
+    as conflicting and authorize nothing. (Finding 6: each rival
+    matches its own current certificate for the same visit with a
+    different writer set — genuine ambiguity. A rival matching no
+    current certificate would be ignored instead.)"""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    key = reference.visit_key()
+    use = (root.id, "sample")
+    semantic = ("storage_writers", "member", "decl:x")
+    certificate, proof = _t6b_hand_proof(use, key, semantic)
+    rival_certificate, rival = _t6b_hand_proof(
+        use, key, semantic, writers=("other-site",))
+    from dataclasses import replace
+    rival = replace(rival, basis="guard-exact-producer")
+    result = _run_t6b_round(
+        dag, samples, policies,
+        coverage_certificates=[certificate, rival_certificate],
+        proof_version=0, applicability_proofs=[proof, rival])
+    assert result.proof_authority is not None
+    assert result.proof_authority.conflicting_applicability_uses == (
+        tuple(use),)
+    assert result.proof_authority.applicability_ok is False
+    assert result.proof_authority.authorizes_stop is False
+
+
+def test_round_local_obligation_uncovered_vetoes_silently(tmp_path):
+    """E-authority: an F1 local-only obligation with no certificate is
+    uncovered; authority records it without disturbing the round."""
+    dag, samples, reference = _opaque_member_obligation(tmp_path)
+    reference.origin_vertex_ids = ["elsewhere-outside-closure"]
+    result = _run_proof_round(dag, samples, proof_version=0)
+    key = reference.visit_key()
+    assert result.proof_authority is not None
+    assert result.proof_authority.gate_active is True
+    assert key in result.proof_authority.uncovered_relevant
+    assert result.proof_authority.coverage_ok is False
+    assert result.proof_authority.authorizes_stop is False
+    assert result.action != "verified"
+
+
+def test_round_exhausted_covered_obligation_ignores_queue(tmp_path):
+    """Q-analog: an exhausted (unscheduled) obligation with a current
+    certificate is still covered — authority follows proof, and the
+    legacy-dirty round still refuses stop for its own reasons."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    key = reference.visit_key()
+    dag.exhausted_source_requests.add(key)
+    semantic = ("storage_writers", "member", "decl:x")
+    use = (root.id, "sample")
+    certificate, proof = _t6b_hand_proof(use, key, semantic)
+    result = _run_t6b_round(
+        dag, samples, policies, coverage_certificates=[certificate],
+        proof_version=0, applicability_proofs=[proof])
+    assert key not in [item.visit_key() for item in result.references]
+    assert key in result.proof_observation.relevant_obligation_keys
+    assert key in result.proof_observation.covered_obligation_keys
+    assert result.proof_authority is not None
+    assert result.proof_authority.coverage_ok is True
+    assert result.proof_authority.authorizes_stop is False
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("authorizes_discovery_stop", False) is False
+
+
+def test_proof_authority_stale_applicability_refuses():
+    """H: coverage current but the only applicability proof is old —
+    applicability stays false and stop stays false."""
+    from dataclasses import replace
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    stale_proof = replace(proof, version=99)
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[stale_proof], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.coverage_ok is True
+    assert authority.writer_coverage_verified is True
+    assert authority.applicability_ok is False
+    assert authority.missing_applicability_uses == (tuple(use),)
+    assert authority.authorizes_stop is False
+
+
+def test_proof_authority_writer_set_mismatch_refuses():
+    """I: the applicability proof binds a different writer set than the
+    current certificate — no valid pair exists, so the use is unproven."""
+    from dataclasses import replace
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    skewed = replace(proof, writers=("other-site",))
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[skewed], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.applicability_ok is False
+    assert authority.missing_applicability_uses == (tuple(use),)
+    assert authority.authorizes_stop is False
+
+
+def test_proof_authority_conflicting_proofs_fail_closed():
+    """Two distinct VALID bindings for one scheduled use conflict:
+    each proof matches its own current certificate for the same visit
+    with a different writer set, so neither is trusted, while
+    byte-identical duplicates merge silently. (Finding 6: conflict is
+    scoped to otherwise-binding proofs; basis labels are not
+    compared. A rival that matches no current certificate is simply
+    ignored — see irrelevant_rival_ignored.)"""
+    from dataclasses import replace
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    rival_certificate, rival = _proof_pair(
+        use, key, semantic, writers=("other-site",))
+    rival = replace(rival, basis="guard-exact-producer")
+    conflicted = _authority(
+        observation=observation,
+        certificates=[certificate, rival_certificate],
+        applicability_proofs=[proof, rival], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert conflicted.conflicting_applicability_uses == (tuple(use),)
+    assert conflicted.applicability_ok is False
+    assert conflicted.authorizes_stop is False
+    assert conflicted.conflicting_applicability_uses == (tuple(use),)
+    assert conflicted.applicability_ok is False
+    assert conflicted.authorizes_stop is False
+    duet = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[proof, proof], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert duet.conflicting_applicability_uses == ()
+    assert duet.applicability_ok is True
+    assert duet.authorizes_stop is True
+
+
+def test_proof_authority_split_use_isolation():
+    """F: one shared certificate, two uses — the proven use does not
+    carry the unproven one. Applicability stays per-use."""
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use_a = ("op-a", "signal-a")
+    use_b = ("op-b", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof_a = _proof_pair(use_a, key, semantic)
+    split = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[proof_a], legacy_verified=True,
+        applicability_uses=[(use_a, key), (use_b, key)])
+    assert split.applicability_ok is False
+    assert split.missing_applicability_uses == (tuple(use_b),)
+    assert split.authorizes_stop is False
+    whole = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[
+            proof_a,
+            _proof_pair(use_b, key, semantic)[1],
+        ],
+        legacy_verified=True,
+        applicability_uses=[(use_a, key), (use_b, key)])
+    assert whole.applicability_ok is True
+    assert whole.authorizes_stop is True
+
+
+def test_proof_authority_multi_obligation_conjunction():
+    """Two covered obligations, each with its own use: every use must
+    prove — no any() semantics over uses or obligations."""
+    key_a = ("storage_writers", "global", "decl-a")
+    key_b = ("storage_writers", "global", "decl-b")
+    semantic_a = ("storage_writers", "global", "decl-a")
+    semantic_b = ("storage_writers", "global", "decl-b")
+    use_a = ("op-a", "signal-a")
+    use_b = ("op-b", "signal-b")
+    observation = _proof_observation(
+        relevant=[key_a, key_b], covered=[key_a, key_b])
+    certificate_a, proof_a = _proof_pair(use_a, key_a, semantic_a)
+    certificate_b, _proof_b = _proof_pair(use_b, key_b, semantic_b)
+    half = _authority(
+        observation=observation,
+        certificates=[certificate_a, certificate_b],
+        applicability_proofs=[proof_a], legacy_verified=True,
+        applicability_uses=[(use_a, key_a), (use_b, key_b)])
+    assert half.coverage_ok is True
+    assert half.applicability_ok is False
+    assert half.missing_applicability_uses == (tuple(use_b),)
+    assert half.authorizes_stop is False
+
+
+def test_collect_applicability_uses():
+    """Use assembly: reference origins × operands plus exact local-need
+    pairs, deduplicated, skipping origin-less/operand-less entries."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        collect_applicability_uses,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="gain", kind="storage_writers",
+        origin_vertex_ids=["op-a", "op-b"],
+        origin_operands=["signal-a", ""],
+        identity={"kind": "global", "symbol": "gain", "root": "gain",
+                  "file": "s.cpp", "declaration_id": "global:decl",
+                  "declaration_proven": True})
+    assert collect_applicability_uses([reference], []) == (
+        ((("op-a", "signal-a"), reference.visit_key()),
+         (("op-b", "signal-a"), reference.visit_key())))
+    needs = [{"vertex_id": "op-need", "operand": "signal-n",
+              "source_requests": []}]
+    assert collect_applicability_uses([], needs) == ()
+    assert collect_applicability_uses([], []) == ()
+
+
+def _t6b_round_dag():
+    """Hand DAG mirroring the checkpoint-controller fixture shape, with
+    samples that verify the terminal when nothing is unresolved."""
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    def expression(text, *inputs):
+        return {"text": text, "lowered_text": text,
+                "input_symbols": list(inputs),
+                "input_identities": {}, "call_results": [], "exact": True}
+
+    bindings = [
+        {"target_symbol": "sample", "source_symbol": "measurement.value",
+         "external_source_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "subscribe",
+         "expression_ref": expression("measurement.value", "measurement.value"),
+         "assignment_path": [{"file": "sample.cpp", "line": 2}],
+         "function": "Controller::step"},
+        {"target_symbol": "command.value", "source_symbol": "sample * 2.0",
+         "external_target_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "publish",
+         "expression_ref": expression("sample * 2.0", "sample"),
+         "assignment_path": [{"file": "sample.cpp", "line": 3}],
+         "function": "Controller::step"},
+    ]
+    samples = {"measurement.value": [(0.0, 3.0), (10.0, 3.0)],
+               "command.value": [(0.0, 6.0), (10.0, 6.0)]}
+    policies = {signal: {"method": "linear"} for signal in samples}
+    dag = build_mechanism_dag(bindings, "command.value",
+                              logged_signals=set(samples))
+    return dag, samples, policies
+
+
+def _run_t6b_round(dag, samples, policies, **kwargs):
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        evaluate_checkpoint_round,
+    )
+    return evaluate_checkpoint_round(
+        dag, parameter_values={}, observed_signals=set(samples),
+        signal_policies=policies,
+        load_samples=lambda _view, _observed: samples, **kwargs)
+
+
+def _t6b_hand_proof(use, visit, semantic, writers=("w:1",), version=0):
+    """Mechanism-test proof/cert pair with fully controlled keys (the
+    combination logic is under test, not derivation)."""
+    from flight_log_agent.analysis.coverage import (
+        WriterApplicabilityProof,
+        WriterCoverageCertificate,
+    )
+    certificate = WriterCoverageCertificate(
+        obligation_key=tuple(semantic),
+        scheduling_key=tuple(visit),
+        declaration=("global", semantic[2] if len(semantic) > 2 else "",
+                     "signal"),
+        receiver_context=("", "", ""),
+        strategy="storage-internal-only",
+        boundary=("src/lib/sg.cpp",),
+        examined=("src/lib/sg.cpp",),
+        version=version,
+        assumptions=("file-linkage-closed",
+                     "writer-syntax-enumerated"),
+        writers=tuple(writers),
+    )
+    proof = WriterApplicabilityProof(
+        use_key=tuple(use),
+        scheduling_key=tuple(visit),
+        obligation_key=tuple(semantic),
+        declaration=("global", semantic[2] if len(semantic) > 2 else "",
+                     "signal"),
+        writers=tuple(writers),
+        producer_vertex="op-producer",
+        basis="single-exact-producer",
+        supporting_facts=("use:op",),
+        version=version,
+        receiver_context=("", "", ""),
+    )
+    return certificate, proof
+
+
+def _t6b_round_dag():
+    """Hand DAG mirroring the checkpoint-controller shape for authority
+    round tests (no mini-tree needed; obligation refs are appended)."""
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    def expression(text, *inputs):
+        return {"text": text, "lowered_text": text,
+                "input_symbols": list(inputs),
+                "input_identities": {}, "call_results": [], "exact": True}
+
+    bindings = [
+        {"target_symbol": "sample", "source_symbol": "measurement.value",
+         "external_source_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "subscribe",
+         "expression_ref": expression("measurement.value", "measurement.value"),
+         "assignment_path": [{"file": "sample.cpp", "line": 2}],
+         "function": "Controller::step"},
+        {"target_symbol": "command.value", "source_symbol": "sample * 2.0",
+         "external_target_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "publish",
+         "expression_ref": expression("sample * 2.0", "sample"),
+         "assignment_path": [{"file": "sample.cpp", "line": 3}],
+         "function": "Controller::step"},
+    ]
+    samples = {"measurement.value": [(0.0, 3.0), (10.0, 3.0)],
+               "command.value": [(0.0, 6.0), (10.0, 6.0)]}
+    policies = {signal: {"method": "linear"} for signal in samples}
+    dag = build_mechanism_dag(bindings, "command.value",
+                              logged_signals=set(samples))
+    return dag, samples, policies
+
+
+def _run_t6b_round(dag, samples, policies, **kwargs):
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        evaluate_checkpoint_round,
+    )
+    return evaluate_checkpoint_round(
+        dag, parameter_values={}, observed_signals=set(samples),
+        signal_policies=policies,
+        load_samples=lambda _view, _observed: samples, **kwargs)
+
+
+def test_round_legacy_false_dominates_full_proof():
+    """O: legacy-verified False with complete threaded proof still
+    refuses — the gate adds conjuncts, never removes the legacy one."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    key = reference.visit_key()
+    semantic = ("storage_writers", "member", "decl:x")
+    use = (root.id, "sample")
+    certificate, proof = _t6b_hand_proof(use, key, semantic)
+    result = _run_t6b_round(
+        dag, samples, policies, coverage_certificates=[certificate],
+        proof_version=0, applicability_proofs=[proof])
+    assert result.action != "verified"
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("authorizes_discovery_stop", False) is False
+    authority = result.proof_authority
+    assert authority is not None
+    assert authority.legacy_verified is False
+    assert authority.coverage_ok is True
+    assert authority.applicability_ok is True
+    assert authority.writer_coverage_verified is True
+    assert authority.applicability_verified is True
+    assert authority.authorizes_stop is False
+
+
+def test_round_pending_construction_blocks_with_full_proof():
+    """P: an unresolved construction requirement blocks stop even when
+    coverage and applicability both prove — flags never imply stop."""
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    dag.pending_construction = [root.id]
+    result = _run_t6b_round(
+        dag, samples, policies)
+    assert result.action != "verified"
+    assert result.proof_authority is not None
+    assert result.proof_authority.legacy_verified is False
+    assert result.proof_authority.authorizes_stop is False
+
+
+def test_round_exhausted_without_proof_stays_unresolved():
+    """K: scheduler exhaustion without proof changes nothing about
+    authority — and the gate stays disengaged without threaded proof."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    dag.exhausted_source_requests.add(reference.visit_key())
+    result = _run_t6b_round(dag, samples, policies)
+    assert result.action != "verified"
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("authorizes_discovery_stop", False) is False
+    assert result.proof_authority is not None
+    assert result.proof_authority.gate_active is False
+    assert result.proof_observation is not None
+    assert (reference.visit_key() in
+            result.proof_observation.relevant_obligation_keys)
+
+
+def test_round_stale_certificate_covers_nothing():
+    """G-stale at round level: a stale threaded certificate leaves the
+    obligation uncovered; authority follows the current (empty) proof."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    key = reference.visit_key()
+    certificate, _proof = _t6b_hand_proof(
+        (root.id, "sample"), key,
+        ("storage_writers", "member", "decl:x"), version=99)
+    result = _run_t6b_round(
+        dag, samples, policies, coverage_certificates=[certificate],
+        proof_version=0)
+    assert result.proof_observation is not None
+    assert key in result.proof_observation.relevant_obligation_keys
+    assert key in result.proof_observation.uncovered_obligation_keys
+    assert result.proof_authority is not None
+    assert result.proof_authority.coverage_ok is False
+    assert result.proof_authority.authorizes_stop is False
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("authorizes_discovery_stop", False) is False
+
+
+def test_round_vacuous_threaded_preserves_legacy_stop():
+    """M-vacuous at round level: threaded proof on a clean verified
+    terminal changes nothing — stop follows legacy, flags stay false."""
+    dag, samples, policies = _t6b_round_dag()
+    plain = _run_t6b_round(dag, samples, policies)
+    plain_selected = plain.summary.get("selected_checkpoint") or {}
+    assert plain.action == "verified"
+    assert plain_selected.get("authorizes_discovery_stop") is True
+    certificate, _proof = _t6b_hand_proof(
+        ("op-nowhere", "signal-nowhere"),
+        ("storage_writers", "global", "decl-foreign"),
+        ("storage_writers", "global", "decl-foreign"), version=0)
+    threaded = _run_t6b_round(
+        dag, samples, policies, coverage_certificates=[certificate],
+        proof_version=0)
+    assert threaded.action == "verified"
+    threaded_selected = threaded.summary.get("selected_checkpoint") or {}
+    assert threaded_selected.get("authorizes_discovery_stop") is True
+    assert threaded_selected.get("writer_coverage_verified", False) is False
+    assert threaded_selected.get("applicability_verified", False) is False
+    assert threaded.proof_observation is not None
+    assert threaded.proof_observation.relevant_empty is True
+    assert threaded.proof_authority is not None
+    assert threaded.proof_authority.gate_active is True
+    assert threaded.proof_authority.writer_coverage_verified is False
+    assert threaded.proof_authority.applicability_verified is False
+    assert threaded.proof_authority.authorizes_stop is True
+
+
+def test_proof_authority_partial_coverage_blocks_one_uncovered():
+    """D: two relevant obligations, one covered — coverage stays false
+    even though most proof is present."""
+    key_a = ("storage_writers", "global", "decl-a")
+    key_b = ("storage_writers", "global", "decl-b")
+    semantic_a = ("storage_writers", "global", "decl-a")
+    use_a = ("op-a", "signal-a")
+    observation = _proof_observation(
+        relevant=[key_a, key_b], covered=[key_a])
+    certificate_a, proof_a = _proof_pair(use_a, key_a, semantic_a)
+    authority = _authority(
+        observation=observation,
+        certificates=[certificate_a],
+        applicability_proofs=[proof_a], legacy_verified=True,
+        applicability_uses=[(use_a, key_a)])
+    assert authority.coverage_ok is False
+    assert authority.uncovered_relevant == (key_b,)
+    assert authority.authorizes_stop is False
+
+
+def test_proof_authority_cross_declaration_proof_rejected():
+    """J: a proof bound to another declaration cannot satisfy this use,
+    even when its writer set and version look plausible."""
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, _proof = _proof_pair(use, key, semantic)
+    foreign = _proof_pair(use, ("storage_writers", "global", "decl-b"),
+                          ("storage_writers", "global", "decl-b"))[1]
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[foreign], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.applicability_ok is False
+    assert authority.missing_applicability_uses == (tuple(use),)
+    assert authority.authorizes_stop is False
+
+
+def test_proof_authority_vacuous_use_needs_no_proof():
+    """Covered obligations with no concrete uses require no
+    applicability proof: nothing consumes the value, so nothing must
+    govern it. Flags stay false while the internal ok stays true."""
+    key = ("storage_writers", "global", "decl-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    authority = _authority(
+        observation=observation, legacy_verified=True,
+        applicability_uses=[])
+    assert authority.applicability_ok is True
+    assert authority.applicability_verified is False
+    assert authority.authorizes_stop is True
+
+
+def test_proof_authority_omitted_proof_vetoes_nonempty_relevance():
+    """R1/Finding 1: non-empty relevance + omitted proof inputs vetoes
+    stop even when legacy verifies — omitted proof is required proof
+    absent, never a disengaged gate."""
+    key = ("storage_writers", "global", "decl-a")
+    observation = _proof_observation(relevant=[key], covered=[])
+    for legacy in (False, True):
+        authority = _authority(
+            observation=observation, proof_version=None,
+            legacy_verified=legacy,
+            applicability_uses=[(("op-use", "signal-a"), key)])
+        assert authority.writer_coverage_verified is False
+        assert authority.applicability_verified is False
+        assert authority.authorizes_stop is False
+
+
+def test_proof_authority_omitted_proof_preserves_empty_nondegenerate_path():
+    """R2/Finding 1 §9 exception: empty relevance + non-degenerate
+    scope follows legacy; proof flags stay non-authoritative."""
+    observation = _proof_observation(relevant=[])
+    authority = _authority(
+        observation=observation, proof_version=None, legacy_verified=True)
+    assert authority.writer_coverage_verified is False
+    assert authority.applicability_verified is False
+    assert authority.authorizes_stop is True
+    denied = _authority(
+        observation=observation, proof_version=None,
+        legacy_verified=False)
+    assert denied.authorizes_stop is False
+
+
+def test_proof_authority_omitted_proof_degenerate_vetoes():
+    """R3/Finding 1: empty relevance + degenerate scope vetoes even
+    with legacy verified and proof omitted."""
+    observation = _proof_observation(relevant=[], degenerate=True)
+    authority = _authority(
+        observation=observation, proof_version=None, legacy_verified=True)
+    assert authority.authorizes_stop is False
+
+
+def test_proof_authority_foreign_scheduling_proof_rejected():
+    """R4/Finding 5: same use/obligation/writers/version but a
+    DIFFERENT proof scheduling key does not satisfy the required
+    visit — applicability is per call scope."""
+    from dataclasses import replace
+    key = ("storage_writers", "global", "decl-a")
+    foreign_visit = ("storage_writers", "global", "decl-foreign")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    foreign = replace(proof, scheduling_key=tuple(foreign_visit))
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[foreign], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.applicability_ok is False
+    assert authority.missing_applicability_uses == (tuple(use),)
+    assert authority.authorizes_stop is False
+
+
+def test_proof_authority_exact_scheduling_proof_accepted():
+    """R5/Finding 5 control: the exact scheduling context qualifies —
+    same bindings as R4 except the visit matches."""
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[proof], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.applicability_ok is True
+    assert authority.authorizes_stop is True
+
+
+def test_proof_authority_irrelevant_rival_ignored():
+    """R6/Finding 6: a rival sharing only the use key but mismatching
+    the current obligation/writer set is ignored — the valid exact
+    proof still satisfies applicability with no conflict."""
+    from dataclasses import replace
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    rival = replace(
+        proof,
+        obligation_key=("storage_writers", "global", "decl-b"),
+        writers=("other-site",),
+        basis="guard-exact-producer")
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[proof, rival], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.conflicting_applicability_uses == ()
+    assert authority.applicability_ok is True
+    assert authority.authorizes_stop is True
+
+
+def test_proof_authority_dual_positive_basis_corroborates():
+    """R7/Finding 6: two otherwise-valid proofs for the SAME exact
+    current claim differing only in positive basis corroborate the
+    claim rather than conflict."""
+    from dataclasses import replace
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    twin = replace(proof, basis="guard-exact-producer")
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[proof, twin], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.conflicting_applicability_uses == ()
+    assert authority.applicability_ok is True
+    assert authority.authorizes_stop is True
+
+
+def test_proof_authority_invalid_bindings_still_veto():
+    """R8/conflict-relaxation guard: two invalid proofs (wrong writer
+    set; stale version) still leave the use unproven — relaxation
+    never manufactures applicability."""
+    from dataclasses import replace
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-use", "signal-a")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate, proof = _proof_pair(use, key, semantic)
+    skewed = replace(proof, writers=("other-site",))
+    stale = replace(proof, version=99)
+    authority = _authority(
+        observation=observation, certificates=[certificate],
+        applicability_proofs=[skewed, stale], legacy_verified=True,
+        applicability_uses=[(use, key)])
+    assert authority.missing_applicability_uses == (tuple(use),)
+    assert authority.applicability_ok is False
+    assert authority.authorizes_stop is False
