@@ -9448,3 +9448,335 @@ def test_exact_pairs_preserve_declaration_isolation(tmp_path):
         conditional_writer_ids=())
     assert outcome.proof is None
     assert outcome.refusal == APPLICABILITY_USE_IDENTITY_MISMATCH
+
+
+# --- P2A: session proof-store model ---
+
+def _p2a_store():
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    return CoverageProofStore()
+
+
+def test_proof_store_starts_empty():
+    """P2A-A: a fresh store holds nothing and exposes no authority."""
+    store = _p2a_store()
+    assert store.certificates_for(0) == ()
+    assert store.proofs_for(0) == ()
+    for name in ("coverage_verified", "applicability_verified",
+                 "authorizes_stop", "verified", "complete",
+                 "safe_to_stop", "visited", "retired", "exhausted",
+                 "eligible", "mark_visited", "mark_exhausted"):
+        assert not hasattr(store, name), name
+
+
+def test_proof_store_certificate_isolation():
+    """P2A-B: certificates retrieve by exact (version, scheduling)
+    and (version, obligation) — unrelated keys miss."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    certificate, _proof = _proof_pair(("op-a", "signal-a"), key, semantic)
+    assert store.store_certificate(certificate) is True
+    assert store.certificates_for(0) == (certificate,)
+    assert store.certificates_for_obligation(0, semantic) == (certificate,)
+    assert store.certificates_for_visit(0, key) == (certificate,)
+    assert store.certificates_for(1) == ()
+    other_visit = ("storage_writers", "global", "decl-b")
+    assert store.certificates_for_visit(0, other_visit) == ()
+    assert store.certificates_for_obligation(
+        0, ("storage_writers", "global", "decl-b")) == ()
+    assert _proof_pair(("op-a", "signal-a"), other_visit,
+                       semantic)[0] not in store.certificates_for(0)
+
+
+def test_proof_store_proof_isolation():
+    """P2A-C: proofs retrieve by exact (version, use, visit)."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    _certificate, proof = _proof_pair(use, key, semantic)
+    assert store.store_proof(proof) is True
+    assert store.proofs_for(0) == (proof,)
+    assert store.proof_for(0, use, key) == proof
+    assert store.proof_for(0, ("op-b", "signal-a"), key) is None
+    assert store.proof_for(0, use, ("storage_writers", "x", "y")) is None
+    assert store.proof_for(1, use, key) is None
+
+
+def test_proof_store_idempotent_insert():
+    """P2A-D: identical re-insertion is a no-op, not a duplicate."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    certificate, proof = _proof_pair(("op-a", "signal-a"), key, semantic)
+    assert store.store_certificate(certificate) is True
+    assert store.store_certificate(certificate) is True
+    assert store.store_proof(proof) is True
+    assert store.store_proof(proof) is True
+    assert store.certificates_for(0) == (certificate,)
+    assert store.proofs_for(0) == (proof,)
+
+
+def test_proof_store_conflicting_replacement_fail_closed():
+    """P2A-E: same key with incompatible data is refused; the
+    existing entry is retained, never silently merged."""
+    from dataclasses import replace
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    certificate, proof = _proof_pair(use, key, semantic)
+    assert store.store_certificate(certificate) is True
+    assert store.store_proof(proof) is True
+    rival_certificate = replace(certificate, writers=("other-site",))
+    rival_proof = replace(proof, writers=("other-site",))
+    assert store.store_certificate(rival_certificate) is False
+    assert store.store_proof(rival_proof) is False
+    assert store.certificates_for(0) == (certificate,)
+    assert store.proofs_for(0) == (proof,)
+
+
+def test_proof_store_version_isolation_and_prune():
+    """P2A-F/G: v0 proof is non-current under v1; pruning drops stale
+    versions while keeping current proof queryable."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    old_certificate, old_proof = _proof_pair(use, key, semantic, version=0)
+    new_certificate, new_proof = _proof_pair(use, key, semantic, version=1)
+    assert store.store_certificate(old_certificate) is True
+    assert store.store_proof(old_proof) is True
+    assert store.store_certificate(new_certificate) is True
+    assert store.store_proof(new_proof) is True
+    assert store.certificates_for(1) == (new_certificate,)
+    assert store.proofs_for(1) == (new_proof,)
+    assert old_certificate not in store.certificates_for(1)
+    assert old_proof not in store.proofs_for(1)
+    store.prune_older_than(1)
+    assert store.certificates_for(0) == ()
+    assert store.proofs_for(0) == ()
+    assert store.certificates_for(1) == (new_certificate,)
+    assert store.proofs_for(1) == (new_proof,)
+
+
+def test_proof_store_deterministic_order():
+    """P2A-H: insertion order never leaks into read order."""
+    store = _p2a_store()
+    key_a = ("storage_writers", "global", "decl-a")
+    key_b = ("storage_writers", "global", "decl-b")
+    certificate_a, _ = _proof_pair(
+        ("op-a", "signal-a"), key_a, key_a)
+    certificate_b, _ = _proof_pair(
+        ("op-b", "signal-b"), key_b, key_b)
+    assert store.store_certificate(certificate_b) is True
+    assert store.store_certificate(certificate_a) is True
+    assert store.certificates_for(0) == (certificate_a, certificate_b)
+
+
+def test_proof_store_immutable_reads():
+    """P2A-I: reads are tuples; mutating attempts cannot reach the
+    store, and snapshots detach from later inserts."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    certificate, proof = _proof_pair(("op-a", "signal-a"), key, semantic)
+    assert store.store_certificate(certificate) is True
+    assert store.store_proof(proof) is True
+    certificates = store.certificates_for(0)
+    try:
+        certificates[0] = certificate
+        mutated = True
+    except TypeError:
+        mutated = False
+    assert mutated is False
+    snapshot = store.snapshot_for(0)
+    other, other_proof = _proof_pair(
+        ("op-b", "signal-b"),
+        ("storage_writers", "global", "decl-b"),
+        ("storage_writers", "global", "decl-b"))
+    assert store.store_certificate(other) is True
+    assert store.store_proof(other_proof) is True
+    assert snapshot.certificates == (certificate,)
+    assert snapshot.applicability_proofs == (proof,)
+
+
+def _p2a_attempt(**overrides):
+    from flight_log_agent.analysis.coverage import SearchAttempt
+    fields = dict(
+        obligation_key=("storage_writers", "global", "decl-a"),
+        scheduling_key=("storage_writers", "global", "decl-a"),
+        strategy="storage-internal-only",
+        strategy_class="complete",
+        examined_domain={"files": ("src/lib/sg.cpp",)},
+        universe_ref={"search_version": 0},
+        outcome="admitted",
+        details={"file_verdicts": {"src/lib/sg.cpp": "exact:op"},
+                 "writer_census": {"src/lib/sg.cpp": ["op"]}},
+    )
+    fields.update(overrides)
+    return SearchAttempt(**fields)
+
+
+def test_evidence_fingerprint_contract():
+    """P2A-J: identical ordered evidence fingerprints equal;
+    material changes differ; object identity never matters."""
+    from flight_log_agent.analysis.coverage import evidence_fingerprint
+    first = [_p2a_attempt(), _p2a_attempt(strategy="storage-owner-files",
+                                         outcome="non-writer")]
+    twin = [_p2a_attempt(), _p2a_attempt(strategy="storage-owner-files",
+                                        outcome="non-writer")]
+    assert first[0] is not twin[0]
+    assert evidence_fingerprint(first) == evidence_fingerprint(twin)
+    changed = [_p2a_attempt(outcome="non-writer"), twin[1]]
+    assert evidence_fingerprint(changed) != evidence_fingerprint(first)
+    reordered = [twin[1], twin[0]]
+    assert evidence_fingerprint(reordered) != evidence_fingerprint(first)
+
+
+def test_proof_store_evidence_state():
+    """P2A-J store side: per-key fingerprint notes change exactly
+    once; identical restatement is not a change."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    attempts = [_p2a_attempt()]
+    assert store.note_evidence(0, key, attempts) is True
+    assert store.note_evidence(0, key, [_p2a_attempt()]) is False
+    assert store.note_evidence(0, key, [_p2a_attempt(outcome="x")]) is True
+    assert store.note_evidence(1, key, attempts) is True
+
+
+def test_proof_store_cross_declaration_isolation():
+    """Same spelling under different declarations stays isolated
+    through obligation-keyed indexing."""
+    store = _p2a_store()
+    key_a = ("storage_writers", "global", "decl-a")
+    key_b = ("storage_writers", "global", "decl-b")
+    certificate_a, _ = _proof_pair(("op-a", "s"), key_a, key_a)
+    certificate_b, _ = _proof_pair(("op-a", "s"), key_b, key_b)
+    assert store.store_certificate(certificate_a) is True
+    assert store.store_certificate(certificate_b) is True
+    assert store.certificates_for_obligation(0, key_a) == (certificate_a,)
+    assert store.certificates_for_obligation(0, key_b) == (certificate_b,)
+
+
+def test_proof_store_writer_set_distinction():
+    """Same use/visit with different writer sets are not equivalent:
+    the rival is refused and the original retained."""
+    from dataclasses import replace
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    _certificate, proof = _proof_pair(use, key, semantic)
+    assert store.store_proof(proof) is True
+    assert store.store_proof(replace(proof, writers=("other",))) is False
+    assert store.proofs_for(0) == (proof,)
+    assert store.proof_for(0, use, key) == proof
+
+
+def test_proof_store_snapshot_contract():
+    """Current-version snapshot: only that version, deterministic
+    immutable tuples, frozen value, no verification flags."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    certificate, proof = _proof_pair(use, key, semantic, version=1)
+    stale_certificate, stale_proof = _proof_pair(use, key, semantic,
+                                                 version=0)
+    assert store.store_certificate(certificate) is True
+    assert store.store_proof(proof) is True
+    assert store.store_certificate(stale_certificate) is True
+    assert store.store_proof(stale_proof) is True
+    snapshot = store.snapshot_for(1)
+    assert snapshot.version == 1
+    assert snapshot.certificates == (certificate,)
+    assert snapshot.applicability_proofs == (proof,)
+    assert isinstance(snapshot.certificates, tuple)
+    assert isinstance(snapshot.applicability_proofs, tuple)
+    for name in ("coverage_verified", "applicability_verified",
+                 "authorizes_stop"):
+        assert not hasattr(snapshot, name), name
+    import dataclasses
+    try:
+        snapshot.version = 99
+        frozen = False
+    except dataclasses.FrozenInstanceError:
+        frozen = True
+    assert frozen is True
+
+
+def test_proof_store_certificate_replacement():
+    """Review-1A: ordinary conflicting insert refuses, but explicit
+    replacement supersedes the same logical key — exactly one entry
+    remains and unrelated keys/versions are untouched."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    old_certificate, _proof = _proof_pair(use, key, semantic, version=0)
+    new_certificate = old_certificate
+    import dataclasses as _dataclasses
+    new_certificate = _dataclasses.replace(
+        old_certificate, writers=("w:2",),
+        assumptions=("file-linkage-closed",
+                     "writer-syntax-enumerated", "extra-assumption"))
+    other_certificate, _ = _proof_pair(
+        use, ("storage_writers", "global", "decl-b"),
+        ("storage_writers", "global", "decl-b"), version=0)
+    assert store.replace_certificate(new_certificate) is False
+    assert store.store_certificate(old_certificate) is True
+    assert store.store_certificate(other_certificate) is True
+    assert store.store_certificate(new_certificate) is False
+    assert store.certificates_for_obligation(0, semantic) == (
+        old_certificate,)
+    assert store.replace_certificate(new_certificate) is True
+    assert store.certificates_for_obligation(0, semantic) == (
+        new_certificate,)
+    assert store.certificates_for(0) == (new_certificate,
+                                         other_certificate)
+    assert store.replace_certificate(old_certificate) is True
+    assert store.certificates_for_obligation(0, semantic) == (
+        old_certificate,)
+
+
+def test_proof_store_proof_replacement():
+    """Review-1B: same supersede pattern for applicability proofs,
+    keyed by exact (version, use, visit)."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    _certificate, old_proof = _proof_pair(use, key, semantic, version=0)
+    import dataclasses as _dataclasses
+    new_proof = _dataclasses.replace(
+        old_proof, writers=("w:1", "w:2"), basis="refined-basis",
+        supporting_facts=("use:op-a", "producer:op-second"))
+    other_use = ("op-b", "signal-b")
+    _other_certificate, other_proof = _proof_pair(
+        other_use, key, semantic, version=0)
+    assert store.replace_proof(new_proof) is False
+    assert store.store_proof(old_proof) is True
+    assert store.store_proof(other_proof) is True
+    assert store.store_proof(new_proof) is False
+    assert store.proof_for(0, use, key) == old_proof
+    assert store.replace_proof(new_proof) is True
+    assert store.proof_for(0, use, key) == new_proof
+    assert store.proof_for(0, other_use, key) == other_proof
+    assert store.proofs_for(0) == (new_proof, other_proof)
+
+
+def test_evidence_fingerprint_dict_order_canonical():
+    """Review-3: identical semantic evidence with different nested
+    dict insertion orders fingerprints equally; attempt order stays
+    significant."""
+    from flight_log_agent.analysis.coverage import evidence_fingerprint
+    first = [_p2a_attempt(details={
+        "file_verdicts": {"b.cpp": "exact:y", "a.cpp": "exact:x"},
+        "writer_census": {"b.cpp": ["y2", "y1"], "a.cpp": ["x"]}})]
+    second = [_p2a_attempt(details={
+        "file_verdicts": {"a.cpp": "exact:x", "b.cpp": "exact:y"},
+        "writer_census": {"a.cpp": ["x"], "b.cpp": ["y1", "y2"]}})]
+    assert evidence_fingerprint(first) == evidence_fingerprint(second)

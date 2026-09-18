@@ -889,3 +889,272 @@ def derive_writer_applicability(
         refusal="",
         refusal_detail={},
     )
+
+
+# --- P2A: session proof store (derived state, never authority) ---
+#
+# `CoverageProofStore` is session-owned derived proof state for future
+# P2B/P2C/P3 consumption. It stores/indexes T3 certificates, T5
+# proofs, and per-key evidence fingerprints; it derives nothing,
+# retires nothing, and authorizes nothing. It is deliberately separate
+# from `CoverageSearchState` (scheduling/version/visited/retirement):
+# the two synchronize only through the search-universe version, which
+# remains owned by `CoverageSearchState`. All authority reads pass an
+# explicit version, so stale proof can never be current by
+# construction — there is no "current version" state to go stale.
+
+
+def evidence_fingerprint(attempts: Any) -> tuple:
+    """Deterministic digest of ordered search attempts.
+
+    Derived only from stable coverage-relevant fields (strategy,
+    outcome, examined files, per-file verdicts/census, universe
+    version, obligation/scheduling identity). Never object identity,
+    timestamps, or iteration order beyond the recorded attempt order.
+    P2B compares fingerprints to detect materially changed evidence
+    without re-deriving on identical input.
+    """
+    digest: list = []
+    for attempt in attempts or ():
+        details = getattr(attempt, "details", None) or {}
+        examined = getattr(attempt, "examined_domain", None) or {}
+        files = tuple(sorted(
+            str(item) for item in (examined.get("files") or ())))
+        verdicts = tuple(sorted(
+            (str(name), str(verdict))
+            for name, verdict in (
+                (details.get("file_verdicts") or {}).items())))
+        census = tuple(sorted(
+            (str(name), tuple(sorted(
+                str(site) for site in (sites or ()))))
+            for name, sites in (
+                (details.get("writer_census") or {}).items())))
+        universe = (getattr(attempt, "universe_ref", None) or {}).get(
+            "search_version")
+        digest.append((
+            str(getattr(attempt, "strategy", "") or ""),
+            str(getattr(attempt, "strategy_class", "") or ""),
+            str(getattr(attempt, "outcome", "") or ""),
+            files,
+            verdicts,
+            census,
+            universe,
+            repr(tuple(getattr(attempt, "obligation_key", None) or ())),
+            repr(tuple(getattr(attempt, "scheduling_key", None) or ())),
+        ))
+    return tuple(digest)
+
+
+@dataclass(frozen=True)
+class ProofSnapshot:
+    """Immutable current-version proof view for future checkpoint use.
+
+    Carries only derived values (never verification flags): the exact
+    version plus deterministic tuples of that version's certificates
+    and applicability proofs. Field names project directly onto the
+    T6B round inputs (`proof_version`, `coverage_certificates`,
+    `applicability_proofs`). P3 threads snapshots; nothing mutates
+    through them.
+    """
+
+    version: Any
+    certificates: tuple = ()
+    applicability_proofs: tuple = ()
+
+
+@dataclass
+class CoverageProofStore:
+    """Session-scoped store of derived proof state.
+
+    Certificates keyed by (version, scheduling, obligation);
+    applicability proofs by (version, use, scheduling); evidence
+    fingerprints by (version, scheduling). Raw attempts stay in the
+    P0 session sink (canonical history); only fingerprints live here.
+    Identical re-insertion is idempotent; a differing value under an
+    occupied key is refused with the existing entry retained
+    (fail-closed, never silently merged). Reads return tuples in
+    repr-key order. Pruning is explicit and caller-driven; the store
+    never decides when the universe changes.
+    """
+
+    _certificates: dict = field(default_factory=dict, repr=False)
+    _proofs: dict = field(default_factory=dict, repr=False)
+    _evidence: dict = field(default_factory=dict, repr=False)
+
+    @staticmethod
+    def _sorted_entries(entries: Any) -> tuple:
+        return tuple(
+            value for _key, value in sorted(
+                entries, key=lambda item: repr(item[0])))
+
+    @staticmethod
+    def _certificate_key(certificate: Any) -> Optional[tuple]:
+        """Storage key, or None when the object cannot bind proof."""
+        try:
+            version = getattr(certificate, "version", None)
+            scheduling = tuple(
+                getattr(certificate, "scheduling_key", None) or ())
+            obligation = tuple(
+                getattr(certificate, "obligation_key", None) or ())
+        except TypeError:
+            return None
+        if version is None or not scheduling or not obligation:
+            return None
+        return (version, scheduling, obligation)
+
+    @staticmethod
+    def _proof_key(proof: Any) -> Optional[tuple]:
+        """Storage key, or None when the object cannot bind proof."""
+        try:
+            version = getattr(proof, "version", None)
+            use = tuple(getattr(proof, "use_key", None) or ())
+            scheduling = tuple(
+                getattr(proof, "scheduling_key", None) or ())
+        except TypeError:
+            return None
+        if version is None or not use or not scheduling:
+            return None
+        return (version, use, scheduling)
+
+    def store_certificate(self, certificate: Any) -> bool:
+        """Store one certificate, or refuse without touching state."""
+        key = self._certificate_key(certificate)
+        if key is None:
+            return False
+        existing = self._certificates.get(key)
+        if existing is not None:
+            return bool(existing == certificate)
+        self._certificates[key] = certificate
+        return True
+
+    def replace_certificate(self, certificate: Any) -> bool:
+        """Supersede one stored certificate with a newer value.
+
+        Explicit replacement route for later derivation lifecycle
+        (newer evidence re-derives, then replaces): overwrites exactly
+        the key derived from the replacement object itself, so an
+        object can never migrate between identities. Refuses when no
+        entry occupies that key or the replacement cannot bind proof.
+        Contains no lifecycle policy — it never decides WHEN newer
+        evidence justifies replacement.
+        """
+        key = self._certificate_key(certificate)
+        if key is None or key not in self._certificates:
+            return False
+        self._certificates[key] = certificate
+        return True
+
+    def certificates_for(self, version: Any) -> tuple:
+        """All certificates stored under one version, deterministically."""
+        return self._sorted_entries(
+            (key, certificate)
+            for key, certificate in self._certificates.items()
+            if key[0] == version)
+
+    def certificates_for_visit(
+        self, version: Any, scheduling_key: Any,
+    ) -> tuple:
+        """Certificates bound to one scheduling visit under one version."""
+        try:
+            wanted = tuple(scheduling_key or ())
+        except TypeError:
+            return ()
+        return self._sorted_entries(
+            (key, certificate)
+            for key, certificate in self._certificates.items()
+            if key[0] == version and key[1] == wanted)
+
+    def certificates_for_obligation(
+        self, version: Any, obligation_key: Any,
+    ) -> tuple:
+        """Certificates bound to one obligation under one version."""
+        try:
+            wanted = tuple(obligation_key or ())
+        except TypeError:
+            return ()
+        return self._sorted_entries(
+            (key, certificate)
+            for key, certificate in self._certificates.items()
+            if key[0] == version and key[2] == wanted)
+
+    def store_proof(self, proof: Any) -> bool:
+        """Store one applicability proof, or refuse without touching."""
+        key = self._proof_key(proof)
+        if key is None:
+            return False
+        existing = self._proofs.get(key)
+        if existing is not None:
+            return bool(existing == proof)
+        self._proofs[key] = proof
+        return True
+
+    def replace_proof(self, proof: Any) -> bool:
+        """Supersede one stored proof with a newer value.
+
+        Same explicit-replacement contract as `replace_certificate`:
+        overwrites exactly the key derived from the replacement proof
+        itself, refuses absent or unbindable keys, decides no lifecycle
+        policy.
+        """
+        key = self._proof_key(proof)
+        if key is None or key not in self._proofs:
+            return False
+        self._proofs[key] = proof
+        return True
+
+    def proofs_for(self, version: Any) -> tuple:
+        """All applicability proofs stored under one version."""
+        return self._sorted_entries(
+            (key, proof)
+            for key, proof in self._proofs.items()
+            if key[0] == version)
+
+    def proof_for(
+        self, version: Any, use_key: Any, scheduling_key: Any,
+    ) -> Optional[Any]:
+        """The proof for one exact (use, visit) under one version."""
+        try:
+            key = (version, tuple(use_key or ()),
+                   tuple(scheduling_key or ()))
+        except TypeError:
+            return None
+        return self._proofs.get(key)
+
+    def note_evidence(
+        self, version: Any, scheduling_key: Any, attempts: Any,
+    ) -> bool:
+        """Record an evidence fingerprint; True when it changed.
+
+        P2B passes the session sink's current attempts for one key;
+        identical restatement is not a change. Raw attempts stay in
+        the sink; only the deterministic fingerprint lives here.
+        """
+        try:
+            key = (version, tuple(scheduling_key or ()))
+        except TypeError:
+            return False
+        fingerprint = evidence_fingerprint(attempts)
+        if self._evidence.get(key) == fingerprint:
+            return False
+        self._evidence[key] = fingerprint
+        return True
+
+    def prune_older_than(self, version: Any) -> None:
+        """Drop entries below one version (caller owns version truth)."""
+        self._certificates = {
+            key: value for key, value in self._certificates.items()
+            if not key[0] < version}
+        self._proofs = {
+            key: value for key, value in self._proofs.items()
+            if not key[0] < version}
+        self._evidence = {
+            key: value for key, value in self._evidence.items()
+            if not key[0] < version}
+
+    def snapshot_for(self, version: Any) -> ProofSnapshot:
+        """Immutable deterministic view of one version's proof."""
+        return ProofSnapshot(
+            version=version,
+            certificates=self.certificates_for(version),
+            applicability_proofs=self.proofs_for(version),
+        )
