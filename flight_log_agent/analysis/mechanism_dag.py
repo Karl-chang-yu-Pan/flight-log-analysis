@@ -47,6 +47,7 @@ from flight_log_agent.analysis.source_expansion import (
     UnresolvedSourceReference,
     reference_receiver_is_source_boundary,
     source_reference_resolution_key,
+    union_origin_uses,
 )
 from flight_log_agent.px4.mechanism_source_profiler import (
     callable_accepts_argument_count,
@@ -3509,6 +3510,11 @@ class _DAGBuilder:
                 [origin_vertex_id] if origin_vertex_id else []
             ),
             origin_operands=([origin_operand] if origin_operand else []),
+            origin_uses=(
+                [(origin_vertex_id, origin_operand)]
+                if origin_vertex_id and origin_operand
+                else []
+            ),
         )
         reference_key: tuple[Any, ...] = reference.visit_key()
         if (
@@ -3542,6 +3548,13 @@ class _DAGBuilder:
                             origin_operand,
                         ]
                         if value
+                    ),
+                    # Exact pairs union AS PAIRS: {(A,x),(B,y)} never
+                    # becomes {(A,y),(B,x)}. Operand-less additions
+                    # contribute no pair.
+                    "origin_uses": union_origin_uses(
+                        existing.origin_uses,
+                        [(origin_vertex_id, origin_operand)],
                     ),
                 }
             )

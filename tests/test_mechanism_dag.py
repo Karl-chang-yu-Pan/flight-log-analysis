@@ -3111,6 +3111,188 @@ def test_shared_storage_obligation_dedupes_with_accumulated_origins():
     assert reference.identity.declaration_id == _COMPOSITE_DECLARATION
 
 
+def test_origin_uses_created_exact():
+    """P1A-A: one consuming use exposes exactly its (origin, operand)
+    pair through the real builder funnel — nothing invented."""
+    structure = SourceStructureIndex(members=_sensor_members())
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1", target="answer", expression="sensor._value",
+        file="ctl.cpp", line=20, function="Controller::step",
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    binding["reference_identities"] = {
+        "sensor._value": _composite_sensor_identity()
+    }
+    dag = build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+    reference = _storage_writer_for(dag, "sensor")
+    assert reference.origin_operands == ["sensor._value"]
+    assert reference.origin_uses == [
+        (origin, "sensor._value")
+        for origin in sorted(reference.origin_vertex_ids)
+    ]
+    assert len(reference.origin_uses) == len(reference.origin_vertex_ids)
+
+
+def test_origin_uses_merge_exact_no_cross_pairs():
+    """P1A-B/C/D: pair-union keeps exactly the known pairs — no
+    Cartesian invention, duplicates collapsed, order deterministic
+    regardless of insertion order."""
+    from flight_log_agent.analysis.source_expansion import union_origin_uses
+    merged = union_origin_uses([("A", "x")], [("B", "y")])
+    assert merged == [("A", "x"), ("B", "y")]
+    assert ("A", "y") not in merged
+    assert ("B", "x") not in merged
+    assert union_origin_uses([("B", "y")], [("A", "x")]) == merged
+    assert union_origin_uses([("A", "x")], [("A", "x")]) == [("A", "x")]
+    assert union_origin_uses([("B", "y"), ("A", "x")], []) == merged
+    assert union_origin_uses([], []) == []
+
+
+def test_origin_uses_excluded_from_identity():
+    """P1A-E: semantically identical references differing only in
+    provenance pairs share visit, resolution, and obligation identity —
+    one use or five uses is still one obligation."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+        source_reference_resolution_key,
+    )
+    base = dict(
+        symbol="kzero", kind="storage_writers", file="src/main.cpp",
+        callable_id="use",
+        identity={
+            "kind": "global", "symbol": "kzero", "root": "kzero",
+            "file": "src/main.cpp",
+            "declaration_id": "global:internal:kzero",
+            "declaration_proven": True,
+        },
+    )
+    one = UnresolvedSourceReference(
+        **base, origin_vertex_ids=["A"], origin_operands=["x"],
+        origin_uses=[("A", "x")])
+    many = UnresolvedSourceReference(
+        **base, origin_vertex_ids=["A", "B"], origin_operands=["x", "y"],
+        origin_uses=[("A", "x"), ("B", "y")])
+    assert one.origin_uses == [("A", "x")]
+    assert many.origin_uses == [("A", "x"), ("B", "y")]
+    assert one.visit_key() == many.visit_key()
+    structure = SourceStructureIndex()
+    assert (source_reference_resolution_key(one, structure)
+            == source_reference_resolution_key(many, structure))
+
+
+def test_origin_uses_shared_obligation_not_split():
+    """P1A-F: two uses of one proven declaration merge into ONE
+    unresolved obligation carrying both exact pairs."""
+    structure = SourceStructureIndex(members=_sensor_members())
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1", target="answer", expression="sensor._value",
+        file="ctl.cpp", line=20, function="Controller::step",
+        control_predicates=["sensor._value > 0"],
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    binding["reference_identities"] = {
+        "sensor._value": _composite_sensor_identity()
+    }
+    dag = build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+    obligations = [
+        r for r in dag.unresolved_references
+        if (r.identity is not None
+            and r.identity.declaration_id == _COMPOSITE_DECLARATION)
+    ]
+    assert len(obligations) == 1
+    reference = obligations[0]
+    assert len(reference.origin_uses) == len(reference.origin_vertex_ids)
+    assert sorted(reference.origin_uses) == sorted(
+        (origin, "sensor._value")
+        for origin in reference.origin_vertex_ids
+    )
+
+
+def test_origin_uses_cross_declaration_isolated():
+    """P1A-G: same-shape different declarations stay separate
+    obligations, each owning only its own pairs."""
+    structure = SourceStructureIndex(members=_sensor_members())
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1", target="answer", expression="sensor._value + backup._value",
+        file="ctl.cpp", line=20, function="Controller::step",
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    def _decl(symbol, root, declaring, declaration):
+        return {
+            "kind": "member", "symbol": symbol, "root": root,
+            "file": "ctl.cpp", "callable_id": "ctl.cpp:1:Controller::step",
+            "class_owner": "Controller", "declaring_class": declaring,
+            "declaration_id": declaration, "declaration_proven": True,
+        }
+    binding["reference_identities"] = {
+        "sensor._value": _decl(
+            "sensor._value", "sensor", "Sensor", "decl-a::subobject::decl-v"),
+        "backup._value": _decl(
+            "backup._value", "backup", "Other", "decl-b::subobject::decl-v"),
+    }
+    dag = build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+    by_symbol = {r.symbol: r for r in dag.unresolved_references
+                 if r.kind == "storage_writers"}
+    assert set(by_symbol) == {"sensor", "backup"}
+    for symbol, reference in by_symbol.items():
+        assert reference.origin_uses
+        assert all(
+            origin in reference.origin_vertex_ids
+            for origin, _operand in reference.origin_uses
+        )
+
+
+def test_origin_uses_never_invented():
+    """P1A-H: every recorded pair's origin and operand come from the
+    reference's own provenance — operand-less origins (e.g. terminal
+    appends) contribute no fake concrete use."""
+    structure = SourceStructureIndex(members=_sensor_members())
+    structure.authoritative_declarations = True
+    binding = _fake_binding(
+        binding_id="b1", target="answer", expression="sensor._value",
+        file="ctl.cpp", line=20, function="Controller::step",
+        control_predicates=["sensor._value > 0"],
+    )
+    binding["callable_id"] = "ctl.cpp:1:Controller::step"
+    binding["reference_identities"] = {
+        "sensor._value": _composite_sensor_identity()
+    }
+    dag = build_mechanism_dag(
+        [binding], "answer", source_structure=structure,
+    )
+    for reference in dag.unresolved_references:
+        origins = set(reference.origin_vertex_ids)
+        operands = set(reference.origin_operands)
+        for origin, operand in reference.origin_uses:
+            assert origin and operand
+            assert origin in origins
+            assert operand in operands
+
+
+def test_legacy_reference_loads_without_pairs():
+    """P1A-I: payloads predating exact provenance load with an empty
+    pair set — uncertainty preserved, never Cartesian-backfilled."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference.model_validate({
+        "symbol": "gain", "kind": "storage_writers",
+        "origin_vertex_ids": ["A", "B"], "origin_operands": ["x", "y"],
+    })
+    assert reference.origin_uses == []
+    assert reference.origin_vertex_ids == ["A", "B"]
+    assert reference.origin_operands == ["x", "y"]
+
+
 def test_proven_identity_coexists_with_bare_root_demand():
     """A proven composite request and a bare-root demand of the same storage
     name remain distinct obligations: the proven identity is not downgraded

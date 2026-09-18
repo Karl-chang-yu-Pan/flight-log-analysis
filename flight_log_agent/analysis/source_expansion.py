@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional, Sequence
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from flight_log_agent.analysis.source_expression import source_expression_names
 from flight_log_agent.analysis.coverage import (
@@ -134,6 +134,28 @@ def _source_symbol_identity(value: Any) -> SourceSymbolIdentity:
     return SourceSymbolIdentity.model_validate(value)
 
 
+def union_origin_uses(*pair_lists: Any) -> list[tuple[str, str]]:
+    """Union exact concrete-use pairs as pairs.
+
+    Deduplicated, deterministically sorted, and free of half-known
+    entries: a pair without a concrete origin vertex AND a concrete
+    operand is not a governable use and is dropped (operand-less
+    origins stay visible via `origin_vertex_ids`, never as pairs).
+    Pure function; the single merge rule for use provenance.
+    """
+    seen: set[tuple[str, str]] = set()
+    for pairs in pair_lists or ():
+        for pair in pairs or ():
+            try:
+                origin, operand = pair
+            except (TypeError, ValueError):
+                continue
+            origin, operand = str(origin or ""), str(operand or "")
+            if origin and operand:
+                seen.add((origin, operand))
+    return sorted(seen)
+
+
 class UnresolvedSourceReference(BaseModel):
     """A typed DAG frontier item with its originating source context."""
 
@@ -157,6 +179,19 @@ class UnresolvedSourceReference(BaseModel):
     # remain descriptive and are never used to infer reachability.
     origin_vertex_ids: list[str] = Field(default_factory=list)
     origin_operands: list[str] = Field(default_factory=list)
+    # Exact concrete-use provenance: which (origin vertex, operand)
+    # pairs are genuinely known. Structural only — excluded from
+    # `visit_key`, resolution keys, and obligation dedup, so one use or
+    # many uses is still one shared semantic obligation. Normalized
+    # (sorted, deduplicated) on validation; merged as pairs, never
+    # re-derived from the independent lists above.
+    origin_uses: list[tuple[str, str]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize_origin_uses(self) -> "UnresolvedSourceReference":
+        object.__setattr__(
+            self, "origin_uses", union_origin_uses(self.origin_uses))
+        return self
 
     def visit_key(self) -> tuple[Any, ...]:
         return (
