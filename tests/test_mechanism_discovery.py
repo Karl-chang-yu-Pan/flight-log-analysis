@@ -4293,6 +4293,7 @@ def test_checkpoint_continues_only_its_requested_source_frontier(tmp_path, monke
         "unrelated.cpp": "float unrelated = 9;",
     }, backend="tree_sitter")
     original = SourceExpansionResolver.resolve
+    original_with_evidence = SourceExpansionResolver.resolve_with_evidence
     searched = []
 
     def resolve(self, reference, structure):
@@ -4300,12 +4301,23 @@ def test_checkpoint_continues_only_its_requested_source_frontier(tmp_path, monke
         assert reference.symbol == "wanted"
         return original(self, reference, structure)
 
+    def resolve_with_evidence(self, reference, structure, sink,
+                              skip_stages=None, universe_version=None):
+        searched.append(reference.symbol)
+        assert reference.symbol == "wanted"
+        return original_with_evidence(
+            self, reference, structure, sink, skip_stages=skip_stages,
+            universe_version=universe_version)
+
     def checkpoint(dag, index):
         references = [r for r in dag.unresolved_references if r.symbol == "wanted"]
         assert references
         return CheckpointRound("continue", dag, references, {"action": "continue"})
 
     monkeypatch.setattr(SourceExpansionResolver, "resolve", resolve)
+    monkeypatch.setattr(
+        SourceExpansionResolver, "resolve_with_evidence",
+        resolve_with_evidence)
     result = discover_mechanism_dag(
         profiler, tmp_path / "cache", seeds=[], terminal="output", source_hash="hash",
         preranked_files=["sample.cpp"], terminal_file="sample.cpp",
@@ -5233,6 +5245,7 @@ def test_cross_version_retry_reopens_suppressed_request(tmp_path, monkeypatch):
     # never happens, so this count fails.
     resolve_calls: list = []
     original_resolve = SourceExpansionResolver.resolve
+    original_with_evidence = SourceExpansionResolver.resolve_with_evidence
 
     def counting_resolve(self, reference, structure):
         if (reference.kind == "storage_writers"
@@ -5240,8 +5253,21 @@ def test_cross_version_retry_reopens_suppressed_request(tmp_path, monkeypatch):
             resolve_calls.append(reference.visit_key())
         return original_resolve(self, reference, structure)
 
+    def counting_resolve_with_evidence(self, reference, structure, sink,
+                                       skip_stages=None,
+                                       universe_version=None):
+        if (reference.kind == "storage_writers"
+                and reference.symbol == "cfg"):
+            resolve_calls.append(reference.visit_key())
+        return original_with_evidence(
+            self, reference, structure, sink, skip_stages=skip_stages,
+            universe_version=universe_version)
+
     monkeypatch.setattr(
         SourceExpansionResolver, "resolve", counting_resolve)
+    monkeypatch.setattr(
+        SourceExpansionResolver, "resolve_with_evidence",
+        counting_resolve_with_evidence)
     result = _derived_gain_fixture(tmp_path)
     assert result.dag is not None
     assert len(resolve_calls) == 2, (
@@ -7176,19 +7202,36 @@ def _retire_tree(tmp_path):
 
 
 def _spy_resolution_keys(monkeypatch):
-    """Count discovery-loop resolutions keyed by resolution key."""
+    """Count discovery-loop resolutions keyed by resolution key.
+
+    Intercepts both the legacy and evidence-capable resolver entry
+    points (P0 routes frontier scheduling through
+    `resolve_with_evidence`, which records the same search): every
+    resolution is counted once with the identical key tuple, so
+    pinned scheduling behavior is observed unchanged."""
     from flight_log_agent.analysis.source_expansion import (
         SourceExpansionResolver,
     )
     calls: list = []
     original = SourceExpansionResolver.resolve
+    original_with_evidence = SourceExpansionResolver.resolve_with_evidence
 
     def spy(self, reference, structure):
         calls.append((reference.kind, reference.symbol,
                       self.resolution_key(reference, structure)))
         return original(self, reference, structure)
 
+    def evidence_spy(self, reference, structure, sink, skip_stages=None,
+                     universe_version=None):
+        calls.append((reference.kind, reference.symbol,
+                      self.resolution_key(reference, structure)))
+        return original_with_evidence(
+            self, reference, structure, sink, skip_stages=skip_stages,
+            universe_version=universe_version)
+
     monkeypatch.setattr(SourceExpansionResolver, "resolve", spy)
+    monkeypatch.setattr(
+        SourceExpansionResolver, "resolve_with_evidence", evidence_spy)
     return calls
 
 
@@ -7395,13 +7438,24 @@ def _discover_gain_tree(tmp_path, monkeypatch, files, **kwargs):
     profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
     calls: list = []
     original = SourceExpansionResolver.resolve
+    original_with_evidence = SourceExpansionResolver.resolve_with_evidence
 
     def spy(self, reference, structure):
         calls.append((reference.kind, reference.symbol,
                       self.resolution_key(reference, structure)))
         return original(self, reference, structure)
 
+    def evidence_spy(self, reference, structure, sink, skip_stages=None,
+                     universe_version=None):
+        calls.append((reference.kind, reference.symbol,
+                      self.resolution_key(reference, structure)))
+        return original_with_evidence(
+            self, reference, structure, sink, skip_stages=skip_stages,
+            universe_version=universe_version)
+
     monkeypatch.setattr(SourceExpansionResolver, "resolve", spy)
+    monkeypatch.setattr(
+        SourceExpansionResolver, "resolve_with_evidence", evidence_spy)
     result = discover_mechanism_dag(
         profiler, tmp_path / "cache", seeds=["run"], terminal="out",
         source_hash="hash", terminal_file="src/main.cpp", **kwargs)
@@ -7540,13 +7594,24 @@ def test_closed_empty_certificate_retires_without_invention(tmp_path,
     profiler, files = _closed_empty_consumer_tree(tmp_path)
     calls: list = []
     original = SourceExpansionResolver.resolve
+    original_with_evidence = SourceExpansionResolver.resolve_with_evidence
 
     def spy(self, reference, structure):
         calls.append((reference.kind, reference.symbol,
                       self.resolution_key(reference, structure)))
         return original(self, reference, structure)
 
+    def evidence_spy(self, reference, structure, sink, skip_stages=None,
+                     universe_version=None):
+        calls.append((reference.kind, reference.symbol,
+                      self.resolution_key(reference, structure)))
+        return original_with_evidence(
+            self, reference, structure, sink, skip_stages=skip_stages,
+            universe_version=universe_version)
+
     monkeypatch.setattr(SourceExpansionResolver, "resolve", spy)
+    monkeypatch.setattr(
+        SourceExpansionResolver, "resolve_with_evidence", evidence_spy)
     baseline = discover_mechanism_dag(
         profiler, tmp_path / "cache", seeds=["use"], terminal="out",
         source_hash="hash", terminal_file="src/main.cpp")
@@ -7581,7 +7646,17 @@ def test_closed_empty_certificate_retires_without_invention(tmp_path,
                        self.resolution_key(reference, structure)))
         return original(self, reference, structure)
 
+    def evidence_spy2(self, reference, structure, sink, skip_stages=None,
+                      universe_version=None):
+        calls2.append((reference.kind, reference.symbol,
+                       self.resolution_key(reference, structure)))
+        return original_with_evidence(
+            self, reference, structure, sink, skip_stages=skip_stages,
+            universe_version=universe_version)
+
     monkeypatch.setattr(SourceExpansionResolver, "resolve", spy2)
+    monkeypatch.setattr(
+        SourceExpansionResolver, "resolve_with_evidence", evidence_spy2)
     retired = discover_mechanism_dag(
         profiler2, tmp_path / "cache", seeds=["use"], terminal="out",
         source_hash="hash", terminal_file="src/main.cpp",
@@ -8990,3 +9065,190 @@ def test_proof_authority_invalid_bindings_still_veto():
     assert authority.missing_applicability_uses == (tuple(use),)
     assert authority.applicability_ok is False
     assert authority.authorizes_stop is False
+
+
+# --- P0: production evidence source ---
+
+def _p0_tree(tmp_path):
+    return _mini_tree(tmp_path, {
+        "src/modules/example/rtl.cpp": """
+#include "rtl.h"
+
+void Rtl::pick_altitude()
+{
+    _final_out = _dest_val + 1.0f;
+}
+""",
+        "src/modules/example/rtl.h": """
+class Rtl
+{
+    float _final_out;
+    float _dest_val;
+};
+""",
+        "src/modules/example/dest.cpp": """
+#include "rtl.h"
+
+void Rtl::update()
+{
+    speed_s speed_data{};
+    orb_copy(ORB_ID(speed), subscription, &speed_data);
+    _dest_val = speed_data.value;
+}
+""",
+    })
+
+
+def _p0_discover(profiler, tmp_path, **kwargs):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    return discover_mechanism_dag(
+        profiler,
+        tmp_path / "cache",
+        seeds=["pick_altitude"],
+        terminal="_final_out",
+        source_hash="hash",
+        terminal_file="src/modules/example/rtl.cpp",
+        **kwargs)
+
+
+def test_production_frontier_resolve_retains_evidence(tmp_path):
+    """P0 RED: a natural writer obligation reaching the production
+    frontier retains version-stamped search attempts while discovery
+    behavior stays identical with and without the sink."""
+    profiler = _p0_tree(tmp_path)
+    sink: list = []
+    result = _p0_discover(profiler, tmp_path, attempt_sink=sink)
+    plain = _p0_discover(profiler, tmp_path)
+    assert sink, "production frontier resolution retained no evidence"
+    assert all(
+        attempt.universe_ref.get("search_version") is not None
+        for attempt in sink
+    )
+    assert {a.universe_ref["search_version"] for a in sink} == {0, 1}
+    assert result.files_loaded == plain.files_loaded
+    assert result.stop_reason == plain.stop_reason
+    assert result.dag is not None and plain.dag is not None
+    assert [v.id for v in result.dag.vertices] == [
+        v.id for v in plain.dag.vertices]
+    assert [e.id for e in result.dag.edges] == [
+        e.id for e in plain.dag.edges]
+
+
+def _p0_candidate_dump(candidates):
+    import dataclasses
+    dumped = []
+    for item in candidates:
+        as_dict = (
+            dataclasses.asdict(item)
+            if dataclasses.is_dataclass(item)
+            else item.model_dump(mode="json")
+        )
+        dumped.append(as_dict)
+    return dumped
+
+
+def test_evidence_path_preserves_resolver_semantics(tmp_path):
+    """P0 pins B–F: evidence-enabled resolution returns semantically
+    identical candidates/admission for success, miss, ambiguity, and
+    unavailable shapes (T1 fixtures)."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+        UnresolvedSourceReference,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/widget.cpp": (
+            "struct Widget { float level; void fill() { level = 1; } };"
+        ),
+        "src/lib/over.cpp": "void tune(int x) {} void tune(float x) {}",
+        "src/lib/user.cpp": "void run() { helper.adjust(1); }",
+    })
+    resolver = SourceExpansionResolver(profiler, "hash")
+    identity = inputs.structure.symbol_identity(
+        "level", file="src/lib/widget.cpp",
+        callable_id="Widget::fill", function_name="Widget::fill")
+    references = [
+        UnresolvedSourceReference(
+            symbol="level", kind="storage_writers",
+            file="src/lib/widget.cpp", callable_id="Widget::fill",
+            identity=identity),
+        UnresolvedSourceReference(
+            symbol="tune", kind="callable", file="src/lib/over.cpp",
+            argument_count=1),
+        UnresolvedSourceReference(
+            symbol="NoSuchEntity", kind="class",
+            file="src/lib/over.cpp"),
+        UnresolvedSourceReference(
+            symbol="adjust", kind="callable", file="src/lib/user.cpp",
+            callable_id="run", receiver="helper", receiver_type="",
+            argument_count=1),
+    ]
+    for reference in references:
+        legacy = resolver.resolve(reference, inputs.structure)
+        sink: list = []
+        evidenced, evidence = resolver.resolve_with_evidence(
+            reference, inputs.structure, sink)
+        assert _p0_candidate_dump(evidenced) == _p0_candidate_dump(legacy)
+        assert evidence.attempts == sink
+        assert sink, "evidence path recorded no attempt"
+
+
+def test_evidence_version_stamp_and_session_isolation(tmp_path):
+    """P0 pins G–I: explicit version stamps, per-session sink
+    isolation, and deterministic same-version repeats."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+        UnresolvedSourceReference,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/widget.cpp": (
+            "struct Widget { float level; void fill() { level = 1; } };"
+        ),
+    })
+    identity = inputs.structure.symbol_identity(
+        "level", file="src/lib/widget.cpp",
+        callable_id="Widget::fill", function_name="Widget::fill")
+    reference = UnresolvedSourceReference(
+        symbol="level", kind="storage_writers",
+        file="src/lib/widget.cpp", callable_id="Widget::fill",
+        identity=identity)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    stamped: list = []
+    _, stamped_evidence = resolver.resolve_with_evidence(
+        reference, inputs.structure, stamped, universe_version=3)
+    assert stamped
+    assert all(
+        attempt.universe_ref.get("search_version") == 3
+        for attempt in stamped)
+    assert stamped_evidence.universe_ref.get("search_version") == 3
+    unstamped: list = []
+    resolver.resolve_with_evidence(
+        reference, inputs.structure, unstamped)
+    assert all(
+        "search_version" not in attempt.universe_ref
+        for attempt in unstamped)
+
+    tree_profiler = _p0_tree(tmp_path)
+    sink_a: list = []
+    sink_b: list = []
+    _p0_discover(tree_profiler, tmp_path, attempt_sink=sink_a)
+    _p0_discover(tree_profiler, tmp_path, attempt_sink=sink_b)
+    assert sink_a and sink_b
+    assert sink_a is not sink_b
+    assert not any(a is b for a in sink_a for b in sink_b)
+    assert len(sink_a) == len(sink_b)
+
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    shared_state = CoverageSearchState()
+    replay_sink: list = []
+    _p0_discover(tree_profiler, tmp_path, attempt_sink=replay_sink,
+                 search_state=shared_state)
+    first_pass = len(replay_sink)
+    assert first_pass > 0
+    _p0_discover(tree_profiler, tmp_path, attempt_sink=replay_sink,
+                 search_state=shared_state)
+    assert len(replay_sink) == first_pass

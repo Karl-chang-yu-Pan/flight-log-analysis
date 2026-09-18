@@ -1601,6 +1601,7 @@ def discover_mechanism_dag(
     checkpoint_evaluator: Optional[Callable[[MechanismDAG, int], CheckpointRound]] = None,
     construction_evaluator: Optional[Callable[[MechanismDAG, int], CheckpointRound]] = None,
     search_state: Optional[CoverageSearchState] = None,
+    attempt_sink: Optional[list] = None,
 ) -> DiscoveryResult:
     """Build a DAG by exact, provenance-checked fixed-point expansion.
 
@@ -1684,6 +1685,12 @@ def discover_mechanism_dag(
     # defaults to fresh so default discovery behavior is unchanged.
     if search_state is None:
         search_state = CoverageSearchState()
+    # Session-owned T1 evidence sink (P0, observational only): frontier
+    # resolution records its search attempts here without changing
+    # candidates, admission, or scheduling. Retained across rounds of
+    # this session; never shared across sessions. No derivation,
+    # retirement, or authority reads it yet.
+    evidence_sink: list = attempt_sink if attempt_sink is not None else []
     checkpoint: Optional[CheckpointRound] = None
     stop_reason = "frontier_exhausted"
     construction_session = DAGConstructionSession() if construction_evaluator is not None else None
@@ -1945,7 +1952,13 @@ def discover_mechanism_dag(
                 # attempted or deprioritized work, not proof.
                 continue
             search_state.mark_visited(key)
-            for candidate in resolver.resolve(reference, inputs.structure):
+            candidates, _frontier_evidence = resolver.resolve_with_evidence(
+                reference,
+                inputs.structure,
+                evidence_sink,
+                universe_version=search_state.version,
+            )
+            for candidate in candidates:
                 next_files.extend(declared_source_files(candidate.file))
         for file_path in fetched_files:
             next_files.extend(declared_source_files(file_path))
