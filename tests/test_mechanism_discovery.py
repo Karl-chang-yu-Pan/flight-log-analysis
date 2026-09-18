@@ -9252,3 +9252,199 @@ def test_evidence_version_stamp_and_session_isolation(tmp_path):
     _p0_discover(tree_profiler, tmp_path, attempt_sink=replay_sink,
                  search_state=shared_state)
     assert len(replay_sink) == first_pass
+
+
+# --- P1B: exact-pair consumers + bounded fallback ---
+
+def _p1b_rigged_pairs(reference, use_a, use_b):
+    """Crafted {(A,x),(B,y)} shape over noisy legacy arrays, through
+    validation-bypassing copy (production merge always normalizes)."""
+    return reference.model_copy(update={
+        "origin_vertex_ids": [use_a, use_b],
+        "origin_operands": ["kgain", "other"],
+        "origin_uses": [(use_a, "kgain"), (use_b, "other")],
+    })
+
+
+def test_t5_rejects_cartesian_invented_pair(tmp_path):
+    """P1B-A: (A,y) shares sides with known pairs but is not an exact
+    use — T5 must refuse on pair membership, not later stages."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_USE_IDENTITY_MISMATCH,
+        derive_writer_applicability,
+    )
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    rigged = _p1b_rigged_pairs(reference_a, use_a.id, "op-foreign")
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    outcome = derive_writer_applicability(
+        rigged, use_a.id, "other", cert, dag_a, 0,
+        conditional_writer_ids=())
+    assert outcome.proof is None
+    assert outcome.refusal == APPLICABILITY_USE_IDENTITY_MISMATCH
+
+
+def test_t5_accepts_real_exact_pair(tmp_path):
+    """P1B-B: the exact pair (A,x) still proceeds through normal T5
+    qualification on the same rigged reference."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER,
+        derive_writer_applicability,
+    )
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    rigged = _p1b_rigged_pairs(reference_a, use_a.id, "op-foreign")
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    positive = derive_writer_applicability(
+        rigged, use_a.id, "kgain", cert, dag_a, 0,
+        conditional_writer_ids=())
+    assert positive.refusal == "", positive.refusal_detail
+    assert positive.proof is not None
+    assert positive.proof.basis == APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER
+
+
+def test_t6b_enumerates_exact_pairs_only():
+    """P1B-C/D/G: exact pairs are authoritative — two pairs out, no
+    Cartesian cross-pairs, duplicates collapsed, noisy legacy arrays
+    ignored."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        collect_applicability_uses,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/main.cpp",
+        callable_id="usea", origin_vertex_ids=["op-a", "op-b"],
+        origin_operands=["kgain", "other"],
+        origin_uses=[("op-a", "kgain"), ("op-b", "other"),
+                     ("op-a", "kgain")])
+    visit = reference.visit_key()
+    assert collect_applicability_uses([reference], []) == (
+        ((("op-a", "kgain"), visit), (("op-b", "other"), visit)))
+
+
+def test_concrete_use_provenance_labels():
+    """P1B-E/F: single-single legacy entails one pair; ambiguous
+    legacy stays compatibility-cartesian (fail-closed); exact wins."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    from flight_log_agent.analysis.coverage import reference_concrete_uses
+    single = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/main.cpp",
+        callable_id="usea", origin_vertex_ids=["op-a"],
+        origin_operands=["kgain"])
+    assert reference_concrete_uses(single) == (
+        [("op-a", "kgain")], "entailed")
+    ambiguous = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/main.cpp",
+        callable_id="usea", origin_vertex_ids=["op-a", "op-b"],
+        origin_operands=["kgain", "other"])
+    uses, provenance = reference_concrete_uses(ambiguous)
+    assert provenance == "compatibility"
+    assert uses == [("op-a", "kgain"), ("op-a", "other"),
+                    ("op-b", "kgain"), ("op-b", "other")]
+    exact = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/main.cpp",
+        callable_id="usea", origin_vertex_ids=["op-a", "op-b"],
+        origin_operands=["kgain", "other"],
+        origin_uses=[("op-a", "kgain"), ("op-b", "other")])
+    assert reference_concrete_uses(exact) == (
+        [("op-a", "kgain"), ("op-b", "other")], "exact")
+
+
+def test_operand_less_reference_yields_no_use():
+    """P1B-H: origins without operands (and no pairs) fabricate no
+    concrete applicability use."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        collect_applicability_uses,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/main.cpp",
+        callable_id="usea", origin_vertex_ids=["op-a"],
+        origin_operands=[])
+    assert collect_applicability_uses([reference], []) == ()
+
+
+def test_exact_pairs_remove_fabricated_liveness_veto(tmp_path):
+    """P1B liveness: with exact pairs, proving the two REAL uses
+    authorizes — the Cartesian-fabricated vetoes are gone while every
+    real requirement remains."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/main.cpp",
+        callable_id="usea", origin_vertex_ids=["op-a", "op-b"],
+        origin_operands=["kgain", "other"],
+        origin_uses=[("op-a", "kgain"), ("op-b", "other")])
+    key = reference.visit_key()
+    semantic = ("storage_writers", "global", "decl-kgain")
+    use_a, use_b = ("op-a", "kgain"), ("op-b", "other")
+    observation = _proof_observation(relevant=[key], covered=[key])
+    certificate_a, proof_a = _proof_pair(use_a, key, semantic)
+    _certificate_b, proof_b = _proof_pair(use_b, key, semantic)
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        collect_applicability_uses,
+    )
+    uses = collect_applicability_uses([reference], [])
+    assert [use for use, _visit in uses] == [use_a, use_b]
+    authority = _authority(
+        observation=observation,
+        certificates=[certificate_a],
+        applicability_proofs=[proof_a, proof_b], legacy_verified=True,
+        applicability_uses=uses)
+    assert authority.missing_applicability_uses == ()
+    assert authority.applicability_ok is True
+    assert authority.authorizes_stop is True
+
+
+def test_exact_pairs_preserve_declaration_isolation(tmp_path):
+    """P1B-J: pair-aware membership does not weaken cross-declaration
+    isolation — a foreign declaration's use still refuses."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_USE_IDENTITY_MISMATCH,
+        derive_writer_applicability,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    foreign = reference_a.model_copy(update={
+        "origin_uses": [(use_a.id, "kgain")],
+    })
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    outcome = derive_writer_applicability(
+        foreign, "op-foreign", "kgain", cert, dag_a, 0,
+        conditional_writer_ids=())
+    assert outcome.proof is None
+    assert outcome.refusal == APPLICABILITY_USE_IDENTITY_MISMATCH

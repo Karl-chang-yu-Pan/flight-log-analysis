@@ -658,6 +658,52 @@ def _refuse_applicability(code: str, **detail: Any
         proof=None, refusal=code, refusal_detail=dict(detail))
 
 
+def reference_concrete_uses(
+    reference: Any,
+) -> tuple[list[tuple[str, str]], str]:
+    """Effective concrete uses of one unresolved obligation.
+
+    Returns `(uses, provenance)` where provenance is one of:
+    - `"exact"`: `origin_uses` present — authoritative; legacy
+      origins/operands arrays are ignored, however noisy;
+    - `"entailed"`: legacy single-origin/single-operand shape
+      mechanically entails exactly one pair;
+    - `"compatibility"`: ambiguous legacy fields — conservative
+      cartesian fallback, fail-closed (extra pairs only add proof
+      requirements, never omit a real use).
+
+    The cartesian path exists only for references predating exact
+    provenance and is removed when the old DAG/snapshot format
+    retires; no format version exists today, so the condition is the
+    empty-pair state itself. Shared pure helper so T5 membership and
+    T6B enumeration cannot implement divergent fallback semantics.
+    Order-preserving, deduplicated.
+    """
+    pairs: list[tuple[str, str]] = []
+    for pair in list(getattr(reference, "origin_uses", None) or ()):
+        try:
+            origin, operand = pair
+        except (TypeError, ValueError):
+            continue
+        if (origin and operand
+                and (origin, operand) not in pairs):
+            pairs.append((origin, operand))
+    if pairs:
+        return pairs, "exact"
+    origins = [item for item in list(
+        getattr(reference, "origin_vertex_ids", None) or ()) if item]
+    operands = [item for item in list(
+        getattr(reference, "origin_operands", None) or ()) if item]
+    if len(origins) == 1 and len(operands) == 1:
+        return [(origins[0], operands[0])], "entailed"
+    uses: list[tuple[str, str]] = []
+    for origin in origins:
+        for operand in operands:
+            if (origin, operand) not in uses:
+                uses.append((origin, operand))
+    return uses, "compatibility"
+
+
 def _reachability_exact(vertex: Any) -> Optional[bool]:
     """The builder's exactness verdict for one vertex, if recorded."""
     metadata = getattr(vertex, "metadata", None) or {}
@@ -696,15 +742,18 @@ def derive_writer_applicability(
     effect, never stop authority.
     """
     use_key = (origin_vertex_id, operand)
-    origins = list(getattr(reference, "origin_vertex_ids", None) or ())
-    operands = list(getattr(reference, "origin_operands", None) or ())
-    if origins and origin_vertex_id not in origins:
+    # Concrete-use membership over the effective use view: exact pairs
+    # when provenance exists, else the bounded legacy compatibility
+    # (single entailed pair or conservative cartesian). A requested use
+    # outside that view — e.g. a Cartesian-invented cross-pair — is not
+    # a use of this obligation. Empty views constrain nothing, as
+    # before: a use without recorded provenance cannot be refused here.
+    concrete_uses, _use_provenance = reference_concrete_uses(reference)
+    if concrete_uses and (origin_vertex_id, operand) not in [
+            (str(use_origin), str(use_operand))
+            for use_origin, use_operand in concrete_uses]:
         return _refuse_applicability(
-            APPLICABILITY_USE_IDENTITY_MISMATCH, reason="origin",
-            use_key=use_key)
-    if operands and operand not in operands:
-        return _refuse_applicability(
-            APPLICABILITY_USE_IDENTITY_MISMATCH, reason="operand",
+            APPLICABILITY_USE_IDENTITY_MISMATCH, reason="concrete-use",
             use_key=use_key)
     # Semantic obligation binding: the certificate's proven obligation
     # must equal the use's obligation recomputed without structure.

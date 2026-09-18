@@ -19,6 +19,7 @@ from flight_log_agent.analysis.mechanism_dag import (
     ConstructionDemand, MechanismDAG, evaluate_feasibility, prepare_signal_series, sample_prepared_signal,
 )
 from flight_log_agent.analysis.source_expansion import UnresolvedSourceReference
+from flight_log_agent.analysis.coverage import reference_concrete_uses
 
 
 @dataclass(frozen=True)
@@ -177,14 +178,15 @@ def collect_applicability_uses(
     """Concrete (use, obligation) pairs for applicability matching.
 
     A use is an (origin vertex, operand) pair; its obligation is the
-    scheduling visit key it was derived alongside. Reference origins
-    and operands accumulate independently upstream, so the pairing is
-    the conservative cartesian product (extra pairs fail closed: an
+    scheduling visit key it was derived alongside. Reference uses come
+    from the shared concrete-use view: exact `origin_uses` when
+    provenance exists (authoritative over noisy legacy arrays),
+    otherwise the bounded legacy compatibility (single entailed pair
+    or conservative cartesian fallback — extra pairs fail closed: an
     unprovable pair vetoes). Local needs contribute exact
-    (vertex, operand) pairs bound to each attached request. Empty
-    origins/operands contribute nothing: a use without a concrete
-    vertex and operand cannot govern a value. Order-preserving,
-    deduplicated.
+    (vertex, operand) pairs bound to each attached request. A use
+    without a concrete vertex and operand cannot govern a value.
+    Order-preserving, deduplicated.
     """
     uses: list = []
 
@@ -198,12 +200,10 @@ def collect_applicability_uses(
             visit = tuple(reference.visit_key())
         except (AttributeError, TypeError, ValueError):
             continue
-        origins = list(getattr(reference, "origin_vertex_ids", None) or ())
-        operands = list(getattr(reference, "origin_operands", None) or ())
-        for origin in origins:
-            for operand in operands:
-                if origin and operand:
-                    _add((origin, operand), visit)
+        concrete_uses, _provenance = reference_concrete_uses(reference)
+        for origin, operand in concrete_uses:
+            if origin and operand:
+                _add((origin, operand), visit)
     for need in local_needs or ():
         if not isinstance(need, dict):
             continue
