@@ -34,7 +34,9 @@ from flight_log_agent.analysis.coverage import (
     CoverageEvidence,
     CoverageProofStore,
     CoverageSearchState,
+    derive_writer_applicability,
     derive_writer_coverage_certificate,
+    reference_concrete_uses,
 )
 from flight_log_agent.analysis.checkpoint_discovery import CheckpointRound
 from flight_log_agent.analysis.mechanism_dag import (
@@ -1659,6 +1661,154 @@ def derive_current_coverage_proofs(
             proof_store.replace_certificate(result.certificate)
 
 
+def derive_current_applicability_proofs(
+    references: Any,
+    search_version: Any,
+    dag: Any,
+    proof_store: CoverageProofStore,
+    conditional_writer_ids: Any = None,
+) -> None:
+    """Derive T5 applicability proofs into the proof store.
+
+    Session orchestration only, mirroring the T3 hook: for each
+    reference, enumerate effective concrete uses through the shared
+    P1B view and, per use, reuse a still-valid current proof or invoke
+    the pure T5 derivation against each current certificate for the
+    visit. Proofs whose use left the effective set, or whose inputs no
+    longer support them while nothing re-proves them, are discarded.
+
+    `conditional_writer_ids` carries the round's evaluated conditional
+    context (`None` means unknown). Unknown context fails closed: the
+    whole pass is skipped, because an absent conditional set must
+    never be upgraded to "no conditional writers". An explicitly empty
+    set is a known-empty context established by evaluation.
+    """
+    if conditional_writer_ids is None:
+        return
+    conditional = set(conditional_writer_ids or ())
+    vertices = {vertex.id: vertex
+                for vertex in (getattr(dag, "vertices", None) or ())}
+    edges = list(getattr(dag, "edges", None) or ())
+
+    def inputs_unchanged(
+        proof: Any, certificate: Any, use: Any,
+    ) -> bool:
+        """Whether a stored proof still matches current inputs.
+
+        Conservative change detection, never a refusal: any doubt
+        routes to fresh T5 derivation. Compares the certificate
+        binding T5 actually consumes, the dataflow edges feeding the
+        use, control absence, and conditional clearance.
+        """
+        if (tuple(getattr(proof, "obligation_key", None) or ())
+                != tuple(getattr(certificate, "obligation_key", None)
+                         or ())):
+            return False
+        if (set(getattr(proof, "writers", None) or ())
+                != set(getattr(certificate, "writers", None) or ())):
+            return False
+        if (tuple(getattr(proof, "declaration", None) or ())
+                != tuple(getattr(certificate, "declaration", None)
+                         or ())):
+            return False
+        if (tuple(getattr(proof, "receiver_context", None) or ())
+                != tuple(
+                    getattr(certificate, "receiver_context", None)
+                    or ())):
+            return False
+        try:
+            origin, operand = tuple(use)
+        except (TypeError, ValueError):
+            return False
+        producer = str(getattr(proof, "producer_vertex", "") or "")
+        if not origin or not operand or not producer:
+            return False
+        if origin in conditional or producer in conditional:
+            return False
+        use_vertex = vertices.get(origin)
+        if use_vertex is None or getattr(use_vertex, "kind", "") != (
+                "operation"):
+            return False
+        if vertices.get(producer) is None:
+            return False
+        recorded_edges = {
+            str(item)[len("edge:"):]
+            for item in (getattr(proof, "supporting_facts", None) or ())
+            if str(item).startswith("edge:")}
+        current_edges = {
+            str(getattr(edge, "id", "") or "")
+            for edge in edges
+            if getattr(edge, "target_id", "") == origin
+            and getattr(edge, "kind", "") == "data"
+            and getattr(edge, "role", "") == operand
+            and str(getattr(edge, "id", "") or "")}
+        if current_edges != recorded_edges:
+            return False
+        for edge in edges:
+            if getattr(edge, "kind", "") == "control" and getattr(
+                    edge, "target_id", "") in (origin, producer):
+                return False
+        return True
+
+    effective: set = set()
+    for reference in references or ():
+        try:
+            visit = tuple(reference.visit_key())
+        except (AttributeError, TypeError, ValueError):
+            continue
+        concrete_uses, _provenance = reference_concrete_uses(reference)
+        for origin, operand in concrete_uses:
+            if origin and operand:
+                effective.add(((origin, operand), visit))
+    for (use, visit) in sorted(effective, key=repr):
+        origin, operand = use
+        reference = next(
+            (item for item in references or ()
+             if _visit_of(item) == visit),
+            None)
+        if reference is None:
+            continue
+        try:
+            certificates = proof_store.certificates_for_visit(
+                search_version, visit)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        proven = False
+        existing = proof_store.proof_for(search_version, use, visit)
+        if existing is not None and any(
+                inputs_unchanged(existing, certificate, use)
+                for certificate in certificates):
+            proven = True
+        if not proven:
+            for certificate in certificates:
+                result = derive_writer_applicability(
+                    reference, origin, operand, certificate, dag,
+                    search_version,
+                    conditional_writer_ids=conditional_writer_ids)
+                if result.proof is not None:
+                    if not proof_store.store_proof(result.proof):
+                        proof_store.replace_proof(result.proof)
+                    proven = True
+                    break
+        if not proven:
+            proof_store.discard_proof(search_version, use, visit)
+    for stored in proof_store.proofs_for(search_version):
+        try:
+            entry = ((tuple(stored.use_key), tuple(stored.scheduling_key)))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if entry not in effective:
+            proof_store.discard_proof(
+                search_version, entry[0], entry[1])
+
+
+def _visit_of(reference: Any) -> Any:
+    try:
+        return tuple(reference.visit_key())
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def discover_mechanism_dag(
     profiler: MechanismSourceProfiler,
     cache_root: Union[str, Path],
@@ -2075,6 +2225,31 @@ def discover_mechanism_dag(
             evidence_log,
             proof_store,
         )
+        # Incremental T5 proof production (P2C): derive applicability
+        # for current uses immediately after T3, on the same DAG and
+        # version. Conditional context comes from this round's
+        # checkpoint evaluation; without an explicit conditional key
+        # in the checkpoint summary the context is unknown and the
+        # whole pass is skipped (fail-closed: unknown is never
+        # upgraded to "no conditional writers").
+        conditional_context: Any = None
+        local_checks = (None if checkpoint is None else
+                        (checkpoint.summary or {}).get(
+                            "local_equation_checks"))
+        if local_checks is not None:
+            conditional_context = set()
+            for check in local_checks or ():
+                if isinstance(check, dict):
+                    conditional_context.update(
+                        check.get("conditional_writer_ids") or ())
+        if conditional_context is not None:
+            derive_current_applicability_proofs(
+                dag.unresolved_references if dag is not None else [],
+                search_state.version,
+                dag,
+                proof_store,
+                conditional_context,
+            )
         if not pending:
             if construction_session is not None and references:
                 attempted = {reference.visit_key() for reference in references}

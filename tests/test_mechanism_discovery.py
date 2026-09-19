@@ -10266,3 +10266,454 @@ def test_proof_store_discard_proof():
     assert store.proof_for(1, use, key) == other_version
     assert store.discard_proof(0, use, key) is False
     assert store.discard_proof(0, ("missing",), key) is False
+
+
+# --- P2C: incremental T5 applicability derivation ---
+
+def _p2c_continue_evaluator(dag, index):
+    """Test checkpoint evaluator exposing empty conditional context
+    on a branch-free fixture (emptiness established by inspection)."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        CheckpointRound,
+    )
+    return CheckpointRound(
+        "continue", dag, list(dag.unresolved_references),
+        {"action": "continue", "local_equation_checks": []})
+
+
+def _p2c_t5_spy(monkeypatch):
+    import flight_log_agent.analysis.mechanism_discovery as discovery
+    calls: list = []
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_applicability as real_derive,
+    )
+
+    def spy(reference, origin_vertex_id, operand, certificate, dag,
+            version, conditional_writer_ids=()):
+        calls.append((origin_vertex_id, operand,
+                      tuple(getattr(certificate, "writers", None) or ())))
+        return real_derive(reference, origin_vertex_id, operand,
+                           certificate, dag, version,
+                           conditional_writer_ids=conditional_writer_ids)
+
+    monkeypatch.setattr(discovery, "derive_writer_applicability", spy)
+    return calls
+
+
+def test_p2c_production_chain_derives_proof(tmp_path):
+    """P2C-A: natural obligation → retained evidence → real T3 cert →
+    exact use → pure T5 proof stored with full payload."""
+    from flight_log_agent.analysis.coverage import (
+        APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER,
+        CoverageProofStore,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    assert result_a.dag is not None
+    store = CoverageProofStore()
+    result = discover_mechanism_dag(
+        profiler_a, tmp_path / "cache_a", seeds=["usea"],
+        terminal="out_a", source_hash="hash",
+        terminal_file="src/main.cpp", proof_store=store,
+        checkpoint_evaluator=_p2c_continue_evaluator)
+    assert result.dag is not None
+    dag = result.dag
+    use_a = next(vertex for vertex in dag.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference = next(item for item in dag.unresolved_references
+                     if item.symbol == "kgain"
+                     and item.kind == "storage_writers")
+    visit = reference.visit_key()
+    certificates = store.certificates_for(0)
+    assert len(certificates) == 1
+    proof = store.proof_for(0, (use_a.id, "kgain"), visit)
+    assert proof is not None
+    assert proof.version == 0
+    assert tuple(proof.use_key) == (use_a.id, "kgain")
+    assert tuple(proof.scheduling_key) == tuple(visit)
+    assert tuple(proof.obligation_key) == tuple(
+        certificates[0].obligation_key)
+    assert set(proof.writers) == set(certificates[0].writers)
+    assert proof.producer_vertex
+    assert proof.basis == APPLICABILITY_BASIS_SINGLE_EXACT_PRODUCER
+    assert tuple(proof.supporting_facts)
+    assert tuple(proof.receiver_context) == tuple(
+        certificates[0].receiver_context)
+
+
+def test_p2c_no_certificate_no_derivation(tmp_path, monkeypatch):
+    """P2C-B: exact use without a current certificate never invokes
+    T5 and stores nothing."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    ( _profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    calls = _p2c_t5_spy(monkeypatch)
+    store = CoverageProofStore()
+    derive_current_applicability_proofs(
+        result_a.dag.unresolved_references, 0, result_a.dag, store, set())
+    assert calls == []
+    assert store.proofs_for(0) == ()
+
+
+def test_p2c_fabricated_pair_never_derived(tmp_path, monkeypatch):
+    """P2C-D: T5 is never invoked with a Cartesian-invented pair, even
+    when both sides appear in legacy arrays."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    rigged = reference_a.model_copy(update={
+        "origin_vertex_ids": [use_a.id, "op-foreign"],
+        "origin_operands": ["kgain", "other"],
+        "origin_uses": [(use_a.id, "kgain")],
+    })
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(cert) is True
+    calls = _p2c_t5_spy(monkeypatch)
+    derive_current_applicability_proofs(
+        [rigged], 0, dag_a, store, set())
+    assert (use_a.id, "other") not in [
+        (origin, operand) for origin, operand, _writers in calls]
+    assert (use_a.id, "kgain") in [
+        (origin, operand) for origin, operand, _writers in calls]
+
+
+def test_p2c_shared_coverage_per_use_proofs(tmp_path, monkeypatch):
+    """P2C-E: one shared certificate, two exact uses → independent
+    proof attempts per use, no certificate duplication."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    rigged = reference_a.model_copy(update={
+        "origin_vertex_ids": [use_a.id, "op-second"],
+        "origin_operands": ["kgain", "kgain"],
+        "origin_uses": [(use_a.id, "kgain"), ("op-second", "kgain")],
+    })
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(cert) is True
+    calls = _p2c_t5_spy(monkeypatch)
+    derive_current_applicability_proofs(
+        [rigged], 0, dag_a, store, set())
+    attempted = {(origin, operand) for origin, operand, _ in calls}
+    assert (use_a.id, "kgain") in attempted
+    assert ("op-second", "kgain") in attempted
+    assert len(store.certificates_for(0)) == 1
+
+
+def test_p2c_unchanged_proof_reused(tmp_path, monkeypatch):
+    """P2C-F: identical current inputs rerun T5 zero times."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(cert) is True
+    calls = _p2c_t5_spy(monkeypatch)
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, store, set())
+    first_count = len(calls)
+    assert first_count > 0
+    first_proofs = store.proofs_for(0)
+    assert len(first_proofs) == len(
+        {tuple(proof.use_key) for proof in first_proofs})
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, store, set())
+    assert len(calls) == first_count
+    assert store.proofs_for(0) == first_proofs
+
+
+def test_p2c_certificate_change_revalidates(tmp_path, monkeypatch):
+    """P2C-G: same-version certificate replacement with a new writer
+    set invalidates the old proof unless T5 re-proves the new set."""
+    from dataclasses import replace
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    visit = reference_a.visit_key()
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(cert) is True
+    calls = _p2c_t5_spy(monkeypatch)
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, store, set())
+    old_proof = store.proof_for(0, (use_a.id, "kgain"), visit)
+    assert old_proof is not None
+    grown = replace(cert, writers=tuple(cert.writers) + ("extra-site",))
+    assert store.replace_certificate(grown) is True
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, store, set())
+    current = store.proof_for(0, (use_a.id, "kgain"), visit)
+    assert current is None or set(current.writers) == set(grown.writers)
+    assert current != old_proof or current is None
+    assert len(calls) > 1
+
+
+def test_p2c_conditional_control_mismatch_refuse(tmp_path, monkeypatch):
+    """P2C-H/I/J/K: conditional membership, guarded control, and
+    writer mismatch each refuse without storing positive proof."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, result_b) = _split_use_tree(
+        tmp_path)
+    dag_a, dag_b = result_a.dag, result_b.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    use_b = next(vertex for vertex in dag_b.vertices
+                 if vertex.variable == "out_b"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    # Conditional producer blocks.
+    blocked = CoverageProofStore()
+    assert blocked.store_certificate(cert) is True
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, blocked, {use_a.id})
+    assert blocked.proofs_for(0) == ()
+    # Guarded use refuses via control.
+    guarded = CoverageProofStore()
+    assert guarded.store_certificate(cert) is True
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    guarded_ref = UnresolvedSourceReference.model_validate(
+        reference_a.model_dump())
+    calls = _p2c_t5_spy(monkeypatch)
+    derive_current_applicability_proofs(
+        [guarded_ref], 0, dag_b, guarded, set())
+    assert guarded.proof_for(
+        0, (use_b.id, "kgain"), guarded_ref.visit_key()) is None
+    # Writer-mismatched certificate cannot prove.
+    from dataclasses import replace
+    skewed_store = CoverageProofStore()
+    skewed = replace(cert, writers=("elsewhere",))
+    assert skewed_store.store_certificate(skewed) is True
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, skewed_store, set())
+    assert skewed_store.proof_for(
+        0, (use_a.id, "kgain"), reference_a.visit_key()) is None
+    assert calls is not None
+
+
+def test_p2c_cross_declaration_isolated(tmp_path, monkeypatch):
+    """P2C-L: a proof derived for declaration A never satisfies a
+    same-spelling declaration B use."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(cert) is True
+    _p2c_t5_spy(monkeypatch)
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, store, set())
+    assert store.proof_for(
+        0, (use_a.id, "kgain"), reference_a.visit_key()) is not None
+    _other_profiler, other_inputs = _evidence_setup(tmp_path, {
+        "src/lib/h.cpp": (
+            "static float kgain = 9.0f;\nvoid other() { kgain = 3.0f; }\n"
+        ),
+    })
+    other_identity = other_inputs.structure.symbol_identity(
+        "kgain", file="src/lib/h.cpp",
+        callable_id="other", function_name="other")
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    other_ref = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers", file="src/lib/h.cpp",
+        callable_id="other", identity=other_identity,
+        origin_vertex_ids=[use_a.id], origin_operands=["kgain"],
+        origin_uses=[(use_a.id, "kgain")])
+    assert other_ref.visit_key() != reference_a.visit_key()
+    derive_current_applicability_proofs(
+        [other_ref], 0, dag_a, store, set())
+    assert store.proof_for(
+        0, (use_a.id, "kgain"), other_ref.visit_key()) is None
+
+
+def test_p2c_version_extension_starts_fresh(tmp_path, monkeypatch):
+    """P2C-M: v0 proofs never appear under v1; v1 needs fresh certs."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(cert) is True
+    calls = _p2c_t5_spy(monkeypatch)
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, store, set())
+    assert store.proof_for(
+        0, (use_a.id, "kgain"), reference_a.visit_key()) is not None
+    derive_current_applicability_proofs(
+        [reference_a], 1, dag_a, store, set())
+    assert store.proofs_for(1) == ()
+    assert store.proof_for(
+        1, (use_a.id, "kgain"), reference_a.visit_key()) is None
+    assert len(calls) >= 1
+
+
+def test_p2c_removed_use_discarded(tmp_path, monkeypatch):
+    """P2C-N: a proof whose use leaves the effective set is
+    explicitly discarded, not left reusable."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_applicability_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    dag_a = result_a.dag
+    use_a = next(vertex for vertex in dag_a.vertices
+                 if vertex.variable == "out_a"
+                 and vertex.kind == "operation")
+    reference_a = next(item for item in dag_a.unresolved_references
+                       if item.symbol == "kgain"
+                       and item.kind == "storage_writers")
+    cert = _derive_use_certificate(
+        profiler_a, result_a.inputs.structure, reference_a, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(cert) is True
+    _p2c_t5_spy(monkeypatch)
+    derive_current_applicability_proofs(
+        [reference_a], 0, dag_a, store, set())
+    assert store.proof_for(
+        0, (use_a.id, "kgain"), reference_a.visit_key()) is not None
+    narrowed = reference_a.model_copy(update={
+        "origin_vertex_ids": ["op-elsewhere"],
+        "origin_operands": ["kgain"],
+        "origin_uses": [("op-elsewhere", "kgain")],
+    })
+    assert narrowed.visit_key() == reference_a.visit_key()
+    derive_current_applicability_proofs(
+        [narrowed], 0, dag_a, store, set())
+    assert store.proof_for(
+        0, (use_a.id, "kgain"), reference_a.visit_key()) is None
+
+
+def test_p2c_skips_without_conditional_context(tmp_path, monkeypatch):
+    """Conditional gating: unknown conditional context (no
+    checkpoint) means no T5 invocation at all — fail-closed."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    store = CoverageProofStore()
+    calls = _p2c_t5_spy(monkeypatch)
+    result = _p2c_discover_no_evaluator(
+        profiler_a, tmp_path, store)
+    assert result.dag is not None
+    assert len(store.certificates_for(0)) == 1
+    assert calls == []
+    assert store.proofs_for(0) == ()
+
+
+def _p2c_discover_no_evaluator(profiler, tmp_path, store):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    return discover_mechanism_dag(
+        profiler, tmp_path / "cache_a", seeds=["usea"],
+        terminal="out_a", source_hash="hash",
+        terminal_file="src/main.cpp", proof_store=store)
+
+
+def test_p2c_checkpoint_unaffected(tmp_path):
+    """P2C-O: stored applicability proofs never reach the checkpoint
+    in P2C — discovery behavior identical with/without the store."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    (profiler_a, _result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    plain = discover_mechanism_dag(
+        profiler_a, tmp_path / "cache_a", seeds=["usea"],
+        terminal="out_a", source_hash="hash",
+        terminal_file="src/main.cpp",
+        checkpoint_evaluator=_p2c_continue_evaluator)
+    store = CoverageProofStore()
+    threaded = discover_mechanism_dag(
+        profiler_a, tmp_path / "cache_a", seeds=["usea"],
+        terminal="out_a", source_hash="hash",
+        terminal_file="src/main.cpp", proof_store=store,
+        checkpoint_evaluator=_p2c_continue_evaluator)
+    assert threaded.files_loaded == plain.files_loaded
+    assert threaded.stop_reason == plain.stop_reason
+    assert threaded.dag is not None and plain.dag is not None
+    assert [v.id for v in threaded.dag.vertices] == [
+        v.id for v in plain.dag.vertices]
