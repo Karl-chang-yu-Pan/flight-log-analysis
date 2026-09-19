@@ -6542,6 +6542,41 @@ def _split_use_tree(tmp_path):
     return (profiler_a, result_a), (profiler_b, result_b)
 
 
+def _published_use_tree(tmp_path):
+    """Split-use shape plus a parser-recognized publication transfer
+    strictly downstream of the writer obligation: the straight-line
+    consumer publishes a local snapshot through a uORB Publication so
+    the terminal is a source-backed publication with plain-identifier
+    replay equations. The `kgain` obligation, its origin use, and its
+    production-born proof chain are byte-identical in shape to
+    `_split_use_tree` branch A."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    files = {
+        "src/main.cpp": (
+            "struct out_a_s { float value; };\n"
+            "static float kgain = 1.0f;\n"
+            "class Pub {\n"
+            "    uORB::Publication<out_a_s> _pub{ORB_ID(out_a)};\n"
+            "    void usea() {\n"
+            "        out_a_s snap{};\n"
+            "        snap.value = kgain * 3.0f;\n"
+            "        _pub.publish(snap);\n"
+            "    }\n"
+            "};\n"
+        ),
+    }
+    profiler = _mini_tree(tmp_path, files, backend="tree_sitter")
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["usea"],
+        terminal="out_a.value", source_hash="hash",
+        terminal_file="src/main.cpp",
+        logged_signals={"out_a.value"})
+    assert result.dag is not None
+    return profiler, result
+
+
 def test_applicability_splits_shared_declaration_by_use(tmp_path):
     """E: two uses share one declaration and one coverage certificate —
     the straight-line use proves applicable while the guarded use does
@@ -10993,10 +11028,18 @@ def test_p2d_checkpoint_unaffected(tmp_path):
 
 # --- P3: immutable proof snapshot + checkpoint threading ---
 
-def _p3_threading_evaluator(seen_rounds, seen_snapshots):
+def _p3_threading_evaluator(seen_rounds, seen_snapshots, *,
+                            observed_signals=None,
+                            signal_samples=None,
+                            signal_policies=None):
     """Real checkpoint round accepting an optional proof snapshot
     exactly like the production control round: snapshot values flow
-    into the existing T6B inputs, omission preserves legacy call."""
+    into the existing T6B inputs, omission preserves legacy call.
+
+    Optional observed-signal/sample/policy inputs default to the
+    legacy sample-less call; passing them wires honest observation
+    (e.g. R2 publication-terminal replay) without touching the
+    production path."""
     from flight_log_agent.analysis.checkpoint_discovery import (
         evaluate_checkpoint_round,
     )
@@ -11012,10 +11055,18 @@ def _p3_threading_evaluator(seen_rounds, seen_snapshots):
                     proof_snapshot.applicability_proofs or ()),
                 "proof_version": proof_snapshot.version,
             }
+        if signal_samples is None:
+            load_samples = lambda _view, _observed: {}
+        else:
+            samples = dict(signal_samples)
+            load_samples = lambda _view, _observed: dict(samples)
         result = evaluate_checkpoint_round(
-            dag, parameter_values={}, observed_signals=set(),
-            signal_policies={},
-            load_samples=lambda _view, _observed: {},
+            dag, parameter_values={},
+            observed_signals=set()
+            if observed_signals is None else set(observed_signals),
+            signal_policies={}
+            if signal_policies is None else dict(signal_policies),
+            load_samples=load_samples,
             **kwargs)
         seen_rounds.append(result)
         return result
@@ -11316,58 +11367,111 @@ def test_p3_construction_evaluator_receives_snapshot(tmp_path):
               for snapshot, version_at_call in seen)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Gate B: covered relevant obligations still dirty legacy "
-           "source_requests (relevance and source-requests derive from "
-           "the same origin sets), so no non-vacuous positive stop is "
-           "reachable yet; see P4 STOP report",
-)
+def test_published_use_tree_has_publish_boundary(tmp_path):
+    """R2-A: the published fixture lowers a parser-generated publish
+    boundary operation (publish direction, external target, source
+    file/line provenance) — no hand-fabricated terminal vertex."""
+    profiler, _result = _published_use_tree(tmp_path)
+    facts = load_facts(
+        profiler, tmp_path / "cache_facts", ["src/main.cpp"], "hash")
+    inputs = dag_inputs_from_facts(facts)
+    pubs = [
+        item for item in inputs.bindings
+        if item.get("synthetic_boundary_transfer")
+        and item.get("boundary_direction") == "publish"
+    ]
+    assert pubs, "no parser-generated publish boundary operation"
+    publication = next(
+        item for item in pubs if item.get("target_symbol") == "out_a")
+    assert publication["source_symbol"] == "snap"
+    path = (publication.get("assignment_path") or [{}])[0]
+    assert path.get("file") == "src/main.cpp"
+    assert path.get("line"), "publish lacks source line provenance"
+
+
 def test_p4_honest_production_positive_stop(tmp_path):
-    """P4 E2E (known gap): natural obligation → P0 evidence → P2B
-    cert → exact use → P2C proof → threaded snapshot → real round
-    must eventually authorize a non-vacuous stop. Today full proof
-    (coverage AND applicability, non-empty relevance) still yields
-    stop False because the proven obligation itself keeps legacy
-    source_requests dirty. XPASS means the gap closed: update this
-    test and the P4 report instead of weakening anything."""
+    """P4 E2E: natural obligation → P0 evidence → P2B cert → exact
+    use → P2C proof → threaded snapshot → real round authorizes a
+    non-vacuous stop. The straight-line consumer publishes a local
+    snapshot through a parser-recognized publication, so the terminal
+    is source-backed and honestly observed: replay matches the known
+    cone while T3/T5 proof (not the match) authorizes stop."""
     from flight_log_agent.analysis.coverage import (
         CoverageProofStore,
         CoverageSearchState,
+        reference_concrete_uses,
     )
     from flight_log_agent.analysis.mechanism_discovery import (
         discover_mechanism_dag,
     )
-    (profiler_a, _result_a), (_profiler_b, _result_b) = _split_use_tree(
-        tmp_path)
+    profiler, _result = _published_use_tree(tmp_path)
     store = CoverageProofStore()
     state = CoverageSearchState()
+    samples = {"out_a.value": [(0.0, 3.0), (10.0, 3.0)]}
+    policies = {"out_a.value": {"method": "linear"}}
     kwargs = dict(
-        seeds=["usea"], terminal="out_a", source_hash="hash",
-        terminal_file="src/main.cpp")
+        seeds=["usea"], terminal="out_a.value", source_hash="hash",
+        terminal_file="src/main.cpp",
+        logged_signals={"out_a.value"})
     seen_rounds: list = []
     seen_snapshots: list = []
-    discover_mechanism_dag(
-        profiler_a, tmp_path / "cache_a", proof_store=store,
-        search_state=state,
-        checkpoint_evaluator=_p3_threading_evaluator(
-            seen_rounds, seen_snapshots),
-        **kwargs)
-    discover_mechanism_dag(
-        profiler_a, tmp_path / "cache_a", proof_store=store,
-        search_state=state,
-        checkpoint_evaluator=_p3_threading_evaluator(
-            seen_rounds, seen_snapshots),
-        **kwargs)
+    for cache in ("cache_a", "cache_b"):
+        discover_mechanism_dag(
+            profiler, tmp_path / cache, proof_store=store,
+            search_state=state,
+            checkpoint_evaluator=_p3_threading_evaluator(
+                seen_rounds, seen_snapshots,
+                observed_signals=set(samples),
+                signal_samples=samples, signal_policies=policies),
+            **kwargs)
     assert seen_rounds, "no checkpoint evaluated"
     final = seen_rounds[-1]
     authority = final.proof_authority
     observation = final.proof_observation
+    # Anti-vacuity: publication wiring must not erase proof relevance
+    # or the exact applicability use.
     assert len(observation.relevant_obligation_keys) >= 1
+    assert len(observation.covered_obligation_keys) >= 1
+    assert observation.uncovered_obligation_keys == ()
+    concrete_uses = [
+        use for reference in final.annotated.unresolved_references
+        for use in reference_concrete_uses(reference)[0]
+    ]
+    assert len(concrete_uses) >= 1
     assert authority.writer_coverage_verified is True
     assert authority.applicability_verified is True
-    assert final.action == "verified"
+    # The selected terminal is the parser-generated publication.
+    terminals = [
+        vertex for vertex in final.annotated.vertices
+        if (vertex.metadata or {}).get("is_terminal")
+    ]
+    assert len(terminals) == 1
+    assert (terminals[0].metadata or {}).get(
+        "boundary_direction") == "publish"
+    assert (terminals[0].metadata or {}).get(
+        "external_target_signal") == "out_a.value"
     selected = final.summary.get("selected_checkpoint") or {}
+    assert selected.get("root_vertex_ids") == [terminals[0].id]
+    # Honest observation: replay matched the known cone; the only
+    # remaining requirement kind is the proof-discharged search.
+    assert selected.get("observed") == "out_a.value"
+    assert selected.get("status") == "matched"
+    assert selected.get("complete") is True
+    assert {item.get("kind")
+            for item in selected.get("analysis_requirements", [])} == {
+                "source_lookup"}
+    # Production-born proof reached the round through the snapshot.
+    snapshot = seen_snapshots[-1]
+    assert snapshot is not None
+    assert len(snapshot.certificates or ()) >= 1
+    assert len(snapshot.applicability_proofs or ()) >= 1
+    # Gate-B architecture: raw stays structural/diagnostic while proof
+    # discharge authorizes.
+    assert len(authority.discharged_source_request_keys) >= 1
+    assert selected.get("source_requests"), \
+        "raw source request must remain structural"
+    assert authority.legacy_verified is False
+    assert final.action == "verified"
     assert selected.get("authorizes_discovery_stop") is True
 
 
