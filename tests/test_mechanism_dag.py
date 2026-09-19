@@ -5569,3 +5569,172 @@ def test_static_unevaluable_branch_schedules_no_timestamps(monkeypatch):
     branch = next(vertex for vertex in annotated.vertices if vertex.kind == "branch")
     assert branch.feasibility_verdict == "unknown"
     assert timestamps == [None]
+
+
+def _provenance_branch(*, verdict="unknown", windows=(), assumed=False,
+                       reason="temporary: uORB freshness gate assumed fresh"):
+    """Hand-built branch vertex mirroring production feasibility shapes."""
+    static_evaluation = {"status": "value", "reason": reason}
+    if assumed:
+        static_evaluation["assumed"] = True
+    return DAGVertex(
+        id="br-provenance",
+        kind="branch",
+        feasibility_verdict=verdict,
+        active_windows=list(windows),
+        metadata={"static_evaluation": static_evaluation},
+    )
+
+
+def test_feasibility_provenance_reads_assumed_flag():
+    """D1: ASSUMED status comes from the structured assumed flag,
+    for either verdict direction."""
+    from flight_log_agent.analysis.mechanism_dag import (
+        feasibility_provenance,
+    )
+    assert feasibility_provenance(_provenance_branch(
+        verdict="always_false", assumed=True)) == "assumed"
+    assert feasibility_provenance(_provenance_branch(
+        verdict="always_true", assumed=True)) == "assumed"
+
+
+def test_feasibility_provenance_ignores_reason_text():
+    """D1: assumption status is never inferred from reason strings —
+    the same verdict with unrelated wording reads unassumed."""
+    from flight_log_agent.analysis.mechanism_dag import (
+        feasibility_provenance,
+    )
+    assert feasibility_provenance(_provenance_branch(
+        verdict="always_false", assumed=False,
+        reason="static value is falsy")) == "proven"
+    assert feasibility_provenance(_provenance_branch(
+        verdict="always_true", assumed=False,
+        reason="static value is truthy")) == "proven"
+    assert feasibility_provenance(_provenance_branch(
+        verdict="unknown", assumed=False,
+        reason="no samples")) == "unknown"
+
+
+def test_feasibility_provenance_derived_needs_windows():
+    """D1: DERIVED requires sample/window-derived state; assumed
+    dominates even where windows exist (defensive: production
+    never emits that combination)."""
+    from flight_log_agent.analysis.mechanism_dag import (
+        feasibility_provenance,
+    )
+    assert feasibility_provenance(_provenance_branch(
+        verdict="unknown", windows=[(0.0, 1.0)],
+        assumed=False)) == "derived"
+    assert feasibility_provenance(_provenance_branch(
+        verdict="always_false", windows=[(0.0, 1.0)],
+        assumed=True)) == "assumed"
+
+
+def test_freshness_stopgap_trigger_shape():
+    """D1: the assumption source fires only on standalone hrt
+    comparisons — conjunctions and non-hrt predicates stay
+    unresolved (unassumed)."""
+    from flight_log_agent.analysis.mechanism_dag import (
+        _freshness_gate_verdict,
+    )
+    assert _freshness_gate_verdict(
+        "(hrt_absolute_time() - _t) > 1_s") is False
+    assert _freshness_gate_verdict(
+        "hrt_elapsed_time(&_last) < TIMEOUT") is True
+    assert _freshness_gate_verdict("a > 0 && hrt_absolute_time() > 1") is None
+    assert _freshness_gate_verdict("plain_param > 0") is None
+
+
+def _assumed_gate_bindings():
+    return [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="cone_result",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=[
+                "(hrt_absolute_time() - _destination_check_time) > 1"],
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_rtl_alt",
+            expression="max(gpos.alt, 10)",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+        _fake_binding(
+            binding_id="b3",
+            target="other_signal",
+            expression="cone_result",
+            file="src/modules/navigator/rtl.cpp",
+            line=300,
+            control_predicates=[
+                "(hrt_absolute_time() - _destination_check_time) > 1"],
+        ),
+    ]
+
+
+def test_assumed_pruned_terminal_writer_is_retained():
+    """D2/T1: an ASSUMED_FALSE-gated terminal writer leaves the
+    executable vertex set but survives as retained provenance."""
+    bindings = _assumed_gate_bindings()
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
+    reduced = evaluate_feasibility(
+        dag, parameter_values={}, prune_dead=True)
+    remaining = [v for v in reduced.vertices
+                 if v.kind == "operation" and v.variable == "_rtl_alt"]
+    assert [v.line for v in remaining] == [248]
+    retained = reduced.assumed_pruned_provenance
+    assert len(retained) == 1
+    record = retained[0]
+    assert record["file"] == "src/modules/navigator/rtl.cpp"
+    assert record["line"] == 245
+    assert record["variable"] == "_rtl_alt"
+    assert record["terminal"] is True
+    assert record["assumed"] is True
+    assert record["verdict"] == "always_false"
+
+
+def test_proven_pruned_terminal_writer_is_not_retained():
+    """D2/T2: a PROVEN_FALSE-gated terminal writer is pruned and
+    stays pruned — no causal candidate record."""
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="cone_result",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=["_param_rtl_cone_half_angle_deg.get() > 0"],
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_rtl_alt",
+            expression="max(gpos.alt, 10)",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+    ]
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
+    reduced = evaluate_feasibility(
+        dag,
+        parameter_values={"RTL_CONE_HALF_ANGLE_DEG": 0},
+        prune_dead=True,
+    )
+    remaining = [v for v in reduced.vertices
+                 if v.kind == "operation" and v.variable == "_rtl_alt"]
+    assert [v.line for v in remaining] == [248]
+    assert reduced.assumed_pruned_provenance == []
+
+
+def test_assumed_pruned_nonterminal_writer_is_not_retained():
+    """D2: retention is terminal-writer scoped — a non-terminal
+    operation under the same assumed gate leaves no record."""
+    bindings = _assumed_gate_bindings()
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
+    reduced = evaluate_feasibility(
+        dag, parameter_values={}, prune_dead=True)
+    assert "other_signal" not in [
+        record.get("variable") for record
+        in reduced.assumed_pruned_provenance]

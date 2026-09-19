@@ -292,11 +292,13 @@ def test_a5_report_validates_and_binds_evidence(_rtl_stage):
     """A5: real report validates; mechanism/evidence bound through
     structures, never blob-presence; honest classification.
 
-    Calibrated finding: the stage's annotated view anchors the
-    _rtl_alt member declaration (rtl.h), not the computation
-    operations; computation causality is verified independently in
-    A4. The pin below asserts production truth, not the stronger
-    computation anchoring the draft spec hoped for."""
+    Post Workstream A the report carries retained causal runtime
+    refs (rtl.cpp computation candidates) ahead of the declaration
+    anchor. Candidate marking below is calibrated to today's
+    assumed path: if real freshness later derives the branch, the
+    same computation must appear as ordinary surviving evidence
+    and this marking pin is updated as legitimate contract
+    evolution."""
     from flight_log_agent.analysis.report_validation import (
         validate_report,
     )
@@ -319,6 +321,21 @@ def test_a5_report_validates_and_binds_evidence(_rtl_stage):
             f"fabricated source reference: {ref.file}"
     assert any(ref.file.endswith("navigator/rtl.h") for ref in top.source_refs), \
         "declaration anchor for _rtl_alt missing"
+    computation = [
+        ref for ref in top.source_refs
+        if ref.file.endswith("navigator/rtl.cpp")
+        and ref.start_line in (245, 248)]
+    assert {ref.start_line for ref in computation} == {245, 248}, \
+        "retained causal runtime refs missing"
+    assert all(ref.explanation.startswith(
+        "candidate terminal write excluded by assumed feasibility "
+        "condition:") for ref in computation), \
+        "causal refs must be candidate-marked while assumed"
+    assert not any(
+        ref.file.endswith("navigator/rtl.cpp")
+        and ref.start_line is not None and 690 <= ref.start_line <= 735
+        for ref in top.source_refs), \
+        "helper-body refs belong to deferred Workstream B"
     assert top.expected_logged_signature, "no expected log signature"
     inventory = parse_ulog_inventory(RTL_LOG, SOURCE_ROOT)
     observed = set(observed_signals_from_inventory(inventory))

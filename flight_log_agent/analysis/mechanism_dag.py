@@ -223,6 +223,13 @@ class MechanismDAG(BaseModel):
     pending_construction: list[str] = Field(default_factory=list, exclude=True)
     exhausted_source_requests: set[tuple[Any, ...]] = Field(default_factory=set, exclude=True)
     observation_witnesses: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
+    # Causal provenance for terminal writers removed solely under ASSUMED
+    # feasibility verdicts. Diagnostic/report provenance only: never
+    # re-admitted into scheduling, replay, checkpoint, or proof paths.
+    # Excluded from serialized DAG/report schemas like the frontier above.
+    assumed_pruned_provenance: list[dict[str, Any]] = Field(
+        default_factory=list, exclude=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5962,6 +5969,31 @@ def _freshness_gate_verdict(predicate: str) -> Optional[bool]:
     return (not fresh) if negated else fresh
 
 
+def feasibility_provenance(vertex: Any) -> str:
+    """Classify how a branch feasibility verdict was established.
+
+    Reads only structured fields, never reason strings: ASSUMED iff
+    ``static_evaluation.assumed`` is true (dominates, including the
+    defensive windows-present combination production never emits);
+    else DERIVED iff sample/window-derived state exists; else
+    PROVEN iff a static verdict stands; else unknown. Callers that
+    must distinguish assumed removals from proven ones (retained
+    causal provenance, report candidate marking) key off the
+    ``assumed`` outcome only.
+    """
+    metadata = getattr(vertex, "metadata", None) or {}
+    static_evaluation = metadata.get("static_evaluation") or {}
+    if static_evaluation.get("assumed", False) is True:
+        return "assumed"
+    windows = list(getattr(vertex, "active_windows", None) or ())
+    if windows:
+        return "derived"
+    if getattr(vertex, "feasibility_verdict", None) in (
+            "always_true", "always_false"):
+        return "proven"
+    return "unknown"
+
+
 def evaluate_feasibility(
     dag: MechanismDAG,
     *,
@@ -6165,6 +6197,96 @@ def evaluate_feasibility(
     return prune_infeasible_operations(annotated) if prune_dead else annotated
 
 
+def _assumed_pruned_records(
+    dag: MechanismDAG,
+    dead_branches: set[str],
+    dead_operations: set[str],
+) -> list[dict[str, Any]]:
+    """Provenance records for terminal writers removed solely under
+    ASSUMED feasibility verdicts.
+
+    Diagnostic/report provenance only: records never re-enter
+    scheduling, replay, checkpoint, or proof paths. An operation is
+    eligible iff it is a source-parsed terminal writer whose every
+    dead-branch cause reads ASSUMED (a single proven-false cause
+    disqualifies it). Deterministic order; duplicates against
+    already-retained records are skipped.
+    """
+    by_id = {vertex.id: vertex for vertex in dag.vertices}
+    doomed = sorted(
+        (by_id[op_id] for op_id in dead_operations if op_id in by_id),
+        key=lambda vertex: (
+            vertex.file or "",
+            vertex.line if vertex.line is not None else -1,
+            vertex.variable or "",
+            vertex.expression or "",
+        ),
+    )
+    seen = {
+        (record.get("file"), record.get("line"),
+         record.get("variable"), record.get("expression"))
+        for record in dag.assumed_pruned_provenance
+    }
+    records: list[dict[str, Any]] = []
+    for vertex in doomed:
+        if vertex.kind != "operation":
+            continue
+        metadata = vertex.metadata or {}
+        if not metadata.get("is_terminal"):
+            continue
+        if not vertex.file:
+            continue
+        causes = sorted(
+            (by_id[edge.source_id] for edge in dag.edges
+             if edge.target_id == vertex.id and edge.kind == "control"
+             and edge.source_id in dead_branches
+             and edge.source_id in by_id),
+            key=lambda branch: (
+                str(branch.predicate_raw or branch.predicate_lowered or "")),
+        )
+        if not causes:
+            continue
+        if any(feasibility_provenance(branch) != "assumed"
+               for branch in causes):
+            continue
+        predicates = sorted({
+            str(branch.predicate_raw or branch.predicate_lowered or "")
+            for branch in causes
+        })
+        reasons = sorted({
+            str((branch.metadata or {}).get(
+                "static_evaluation", {}).get("reason") or "")
+            for branch in causes
+        })
+        windows: list = []
+        for branch in causes:
+            windows.extend(list(branch.active_windows or ()))
+        identity = (vertex.file, vertex.line, vertex.variable,
+                    vertex.expression)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        records.append({
+            "file": vertex.file,
+            "line": vertex.line,
+            "end_line": getattr(vertex, "end_line", None),
+            "variable": vertex.variable,
+            "expression": vertex.expression,
+            "callable": (metadata.get("callable")
+                         or metadata.get("callable_id")
+                         or metadata.get("function")),
+            "source_site_id": metadata.get("source_site_id"),
+            "terminal": True,
+            "control_predicates": predicates,
+            "verdict": "always_false",
+            "windows": sorted(set(windows)),
+            "assumed": True,
+            "assumption_category": "assumed_feasibility",
+            "assumption_reason": reasons,
+        })
+    return records
+
+
 def prune_infeasible_operations(dag: MechanismDAG) -> MechanismDAG:
     """Apply existing conjunction pruning without reevaluating the graph."""
     persisted_receivers = {
@@ -6190,10 +6312,13 @@ def prune_infeasible_operations(dag: MechanismDAG) -> MechanismDAG:
     }
     dead_branches -= retained_gates
     kept = {vertex.id for vertex in dag.vertices} - dead_branches - dead_operations
+    retained = list(dag.assumed_pruned_provenance) + _assumed_pruned_records(
+        dag, dead_branches, dead_operations)
     return dag.model_copy(update={
         "vertices": [vertex for vertex in dag.vertices if vertex.id in kept],
         "edges": [edge for edge in dag.edges
                   if edge.source_id in kept and edge.target_id in kept],
+        "assumed_pruned_provenance": retained,
     })
 
 

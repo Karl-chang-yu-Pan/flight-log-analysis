@@ -1519,3 +1519,111 @@ def test_matched_unverified_report_stays_unresolved(tmp_path):
     report = build_report_from_dag("why?", judged, result.dag, replay=matched)
     assert report.ranked_hypotheses[0].confidence != "high"
     assert report.confirmed == []
+
+
+def _report_vertex(*, vid, variable, expression, file, line):
+    from flight_log_agent.analysis.mechanism_dag import DAGVertex
+    return DAGVertex(
+        id=vid, kind="operation", variable=variable,
+        expression=expression, file=file, line=line,
+        metadata={"is_terminal": True})
+
+
+def _report_observed_leaf(*, vid, signal):
+    from flight_log_agent.analysis.mechanism_dag import DAGVertex
+    return DAGVertex(
+        id=vid, kind="evidence", sub_kind="logged_signal",
+        signal_name=signal, metadata={"observation": "observed"})
+
+
+def _report_candidate_record(*, file, line, variable="stored",
+                             expression="input * 3.0"):
+    return {
+        "file": file, "line": line, "end_line": None,
+        "variable": variable, "expression": expression,
+        "callable": None, "source_site_id": None,
+        "terminal": True,
+        "control_predicates": ["(hrt_absolute_time() - _t) > 1"],
+        "verdict": "always_false", "windows": [],
+        "assumed": True,
+        "assumption_category": "assumed_feasibility",
+        "assumption_reason": ["temporary: uORB freshness gate assumed fresh"],
+    }
+
+
+def _report_for(vertices, retained=()):
+    from flight_log_agent.analysis.mechanism_dag import MechanismDAG
+    from flight_log_agent.analysis.mechanism_judge import JudgedDiscovery
+    dag = MechanismDAG(
+        dag_id="dag-acceptance", terminal="_final_out",
+        vertices=list(vertices), edges=[],
+        assumed_pruned_provenance=list(retained))
+    judged = JudgedDiscovery(
+        seeds=DiscoverySeeds(seeds=[], candidate_terminals=[]),
+        verdict=DiscoveryVerdict(
+            sufficient=True, selected_terminal="_final_out",
+            explaining_branches=[], reasoning="acceptance"),
+        results={}, selected=None)
+    return build_report_from_dag("why?", judged, dag, replay=None)
+
+
+def test_report_orders_runtime_before_declaration_anchor():
+    """D3/T3: a runtime terminal writer precedes a supporting
+    declaration anchor even when the anchor vertex comes first;
+    a lone declaration may still lead."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    anchor = _report_vertex(
+        vid="decl", variable="_final_out", expression="0.0f",
+        file="include/decl.h", line=3)
+    computation = _report_vertex(
+        vid="calc", variable="_final_out", expression="input * 3.0",
+        file="src/calc.cpp", line=10)
+    report = _report_for([leaf, anchor, computation])
+    refs = report.ranked_hypotheses[0].source_refs
+    assert [ref.file for ref in refs] == ["src/calc.cpp", "include/decl.h"]
+    assert refs[0].explanation.startswith("terminal write:")
+
+    lone = _report_for([leaf, anchor])
+    assert [ref.file for ref in lone.ranked_hypotheses[0].source_refs] == [
+        "include/decl.h"]
+
+
+def test_report_dedups_retained_writer_instances():
+    """D3/T4: duplicate retained records of one source writer
+    collapse; a genuinely different assignment stays distinct."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    retained = [
+        _report_candidate_record(
+            file="src/a.cpp", line=5, variable="_final_out"),
+        _report_candidate_record(
+            file="src/a.cpp", line=5, variable="_final_out"),
+        _report_candidate_record(
+            file="src/a.cpp", line=9, variable="_final_out",
+            expression="input * 4.0"),
+    ]
+    report = _report_for([leaf], retained=retained)
+    refs = report.ranked_hypotheses[0].source_refs
+    assert sorted((ref.file, ref.start_line) for ref in refs) == [
+        ("src/a.cpp", 5), ("src/a.cpp", 9)]
+    assert all(ref.explanation.startswith(
+        "candidate terminal write excluded by assumed feasibility "
+        "condition:") for ref in refs)
+
+
+def test_report_budget_keeps_causal_runtime_ref():
+    """D3/T5: with more refs than budget, an eligible causal
+    runtime ref survives selection without vertex-ID ordering."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    anchors = [
+        _report_vertex(
+            vid=f"decl-{line}", variable="_final_out", expression="0.0",
+            file="include/decl.h", line=line)
+        for line in range(20, 28)
+    ]
+    computation = _report_vertex(
+        vid="calc", variable="_final_out", expression="input * 3.0",
+        file="src/calc.cpp", line=10)
+    report = _report_for([leaf, *anchors, computation])
+    refs = report.ranked_hypotheses[0].source_refs
+    assert len(refs) <= 8
+    assert refs[0].file == "src/calc.cpp"

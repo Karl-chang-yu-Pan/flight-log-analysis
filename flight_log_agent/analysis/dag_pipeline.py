@@ -568,6 +568,145 @@ def replay_terminal_expressions(
     )
 
 
+_CANDIDATE_REF_PREFIX = (
+    "candidate terminal write excluded by assumed feasibility condition: "
+)
+
+
+def _is_constant_writer_expression(expression: Any) -> bool:
+    """Whether a writer expression is a bare constant (initializer-shaped).
+
+    Decimal numerics (C++ float/int suffixes tolerated), quoted
+    strings, and booleans count; anything naming a value or applying
+    an operator does not. Structural heuristic only — the anchor
+    role additionally requires a runtime cowriter for the same
+    symbol (see _order_source_ref_entries), never this alone.
+    """
+    text = str(expression or "").strip()
+    while len(text) >= 2 and text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    if text.lower() in ("true", "false"):
+        return True
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return True
+    try:
+        float(text.rstrip("fFlLuU"))
+    except ValueError:
+        return False
+    return True
+
+
+def _provenance_identity_key(
+    file: Any, line: Any, variable: Any, expression: Any,
+) -> tuple:
+    """Stable writer identity for dedup/ordering. Never vertex IDs."""
+    return (
+        str(file or ""),
+        line if isinstance(line, int) else None,
+        str(variable or ""),
+        str(expression or ""),
+    )
+
+
+def _retained_candidate_ref(record: dict[str, Any]) -> Optional[CodeRef]:
+    """Honestly-marked CodeRef for one retained assumed-pruned
+    terminal writer, or None when the record cannot identify the
+    writer. Candidate wording replaces (never extends) ordinary
+    terminal-write wording."""
+    file = str(record.get("file") or "")
+    if not file:
+        return None
+    variable = str(record.get("variable") or "")
+    expression = str(record.get("expression") or "")
+    line = record.get("line")
+    location = f"{file}:{line}" if isinstance(line, int) else file
+    end_line = record.get("end_line")
+    return CodeRef(
+        file=file,
+        function=(str(record.get("callable") or "") or None),
+        start_line=line if isinstance(line, int) else None,
+        end_line=end_line if isinstance(end_line, int) else None,
+        snippet=None,
+        explanation=(
+            f"{_CANDIDATE_REF_PREFIX}{variable} <- "
+            f"{expression} [{location}]"
+        ),
+    )
+
+
+def _order_source_ref_entries(
+    entries: list[dict[str, Any]],
+    retained: Any,
+    selected_terminal: str,
+) -> list[CodeRef]:
+    """Order surviving terminal refs with retained assumed-pruned
+    candidates per the causal-evidence contract: runtime
+    computation writers before declaration/storage anchors;
+    surviving derived/proven writers before assumed candidates;
+    source order as deterministic tiebreak. Surviving refs keep
+    their existing no-dedup behavior; retained records dedup
+    against surviving refs (surviving wins) by stable identity.
+    """
+    runtime_vars = {
+        str(entry.get("variable") or "") for entry in entries
+        if not _is_constant_writer_expression(entry.get("expression"))
+    }
+    runtime_vars.update(
+        str(record.get("variable") or "") for record in (retained or ())
+        if isinstance(record, dict) and record.get("assumed", False)
+        and str(record.get("file") or "")
+        and (not selected_terminal
+             or str(record.get("variable") or "") == selected_terminal)
+    )
+    surviving_keys = {
+        _provenance_identity_key(
+            entry.get("file"), entry.get("line"),
+            entry.get("variable"), entry.get("expression"))
+        for entry in entries
+    }
+    ranked: list[tuple[tuple, CodeRef]] = []
+    for entry in entries:
+        anchor = (
+            _is_constant_writer_expression(entry.get("expression"))
+            and str(entry.get("variable") or "") in runtime_vars
+        )
+        line = entry.get("line")
+        ranked.append((
+            (1 if anchor else 0, 0,
+             str(entry.get("file") or ""),
+             line if isinstance(line, int) else -1),
+            entry["ref"],
+        ))
+    for record in (retained or ()):
+        if not isinstance(record, dict):
+            continue
+        if not record.get("assumed", False):
+            continue
+        if not str(record.get("file") or ""):
+            continue
+        if (selected_terminal
+                and str(record.get("variable") or "") != selected_terminal):
+            continue
+        key = _provenance_identity_key(
+            record.get("file"), record.get("line"),
+            record.get("variable"), record.get("expression"))
+        if key in surviving_keys:
+            continue
+        surviving_keys.add(key)
+        ref = _retained_candidate_ref(record)
+        if ref is None:
+            continue
+        line = record.get("line")
+        ranked.append((
+            (0, 1,
+             str(record.get("file") or ""),
+             line if isinstance(line, int) else -1),
+            ref,
+        ))
+    ranked.sort(key=lambda item: item[0])
+    return [ref for _, ref in ranked]
+
+
 def build_report_from_dag(
     question: str,
     judged: JudgedDiscovery,
@@ -611,6 +750,11 @@ def build_report_from_dag(
     parameters: list[ParameterValue] = []
     source_refs: list[CodeRef] = []
     signature: list[ExpectedSignatureItem] = []
+    # Candidate terminal-write entries collected alongside surviving
+    # refs: each maps a CodeRef to the role/assumed/order facts the
+    # Workstream A selection below needs. CodeRefs alone cannot carry
+    # variable identity or assumed status.
+    terminal_write_entries: list[dict[str, Any]] = []
 
     for vertex in dag.vertices if dag else []:
         if vertex.kind == "branch":
@@ -658,15 +802,29 @@ def build_report_from_dag(
                         signal=logged_output,
                     )
                 )
-            source_refs.append(
-                CodeRef(
+            terminal_write_entries.append({
+                "ref": CodeRef(
                     file=str(vertex.file),
                     start_line=vertex.line,
                     end_line=vertex.line,
                     snippet=vertex.snippet,
                     explanation=f"terminal write: {vertex.variable} <- {vertex.expression}",
-                )
-            )
+                ),
+                "variable": str(vertex.variable or ""),
+                "expression": str(vertex.expression or ""),
+                "file": str(vertex.file or ""),
+                "line": vertex.line,
+                "assumed": False,
+            })
+
+    source_refs.extend(
+        _order_source_ref_entries(
+            terminal_write_entries,
+            (getattr(dag, "assumed_pruned_provenance", None) or ()
+             if dag is not None else ()),
+            str((verdict.selected_terminal if verdict is not None else "") or ""),
+        )
+    )
 
     if not signature:
         return FlightLogReport(
