@@ -8,7 +8,7 @@ whether the established mechanism answers the user's question.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Literal, Optional, Sequence
 
 from flight_log_agent.analysis.dag_checkpoint import assess_checkpoint, dependency_view
@@ -150,6 +150,11 @@ class ProofAuthority:
     uncovered_relevant: tuple = ()
     missing_applicability_uses: tuple = ()
     conflicting_applicability_uses: tuple = ()
+    # Visits whose raw source-search work is already satisfied by
+    # current accepted coverage proof (Gate-B discharge). Diagnostic
+    # only: recorded here so the verdict stays legible, never used as
+    # proof — coverage itself remains independently mandatory.
+    discharged_source_request_keys: tuple = ()
 
 
 def _is_current_proof_certificate(
@@ -371,6 +376,60 @@ def evaluate_proof_authority(
         missing_applicability_uses=tuple(missing),
         conflicting_applicability_uses=tuple(conflicting),
     )
+
+
+def partition_outstanding_source_work(
+    source_requests: Any,
+    analysis_requirements: Any,
+    covered_visits: Any,
+) -> tuple:
+    """Split raw source work into outstanding and discharged sets.
+
+    A raw source request — and its paired `source_lookup` analysis
+    requirement — ceases to count as outstanding work when its exact
+    visit key belongs to the current accepted covered set. Raw entries
+    are never modified or removed; unparseable entries and every
+    non-`source_lookup` requirement stay outstanding (fail closed).
+    Returns `(outstanding_requests, outstanding_requirements,
+    discharged_visits)` with discharged visits deduplicated in first
+   -seen order.
+    """
+    try:
+        covered = {tuple(key) for key in covered_visits or ()}
+    except TypeError:
+        covered = set()
+    outstanding_requests: list = []
+    discharged: list = []
+
+    def _visit_of(raw: Any) -> Any:
+        try:
+            return tuple(UnresolvedSourceReference.model_validate(
+                raw).visit_key())
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    for raw in source_requests or ():
+        visit = _visit_of(raw)
+        if visit is not None and tuple(visit) in covered:
+            if tuple(visit) not in discharged:
+                discharged.append(tuple(visit))
+        else:
+            outstanding_requests.append(raw)
+    outstanding_requirements: list = []
+    for requirement in analysis_requirements or ():
+        visit = None
+        if (isinstance(requirement, dict)
+                and requirement.get("kind") == "source_lookup"):
+            payload = requirement.get("source_reference")
+            if isinstance(payload, dict):
+                visit = _visit_of(payload)
+        if visit is not None and tuple(visit) in covered:
+            if tuple(visit) not in discharged:
+                discharged.append(tuple(visit))
+        else:
+            outstanding_requirements.append(requirement)
+    return (outstanding_requests, outstanding_requirements,
+            tuple(discharged))
 
 
 @dataclass
@@ -596,7 +655,39 @@ def evaluate_checkpoint_round(
         applicability_uses=collect_applicability_uses(
             relevance_references, local_needs),
     )
-    verified = legacy_verified and proof_authority.authorizes_stop
+    # Gate-B outstanding source work (structural unresolvedness is not
+    # outstanding work): raw source requests and paired source_lookup
+    # requirements whose exact visit is currently proof-covered cease
+    # to veto, while raw diagnostics and the raw legacy verdict above
+    # stay untouched. Coverage itself remains independently mandatory
+    # through the unchanged proof conjunction.
+    covered_now = set(proof_observation.covered_obligation_keys)
+    outstanding_requests: list = []
+    outstanding_requirements: list = []
+    discharged: tuple = ()
+    if selected is not None:
+        (outstanding_requests, outstanding_requirements, discharged,
+            ) = partition_outstanding_source_work(
+                selected.get("source_requests"),
+                selected.get("analysis_requirements"),
+                covered_now)
+    proof_authority = replace(
+        proof_authority, discharged_source_request_keys=discharged)
+    proof_adjusted_legacy_ok = bool(
+        selected and selected["observed"] and selected["status"] == "matched"
+        and selected["complete"] and not outstanding_requirements
+        and not outstanding_requests
+        and not any(item["status"] == "mismatched" for item in intermediates.values())
+    )
+    # Final authority conjoins the proof-adjusted legacy gate with the
+    # proof flags directly: `authorizes_stop` embeds the RAW legacy
+    # verdict and therefore cannot be reused here without nullifying
+    # the discharge above. It remains the raw-legacy diagnostic.
+    verified = bool(
+        proof_adjusted_legacy_ok
+        and proof_authority.coverage_ok
+        and proof_authority.applicability_ok
+        and proof_authority.non_vacuous_ok)
     if verified:
         selected["authorizes_discovery_stop"] = True
         selected["verification_scope"] = "questioned_signal" if question_target is not None else "terminal"

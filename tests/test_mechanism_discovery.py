@@ -11287,3 +11287,443 @@ def test_p3_construction_evaluator_receives_snapshot(tmp_path):
     assert all(snapshot is not None for snapshot, _ in seen)
     assert all(snapshot.version == version_at_call
               for snapshot, version_at_call in seen)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Gate B: covered relevant obligations still dirty legacy "
+           "source_requests (relevance and source-requests derive from "
+           "the same origin sets), so no non-vacuous positive stop is "
+           "reachable yet; see P4 STOP report",
+)
+def test_p4_honest_production_positive_stop(tmp_path):
+    """P4 E2E (known gap): natural obligation → P0 evidence → P2B
+    cert → exact use → P2C proof → threaded snapshot → real round
+    must eventually authorize a non-vacuous stop. Today full proof
+    (coverage AND applicability, non-empty relevance) still yields
+    stop False because the proven obligation itself keeps legacy
+    source_requests dirty. XPASS means the gap closed: update this
+    test and the P4 report instead of weakening anything."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageProofStore,
+        CoverageSearchState,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    (profiler_a, _result_a), (_profiler_b, _result_b) = _split_use_tree(
+        tmp_path)
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    kwargs = dict(
+        seeds=["usea"], terminal="out_a", source_hash="hash",
+        terminal_file="src/main.cpp")
+    seen_rounds: list = []
+    seen_snapshots: list = []
+    discover_mechanism_dag(
+        profiler_a, tmp_path / "cache_a", proof_store=store,
+        search_state=state,
+        checkpoint_evaluator=_p3_threading_evaluator(
+            seen_rounds, seen_snapshots),
+        **kwargs)
+    discover_mechanism_dag(
+        profiler_a, tmp_path / "cache_a", proof_store=store,
+        search_state=state,
+        checkpoint_evaluator=_p3_threading_evaluator(
+            seen_rounds, seen_snapshots),
+        **kwargs)
+    assert seen_rounds, "no checkpoint evaluated"
+    final = seen_rounds[-1]
+    authority = final.proof_authority
+    observation = final.proof_observation
+    assert len(observation.relevant_obligation_keys) >= 1
+    assert authority.writer_coverage_verified is True
+    assert authority.applicability_verified is True
+    assert final.action == "verified"
+    selected = final.summary.get("selected_checkpoint") or {}
+    assert selected.get("authorizes_discovery_stop") is True
+
+
+# --- Gate-B outstanding-source-work discharge ---
+
+def _gateb_covered_round(proof_version=0, extra_references=(),
+                         certificates=(), proofs=(), certificate_version=None):
+    """Clean _t6b terminal plus appended writer obligations with
+    caller-supplied proof threaded, returning the round and keys."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    base = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(base)
+    for reference in extra_references:
+        dag.unresolved_references.append(reference)
+    key = base.visit_key()
+    semantic = ("storage_writers", "member", "decl:x")
+    use = (root.id, "sample")
+    own_certificate, own_proof = _t6b_hand_proof(
+        use, key, semantic,
+        version=proof_version if certificate_version is None
+        else certificate_version)
+    result = _run_t6b_round(
+        dag, samples, policies,
+        coverage_certificates=[own_certificate, *certificates],
+        proof_version=proof_version,
+        applicability_proofs=[own_proof, *proofs])
+    return result, base, key, semantic, use
+
+
+def _gateb_bare_round(proof_version=0, with_certificate=True,
+                      with_proof=True):
+    """Covered-round fixture with proof threading toggles exposed."""
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    key = reference.visit_key()
+    semantic = ("storage_writers", "member", "decl:x")
+    use = (root.id, "sample")
+    certificate, proof = _t6b_hand_proof(use, key, semantic)
+    result = _run_t6b_round(
+        dag, samples, policies,
+        coverage_certificates=[certificate] if with_certificate else [],
+        proof_version=proof_version,
+        applicability_proofs=[proof] if with_proof else [])
+    return result, reference, key, semantic, use
+
+
+def test_discharged_source_request_keys_default_empty():
+    """G1: fresh proof authority carries no discharged visits."""
+    authority = _authority()
+    assert authority.discharged_source_request_keys == ()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="End-state pin: needs Gate-B discharge (landed) AND replay "
+           "attempt despite discharged-only requirements (separate "
+           "structural gap, second tripwire below)")
+def test_covered_source_request_discharged_and_verified():
+    """Gate-B A: covered visit leaves raw diagnostics intact but no
+    longer vetoes — full proof authorizes stop."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    result, _reference, key, _semantic, _use = _gateb_covered_round()
+    assert result.action == "verified"
+    assert result.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert any(
+        UnresolvedSourceReference.model_validate(raw).visit_key()
+        == tuple(key)
+        for raw in selected.get("source_requests", []))
+    assert result.proof_authority.legacy_verified is False
+    assert selected.get("authorizes_discovery_stop") is True
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="End-state pin: needs Gate-B discharge (landed) AND replay "
+           "attempt despite discharged-only requirements (separate "
+           "structural gap, second tripwire below)")
+def test_paired_source_lookup_discharged_together():
+    """Gate-B B: the source_lookup requirement paired to a covered
+    visit is satisfied together with its source request."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    result, _reference, key, _semantic, _use = _gateb_covered_round()
+    assert result.action == "verified"
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert any(
+        requirement.get("kind") == "source_lookup"
+        for requirement in selected.get("analysis_requirements", []))
+    assert result.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+
+
+def test_discharge_mechanics_covered_visit():
+    """Gate-B mechanics: covered visit discharged, raw preserved,
+    raw legacy still false; action stays non-verified only because
+    replay never attempts while raw requirements exist (replay gate,
+    separate structural gap)."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    result, _reference, key, _semantic, _use = _gateb_covered_round()
+    assert result.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert any(
+        UnresolvedSourceReference.model_validate(raw).visit_key()
+        == tuple(key)
+        for raw in selected.get("source_requests", []))
+    assert result.proof_authority.legacy_verified is False
+    assert result.action != "verified"
+    assert result.proof_authority.coverage_ok is True
+    assert result.proof_authority.applicability_ok is True
+
+
+def test_discharge_mechanics_paired_requirement():
+    """Gate-B mechanics: the paired source_lookup requirement is
+    discharged together; raw entries stay visible."""
+    result, _reference, key, _semantic, _use = _gateb_covered_round()
+    assert result.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert any(
+        requirement.get("kind") == "source_lookup"
+        for requirement in selected.get("analysis_requirements", []))
+
+
+def test_uncovered_request_stays_outstanding():
+    """Gate-B C: a second uncovered obligation is not discharged and
+    still vetoes, while the covered visit stays discharged."""
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    other = UnresolvedSourceReference(
+        symbol="other", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "other", "root": "other",
+                  "class_owner": "Controller", "declaration_id": "decl:y",
+                  "declaration_proven": True})
+    result, _reference, key, _semantic, _use = _gateb_covered_round(
+        extra_references=[other])
+    assert result.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+    assert other.visit_key() not in (
+        result.proof_authority.discharged_source_request_keys)
+    assert result.action != "verified"
+    assert result.proof_authority.coverage_ok is False
+
+
+def test_undischarged_without_coverage():
+    """Gate-B D: no accepted coverage means no discharge."""
+    result, _reference, _key, _semantic, _use = _gateb_bare_round(
+        with_certificate=False, with_proof=False)
+    assert result.proof_authority.discharged_source_request_keys == ()
+    assert result.action != "verified"
+
+
+def test_covered_missing_applicability_still_vetoes():
+    """Gate-B E: source-work discharge never bypasses T5 — covered
+    but unproven use keeps stop false while discharge is recorded."""
+    result, _reference, key, _semantic, _use = _gateb_bare_round(
+        with_certificate=True, with_proof=False)
+    assert result.proof_authority.writer_coverage_verified is True
+    assert result.proof_authority.applicability_verified is False
+    assert result.proof_authority.authorizes_stop is False
+    assert result.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+    assert result.action != "verified"
+
+
+def test_stale_coverage_discharges_nothing():
+    """Gate-B F: stale-version certificates discharge nothing."""
+    result, _reference, _key, _semantic, _use = _gateb_covered_round(
+        certificate_version=99)
+    assert result.proof_authority.discharged_source_request_keys == ()
+    assert result.proof_authority.coverage_ok is False
+    assert result.action != "verified"
+
+
+def test_no_proof_version_no_discharge():
+    """Gate-B G: disengaged proof gate discharges nothing."""
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    result = _run_t6b_round(dag, samples, policies)
+    assert result.proof_authority.discharged_source_request_keys == ()
+    assert result.action != "verified"
+
+
+def test_exhausted_without_coverage_no_discharge():
+    """Gate-B H: exhausted scheduling state without accepted coverage
+    discharges nothing and stays fail-closed."""
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    dag.exhausted_source_requests.add(reference.visit_key())
+    result = _run_t6b_round(dag, samples, policies, proof_version=0)
+    assert result.proof_authority.discharged_source_request_keys == ()
+    assert result.action != "verified"
+
+
+def test_exhausted_with_coverage_discharges_normally():
+    """Exhaustion is scheduling-only: with accepted current coverage
+    the exhausted obligation discharges exactly like its unexhausted
+    twin — exhaustion neither grants nor blocks discharge."""
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+
+    def make_reference():
+        reference = UnresolvedSourceReference(
+            symbol="stored", kind="storage_writers", file="sample.cpp",
+            callable_id="Controller::step",
+            origin_vertex_ids=[root.id], origin_operands=["sample"],
+            identity={"kind": "member", "symbol": "stored",
+                      "root": "stored", "class_owner": "Controller",
+                      "declaration_id": "decl:x",
+                      "declaration_proven": True})
+        dag.unresolved_references.append(reference)
+        return reference
+
+    reference = make_reference()
+    key = reference.visit_key()
+    semantic = ("storage_writers", "member", "decl:x")
+    use = (root.id, "sample")
+    certificate, _proof = _t6b_hand_proof(use, key, semantic)
+    plain = _run_t6b_round(
+        dag, samples, policies, coverage_certificates=[certificate],
+        proof_version=0)
+    assert plain.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+    dag.exhausted_source_requests.add(key)
+    exhausted = _run_t6b_round(
+        dag, samples, policies, coverage_certificates=[certificate],
+        proof_version=0)
+    assert exhausted.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+    assert (exhausted.proof_authority.coverage_ok
+            == plain.proof_authority.coverage_ok)
+    selected = exhausted.summary.get("selected_checkpoint") or {}
+    assert any(
+        UnresolvedSourceReference.model_validate(raw).visit_key()
+        == tuple(key)
+        for raw in selected.get("source_requests", []))
+
+
+def test_partition_outstanding_source_work_unit():
+    """Gate-B I/J/K unit pins: malformed entries stay outstanding,
+    visits partition independently, spelling never cross-discharges."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        partition_outstanding_source_work,
+    )
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+
+    def raw(**fields):
+        base = dict(
+            symbol="stored", kind="storage_writers", file="sample.cpp",
+            callable_id="Controller::step", origin_vertex_ids=["op"],
+            origin_operands=["sample"],
+            identity={"kind": "member", "symbol": "stored",
+                      "root": "stored", "class_owner": "Controller",
+                      "declaration_id": "decl:x",
+                      "declaration_proven": True})
+        base.update(fields)
+        return UnresolvedSourceReference(**base).model_dump(mode="json")
+
+    def requirement(raw_request):
+        return {"kind": "source_lookup", "reason": "r",
+                "source_reference": raw_request}
+
+    covered_a = UnresolvedSourceReference.model_validate(
+        raw()).visit_key()
+    outstanding, requirements, discharged = (
+        partition_outstanding_source_work(
+            [raw(), {"symbol": [], "kind": 42},
+             {"kind": "source_lookup"}],
+            [requirement(raw()),
+             {"kind": "construction", "reason": "c"},
+             {"kind": "source_lookup", "reason": "unbound"}],
+            {tuple(covered_a)}))
+    assert len(outstanding) == 2
+    assert discharged == (tuple(covered_a),)
+    assert [item.get("kind") for item in requirements] == [
+        "construction", "source_lookup"]
+    other = raw(identity={"kind": "member", "symbol": "stored",
+                          "root": "stored", "class_owner": "Controller",
+                          "declaration_id": "decl:other",
+                          "declaration_proven": True})
+    outstanding, _requirements, discharged = (
+        partition_outstanding_source_work(
+            [raw(), other], [], {tuple(covered_a)}))
+    assert len(outstanding) == 1
+    assert discharged == (tuple(covered_a),)
+
+
+def test_raw_diagnostics_preserved_after_discharge():
+    """Gate-B M: raw source_requests, raw requirements, and raw
+    legacy_verified keep their structural values after discount."""
+    result, _reference, key, _semantic, _use = _gateb_covered_round()
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert len(selected.get("source_requests", [])) >= 1
+    assert any(
+        requirement.get("kind") == "source_lookup"
+        for requirement in selected.get("analysis_requirements", []))
+    assert result.proof_authority.legacy_verified is False
+    assert result.proof_authority.discharged_source_request_keys == (
+        tuple(key),)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Replay is gated on zero raw requirements, so matched/ "
+           "complete can never hold while any source_lookup exists — "
+           "even a discharged one. Needs replay-gating follow-up.")
+def test_replay_attempts_despite_discharged_requirements():
+    """Replay-gate tripwire: a fully replay-capable graph must attempt
+    replay even while (dischargeable) raw requirements exist. Today
+    assess skips replay, freezing matched/complete at false."""
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    result = _run_t6b_round(dag, samples, policies, proof_version=0)
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("status") != "not_attempted"

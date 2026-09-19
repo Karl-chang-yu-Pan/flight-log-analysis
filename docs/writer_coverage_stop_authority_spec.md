@@ -371,6 +371,17 @@ one discovered writer, exact admission alone, heuristic empty result.
 0001: exhaustion never means coverage, local matches never authorize
 stopping.)
 
+Proof-aware outstanding-work rule (Gate-B repair): a raw
+`source_requests` entry, and its paired `source_lookup` analysis
+requirement, remain reported as structural diagnostics but cease to
+count as outstanding work in the final authority conjunction when
+their exact visit key belongs to the current accepted
+`covered_obligation_keys`. Raw `source_requests`, raw requirements,
+and the raw `legacy_verified` verdict keep their existing meanings;
+only current accepted coverage proof discharges, never retirement,
+exhaustion, visited state, or spelling. See
+`docs/outstanding_source_work_authority_spec.md`.
+
 ## 11. Ownership
 
 - **Source expansion** records attempts and evidence

@@ -58,3 +58,13 @@ remain distinct claims with separate producers.
 
 No implementation, no receiver-history or transfer-time evidence production
 design, no invocation reconstruction, no legacy-path retirement.
+
+## Clarification
+
+"Unresolved source work" in the authority discussion above means
+*unproven/outstanding* work, not necessarily the absence of a
+structural unresolved reference. A reference may remain structurally
+reported while its source-search obligation is already satisfied by
+current accepted coverage proof; only current proof discharges it.
+Retirement and exhaustion remain scheduling-only and never discharge
+anything. This clarification changes no decision.

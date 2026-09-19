@@ -119,6 +119,11 @@ expansion demand.
 The frontier filtered to one checkpoint's relevant origins. A scoped view, not a
 new concept.
 
+**Outstanding source work**:
+A source request whose source-search obligation is not yet satisfied by current
+accepted coverage proof. Structurally unresolved references remain reported as
+source requests even after their search work is proven complete.
+
 **Need**:
 One blocked operand's evaluation requirement with its linked source requests.
 Narrower than an analysis requirement.
