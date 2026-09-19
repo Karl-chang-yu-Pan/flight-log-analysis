@@ -834,6 +834,41 @@ def build_report_from_dag(
     )
 
 
+def _proof_snapshot_args(proof_snapshot: Any) -> dict:
+    """Map an immutable proof snapshot onto T6B round inputs (P3).
+
+    Pure value mapping, no session access: `None` yields no arguments
+    (legacy omission preserved exactly), otherwise the snapshot's
+    exact version plus its deterministic certificate/proof tuples.
+    """
+    if proof_snapshot is None:
+        return {}
+    return {
+        "proof_version": proof_snapshot.version,
+        "coverage_certificates": tuple(
+            proof_snapshot.certificates or ()),
+        "applicability_proofs": tuple(
+            proof_snapshot.applicability_proofs or ()),
+    }
+
+
+def _construction_evaluator_for(control_round: Any) -> Any:
+    """Adapt the checkpoint control round to the construction seam.
+
+    Forwards the optional proof snapshot unchanged so construction
+    rounds observe the same current proof as checkpoint rounds.
+    Extracted (rather than inline lambda) so the forwarding contract
+    is directly testable.
+    """
+
+    def evaluate(dag: Any, index: Any, proof_snapshot: Any = None) -> Any:
+        return control_round(
+            dag, index, during_construction=True,
+            proof_snapshot=proof_snapshot)
+
+    return evaluate
+
+
 async def run_dag_discovery_stage(
     profiler: MechanismSourceProfiler,
     cache_root: Union[str, Path],
@@ -1048,7 +1083,8 @@ async def run_dag_discovery_stage(
         discovery_kwargs["round_observer"] = observe_round
 
     if checkpoint_discovery:
-        def control_round(dag: MechanismDAG, index: int, *, during_construction: bool = False):
+        def control_round(dag: MechanismDAG, index: int, *, during_construction: bool = False,
+                          proof_snapshot: Any = None):
             nonlocal scope
             wall_started, cpu_started = time.perf_counter(), time.process_time()
             target = None
@@ -1067,6 +1103,7 @@ async def run_dag_discovery_stage(
                 dag, parameter_values=parameter_values, observed_signals=logged_set,
                 signal_policies=signal_policies or {}, scope=scope, question_target=target,
                 load_samples=lambda view, observed: _signal_samples_for_dag(view, log_path, additional_signals=observed),
+                **_proof_snapshot_args(proof_snapshot),
             )
             summary = {
                 **result.summary, "diagnostic_only": False, "round_index": index,
@@ -1101,9 +1138,8 @@ async def run_dag_discovery_stage(
                 checkpoint_observer(event)
             return result
         discovery_kwargs["checkpoint_evaluator"] = control_round
-        discovery_kwargs["construction_evaluator"] = lambda dag, index: control_round(
-            dag, index, during_construction=True,
-        )
+        discovery_kwargs["construction_evaluator"] = (
+            _construction_evaluator_for(control_round))
 
     def condition_windows(condition: Any, candidates: Any = None) -> Optional[dict[str, Any]]:
         return evaluate_questioned_condition_windows(

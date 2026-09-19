@@ -10962,3 +10962,328 @@ def test_p2d_checkpoint_unaffected(tmp_path):
     assert threaded.dag is not None and plain.dag is not None
     assert [v.id for v in threaded.dag.vertices] == [
         v.id for v in plain.dag.vertices]
+
+
+# --- P3: immutable proof snapshot + checkpoint threading ---
+
+def _p3_threading_evaluator(seen_rounds, seen_snapshots):
+    """Real checkpoint round accepting an optional proof snapshot
+    exactly like the production control round: snapshot values flow
+    into the existing T6B inputs, omission preserves legacy call."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        evaluate_checkpoint_round,
+    )
+
+    def evaluator(dag, index, proof_snapshot=None):
+        seen_snapshots.append(proof_snapshot)
+        kwargs = {}
+        if proof_snapshot is not None:
+            kwargs = {
+                "coverage_certificates": tuple(
+                    proof_snapshot.certificates or ()),
+                "applicability_proofs": tuple(
+                    proof_snapshot.applicability_proofs or ()),
+                "proof_version": proof_snapshot.version,
+            }
+        result = evaluate_checkpoint_round(
+            dag, parameter_values={}, observed_signals=set(),
+            signal_policies={},
+            load_samples=lambda _view, _observed: {},
+            **kwargs)
+        seen_rounds.append(result)
+        return result
+
+    return evaluator
+
+
+def test_p3_stored_proof_reaches_checkpoint(tmp_path):
+    """P3-A/C/G/J/O: P0 evidence → P2B cert → threaded snapshot →
+    real checkpoint observes coverage (flags per T6B rules, stop
+    still false on dirty legacy) — with retirement active, which
+    removes scheduling but not relevance or proof."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageProofStore,
+        CoverageSearchState,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _p2b_kzero_tree(tmp_path)
+    kwargs = dict(
+        seeds=["use"], terminal="out", source_hash="hash",
+        terminal_file="src/main.cpp")
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    first = discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state, **kwargs)
+    assert first.dag is not None
+    assert len(store.certificates_for(0)) == 1
+    certificate = store.certificates_for(0)[0]
+    seen_rounds: list = []
+    seen_snapshots: list = []
+    second = discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state,
+        checkpoint_evaluator=_p3_threading_evaluator(
+            seen_rounds, seen_snapshots),
+        **kwargs)
+    assert second.dag is not None
+    assert seen_rounds, "checkpoint never evaluated"
+    assert seen_snapshots and seen_snapshots[0] is not None
+    snapshot = seen_snapshots[0]
+    assert snapshot.version == 0
+    assert snapshot.version == state.version
+    assert snapshot.certificates == store.certificates_for(0)
+    key = certificate.scheduling_key
+    first_round = seen_rounds[0]
+    observation = first_round.proof_observation
+    assert observation is not None
+    assert observation.proof_version == 0
+    assert tuple(observation.relevant_obligation_keys) == (tuple(key),)
+    assert tuple(observation.covered_obligation_keys) == (tuple(key),)
+    authority = first_round.proof_authority
+    assert authority is not None
+    assert authority.gate_active is True
+    assert authority.writer_coverage_verified is True
+    assert authority.applicability_verified is False
+    assert authority.authorizes_stop is False
+    assert first_round.action != "verified"
+
+
+def test_p3_stable_version_proof_persists_across_rounds(tmp_path):
+    """P3-C: the same current proof is visible to consecutive
+    checkpoints while the version is stable."""
+    from flight_log_agent.analysis.coverage import (
+        CoverageProofStore,
+        CoverageSearchState,
+    )
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _p2b_kzero_tree(tmp_path)
+    kwargs = dict(
+        seeds=["use"], terminal="out", source_hash="hash",
+        terminal_file="src/main.cpp")
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state, **kwargs)
+    seen_rounds: list = []
+    seen_snapshots: list = []
+    evaluator = _p3_threading_evaluator(seen_rounds, seen_snapshots)
+    discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state, checkpoint_evaluator=evaluator, **kwargs)
+    discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state, checkpoint_evaluator=evaluator, **kwargs)
+    assert len(seen_rounds) >= 2
+    covered = [
+        tuple(round_.proof_observation.covered_obligation_keys)
+        for round_ in seen_rounds]
+    assert covered
+    assert all(entry == covered[0] for entry in covered)
+    assert all(entry != () for entry in covered)
+    assert all(round_.proof_observation.proof_version == 0
+              for round_ in seen_rounds)
+
+
+def test_p3_version_extension_invalidates_snapshot(tmp_path):
+    """P3-D/L: v0 proof accumulated before extension never enters a
+    v1 snapshot; the v1 checkpoint sees no v0 content."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _p2b_kzero_tree(tmp_path)
+    kwargs = dict(
+        seeds=["use"], terminal="out", source_hash="hash",
+        terminal_file="src/main.cpp")
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state, **kwargs)
+    assert len(store.certificates_for(0)) == 1
+    seen_rounds: list = []
+    seen_snapshots: list = []
+    profiler_p0 = _p0_tree(tmp_path)
+    result = discover_mechanism_dag(
+        profiler_p0, tmp_path / "cache", seeds=["pick_altitude"],
+        terminal="_final_out", source_hash="hash",
+        terminal_file="src/modules/example/rtl.cpp",
+        proof_store=store, search_state=state,
+        checkpoint_evaluator=_p3_threading_evaluator(
+            seen_rounds, seen_snapshots))
+    assert result.dag is not None
+    assert state.version == 1
+    assert store.certificates_for(0) == ()
+    v1_snapshots = [snapshot for snapshot in seen_snapshots
+                    if snapshot is not None and snapshot.version == 1]
+    assert v1_snapshots, "no v1 snapshot reached checkpoint"
+    for snapshot in v1_snapshots:
+        assert snapshot.certificates == ()
+        assert snapshot.applicability_proofs == ()
+    v1_rounds = [
+        round_ for round_, snapshot in zip(seen_rounds, seen_snapshots)
+        if snapshot is not None and snapshot.version == 1]
+    assert v1_rounds
+    for round_ in v1_rounds:
+        assert round_.proof_authority is not None
+        assert not round_.proof_observation.covered_obligation_keys
+
+
+def test_p3_empty_snapshot_stays_fail_closed(tmp_path):
+    """P3-E: an explicit empty current snapshot keeps non-empty
+    relevance fail-closed while marking the gate engaged."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _p0_tree(tmp_path)
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    seen_rounds: list = []
+    seen_snapshots: list = []
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=["pick_altitude"],
+        terminal="_final_out", source_hash="hash",
+        terminal_file="src/modules/example/rtl.cpp",
+        proof_store=store, search_state=state,
+        checkpoint_evaluator=_p3_threading_evaluator(
+            seen_rounds, seen_snapshots))
+    assert result.dag is not None
+    assert seen_rounds
+    assert seen_snapshots and seen_snapshots[0] is not None
+    assert seen_snapshots[0].certificates == ()
+    assert seen_snapshots[0].applicability_proofs == ()
+    assert seen_snapshots[0].version == 0
+    for round_ in seen_rounds:
+        assert round_.proof_authority is not None
+        assert round_.proof_authority.gate_active is True
+        if round_.proof_observation.relevant_obligation_keys:
+            assert round_.proof_authority.authorizes_stop is False
+
+
+def test_p3_snapshot_immutable_and_store_untouched(tmp_path):
+    """P3-F/I: snapshots detach from later store mutation and
+    checkpoint evaluation never mutates the store."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _p2b_kzero_tree(tmp_path)
+    kwargs = dict(
+        seeds=["use"], terminal="out", source_hash="hash",
+        terminal_file="src/main.cpp")
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state, **kwargs)
+    before = (store.certificates_for(0), store.proofs_for(0))
+    seen_rounds: list = []
+    seen_snapshots: list = []
+    discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state,
+        checkpoint_evaluator=_p3_threading_evaluator(
+            seen_rounds, seen_snapshots),
+        **kwargs)
+    assert seen_snapshots and seen_snapshots[0] is not None
+    assert (store.certificates_for(0), store.proofs_for(0)) == before
+    extra, _proof = _proof_pair(
+        ("op-x", "s"), ("storage_writers", "global", "decl-x"),
+        ("storage_writers", "global", "decl-x"), version=0)
+    assert store.store_certificate(extra) is True
+    assert seen_snapshots[0].certificates == before[0]
+    assert extra not in seen_snapshots[0].certificates
+
+
+def test_p3_proof_without_certificate_stays_fail_closed(tmp_path):
+    """P3-K: an applicability proof with no current certificate
+    cannot satisfy coverage — T6B stays fail-closed."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _p2b_kzero_tree(tmp_path)
+    kwargs = dict(
+        seeds=["use"], terminal="out", source_hash="hash",
+        terminal_file="src/main.cpp")
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    key = ("storage_writers", "global", "decl-seed")
+    _certificate, proof = _proof_pair(
+        ("op-a", "signal-a"), key,
+        ("storage_writers", "global", "decl-seed"), version=0)
+    assert store.store_proof(proof) is True
+    seen_rounds: list = []
+    seen_snapshots: list = []
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", proof_store=store,
+        search_state=state,
+        checkpoint_evaluator=_p3_threading_evaluator(
+            seen_rounds, seen_snapshots),
+        **kwargs)
+    assert result.dag is not None
+    assert seen_rounds
+    seeded_visit = proof.scheduling_key
+    for round_ in seen_rounds:
+        assert round_.proof_authority is not None
+        assert round_.proof_authority.authorizes_stop is False
+        # The seeded foreign proof's visit never enters relevance, so
+        # it can satisfy nothing; any coverage present comes only
+        # from genuinely derived in-session certificates.
+        assert tuple(seeded_visit) not in {
+            tuple(item)
+            for item in round_.proof_observation.relevant_obligation_keys
+        }
+
+
+def test_p3_construction_evaluator_receives_snapshot(tmp_path):
+    """P3 construction site: a proof-aware construction evaluator
+    observes the current-version snapshot through real discovery."""
+    from flight_log_agent.analysis.checkpoint_discovery import (
+        CheckpointRound,
+    )
+    from flight_log_agent.analysis.coverage import (
+        CoverageProofStore,
+        CoverageSearchState,
+    )
+    from flight_log_agent.analysis.mechanism_dag import ConstructionDemand
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    profiler = _mini_tree(tmp_path, {
+        "policy.hpp": "class Policy { public: bool allow(); float value(); void run(); float output; };",
+        "run.cpp": '#include "policy.hpp"\nvoid Policy::run() { if (allow()) { output = value(); } }',
+        "guard.cpp": '#include "policy.hpp"\nbool Policy::allow() { return true; }',
+        "value.cpp": '#include "policy.hpp"\nfloat Policy::value() { return 7.f; }',
+    }, backend="tree_sitter")
+    seen = []
+
+    def construction_evaluator(dag, index, proof_snapshot=None):
+        seen.append((proof_snapshot, state.version))
+        return CheckpointRound(
+            "continue", dag, [], {"action": "continue"},
+            construction=ConstructionDemand())
+
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", seeds=[], terminal="output",
+        terminal_file="run.cpp", source_hash="hash",
+        proof_store=store, search_state=state,
+        construction_evaluator=construction_evaluator)
+    assert result.dag is not None
+    assert seen, "construction evaluation never ran"
+    assert all(snapshot is not None for snapshot, _ in seen)
+    assert all(snapshot.version == version_at_call
+              for snapshot, version_at_call in seen)

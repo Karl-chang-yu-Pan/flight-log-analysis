@@ -18,6 +18,7 @@ frontier. No LLM code belongs in this file.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1826,6 +1827,43 @@ def derive_current_applicability_proofs(
                 search_version, entry[0], entry[1])
 
 
+def _evaluator_accepts_proof(evaluator: Any) -> bool:
+    """Whether a checkpoint evaluator declares proof_snapshot input.
+
+    Probed, never assumed: legacy two-argument evaluators keep working
+    byte-identically. A signature probe (not try/except) is used
+    because evaluators have side effects — a failed speculative call
+    with proof would double-log observer events.
+    """
+    try:
+        parameters = inspect.signature(evaluator).parameters
+    except (TypeError, ValueError):
+        return False
+    return "proof_snapshot" in parameters
+
+
+def _invoke_checkpoint_evaluator(
+    evaluator: Any,
+    dag: Any,
+    index: Any,
+    proof_store: Any,
+    search_version: Any,
+) -> Any:
+    """Evaluate one checkpoint round, threading current proof by value.
+
+    Snapshots the session proof store at the settled search version
+    and passes the immutable value only to evaluators that declare
+    `proof_snapshot`; legacy evaluators run unchanged. The snapshot is
+    taken immediately before evaluation, so it can never race a later
+    version advance within this synchronous round.
+    """
+    if _evaluator_accepts_proof(evaluator):
+        return evaluator(
+            dag, index,
+            proof_snapshot=proof_store.snapshot_for(search_version))
+    return evaluator(dag, index)
+
+
 def _visit_of(reference: Any) -> Any:
     try:
         return tuple(reference.visit_key())
@@ -2117,7 +2155,9 @@ def discover_mechanism_dag(
         )
 
         def construction_checkpoint(snapshot: MechanismDAG):
-            assessment = construction_evaluator(snapshot, index)
+            assessment = _invoke_checkpoint_evaluator(
+                construction_evaluator, snapshot, index,
+                proof_store, search_state.version)
             return assessment.construction
 
         build_arguments = dict(
@@ -2155,7 +2195,10 @@ def discover_mechanism_dag(
             )
         )
 
-        checkpoint = checkpoint_evaluator(dag, index) if checkpoint_evaluator is not None else None
+        checkpoint = (_invoke_checkpoint_evaluator(
+            checkpoint_evaluator, dag, index,
+            proof_store, search_state.version)
+            if checkpoint_evaluator is not None else None)
         frontier_dag = checkpoint.annotated if checkpoint is not None else (
             round_annotator(dag)
             if round_annotator is not None

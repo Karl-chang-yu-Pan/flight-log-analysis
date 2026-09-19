@@ -1416,3 +1416,47 @@ def test_validation_downgrade_resynchronizes_confirmation_lists():
     assert downgraded.ranked_hypotheses[0].confidence == "low"
     assert downgraded.confirmed == []
     assert downgraded.unconfirmed == [title]
+
+
+def test_proof_snapshot_args_contract():
+    """P3-H: snapshot maps onto exact T6B input names; None preserves
+    legacy omission (no empty-proof semantic change)."""
+    from flight_log_agent.analysis.dag_pipeline import _proof_snapshot_args
+    from flight_log_agent.analysis.coverage import ProofSnapshot
+    assert _proof_snapshot_args(None) == {}
+    snapshot = ProofSnapshot(
+        version=3, certificates=("c1",), applicability_proofs=("p1", "p2"))
+    assert _proof_snapshot_args(snapshot) == {
+        "proof_version": 3,
+        "coverage_certificates": ("c1",),
+        "applicability_proofs": ("p1", "p2"),
+    }
+    empty = ProofSnapshot(version=0)
+    assert _proof_snapshot_args(empty) == {
+        "proof_version": 0,
+        "coverage_certificates": (),
+        "applicability_proofs": (),
+    }
+
+
+def test_construction_adapter_forwards_proof_snapshot():
+    """P3 construction fix: the production construction adapter
+    accepts and forwards the current proof snapshot to control_round
+    (previously dropped, silently keeping construction proof-blind)."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _construction_evaluator_for,
+    )
+    from flight_log_agent.analysis.coverage import ProofSnapshot
+    seen = []
+
+    def control_round(dag, index, during_construction=False,
+                      proof_snapshot=None):
+        seen.append((dag, index, during_construction, proof_snapshot))
+        return "round"
+
+    adapter = _construction_evaluator_for(control_round)
+    snapshot = ProofSnapshot(version=2, certificates=("c",))
+    assert adapter("dag", 7, proof_snapshot=snapshot) == "round"
+    assert seen == [("dag", 7, True, snapshot)]
+    assert adapter("dag", 8) == "round"
+    assert seen[-1] == ("dag", 8, True, None)
