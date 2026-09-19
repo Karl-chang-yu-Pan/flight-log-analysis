@@ -130,7 +130,10 @@ Narrower than an analysis requirement.
 
 **Requirement**:
 A graph proof obligation such as observation binding, source lookup,
-construction, state alignment, or replay completeness.
+construction, state alignment, or replay completeness. Only a
+well-formed source lookup (with a validating source-reference
+payload) is replay-non-blocking; every other kind blocks numeric
+replay.
 
 **Pending construction**:
 Deferred known work awaiting materialization. Distinct from unknown source.

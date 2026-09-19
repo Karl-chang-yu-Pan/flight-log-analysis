@@ -20,6 +20,7 @@ from flight_log_agent.analysis.dag_replay import (
 )
 from flight_log_agent.analysis.dag_value import DAGValueProgram, DAGValueSession
 from flight_log_agent.analysis.mechanism_dag import MechanismDAG, PreparedSignalSeries
+from flight_log_agent.analysis.source_expansion import UnresolvedSourceReference
 from flight_log_agent.utils import stable_id
 
 
@@ -47,6 +48,49 @@ def _unbound_operands(expression: Any) -> list[str]:
         if isinstance(node, ast.Name) and id(node) not in callees
         and node.id not in aliases
     })
+
+
+def _is_well_formed_source_lookup(requirement: Any) -> bool:
+    """Whether one requirement is a well-formed source_lookup.
+
+    Well-formed means kind exactly `source_lookup` with a
+    `source_reference` mapping payload that validates as an
+    unresolved source reference (same model_validate pattern used
+    for relevance mapping). Anything else — other kinds, unknown
+    kinds, missing/non-mapping payloads, validation failures —
+    stays replay-blocking (fail closed, conservative by
+    construction for future kinds).
+    """
+    if not isinstance(requirement, dict):
+        return False
+    if requirement.get("kind") != "source_lookup":
+        return False
+    payload = requirement.get("source_reference")
+    if not isinstance(payload, dict):
+        return False
+    try:
+        UnresolvedSourceReference.model_validate(payload)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _has_replay_blocking_requirements(requirements: Any) -> bool:
+    """Whether any requirement blocks numeric replay eligibility.
+
+    Only well-formed `source_lookup` requirements (outstanding
+    writer searches, which say nothing about numeric evaluability)
+    are non-blocking. Accepts the requirements mapping or a plain
+    requirement sequence.
+    """
+    if isinstance(requirements, dict):
+        entries = list(requirements.values())
+    else:
+        entries = list(requirements or ())
+    return any(
+        not _is_well_formed_source_lookup(requirement)
+        for requirement in entries)
+
 
 
 def assess_checkpoint(
@@ -325,7 +369,7 @@ def assess_checkpoint(
     # No numeric upgrade is allowed while graph-local proof obligations remain.
     # In particular, missing storage writers cannot be erased by a local match.
     replay: Optional[dict[str, Any]] = None
-    if not requirements and attempt_replay:
+    if attempt_replay and not _has_replay_blocking_requirements(requirements):
         replay = replay_dag_roots(
             view, sorted(roots), str(observed), parameter_values=parameter_values,
             signal_samples=signal_samples, signal_policies=signal_policies,

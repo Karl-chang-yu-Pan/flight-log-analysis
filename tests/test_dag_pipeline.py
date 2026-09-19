@@ -1460,3 +1460,62 @@ def test_construction_adapter_forwards_proof_snapshot():
     assert seen == [("dag", 7, True, snapshot)]
     assert adapter("dag", 8) == "round"
     assert seen[-1] == ("dag", 8, True, None)
+
+
+def test_diagnostic_observer_checkpoints_stay_replay_free(tmp_path, monkeypatch):
+    """R1 freeze (M/N): pipeline diagnostic observer summaries keep
+    replay disabled even where production checkpoint rounds may now
+    attempt it."""
+    import flight_log_agent.analysis.dag_pipeline as pipeline
+    from unittest import mock
+    samples = {'topic_in.value': [(0.0, 5.0), (10.0, 5.0)],
+               'topic_out.value': [(0.0, 10.0), (10.0, 10.0)]}
+    with mock.patch.object(pipeline, '_signal_samples_for_dag',
+                           lambda *_a, **_k: dict(samples)):
+        profiler = _mini_tree(tmp_path)
+        calls: list[str] = []
+        events: list[dict] = []
+        asyncio.run(pipeline.run_dag_discovery_stage(
+            profiler, tmp_path / 'cache', 'why?', 'srchash',
+            Path('/nonexistent.ulg'), ulog_hash='u',
+            run_agent=_stub_runner(calls), checkpoint_diagnostics=True,
+            checkpoint_observer=events.append))
+    assert events, "diagnostic observer never ran"
+    seen = 0
+    for event in events:
+        for name, check in list((event.get('checkpoints') or {}).items()):
+            seen += 1
+            assert check.get('status') == 'not_attempted', name
+        terminal = event.get('terminal_checkpoint')
+        if terminal is not None:
+            seen += 1
+            assert terminal.get('status') == 'not_attempted'
+    assert seen, "no diagnostic checkpoint entries observed"
+
+
+def test_matched_unverified_report_stays_unresolved(tmp_path):
+    """R1-O: a numerically matched replay without verified authority
+    keeps downstream confidence unresolved/non-authoritative."""
+    from flight_log_agent.analysis.mechanism_judge import (
+        DiscoverySeeds as Seeds, DiscoveryVerdict as Verdict,
+        TerminalCandidate as Cand,
+    )
+    from flight_log_agent.analysis.dag_pipeline import build_report_from_dag
+    from flight_log_agent.analysis.mechanism_discovery import discover_mechanism_dag
+    profiler = _mini_tree(tmp_path)
+    result = discover_mechanism_dag(
+        profiler, tmp_path / "cache", ["pick_altitude"], "_final_out",
+        "hash", logged_signals={"gspeed"})
+    from flight_log_agent.analysis.mechanism_judge import JudgedDiscovery
+    judged = JudgedDiscovery(
+        seeds=Seeds(seeds=[], candidate_terminals=[Cand(terminal="_final_out")]),
+        verdict=Verdict(sufficient=True, selected_terminal="_final_out",
+                        explaining_branches=[]),
+        results={"_final_out": result}, selected=result)
+    matched = {"status": "matched", "complete": True, "observed": "x.y",
+               "authorizes_discovery_stop": False,
+               "results": [{"grounded": "a+b", "evaluable": True,
+                            "match_fraction": 0.9}]}
+    report = build_report_from_dag("why?", judged, result.dag, replay=matched)
+    assert report.ranked_hypotheses[0].confidence != "high"
+    assert report.confirmed == []

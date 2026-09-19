@@ -143,7 +143,13 @@ def test_exact_frontier_request_survives_annotation_and_is_checkpoint_scoped(che
     result = assess((annotated, checkpoint[1], checkpoint[2]))
     assert result["source_requests"] == [ref.model_dump(mode="json")]
     assert "source_lookup" in kinds(result)
-    assert result["complete"] is False
+    # R1 gate evolution: a well-formed source_lookup-only requirement
+    # set no longer blocks numeric replay — the cone is unchanged by
+    # the appended search obligation, so replay matches while the
+    # outstanding search persists diagnostically (raw requirements
+    # and source_requests above are untouched).
+    assert result["status"] == "matched"
+    assert result["complete"] is True
 
 
 def add_gate(dag, target, *, assumed=False):
@@ -605,3 +611,89 @@ def test_construction_revisits_discharge_after_new_definitions():
     assert discharged
     assert dag.pending_construction == []
     assert "missing" in dag.unresolved_symbols
+
+
+def _stored_writer_reference(root_id):
+    return UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root_id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+
+
+def test_replay_attempted_with_only_source_lookup(checkpoint):
+    """R1-A: well-formed source_lookup requirements no longer prevent
+    replay from being attempted."""
+    dag, _, _ = checkpoint
+    root = observed_checkpoint_roots(dag)["command.value"][0]
+    dag.unresolved_references.append(_stored_writer_reference(root))
+    result = assess(checkpoint)
+    assert "source_lookup" in kinds(result)
+    assert result["status"] != "not_attempted"
+
+
+def test_replay_attempted_with_two_source_lookups(checkpoint):
+    """R1-B: multiple well-formed source_lookup requirements still
+    permit replay."""
+    dag, _, _ = checkpoint
+    root = observed_checkpoint_roots(dag)["command.value"][0]
+    dag.unresolved_references.append(_stored_writer_reference(root))
+    dag.unresolved_references.append(_stored_writer_reference(root))
+    result = assess(checkpoint)
+    assert result["status"] != "not_attempted"
+
+
+def test_replay_blocked_with_non_source_requirement(checkpoint):
+    """R1-C: a non-source requirement still blocks replay exactly as
+    before, even beside a well-formed source_lookup."""
+    dag, samples, _ = checkpoint
+    root = observed_checkpoint_roots(dag)["command.value"][0]
+    dag.unresolved_references.append(_stored_writer_reference(root))
+    samples.pop("command.value")
+    result = assess(checkpoint)
+    assert "observation_data" in kinds(result)
+    assert result["status"] == "not_attempted"
+
+
+def test_replay_blocking_predicate_unit():
+    """R1-D/E/F/G: requirement classification unit pins — only
+    well-formed source_lookup entries are non-blocking."""
+    from flight_log_agent.analysis.dag_checkpoint import (
+        _has_replay_blocking_requirements,
+    )
+    valid = _stored_writer_reference("op").model_dump(mode="json")
+    _sentinel = object()
+
+    def lookup(payload=_sentinel):
+        entry = {"kind": "source_lookup", "reason": "r"}
+        if payload is not _sentinel:
+            entry["source_reference"] = payload
+        return entry
+
+    assert _has_replay_blocking_requirements([]) is False
+    assert _has_replay_blocking_requirements([lookup(valid)]) is False
+    assert _has_replay_blocking_requirements(
+        [lookup(valid), lookup(valid)]) is False
+    assert _has_replay_blocking_requirements([lookup()]) is True
+    assert _has_replay_blocking_requirements(
+        [lookup({"not": "a reference"})]) is True
+    assert _has_replay_blocking_requirements(
+        [lookup("somestring")]) is True
+    assert _has_replay_blocking_requirements(
+        [{"kind": "mystery", "reason": "r"}]) is True
+    assert _has_replay_blocking_requirements(
+        [{"kind": "construction", "reason": "c",
+          "vertex_id": "op"}]) is True
+    assert _has_replay_blocking_requirements(
+        [lookup(valid), {"kind": "construction", "reason": "c",
+                         "vertex_id": "op"}]) is True
+
+
+def test_attempt_replay_false_disables_replay(checkpoint):
+    """R1 freeze primitive: explicit attempt_replay=False keeps replay
+    unattempted even on a fully replay-capable graph."""
+    result = assess(checkpoint, attempt_replay=False)
+    assert result["status"] == "not_attempted"
+    assert result["complete"] is False

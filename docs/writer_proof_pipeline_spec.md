@@ -268,12 +268,17 @@ The Gate-B deadlock (proven unresolved obligations keeping legacy
 proof-aware outstanding-work discharge specified in
 `docs/outstanding_source_work_authority_spec.md`: covered visits stop
 counting as outstanding source work while raw diagnostics, relevance,
-and the raw legacy verdict stay unchanged. A second structural gap
-found during that repair — numeric replay is gated on zero raw
-requirements, so `matched`/`complete` can never hold while any
-reference persists — remains open follow-up work with its own
-strict-xfail tripwire; it is independent of Gate B and must not be
-folded into it.
+and the raw legacy verdict stay unchanged. The second structural gap
+found during that repair — numeric replay gated on zero raw
+requirements, so `matched`/`complete` could never hold while any
+reference persisted — is repaired by the replay-gating rule specified
+in `docs/replay_outstanding_requirements_spec.md`: only well-formed
+`source_lookup` requirements are replay-non-blocking, with the
+diagnostic observer path frozen replay-free. The remaining P4 path
+is an honest publication-terminal fixture (source-proven publication
+binding plus aligned samples) for the production loop; the P4
+strict-xfail tripwire stays until that fixture yields a genuine
+green.
 
 ## 27. Deferred/non-goals
 

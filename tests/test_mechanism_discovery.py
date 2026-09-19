@@ -6137,8 +6137,10 @@ def _behavior_surface(result):
 
 def test_round_observes_certificate_without_behavior_change(tmp_path):
     """A: the round observes a current matching certificate
-    diagnostically; scheduling, requirements, flags, and stop are
-    identical with and without threading, and the DAG is unmutated."""
+    diagnostically; scheduling, requirements, flags, and DAG mutation
+    behavior are identical with and without threading. Stop behavior
+    now follows Gate-B discharge plus replay: the valid shape verifies
+    while observation stays record-identical otherwise."""
     from copy import deepcopy
     profiler, inputs, reference = _internal_gain_fixture(tmp_path)
     cert = _derive_for(profiler, inputs, reference, version=0)
@@ -6157,8 +6159,16 @@ def test_round_observes_certificate_without_behavior_change(tmp_path):
     assert (threaded.proof_observation.covered_semantic_keys
             == (cert.obligation_key,))
     assert threaded.proof_observation.uncovered_obligation_keys == ()
-    assert _behavior_surface(threaded) == _behavior_surface(plain)
     assert dag.model_dump() == before
+    plain_surface = _behavior_surface(plain)
+    threaded_surface = _behavior_surface(threaded)
+    for field in ("references", "next_analysis", "next_requests",
+                  "writer_flag", "applicability_flag", "summary_keys"):
+        assert threaded_surface[field] == plain_surface[field]
+    assert threaded_surface["action"] == "verified"
+    assert threaded_surface["stop"] is True
+    assert plain_surface["action"] != "verified"
+    assert plain_surface["stop"] is False
 
 
 def test_round_keeps_exhausted_relevant_without_covering(tmp_path):
@@ -6181,15 +6191,23 @@ def test_round_keeps_exhausted_relevant_without_covering(tmp_path):
     assert key in covered.proof_observation.relevant_obligation_keys
     assert key in covered.proof_observation.filtered_obligation_keys
     assert key in covered.proof_observation.covered_obligation_keys
-    assert _behavior_surface(covered) == _behavior_surface(uncovered)
+    # Exhaustion stays scheduling-only: with genuine coverage the
+    # covered round verifies through proof (not through the queue),
+    # while the uncovered round still cannot.
+    assert covered.action == "verified"
     assert covered.summary.get("selected_checkpoint", {}).get(
-        "authorizes_discovery_stop", False) is False
+        "authorizes_discovery_stop", False) is True
+    assert uncovered.action != "verified"
 
 
 def test_round_differential_across_proof_shapes(tmp_path):
-    """I: across valid / stale / unrelated / uncovered / vacuous proof
-    threading, scheduling, requirements, flags, and stop authorization
-    are identical — only diagnostic proof observation may differ."""
+    """I: across valid / stale / unrelated / uncovered proof
+    threading, observation distinguishes the shapes while behavior
+    follows proof truth: only the valid shape verifies (through
+    coverage, never through queue/scheduling state); the other three
+    remain behaviorally identical in refusal."""
+    profiler, inputs, reference = _internal_gain_fixture(tmp_path)
+    cert = _derive_for(profiler, inputs, reference, version=0)
     profiler, inputs, reference = _internal_gain_fixture(tmp_path)
     cert = _derive_for(profiler, inputs, reference, version=0)
     other_profiler, other_inputs, other_ref = _internal_h_certificate(
@@ -6218,8 +6236,12 @@ def test_round_differential_across_proof_shapes(tmp_path):
     assert observations["unrelated"].covered_obligation_keys == ()
     assert observations["unrelated"].stale_certificate_keys == ()
     assert observations["uncovered"].covered_obligation_keys == ()
-    assert (surfaces["valid"] == surfaces["stale"]
-            == surfaces["unrelated"] == surfaces["uncovered"])
+    assert surfaces["valid"]["action"] == "verified"
+    assert surfaces["valid"]["stop"] is True
+    assert (surfaces["stale"] == surfaces["unrelated"]
+            == surfaces["uncovered"])
+    assert surfaces["stale"]["action"] != "verified"
+    assert surfaces["stale"]["stop"] is False
     # Vacuous scope: no references at all, foreign proof threaded.
     from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
 
@@ -8430,8 +8452,9 @@ def test_round_local_obligation_uncovered_vetoes_silently(tmp_path):
 
 def test_round_exhausted_covered_obligation_ignores_queue(tmp_path):
     """Q-analog: an exhausted (unscheduled) obligation with a current
-    certificate is still covered — authority follows proof, and the
-    legacy-dirty round still refuses stop for its own reasons."""
+    certificate is still covered — authority follows proof, and with
+    replay now attempting, the proof-adjusted round verifies. Queue
+    state itself authorizes nothing either way."""
     from flight_log_agent.analysis.source_expansion import (
         UnresolvedSourceReference,
     )
@@ -8460,7 +8483,10 @@ def test_round_exhausted_covered_obligation_ignores_queue(tmp_path):
     assert result.proof_authority.coverage_ok is True
     assert result.proof_authority.authorizes_stop is False
     selected = result.summary.get("selected_checkpoint") or {}
-    assert selected.get("authorizes_discovery_stop", False) is False
+    # Coverage (not queue state) authorizes: the exhausted
+    # obligation verifies through proof now that replay runs.
+    assert result.action == "verified"
+    assert selected.get("authorizes_discovery_stop", False) is True
 
 
 def test_proof_authority_stale_applicability_refuses():
@@ -8738,9 +8764,10 @@ def _run_t6b_round(dag, samples, policies, **kwargs):
         load_samples=lambda _view, _observed: samples, **kwargs)
 
 
-def test_round_legacy_false_dominates_full_proof():
-    """O: legacy-verified False with complete threaded proof still
-    refuses — the gate adds conjuncts, never removes the legacy one."""
+def test_proof_discharged_legacy_dirt_still_records_legacy_false():
+    """O (Gate-B evolution): raw legacy stays False for a covered
+    source obligation, while proof-adjusted final authority verifies —
+    raw legacy_verified is diagnostic, round verified is decisive."""
     from flight_log_agent.analysis.source_expansion import (
         UnresolvedSourceReference,
     )
@@ -8761,9 +8788,9 @@ def test_round_legacy_false_dominates_full_proof():
     result = _run_t6b_round(
         dag, samples, policies, coverage_certificates=[certificate],
         proof_version=0, applicability_proofs=[proof])
-    assert result.action != "verified"
+    assert result.action == "verified"
     selected = result.summary.get("selected_checkpoint") or {}
-    assert selected.get("authorizes_discovery_stop", False) is False
+    assert selected.get("authorizes_discovery_stop", False) is True
     authority = result.proof_authority
     assert authority is not None
     assert authority.legacy_verified is False
@@ -11414,11 +11441,6 @@ def test_discharged_source_request_keys_default_empty():
     assert authority.discharged_source_request_keys == ()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="End-state pin: needs Gate-B discharge (landed) AND replay "
-           "attempt despite discharged-only requirements (separate "
-           "structural gap, second tripwire below)")
 def test_covered_source_request_discharged_and_verified():
     """Gate-B A: covered visit leaves raw diagnostics intact but no
     longer vetoes — full proof authorizes stop."""
@@ -11438,11 +11460,6 @@ def test_covered_source_request_discharged_and_verified():
     assert selected.get("authorizes_discovery_stop") is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="End-state pin: needs Gate-B discharge (landed) AND replay "
-           "attempt despite discharged-only requirements (separate "
-           "structural gap, second tripwire below)")
 def test_paired_source_lookup_discharged_together():
     """Gate-B B: the source_lookup requirement paired to a covered
     visit is satisfied together with its source request."""
@@ -11457,40 +11474,6 @@ def test_paired_source_lookup_discharged_together():
         for requirement in selected.get("analysis_requirements", []))
     assert result.proof_authority.discharged_source_request_keys == (
         tuple(key),)
-
-
-def test_discharge_mechanics_covered_visit():
-    """Gate-B mechanics: covered visit discharged, raw preserved,
-    raw legacy still false; action stays non-verified only because
-    replay never attempts while raw requirements exist (replay gate,
-    separate structural gap)."""
-    from flight_log_agent.analysis.source_expansion import (
-        UnresolvedSourceReference,
-    )
-    result, _reference, key, _semantic, _use = _gateb_covered_round()
-    assert result.proof_authority.discharged_source_request_keys == (
-        tuple(key),)
-    selected = result.summary.get("selected_checkpoint") or {}
-    assert any(
-        UnresolvedSourceReference.model_validate(raw).visit_key()
-        == tuple(key)
-        for raw in selected.get("source_requests", []))
-    assert result.proof_authority.legacy_verified is False
-    assert result.action != "verified"
-    assert result.proof_authority.coverage_ok is True
-    assert result.proof_authority.applicability_ok is True
-
-
-def test_discharge_mechanics_paired_requirement():
-    """Gate-B mechanics: the paired source_lookup requirement is
-    discharged together; raw entries stay visible."""
-    result, _reference, key, _semantic, _use = _gateb_covered_round()
-    assert result.proof_authority.discharged_source_request_keys == (
-        tuple(key),)
-    selected = result.summary.get("selected_checkpoint") or {}
-    assert any(
-        requirement.get("kind") == "source_lookup"
-        for requirement in selected.get("analysis_requirements", []))
 
 
 def test_uncovered_request_stays_outstanding():
@@ -11702,15 +11685,11 @@ def test_raw_diagnostics_preserved_after_discharge():
         tuple(key),)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Replay is gated on zero raw requirements, so matched/ "
-           "complete can never hold while any source_lookup exists — "
-           "even a discharged one. Needs replay-gating follow-up.")
 def test_replay_attempts_despite_discharged_requirements():
-    """Replay-gate tripwire: a fully replay-capable graph must attempt
-    replay even while (dischargeable) raw requirements exist. Today
-    assess skips replay, freezing matched/complete at false."""
+    """Replay gate (R1): a fully replay-capable graph attempts replay
+    even while raw source_lookup requirements exist. Gate eligibility
+    is asserted here, not numeric success — matched/partial outcome
+    remains replay's own verdict."""
     dag, samples, policies = _t6b_round_dag()
     root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
     from flight_log_agent.analysis.source_expansion import (
@@ -11727,3 +11706,129 @@ def test_replay_attempts_despite_discharged_requirements():
     result = _run_t6b_round(dag, samples, policies, proof_version=0)
     selected = result.summary.get("selected_checkpoint") or {}
     assert selected.get("status") != "not_attempted"
+
+
+def _t6b_covered_round_no_proof():
+    """_t6b terminal plus one covered-but-unproven writer obligation."""
+    dag, samples, policies = _t6b_round_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    key = reference.visit_key()
+    semantic = ("storage_writers", "member", "decl:x")
+    use = (root.id, "sample")
+    certificate, _proof = _t6b_hand_proof(use, key, semantic)
+    return dag, samples, policies, reference, key, semantic, use, certificate
+
+
+def test_uncovered_matched_replay_still_vetoes():
+    """R1-H: replay may now run (and match) beside an uncovered
+    obligation — final authority still vetoes via coverage."""
+    dag, samples, policies, reference, key, _semantic, _use, _cert = (
+        _t6b_covered_round_no_proof())
+    result = _run_t6b_round(dag, samples, policies, proof_version=0)
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("status") == "matched"
+    assert result.proof_authority.coverage_ok is False
+    assert result.proof_authority.authorizes_stop is False
+    assert result.action != "verified"
+
+
+def test_missing_applicability_vetoes_despite_replay():
+    """R1-I: replay matched + coverage valid, but applicability
+    missing → final authority false."""
+    dag, samples, policies, reference, key, semantic, use, certificate = (
+        _t6b_covered_round_no_proof())
+    result = _run_t6b_round(
+        dag, samples, policies, coverage_certificates=[certificate],
+        proof_version=0)
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("status") == "matched"
+    assert result.proof_authority.writer_coverage_verified is True
+    assert result.proof_authority.applicability_verified is False
+    assert result.proof_authority.authorizes_stop is False
+    assert result.action != "verified"
+
+
+def test_mismatch_vetoes_despite_full_proof():
+    """R1-J: replay mismatch vetoes even with valid coverage and
+    applicability proofs threaded."""
+    dag, samples, policies, reference, key, semantic, use = (
+        _t6b_covered_round_no_proof()[:7])
+    certificate, proof = _t6b_hand_proof(use, key, semantic)
+    bad_samples = dict(samples)
+    bad_samples["command.value"] = [(0.0, 9.0), (10.0, 9.0)]
+    result = _run_t6b_round(
+        dag, bad_samples, policies, coverage_certificates=[certificate],
+        proof_version=0, applicability_proofs=[proof])
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("status") == "mismatched"
+    assert result.proof_authority.authorizes_stop is False
+    assert result.action != "verified"
+
+
+def _t6b_unevaluable_dag():
+    """_t6b shape whose terminal equation references an unknown
+    input: replay attempts but cannot evaluate."""
+    from flight_log_agent.analysis.mechanism_dag import build_mechanism_dag
+
+    def expression(text, *inputs):
+        return {"text": text, "lowered_text": text,
+                "input_symbols": list(inputs),
+                "input_identities": {}, "call_results": [], "exact": True}
+
+    bindings = [
+        {"target_symbol": "sample", "source_symbol": "measurement.value",
+         "external_source_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "subscribe",
+         "expression_ref": expression("measurement.value", "measurement.value"),
+         "assignment_path": [{"file": "sample.cpp", "line": 2}],
+         "function": "Controller::step"},
+        {"target_symbol": "command.value", "source_symbol": "sample * mystery",
+         "external_target_signal": True, "synthetic_boundary_transfer": True,
+         "boundary_direction": "publish",
+         "expression_ref": expression("sample * mystery", "sample", "mystery"),
+         "assignment_path": [{"file": "sample.cpp", "line": 3}],
+         "function": "Controller::step"},
+    ]
+    samples = {"measurement.value": [(0.0, 3.0), (10.0, 3.0)],
+               "command.value": [(0.0, 6.0), (10.0, 6.0)]}
+    policies = {signal: {"method": "linear"} for signal in samples}
+    dag = build_mechanism_dag(bindings, "command.value",
+                              logged_signals=set(samples))
+    return dag, samples, policies
+
+
+def test_missing_input_replay_incomplete_not_matched():
+    """R1-K: source_lookup-only requirements permit the attempt, but
+    missing numeric input still reports incomplete — never matched."""
+    dag, samples, policies = _t6b_unevaluable_dag()
+    root = next(v for v in dag.vertices if v.metadata.get("is_terminal"))
+    from flight_log_agent.analysis.source_expansion import (
+        UnresolvedSourceReference,
+    )
+    reference = UnresolvedSourceReference(
+        symbol="stored", kind="storage_writers", file="sample.cpp",
+        callable_id="Controller::step", origin_vertex_ids=[root.id],
+        origin_operands=["sample"],
+        identity={"kind": "member", "symbol": "stored", "root": "stored",
+                  "class_owner": "Controller", "declaration_id": "decl:x",
+                  "declaration_proven": True})
+    dag.unresolved_references.append(reference)
+    result = _run_t6b_round(dag, samples, policies, proof_version=0)
+    selected = result.summary.get("selected_checkpoint") or {}
+    assert selected.get("status") != "not_attempted"
+    assert selected.get("status") != "matched"
+    assert selected.get("complete") is False
+    assert "numerical_replay" in {
+        item.get("kind") for item in selected.get("analysis_requirements", [])}
+    assert result.action != "verified"

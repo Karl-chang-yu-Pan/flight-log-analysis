@@ -1040,6 +1040,10 @@ async def run_dag_discovery_stage(
                 value_program=annotation["program"],
                 value_session=annotation["session"],
                 scope=scope,
+                # Diagnostic observer path: keep replay disabled so
+                # observer summaries retain their previous no-replay
+                # behavior regardless of requirement mix.
+                attempt_replay=False,
             )
             for signal, roots in observed_checkpoint_roots(dag).items()
         }
@@ -1052,6 +1056,8 @@ async def run_dag_discovery_stage(
                 parameter_values=parameter_values, signal_samples=annotation["samples"],
                 signal_policies=signal_policies, prepared_signal_series=annotation["prepared"],
                 value_program=annotation["program"], value_session=annotation["session"], scope=scope,
+                # Diagnostic observer path: frozen without replay, as above.
+                attempt_replay=False,
             )
         summary = {
             "diagnostic_only": True,

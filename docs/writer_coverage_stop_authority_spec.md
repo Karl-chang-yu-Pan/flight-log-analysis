@@ -382,6 +382,19 @@ only current accepted coverage proof discharges, never retirement,
 exhaustion, visited state, or spelling. See
 `docs/outstanding_source_work_authority_spec.md`.
 
+Replay-gating rule (R1 repair): numeric replay is attempted unless a
+replay-blocking requirement exists, and only a well-formed
+`source_lookup` — kind exactly `source_lookup` with a
+`source_reference` mapping payload validating as a source reference —
+is non-blocking. Every other kind (including malformed or
+payload-less `source_lookup`) blocks replay exactly as before, and
+the diagnostic observer path keeps replay disabled. A `matched`
+replay therefore reports numeric agreement of the known evaluable
+cone only: replay agreement is never discovery completeness
+(completeness belongs to T3 alone), and final safety still comes
+exclusively from the §10 conjunction. See
+`docs/replay_outstanding_requirements_spec.md`.
+
 ## 11. Ownership
 
 - **Source expansion** records attempts and evidence
