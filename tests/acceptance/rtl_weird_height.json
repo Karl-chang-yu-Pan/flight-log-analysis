@@ -1,0 +1,50 @@
+{
+  "scenario_id": "rtl_weird_height",
+  "question": "Why did RTL command a climb to about 104 m — roughly 20 m above home — rather than remaining near the destination altitude around 84 m?",
+  "inputs": {
+    "log": "uploads/053127df84724a75998ff355b5a2519a/RTL-wierd-height-1.ulg",
+    "source_snapshot": "1dacb4cdef2d7145754fc788fa8dc482eed74b40",
+    "backend": "tree_sitter",
+    "seeds": ["RTL_RETURN_ALT", "rtl_alt", "RTL::find_RTL_destination"],
+    "terminal": "_rtl_alt",
+    "terminal_file": "src/modules/navigator/rtl.cpp"
+  },
+  "expected": {
+    "mechanism_family": "rtl_cone_branch_acceptance_floor_wins",
+    "selected_branch": "cone-enabled helper",
+    "winning_rule": "outside-acceptance-radius floor",
+    "winning_expression": "destination altitude + 2 * acceptance radius",
+    "predicted_command_m": 103.93812,
+    "tolerance_m": 0.02,
+    "source_evidence": [
+      {"file": "src/modules/navigator/rtl.h", "symbol": "_rtl_alt"}
+    ],
+    "required_stage": ["_rtl_alt slice recovered", "report validates"]
+  },
+  "strength": "PROVEN",
+  "unavailable": [
+    "mission-vs-rally destination label",
+    "1 Hz recompute sampling phase",
+    "per-sample internal helper locals"
+  ],
+  "forbidden": [
+    "fabricated_source_evidence",
+    "nonexistent_observed_signal",
+    "unsupported_complete_claim",
+    "silent_fixture_fallback",
+    "wrong_source_snapshot"
+  ],
+  "normalization": {
+    "unstable_fields": [
+      "ids",
+      "timings",
+      "paths",
+      "prose",
+      "vertex_counts",
+      "explaining_branches",
+      "unresolved_evidence_strings",
+      "replay_status",
+      "confidence_values"
+    ]
+  }
+}
