@@ -7528,15 +7528,17 @@ def test_retired_obligation_stays_stable(tmp_path, monkeypatch):
     assert any(symbol == "bias" for _kind, symbol, _key in first_calls)
     assert first_result.stop_reason == "frontier_exhausted"
     # A second run sharing the session state stays stable: gain is
-    # still retired (record intact), bias is now merely visited — two
-    # distinct suppression reasons, both without re-resolution.
+    # still retired (record intact), bias is now retired too — P2D
+    # derived its genuine certificate in the first run — and neither
+    # re-resolves. Suppression reasons may upgrade to proof, but
+    # scheduling stays settled.
     second_calls, second_result = _spy_run(tmp_path, monkeypatch, state)
     assert not any(symbol == "gain"
                    for _kind, symbol, _key in second_calls)
     assert not any(symbol == "bias"
                    for _kind, symbol, _key in second_calls)
     assert second_result.stop_reason == "frontier_exhausted"
-    assert len(state.retired) == 1
+    assert len(state.retired) == 2
     assert state.proof_retirement(gain_key) is not None
 
 
@@ -7747,9 +7749,9 @@ def _discover_guarded_tree_at_version(tmp_path, monkeypatch, state):
 
 
 def test_missing_certificate_retires_nothing(tmp_path, monkeypatch):
-    """I: without proof nothing retires — and nothing auto-retires
-    during discovery: the retired map stays empty while scheduling
-    proceeds normally."""
+    """I: without proof nothing is fabricated — and P2D only retires
+    genuinely derived current certificates while scheduling proceeds
+    normally (no hand proof was supplied here)."""
     from flight_log_agent.analysis.coverage import (
         CoverageSearchState,
         apply_writer_coverage_retirement,
@@ -7759,7 +7761,11 @@ def test_missing_certificate_retires_nothing(tmp_path, monkeypatch):
     state = CoverageSearchState()
     calls, result = _spy_run(tmp_path, monkeypatch, state)
     assert any(symbol == "gain" for _kind, symbol, _key in calls)
-    assert state.retired == {}
+    for (version, _obligation), record in state.retired.items():
+        assert version == state.version
+        assert tuple(record.obligation_key)
+        assert tuple(record.boundary)
+        assert record.version == state.version
 
 
 def test_malformed_certificate_leaves_scheduling_unchanged(tmp_path,
@@ -10712,6 +10718,245 @@ def test_p2c_checkpoint_unaffected(tmp_path):
         terminal="out_a", source_hash="hash",
         terminal_file="src/main.cpp", proof_store=store,
         checkpoint_evaluator=_p2c_continue_evaluator)
+    assert threaded.files_loaded == plain.files_loaded
+    assert threaded.stop_reason == plain.stop_reason
+    assert threaded.dag is not None and plain.dag is not None
+    assert [v.id for v in threaded.dag.vertices] == [
+        v.id for v in plain.dag.vertices]
+
+
+# --- P2D: production T6A retirement application ---
+
+def _p2d_resolve_spy(monkeypatch):
+    """Count frontier/helper resolutions by symbol across both
+    resolver entry points (P0 routes frontier through evidence)."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+    )
+    calls: list = []
+    original = SourceExpansionResolver.resolve
+    original_with_evidence = SourceExpansionResolver.resolve_with_evidence
+
+    def spy(self, reference, structure):
+        calls.append(reference.symbol)
+        return original(self, reference, structure)
+
+    def evidence_spy(self, reference, structure, sink, skip_stages=None,
+                     universe_version=None):
+        calls.append(reference.symbol)
+        return original_with_evidence(
+            self, reference, structure, sink, skip_stages=skip_stages,
+            universe_version=universe_version)
+
+    monkeypatch.setattr(SourceExpansionResolver, "resolve", spy)
+    monkeypatch.setattr(
+        SourceExpansionResolver, "resolve_with_evidence", evidence_spy)
+    return calls
+
+
+def test_p2d_current_certificate_retires_obligation(tmp_path):
+    """P2D-A/G: honest P0→P2B chain stores a (closed-empty) cert and
+    P2D retires the exact obligation with full provenance."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    result = _p2b_discover_kzero(
+        tmp_path, proof_store=store, search_state=state)
+    assert result.dag is not None
+    certificates = store.certificates_for(0)
+    assert len(certificates) == 1
+    certificate = certificates[0]
+    assert tuple(certificate.writers) == ()
+    reference = next(
+        item for item in result.dag.unresolved_references
+        if item.symbol == "kzero" and item.kind == "storage_writers")
+    key = tuple(certificate.obligation_key)
+    assert state.is_proof_retired(key) is True
+    record = state.proof_retirement(key)
+    assert record is not None
+    assert record.version == 0
+    assert tuple(record.scheduling_key) == reference.visit_key()
+    assert tuple(record.obligation_key) == tuple(
+        certificate.obligation_key)
+    assert tuple(record.declaration) == tuple(certificate.declaration)
+    assert tuple(record.writers) == ()
+    assert tuple(record.boundary) == tuple(certificate.boundary)
+    assert tuple(record.assumptions) == tuple(certificate.assumptions)
+
+
+def test_p2d_retirement_suppresses_next_scheduling(tmp_path, monkeypatch):
+    """P2D-B: a retired obligation is skipped by the real frontier
+    filter on the next session pass, while the DAG still builds."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    calls = _p2d_resolve_spy(monkeypatch)
+    first = _p2b_discover_kzero(
+        tmp_path, proof_store=store, search_state=state)
+    assert first.dag is not None
+    assert "kzero" in calls
+    state.visited.clear()
+    del calls[:]
+    second = _p2b_discover_kzero(
+        tmp_path, proof_store=store, search_state=state)
+    assert second.dag is not None
+    assert "kzero" not in calls
+
+
+def test_p2d_no_certificate_no_retirement(tmp_path):
+    """P2D-C: heuristic-only evidence derives nothing, retires
+    nothing — retirement store stays empty."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        apply_current_coverage_retirements,
+    )
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    assert apply_current_coverage_retirements(store, state, 0) == 0
+    assert state.retired == {}
+
+
+def test_p2d_stale_certificate_no_retirement(tmp_path):
+    """P2D-D: a v0 certificate never retires under current v1."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        apply_current_coverage_retirements,
+    )
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    certificate, _proof = _proof_pair(("op-a", "s"), key, semantic,
+                                      version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(certificate) is True
+    state = CoverageSearchState()
+    state.version = 1
+    assert apply_current_coverage_retirements(store, state, 1) == 0
+    assert state.is_proof_retired(semantic) is False
+    assert state.retired == {}
+
+
+def test_p2d_unrelated_and_spelling_isolation(tmp_path):
+    """P2D-E/F: cert A retires only A — unrelated obligations and
+    same-spelling distinct declarations are unaffected."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        apply_current_coverage_retirements,
+    )
+    key_a = ("storage_writers", "global", "decl-a")
+    certificate_a, _ = _proof_pair(("op-a", "s"), key_a, key_a,
+                                   version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(certificate_a) is True
+    state = CoverageSearchState()
+    assert apply_current_coverage_retirements(store, state, 0) == 1
+    assert state.is_proof_retired(key_a) is True
+    assert state.is_proof_retired(
+        ("storage_writers", "global", "decl-b")) is False
+    assert state.is_proof_retired(
+        ("storage_writers", "member", "decl-a")) is False
+
+
+def test_p2d_nonempty_writer_provenance_retained(tmp_path):
+    """P2D-H: a non-empty writer set retires with provenance exactly
+    equal to the certificate's writers."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        apply_current_coverage_retirements,
+    )
+    key = ("storage_writers", "global", "decl-a")
+    writers = ("src/a.cpp:1:w1", "src/a.cpp:2:w2")
+    certificate, _ = _proof_pair(("op-a", "s"), key, key,
+                                 writers=writers, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(certificate) is True
+    state = CoverageSearchState()
+    assert apply_current_coverage_retirements(store, state, 0) == 1
+    record = state.proof_retirement(key)
+    assert record is not None
+    assert tuple(record.writers) == writers
+
+
+def test_p2d_retirement_idempotent(tmp_path):
+    """P2D-I: repeating the same current certificate leaves one
+    identical retirement record, not duplicates."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        apply_current_coverage_retirements,
+    )
+    key = ("storage_writers", "global", "decl-a")
+    certificate, _ = _proof_pair(("op-a", "s"), key, key, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(certificate) is True
+    state = CoverageSearchState()
+    assert apply_current_coverage_retirements(store, state, 0) == 1
+    first = state.proof_retirement(key)
+    assert apply_current_coverage_retirements(store, state, 0) == 1
+    assert state.proof_retirement(key) == first
+    assert len(state.retired) == 1
+
+
+def test_p2d_retirement_needs_no_applicability(tmp_path):
+    """P2D-J: retirement applies with zero applicability proofs —
+    coverage retirement is independent of applicability authority."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    store = CoverageProofStore()
+    state = CoverageSearchState()
+    result = _p2b_discover_kzero(
+        tmp_path, proof_store=store, search_state=state)
+    assert result.dag is not None
+    assert store.proofs_for(0) == ()
+    key = next(
+        tuple(certificate.obligation_key)
+        for certificate in store.certificates_for(0))
+    assert state.is_proof_retired(key) is True
+
+
+def test_p2d_version_extension_reactivates(tmp_path):
+    """P2D-K: v0 retirement is inert under v1 through real
+    search-state version semantics."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    from flight_log_agent.analysis.mechanism_discovery import (
+        apply_current_coverage_retirements,
+    )
+    key = ("storage_writers", "global", "decl-a")
+    certificate, _ = _proof_pair(("op-a", "s"), key, key, version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(certificate) is True
+    state = CoverageSearchState()
+    assert apply_current_coverage_retirements(store, state, 0) == 1
+    assert state.is_proof_retired(key) is True
+    assert state.advance_version() == 1
+    assert state.is_proof_retired(key) is False
+    assert apply_current_coverage_retirements(store, state, 1) == 0
+    assert state.is_proof_retired(key) is False
+
+
+def test_p2d_checkpoint_unaffected(tmp_path):
+    """P2D-L: retirement changes scheduling only — discovery
+    behavior identical with/without the proof store."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    profiler = _p0_tree(tmp_path)
+    plain = _p0_discover(profiler, tmp_path)
+    store = CoverageProofStore()
+    from flight_log_agent.analysis.coverage import CoverageSearchState
+    threaded = _p0_discover(
+        profiler, tmp_path, proof_store=store,
+        search_state=CoverageSearchState())
     assert threaded.files_loaded == plain.files_loaded
     assert threaded.stop_reason == plain.stop_reason
     assert threaded.dag is not None and plain.dag is not None

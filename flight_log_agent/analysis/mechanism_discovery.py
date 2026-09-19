@@ -34,6 +34,7 @@ from flight_log_agent.analysis.coverage import (
     CoverageEvidence,
     CoverageProofStore,
     CoverageSearchState,
+    apply_writer_coverage_retirement,
     derive_writer_applicability,
     derive_writer_coverage_certificate,
     reference_concrete_uses,
@@ -1661,6 +1662,29 @@ def derive_current_coverage_proofs(
             proof_store.replace_certificate(result.certificate)
 
 
+def apply_current_coverage_retirements(
+    proof_store: CoverageProofStore,
+    search_state: CoverageSearchState,
+    search_version: Any,
+) -> int:
+    """Retire scheduling for current certificates (P2D, T6A wiring).
+
+    Session orchestration only: for every certificate current under
+    the settled search version, apply the existing T6A retirement so
+    the matching source-search obligation is not scheduled again
+    within this version. Stale certificates never reach `apply_*`
+    (version-filtered read plus its own version check). Retirement is
+    scheduling suppression only — never coverage, applicability, or
+    stop truth. Returns the count applied.
+    """
+    applied = 0
+    for certificate in proof_store.certificates_for(search_version):
+        if apply_writer_coverage_retirement(
+                search_state, certificate, search_version):
+            applied += 1
+    return applied
+
+
 def derive_current_applicability_proofs(
     references: Any,
     search_version: Any,
@@ -2224,6 +2248,15 @@ def discover_mechanism_dag(
             search_state.version,
             evidence_log,
             proof_store,
+        )
+        # Production T6A retirement (P2D): retire scheduling for the
+        # just-derived current certificates before the next round can
+        # schedule those obligations again. Scheduling-only; never
+        # coverage, applicability, or authority truth.
+        apply_current_coverage_retirements(
+            proof_store,
+            search_state,
+            search_state.version,
         )
         # Incremental T5 proof production (P2C): derive applicability
         # for current uses immediately after T3, on the same DAG and
