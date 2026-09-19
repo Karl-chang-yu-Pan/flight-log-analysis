@@ -9708,6 +9708,437 @@ def test_proof_store_snapshot_contract():
     assert frozen is True
 
 
+# --- P2B: incremental T3 derivation from retained evidence ---
+
+def _p2b_kzero_tree(tmp_path):
+    files = {
+        "src/main.cpp": (
+            "static float kzero;\n"
+            "float out;\n"
+            "void use() { out = kzero * 3.0f; }\n"
+        ),
+    }
+    return _mini_tree(tmp_path, files, backend="tree_sitter")
+
+
+def _p2b_discover_kzero(tmp_path, **kwargs):
+    from flight_log_agent.analysis.mechanism_discovery import (
+        discover_mechanism_dag,
+    )
+    return discover_mechanism_dag(
+        _p2b_kzero_tree(tmp_path),
+        tmp_path / "cache",
+        seeds=["use"],
+        terminal="out",
+        source_hash="hash",
+        terminal_file="src/main.cpp",
+        **kwargs)
+
+
+def _p2b_spy(monkeypatch):
+    import flight_log_agent.analysis.mechanism_discovery as discovery
+    calls: list = []
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate as real_derive,
+    )
+
+    def spy(obligation, evidence, version):
+        calls.append(evidence.obligation_key)
+        return real_derive(obligation, evidence, version)
+
+    monkeypatch.setattr(
+        discovery, "derive_writer_coverage_certificate", spy)
+    return calls
+
+
+def test_p2b_production_evidence_derives_certificate(tmp_path):
+    """P2B-A/H: a natural certifiable obligation flows production
+    resolve → retained attempt → stored v0 certificate with exact
+    identity, writers, and assumptions."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    sink: list = []
+    store = CoverageProofStore()
+    result = _p2b_discover_kzero(
+        tmp_path, attempt_sink=sink, proof_store=store)
+    assert result.dag is not None
+    assert sink, "no production evidence retained"
+    certificates = store.certificates_for(0)
+    assert len(certificates) == 1
+    certificate = certificates[0]
+    reference = next(
+        item for item in result.dag.unresolved_references
+        if item.symbol == "kzero" and item.kind == "storage_writers")
+    assert tuple(certificate.obligation_key) == (
+        reference.kind, reference.identity.kind,
+        reference.identity.declaration_id)
+    assert tuple(certificate.scheduling_key) == reference.visit_key()
+    assert certificate.version == 0
+    assert tuple(certificate.writers) == ()
+    assert set(certificate.assumptions) == {
+        "file-linkage-closed", "writer-syntax-enumerated"}
+    assert any(str(item).endswith("src/main.cpp")
+               for item in certificate.boundary)
+
+
+def test_p2b_no_evidence_no_derivation(tmp_path, monkeypatch):
+    """P2B-B: without retained evidence T3 is never invoked and
+    nothing is stored."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_coverage_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    calls = _p2b_spy(monkeypatch)
+    store = CoverageProofStore()
+    derive_current_coverage_proofs([], 0, [], store)
+    assert calls == []
+    assert store.certificates_for(0) == ()
+
+
+def _p2b_internal_fixture(tmp_path, files=None):
+    """One certifiable internal-linkage writer obligation with real
+    resolver-produced evidence (storage-internal-only, admitted)."""
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+        UnresolvedSourceReference,
+    )
+    profiler, inputs = _evidence_setup(tmp_path, files or {
+        "src/lib/g.cpp": (
+            "static float kgain = 1.0f;\n"
+            "void usea() { kgain = 3.0f; }\n"
+        ),
+    })
+    identity = inputs.structure.symbol_identity(
+        "kgain", file="src/lib/g.cpp",
+        callable_id="usea", function_name="usea")
+    assert identity.declaration_proven
+    reference = UnresolvedSourceReference(
+        symbol="kgain", kind="storage_writers",
+        file="src/lib/g.cpp", callable_id="usea",
+        identity=identity)
+    resolver = SourceExpansionResolver(profiler, "hash")
+    sink: list = []
+    _, envelope = resolver.resolve_with_evidence(
+        reference, inputs.structure, sink, universe_version=0)
+    return reference, envelope
+
+
+def test_p2b_unchanged_evidence_reuses(tmp_path, monkeypatch):
+    """P2B-C: identical material evidence re-runs derive nothing —
+    the existing certificate is reused (T3 call count stable)."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_coverage_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    reference, envelope = _p2b_internal_fixture(tmp_path)
+    calls = _p2b_spy(monkeypatch)
+    store = CoverageProofStore()
+    derive_current_coverage_proofs([reference], 0, [envelope], store)
+    assert len(calls) == 1
+    first = store.certificates_for(0)
+    assert len(first) == 1
+    derive_current_coverage_proofs([reference], 0, [envelope], store)
+    assert len(calls) == 1
+    assert store.certificates_for(0) == first
+
+
+def test_p2b_changed_evidence_rederives_and_replaces(tmp_path,
+                                                    monkeypatch):
+    """P2B-D: materially changed same-version evidence rederives and
+    explicitly replaces the superseded certificate."""
+    import dataclasses
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_coverage_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    reference, envelope = _p2b_internal_fixture(tmp_path)
+    calls = _p2b_spy(monkeypatch)
+    store = CoverageProofStore()
+    derive_current_coverage_proofs([reference], 0, [envelope], store)
+    assert len(calls) == 1
+    old = store.certificates_for(0)
+    assert len(old) == 1
+    site = next(iter(old[0].writers))
+    grown = dataclasses.replace(
+        envelope.attempts[0],
+        details={**(envelope.attempts[0].details or {}),
+                 "writer_census": {"src/lib/g.cpp": [site, site + "#2"]}})
+    grown_envelope = dataclasses.replace(
+        envelope, attempts=(grown,))
+    derive_current_coverage_proofs(
+        [reference], 0, [envelope, grown_envelope], store)
+    assert len(calls) == 2
+    current = store.certificates_for(0)
+    assert len(current) == 1
+    assert set(current[0].writers) == {site, site + "#2"}
+
+
+def test_p2b_changed_evidence_refusal_invalidates(tmp_path, monkeypatch):
+    """P2B-E (tripwire): changed evidence whose rederivation REFUSES
+    must not leave the old certificate current for the changed state."""
+    import dataclasses
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_coverage_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    reference, envelope = _p2b_internal_fixture(tmp_path)
+    _calls = _p2b_spy(monkeypatch)
+    store = CoverageProofStore()
+    derive_current_coverage_proofs([reference], 0, [envelope], store)
+    assert len(store.certificates_for(0)) == 1
+    ambiguous = dataclasses.replace(
+        envelope.attempts[0], outcome="ambiguous",
+        details={**(envelope.attempts[0].details or {}),
+                 "colliding_identities": ["decl-a", "decl-b"]})
+    poisoned = dataclasses.replace(envelope, attempts=(ambiguous,))
+    derive_current_coverage_proofs(
+        [reference], 0, [envelope, poisoned], store)
+    assert store.certificates_for_obligation(
+        0, tuple(envelope.obligation_key)) == ()
+    assert store.note_evidence(
+        0, tuple(envelope.scheduling_key),
+        list(envelope.attempts) + [ambiguous]) is False
+    before = len(_calls)
+    derive_current_coverage_proofs(
+        [reference], 0, [envelope, poisoned], store)
+    assert len(_calls) == before
+    assert store.certificates_for_obligation(
+        0, tuple(envelope.obligation_key)) == ()
+
+
+def test_p2b_unrelated_obligation_isolated(tmp_path, monkeypatch):
+    """P2B-F: changed evidence for A rederives A only; B is derived
+    once and never touched again."""
+    import dataclasses
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_coverage_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/two.cpp": (
+            "static float ka = 1.0f;\n"
+            "static float kb = 2.0f;\n"
+            "void usea() { ka = 3.0f; kb = 4.0f; }\n"
+        ),
+    })
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+        UnresolvedSourceReference,
+    )
+    refs = []
+    envelopes = []
+    for symbol in ("ka", "kb"):
+        identity = inputs.structure.symbol_identity(
+            symbol, file="src/lib/two.cpp",
+            callable_id="usea", function_name="usea")
+        assert identity.declaration_proven
+        reference = UnresolvedSourceReference(
+            symbol=symbol, kind="storage_writers",
+            file="src/lib/two.cpp", callable_id="usea",
+            identity=identity)
+        resolver = SourceExpansionResolver(profiler, "hash")
+        sink: list = []
+        _, envelope = resolver.resolve_with_evidence(
+            reference, inputs.structure, sink, universe_version=0)
+        refs.append(reference)
+        envelopes.append(envelope)
+    by_obligation = {}
+    real_derive_calls: list = []
+    import flight_log_agent.analysis.mechanism_discovery as discovery
+    from flight_log_agent.analysis.coverage import (
+        derive_writer_coverage_certificate as real_derive,
+    )
+
+    def counting(obligation, evidence, version):
+        by_obligation.setdefault(
+            tuple(evidence.obligation_key), 0)
+        by_obligation[tuple(evidence.obligation_key)] += 1
+        real_derive_calls.append(evidence.obligation_key)
+        return real_derive(obligation, evidence, version)
+
+    monkeypatch.setattr(discovery, "derive_writer_coverage_certificate",
+                        counting)
+    store = CoverageProofStore()
+    derive_current_coverage_proofs(refs, 0, envelopes, store)
+    assert len(store.certificates_for(0)) == 2
+    assert all(count == 1 for count in by_obligation.values())
+    site = next(iter(store.certificates_for_obligation(
+        0, tuple(envelopes[0].obligation_key))[0].writers))
+    grown = dataclasses.replace(
+        envelopes[0].attempts[0],
+        details={**(envelopes[0].attempts[0].details or {}),
+                 "writer_census": {"src/lib/two.cpp": [site, site + "#2"]}})
+    grown_envelope = dataclasses.replace(envelopes[0], attempts=(grown,))
+    derive_current_coverage_proofs(
+        refs, 0, [envelopes[1], grown_envelope], store)
+    assert by_obligation[tuple(envelopes[0].obligation_key)] == 2
+    assert by_obligation[tuple(envelopes[1].obligation_key)] == 1
+    assert len(store.certificates_for(0)) == 2
+
+
+def test_p2b_version_extension_invalidates(tmp_path, monkeypatch):
+    """P2B-G: v0 proof is never current under v1; v1 evidence derives
+    a fresh v1 certificate."""
+    import dataclasses
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_coverage_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    reference, envelope = _p2b_internal_fixture(tmp_path)
+    calls = _p2b_spy(monkeypatch)
+    store = CoverageProofStore()
+    derive_current_coverage_proofs([reference], 0, [envelope], store)
+    assert len(store.certificates_for(0)) == 1
+    assert store.certificates_for(1) == ()
+    stamped_attempts = tuple(
+        dataclasses.replace(
+            attempt,
+            universe_ref={**(attempt.universe_ref or {}),
+                          "search_version": 1})
+        for attempt in envelope.attempts)
+    v1_envelope = dataclasses.replace(
+        envelope, attempts=stamped_attempts,
+        universe_ref={**envelope.universe_ref, "search_version": 1})
+    derive_current_coverage_proofs([reference], 1, [v1_envelope], store)
+    assert len(calls) == 2
+    assert len(store.certificates_for(1)) == 1
+    assert store.certificates_for(1)[0].version == 1
+    assert (store.certificates_for(1)[0]
+            not in store.certificates_for(0))
+
+
+def test_p2b_unsupported_class_stores_nothing(tmp_path):
+    """P2B-I: heuristic-only evidence is retained but derives no
+    certificate and no fake proof."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    sink: list = []
+    store = CoverageProofStore()
+    result = _p0_discover(
+        _mini_tree(tmp_path, {
+            "src/modules/example/rtl.cpp": """
+#include "rtl.h"
+void Rtl::pick_altitude() { _final_out = _dest_val + 1.0f; }
+""",
+            "src/modules/example/rtl.h": """
+class Rtl { float _final_out; float _dest_val; };
+""",
+            "src/modules/example/dest.cpp": """
+#include "rtl.h"
+void Rtl::update() {
+    speed_s speed_data{};
+    orb_copy(ORB_ID(speed), subscription, &speed_data);
+    _dest_val = speed_data.value;
+}
+""",
+        }),
+        tmp_path, attempt_sink=sink, proof_store=store)
+    assert result.dag is not None
+    assert sink, "expected retained frontier evidence"
+    assert store.certificates_for(0) == ()
+    assert store.certificates_for(1) == ()
+
+
+def test_p2b_same_spelling_isolation(tmp_path):
+    """P2B-J: same spelling under different proven declarations
+    derives separately bound certificates."""
+    from flight_log_agent.analysis.mechanism_discovery import (
+        derive_current_coverage_proofs,
+    )
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    profiler, inputs = _evidence_setup(tmp_path, {
+        "src/lib/a.cpp": "static float kgain = 1.0f;\n",
+        "src/lib/b.cpp": "static float kgain = 2.0f;\n",
+    })
+    from flight_log_agent.analysis.source_expansion import (
+        SourceExpansionResolver,
+        UnresolvedSourceReference,
+    )
+    refs = []
+    envelopes = []
+    for path in ("src/lib/a.cpp", "src/lib/b.cpp"):
+        identity = inputs.structure.symbol_identity(
+            "kgain", file=path, callable_id="", function_name="")
+        assert identity.declaration_proven, path
+        reference = UnresolvedSourceReference(
+            symbol="kgain", kind="storage_writers", file=path,
+            identity=identity)
+        resolver = SourceExpansionResolver(profiler, "hash")
+        sink: list = []
+        _, envelope = resolver.resolve_with_evidence(
+            reference, inputs.structure, sink, universe_version=0)
+        refs.append(reference)
+        envelopes.append(envelope)
+    assert refs[0].visit_key() != refs[1].visit_key()
+    store = CoverageProofStore()
+    derive_current_coverage_proofs(refs, 0, envelopes, store)
+    certificates = store.certificates_for(0)
+    assert len(certificates) == 2
+    for certificate, envelope in zip(
+            sorted(certificates,
+                   key=lambda item: repr(item.obligation_key)),
+            sorted(envelopes,
+                   key=lambda item: repr(item.obligation_key))):
+        assert tuple(certificate.obligation_key) == tuple(
+            envelope.obligation_key)
+        assert tuple(certificate.scheduling_key) == tuple(
+            envelope.scheduling_key)
+
+
+def test_p2b_session_isolation(tmp_path):
+    """P2B-K: independent sessions never share proof-store state."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    store_a = CoverageProofStore()
+    store_b = CoverageProofStore()
+    first = _p2b_discover_kzero(
+        tmp_path, proof_store=store_a)
+    second = _p2b_discover_kzero(
+        tmp_path, proof_store=store_b)
+    assert first.dag is not None and second.dag is not None
+    assert len(store_a.certificates_for(0)) == 1
+    assert len(store_b.certificates_for(0)) == 1
+    assert store_a is not store_b
+    import dataclasses
+    lone = store_a.certificates_for(0)[0]
+    assert store_a.replace_certificate(dataclasses.replace(
+        lone, writers=("elsewhere",))) is True
+    assert (store_b.certificates_for(0)[0].writers
+            == lone.writers)
+
+
+def test_p2b_checkpoint_unaffected(tmp_path):
+    """P2B-L: certificates in the session store never reach the
+    checkpoint in P2B — discovery behavior identical with/without."""
+    result = _p2b_discover_kzero(tmp_path)
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    store = CoverageProofStore()
+    sink: list = []
+    threaded = _p2b_discover_kzero(
+        tmp_path, attempt_sink=sink, proof_store=store)
+    assert threaded.files_loaded == result.files_loaded
+    assert threaded.stop_reason == result.stop_reason
+    assert threaded.dag is not None and result.dag is not None
+    assert [v.id for v in threaded.dag.vertices] == [
+        v.id for v in result.dag.vertices]
+    assert len(store.certificates_for(0)) == 1
+
+
+def test_p2b_production_prunes_on_extension(tmp_path):
+    """P2B prune: a seeded stale v0 certificate cannot survive the
+    genuine v0→v1 extension of a production session."""
+    from flight_log_agent.analysis.coverage import CoverageProofStore
+    profiler = _p0_tree(tmp_path)
+    _certificate, _proof = _proof_pair(
+        ("op-a", "signal-a"),
+        ("storage_writers", "global", "decl-seed"),
+        ("storage_writers", "global", "decl-seed"), version=0)
+    store = CoverageProofStore()
+    assert store.store_certificate(_certificate) is True
+    assert len(store.certificates_for(0)) == 1
+    result = _p0_discover(
+        profiler, tmp_path, proof_store=store)
+    assert result.dag is not None
+    assert store.certificates_for(0) == ()
+
+
 def test_proof_store_certificate_replacement():
     """Review-1A: ordinary conflicting insert refuses, but explicit
     replacement supersedes the same logical key — exactly one entry
@@ -9780,3 +10211,58 @@ def test_evidence_fingerprint_dict_order_canonical():
         "file_verdicts": {"a.cpp": "exact:x", "b.cpp": "exact:y"},
         "writer_census": {"a.cpp": ["x"], "b.cpp": ["y1", "y2"]}})]
     assert evidence_fingerprint(first) == evidence_fingerprint(second)
+
+
+def test_proof_store_discard_certificate():
+    """Gate-B A/C: exact-key discard removes one certificate, leaves
+    siblings across obligation/scheduling/version untouched, and
+    reports absence without mutation."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    certificate, _proof = _proof_pair(use, key, semantic, version=0)
+    sibling_obligation, _ = _proof_pair(
+        use, key, ("storage_writers", "global", "decl-b"), version=0)
+    sibling_visit, _ = _proof_pair(
+        use, ("storage_writers", "global", "decl-v"), semantic, version=0)
+    sibling_version, _ = _proof_pair(use, key, semantic, version=1)
+    for entry in (certificate, sibling_obligation, sibling_visit,
+                  sibling_version):
+        assert store.store_certificate(entry) is True
+    assert store.discard_certificate(0, key, semantic) is True
+    assert store.certificates_for_obligation(0, semantic) == (
+        sibling_visit,)
+    assert store.certificates_for_visit(0, key) == (sibling_obligation,)
+    assert store.certificates_for_obligation(
+        0, ("storage_writers", "global", "decl-b")) == (sibling_obligation,)
+    assert store.certificates_for_visit(
+        0, ("storage_writers", "global", "decl-v")) == (sibling_visit,)
+    assert store.certificates_for(1) == (sibling_version,)
+    assert store.discard_certificate(0, key, semantic) is False
+    assert store.discard_certificate(0, key, ("missing",)) is False
+
+
+def test_proof_store_discard_proof():
+    """Gate-B D/E: exact-key discard removes one applicability proof;
+    other uses, visits, and versions survive; absence reports False."""
+    store = _p2a_store()
+    key = ("storage_writers", "global", "decl-a")
+    semantic = ("storage_writers", "global", "decl-a")
+    use = ("op-a", "signal-a")
+    _certificate, proof = _proof_pair(use, key, semantic, version=0)
+    _c2, other_use = _proof_pair(("op-b", "signal-b"), key, semantic,
+                                 version=0)
+    _c3, other_visit = _proof_pair(
+        use, ("storage_writers", "global", "decl-v"), semantic, version=0)
+    _c4, other_version = _proof_pair(use, key, semantic, version=1)
+    for entry in (proof, other_use, other_visit, other_version):
+        assert store.store_proof(entry) is True
+    assert store.discard_proof(0, use, key) is True
+    assert store.proof_for(0, use, key) is None
+    assert store.proof_for(0, ("op-b", "signal-b"), key) == other_use
+    assert store.proof_for(
+        0, use, ("storage_writers", "global", "decl-v")) == other_visit
+    assert store.proof_for(1, use, key) == other_version
+    assert store.discard_proof(0, use, key) is False
+    assert store.discard_proof(0, ("missing",), key) is False

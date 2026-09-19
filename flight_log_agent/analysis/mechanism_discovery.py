@@ -30,7 +30,12 @@ from flight_log_agent.analysis.source_expansion import (
     UnresolvedSourceReference,
     reference_receiver_is_source_boundary,
 )
-from flight_log_agent.analysis.coverage import CoverageSearchState
+from flight_log_agent.analysis.coverage import (
+    CoverageEvidence,
+    CoverageProofStore,
+    CoverageSearchState,
+    derive_writer_coverage_certificate,
+)
 from flight_log_agent.analysis.checkpoint_discovery import CheckpointRound
 from flight_log_agent.analysis.mechanism_dag import (
     DAGConstructionSession,
@@ -1577,6 +1582,83 @@ def _reachable_frontier_references(
     return kept
 
 
+def derive_current_coverage_proofs(
+    references: Any,
+    search_version: Any,
+    evidence_log: Any,
+    proof_store: CoverageProofStore,
+) -> None:
+    """Derive T3 coverage from retained evidence into the proof store.
+
+    Session orchestration only: groups retained `CoverageEvidence`
+    envelopes by scheduling key for the settled search version, detects
+    new/changed evidence through the store fingerprint, and invokes the
+    pure T3 derivation for obligations still present on the current
+    frontier. Unchanged evidence reuses whatever the store holds (T3
+    is deterministic, so re-derivation could add nothing); refused
+    derivation stores nothing.
+    """
+    groups: dict = {}
+    group_order: list = []
+    for envelope in evidence_log or ():
+        envelope_version = (getattr(envelope, "universe_ref", None)
+                            or {}).get("search_version")
+        if envelope_version != search_version:
+            continue
+        try:
+            scheduling = tuple(
+                getattr(envelope, "scheduling_key", None) or ())
+        except TypeError:
+            continue
+        if not scheduling:
+            continue
+        if scheduling not in groups:
+            groups[scheduling] = []
+            group_order.append(scheduling)
+        groups[scheduling].append(envelope)
+    visits: dict = {}
+    for reference in references or ():
+        try:
+            visit = tuple(reference.visit_key())
+        except (AttributeError, TypeError, ValueError):
+            continue
+        visits.setdefault(visit, reference)
+    for scheduling in group_order:
+        envelopes = groups[scheduling]
+        reference = visits.get(scheduling)
+        if reference is None:
+            continue
+        attempts: list = []
+        for envelope in envelopes:
+            attempts.extend(list(getattr(envelope, "attempts", None) or ()))
+        if not proof_store.note_evidence(
+                search_version, scheduling, attempts):
+            continue
+        first = envelopes[0]
+        evidence = CoverageEvidence(
+            obligation_key=tuple(
+                getattr(first, "obligation_key", None) or ()),
+            scheduling_key=scheduling,
+            attempts=list(attempts),
+            universe_ref=dict(
+                getattr(first, "universe_ref", None) or {}),
+        )
+        result = derive_writer_coverage_certificate(
+            reference, evidence, search_version)
+        if result.certificate is None:
+            # Changed evidence with no positive rederivation: the prior
+            # certificate (if any) no longer has supporting evidence,
+            # so discard it rather than letting superseded proof stand
+            # as current. The new fingerprint is already recorded, so
+            # identical later input reuses this refusal without T3.
+            proof_store.discard_certificate(
+                search_version, scheduling,
+                tuple(getattr(first, "obligation_key", None) or ()))
+            continue
+        if not proof_store.store_certificate(result.certificate):
+            proof_store.replace_certificate(result.certificate)
+
+
 def discover_mechanism_dag(
     profiler: MechanismSourceProfiler,
     cache_root: Union[str, Path],
@@ -1602,6 +1684,7 @@ def discover_mechanism_dag(
     construction_evaluator: Optional[Callable[[MechanismDAG, int], CheckpointRound]] = None,
     search_state: Optional[CoverageSearchState] = None,
     attempt_sink: Optional[list] = None,
+    proof_store: Optional[CoverageProofStore] = None,
 ) -> DiscoveryResult:
     """Build a DAG by exact, provenance-checked fixed-point expansion.
 
@@ -1691,6 +1774,16 @@ def discover_mechanism_dag(
     # this session; never shared across sessions. No derivation,
     # retirement, or authority reads it yet.
     evidence_sink: list = attempt_sink if attempt_sink is not None else []
+    # Session-owned proof state (P2B, derived only): T3 certificates
+    # derived from retained evidence live here across rounds. Version
+    # truth stays with `search_state`; checkpoint receives no proof.
+    if proof_store is None:
+        proof_store = CoverageProofStore()
+    # Retained per-resolution coverage evidence envelopes (P2B): the
+    # exact T3 inputs the frontier resolver already produced, grouped
+    # later by (version, scheduling key). Raw attempts stay canonical
+    # in `evidence_sink`; these envelopes are the same objects' views.
+    evidence_log: list = []
     checkpoint: Optional[CheckpointRound] = None
     stop_reason = "frontier_exhausted"
     construction_session = DAGConstructionSession() if construction_evaluator is not None else None
@@ -1799,6 +1892,10 @@ def discover_mechanism_dag(
             # retry against the fuller index. Retries that admit nothing
             # produce no further files and the loop still settles.
             search_state.advance_version()
+            # Proof-store hygiene only: drop stale-version entries so
+            # the store stays bounded. Correctness never depends on
+            # pruning — all reads are version-explicit.
+            proof_store.prune_older_than(search_state.version)
 
         if new_files or not local_resume:
             inputs = dag_inputs_from_facts(facts_by_file.values())
@@ -1952,12 +2049,13 @@ def discover_mechanism_dag(
                 # attempted or deprioritized work, not proof.
                 continue
             search_state.mark_visited(key)
-            candidates, _frontier_evidence = resolver.resolve_with_evidence(
+            candidates, frontier_evidence = resolver.resolve_with_evidence(
                 reference,
                 inputs.structure,
                 evidence_sink,
                 universe_version=search_state.version,
             )
+            evidence_log.append(frontier_evidence)
             for candidate in candidates:
                 next_files.extend(declared_source_files(candidate.file))
         for file_path in fetched_files:
@@ -1967,6 +2065,16 @@ def discover_mechanism_dag(
             for file_path in dedupe_keep_order(next_files)
             if file_path not in facts_by_file
         ]
+        # Incremental T3 proof production (P2B): derive coverage from
+        # retained evidence at the still-current version, using the
+        # same structure the resolution just ran against. Later rounds
+        # reuse unchanged certificates via evidence fingerprints.
+        derive_current_coverage_proofs(
+            dag.unresolved_references if dag is not None else [],
+            search_state.version,
+            evidence_log,
+            proof_store,
+        )
         if not pending:
             if construction_session is not None and references:
                 attempted = {reference.visit_key() for reference in references}

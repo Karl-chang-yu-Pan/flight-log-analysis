@@ -1044,6 +1044,28 @@ class CoverageProofStore:
         self._certificates[key] = certificate
         return True
 
+    def discard_certificate(
+        self, version: Any, scheduling_key: Any, obligation_key: Any,
+    ) -> bool:
+        """Remove one stored certificate by exact key, if present.
+
+        Mechanism only, for derivation lifecycle (changed evidence
+        whose rederivation refuses must not leave the superseded
+        positive value current). Removes exactly
+        (version, scheduling, obligation); sibling keys and versions
+        are untouched. No fingerprint comparison, no derivation, no
+        policy — the caller decides when invalidation is justified.
+        """
+        try:
+            key = (version, tuple(scheduling_key or ()),
+                   tuple(obligation_key or ()))
+        except TypeError:
+            return False
+        if key not in self._certificates:
+            return False
+        del self._certificates[key]
+        return True
+
     def certificates_for(self, version: Any) -> tuple:
         """All certificates stored under one version, deterministically."""
         return self._sorted_entries(
@@ -1100,6 +1122,25 @@ class CoverageProofStore:
         if key is None or key not in self._proofs:
             return False
         self._proofs[key] = proof
+        return True
+
+    def discard_proof(
+        self, version: Any, use_key: Any, scheduling_key: Any,
+    ) -> bool:
+        """Remove one stored applicability proof by exact key.
+
+        Mechanism only, mirroring `discard_certificate`: removes
+        exactly (version, use, scheduling) when present, otherwise
+        reports absence without mutation. No policy of any kind.
+        """
+        try:
+            key = (version, tuple(use_key or ()),
+                   tuple(scheduling_key or ()))
+        except TypeError:
+            return False
+        if key not in self._proofs:
+            return False
+        del self._proofs[key]
         return True
 
     def proofs_for(self, version: Any) -> tuple:
