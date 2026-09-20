@@ -1567,6 +1567,137 @@ def _report_for(vertices, retained=()):
     return build_report_from_dag("why?", judged, dag, replay=None)
 
 
+def _writer_source(*, file="src/a.cpp", line=5, end_line=None,
+                   variable="x", expression="input * 3.0",
+                   extra=None):
+    source = {
+        "file": file, "line": line, "end_line": end_line,
+        "variable": variable, "expression": expression,
+    }
+    if extra:
+        source.update(extra)
+    return source
+
+
+def test_writer_identity_collapses_repeat_instances():
+    """N1a: same source writer instantiated with differing
+    instance-only metadata shares one stable identity."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _source_writer_identity,
+    )
+    first = _writer_source(extra={
+        "call_instance_scope": "fn::@call:aaa",
+        "source_order": 10,
+    })
+    second = _writer_source(extra={
+        "call_instance_scope": "fn::@call:bbb",
+        "source_order": 10,
+    })
+    assert (_source_writer_identity(first)
+            == _source_writer_identity(second))
+
+
+def test_writer_identity_separates_distinct_assignments():
+    """N1b: same symbol with a different line or expression is a
+    different writer identity."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _source_writer_identity,
+    )
+    base = _writer_source()
+    assert (_source_writer_identity(base)
+            != _source_writer_identity(_writer_source(line=9)))
+    assert (_source_writer_identity(base)
+            != _source_writer_identity(
+                _writer_source(expression="input * 4.0")))
+    assert (_source_writer_identity(base)
+            != _source_writer_identity(
+                _writer_source(variable="y")))
+
+
+def test_writer_identity_tolerates_missing_provenance():
+    """N1c: absent optional provenance still yields a deterministic
+    identity instead of crashing."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _source_writer_identity,
+    )
+    sparse = {"variable": "x"}
+    assert (_source_writer_identity(sparse)
+            == _source_writer_identity({"variable": "x"}))
+    assert isinstance(_source_writer_identity({}), tuple)
+
+
+def test_duplicate_surviving_terminals_collapse_to_one_ref():
+    """N2: many terminal graph instances of one publication source
+    site collapse to a single semantic CodeRef."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    first = _report_vertex(
+        vid="a", variable="out", expression="input * 2.0",
+        file="src/pub.cpp", line=44)
+    second = _report_vertex(
+        vid="b", variable="out", expression="input * 2.0",
+        file="src/pub.cpp", line=44)
+    report = _report_for([leaf, first, second])
+    refs = report.ranked_hypotheses[0].source_refs
+    assert [(ref.file, ref.start_line) for ref in refs] == [
+        ("src/pub.cpp", 44)]
+
+
+def test_distinct_writers_stay_distinct():
+    """N2: same terminal symbol with distinct source assignment
+    identity keeps separate CodeRefs."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    first = _report_vertex(
+        vid="a", variable="out", expression="input * 2.0",
+        file="src/pub.cpp", line=44)
+    second = _report_vertex(
+        vid="b", variable="out", expression="input * 3.0",
+        file="src/pub.cpp", line=44)
+    report = _report_for([leaf, first, second])
+    refs = report.ranked_hypotheses[0].source_refs
+    assert len(refs) == 2
+
+
+def _ref_signature(report):
+    return [(ref.file, ref.start_line, ref.explanation)
+            for ref in report.ranked_hypotheses[0].source_refs]
+
+
+def test_normalized_order_ignores_input_order():
+    """N6: semantically identical eligible refs in different input
+    orders normalize to the same CodeRef order."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    calc = _report_vertex(
+        vid="calc", variable="out", expression="input * 3.0",
+        file="src/calc.cpp", line=10)
+    anchor = _report_vertex(
+        vid="decl", variable="out", expression="0.0f",
+        file="include/decl.h", line=3)
+    retained = [_report_candidate_record(
+        file="src/old.cpp", line=7, variable="out")]
+    first = _report_for([leaf, anchor, calc], retained=retained)
+    second = _report_for([leaf, calc, anchor],
+                         retained=list(reversed(retained)))
+    assert _ref_signature(first) == _ref_signature(second)
+
+
+def test_auto_heal_prefers_surviving_over_candidate():
+    """N8: a retained ASSUMED candidate whose equivalent source
+    writer survives normally yields exactly one ordinary ref —
+    no duplicate slot, no candidate wording for that writer."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    surviving = _report_vertex(
+        vid="live", variable="out", expression="input * 3.0",
+        file="src/a.cpp", line=5)
+    retained = [_report_candidate_record(
+        file="src/a.cpp", line=5, variable="out",
+        expression="input * 3.0")]
+    report = _report_for([leaf, surviving], retained=retained)
+    refs = [ref for ref in report.ranked_hypotheses[0].source_refs
+            if (ref.file, ref.start_line) == ("src/a.cpp", 5)]
+    assert len(refs) == 1
+    assert refs[0].explanation.startswith("terminal write:")
+
+
 def test_report_orders_runtime_before_declaration_anchor():
     """D3/T3: a runtime terminal writer precedes a supporting
     declaration anchor even when the anchor vertex comes first;

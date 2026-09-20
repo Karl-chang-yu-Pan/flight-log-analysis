@@ -331,11 +331,17 @@ def test_a5_report_validates_and_binds_evidence(_rtl_stage):
         "candidate terminal write excluded by assumed feasibility "
         "condition:") for ref in computation), \
         "causal refs must be candidate-marked while assumed"
-    assert not any(
-        ref.file.endswith("navigator/rtl.cpp")
-        and ref.start_line is not None and 690 <= ref.start_line <= 735
-        for ref in top.source_refs), \
-        "helper-body refs belong to deferred Workstream B"
+    # WS1 scope pin (not a permanent line-range ban): every ref must
+    # carry a known WS1 wording kind. A future WS2 helper ref with its
+    # own wording will fail here loudly, forcing an explicit
+    # allowlist update rather than slipping through.
+    assert all(
+        ref.explanation.startswith((
+            "terminal write:",
+            "candidate terminal write excluded by assumed "
+            "feasibility condition:",
+        )) for ref in top.source_refs), \
+        "unexpected source-ref kind: helper refs belong to deferred Workstream B"
     assert top.expected_logged_signature, "no expected log signature"
     inventory = parse_ulog_inventory(RTL_LOG, SOURCE_ROOT)
     observed = set(observed_signals_from_inventory(inventory))

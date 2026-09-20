@@ -31,6 +31,7 @@ from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.mechanism_dag import (
     MechanismDAG,
     PreparedSignalSeries,
+    _source_site_order,
     evaluate_feasibility,
     prepare_signal_series,
     prune_infeasible_operations,
@@ -596,16 +597,120 @@ def _is_constant_writer_expression(expression: Any) -> bool:
     return True
 
 
-def _provenance_identity_key(
-    file: Any, line: Any, variable: Any, expression: Any,
-) -> tuple:
-    """Stable writer identity for dedup/ordering. Never vertex IDs."""
+def _normalize_writer_expression(source: Any) -> str:
+    """Deterministic spelling for writer-identity comparison.
+
+    Prefers the already-lowered expression form when present,
+    then collapses whitespace and strips a trailing semicolon.
+    Parentheses and operator spellings are left to the lowered
+    form; nothing here merges semantically different expressions.
+    """
+    mapping = source if isinstance(source, dict) else {}
+    text = mapping.get("lowered_expression") or mapping.get("expression") or ""
+    text = " ".join(str(text).split())
+    return text[:-1].strip() if text.endswith(";") else text
+
+
+def _writer_scope_identity(source: Any) -> str:
+    """Most stable available scope for a writer, preference-ordered.
+
+    Declaration identity first, then source-site identity, then
+    callable scope, then target scope. Empty string when nothing
+    is recorded; callers must treat it as absent, not as a scope.
+    """
+    mapping = source if isinstance(source, dict) else {}
+    target_identity = mapping.get("target_identity")
+    if isinstance(target_identity, dict):
+        declaration_id = target_identity.get("declaration_id")
+        if declaration_id:
+            return f"decl:{declaration_id}"
+    source_site_id = mapping.get("source_site_id")
+    if source_site_id:
+        return f"site:{source_site_id}"
+    for key in ("function", "callable", "callable_id"):
+        value = mapping.get(key)
+        if value:
+            return f"call:{value}"
+    target_scope = mapping.get("target_scope")
+    if isinstance(target_scope, dict):
+        scoped = (str(target_scope.get("file") or ""),
+                  str(target_scope.get("callable") or ""))
+        if any(scoped):
+            return f"scope:{scoped[0]}:{scoped[1]}"
+    return ""
+
+
+def _source_writer_identity(source: Any) -> tuple:
+    """Stable source-writer identity for dedup/ordering.
+
+    Collapses repeat graph instances of one source writer while
+    keeping genuinely different assignments distinct. Instance-only
+    metadata (call-instance scopes, source order, edge roles) never
+    participates; neither do generated vertex/op IDs or graph
+    insertion order. All components tolerate absence.
+    """
+    mapping = source if isinstance(source, dict) else {}
+    line = mapping.get("line")
+    end_line = mapping.get("end_line")
+    call_site = mapping.get("call_site_id")
     return (
-        str(file or ""),
+        str(mapping.get("file") or ""),
         line if isinstance(line, int) else None,
-        str(variable or ""),
-        str(expression or ""),
+        end_line if isinstance(end_line, int) else None,
+        str(mapping.get("variable") or "").strip(),
+        _normalize_writer_expression(mapping),
+        _writer_scope_identity(mapping),
+        str(call_site) if call_site else "",
     )
+
+
+def _entry_source(entry: Any) -> dict[str, Any]:
+    """Flattened identity view for one terminal-write entry.
+
+    Vertex-level fields win; missing provenance degrades through
+    the same fallback chain as retained records, so both sides
+    compare on equal terms.
+    """
+    mapping = entry if isinstance(entry, dict) else {}
+    metadata = mapping.get("metadata")
+    merged: dict[str, Any] = dict(metadata) if isinstance(metadata, dict) else {}
+    for key in ("file", "line", "end_line", "variable", "expression",
+                "lowered_expression"):
+        value = mapping.get(key)
+        if value is not None:
+            merged[key] = value
+    return merged
+
+
+def _order_rank(source: Any) -> tuple:
+    """Deterministic source-order rank: recorded emission order,
+    then source-site order, then unordered. Total and type-safe."""
+    mapping = source if isinstance(source, dict) else {}
+    order = mapping.get("source_order")
+    if isinstance(order, int):
+        return (0, order)
+    site_order = _source_site_order(mapping.get("source_site_id"))
+    if site_order is not None:
+        return (1, site_order)
+    return (2, 0)
+
+
+def _order_key(source: Any, file: str, line: Any) -> tuple:
+    """Total deterministic order key: emission/site order first,
+    then stable location and identity tail. Every element is
+    mutually comparable; no insertion order, no vertex IDs."""
+    line_key = f"{line:012d}" if isinstance(line, int) else ""
+    identity = _source_writer_identity(source)
+    tail = []
+    for part in identity[2:]:
+        if part is None:
+            tail.append("")
+        elif isinstance(part, int):
+            tail.append(f"{part:012d}")
+        else:
+            tail.append(str(part))
+    return (
+        _order_rank(source) + (file, line_key) + tuple(tail))
 
 
 def _retained_candidate_ref(record: dict[str, Any]) -> Optional[CodeRef]:
@@ -643,12 +748,20 @@ def _order_source_ref_entries(
     candidates per the causal-evidence contract: runtime
     computation writers before declaration/storage anchors;
     surviving derived/proven writers before assumed candidates;
-    source order as deterministic tiebreak. Surviving refs keep
-    their existing no-dedup behavior; retained records dedup
-    against surviving refs (surviving wins) by stable identity.
+    deterministic source order as tiebreak. Both surviving entries
+    and retained records dedup by stable source-writer identity
+    (surviving wins cross-dedup ties).
     """
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    for entry in entries:
+        key = _source_writer_identity(_entry_source(entry))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
     runtime_vars = {
-        str(entry.get("variable") or "") for entry in entries
+        str(entry.get("variable") or "") for entry in unique
         if not _is_constant_writer_expression(entry.get("expression"))
     }
     runtime_vars.update(
@@ -659,22 +772,20 @@ def _order_source_ref_entries(
              or str(record.get("variable") or "") == selected_terminal)
     )
     surviving_keys = {
-        _provenance_identity_key(
-            entry.get("file"), entry.get("line"),
-            entry.get("variable"), entry.get("expression"))
-        for entry in entries
+        _source_writer_identity(_entry_source(entry))
+        for entry in unique
     }
     ranked: list[tuple[tuple, CodeRef]] = []
-    for entry in entries:
+    for entry in unique:
+        source = _entry_source(entry)
         anchor = (
             _is_constant_writer_expression(entry.get("expression"))
             and str(entry.get("variable") or "") in runtime_vars
         )
-        line = entry.get("line")
         ranked.append((
             (1 if anchor else 0, 0,
-             str(entry.get("file") or ""),
-             line if isinstance(line, int) else -1),
+             *_order_key(source, str(entry.get("file") or ""),
+                         entry.get("line"))),
             entry["ref"],
         ))
     for record in (retained or ()):
@@ -687,20 +798,17 @@ def _order_source_ref_entries(
         if (selected_terminal
                 and str(record.get("variable") or "") != selected_terminal):
             continue
-        key = _provenance_identity_key(
-            record.get("file"), record.get("line"),
-            record.get("variable"), record.get("expression"))
+        key = _source_writer_identity(record)
         if key in surviving_keys:
             continue
         surviving_keys.add(key)
         ref = _retained_candidate_ref(record)
         if ref is None:
             continue
-        line = record.get("line")
         ranked.append((
             (0, 1,
-             str(record.get("file") or ""),
-             line if isinstance(line, int) else -1),
+             *_order_key(record, str(record.get("file") or ""),
+                         record.get("line"))),
             ref,
         ))
     ranked.sort(key=lambda item: item[0])
@@ -812,8 +920,11 @@ def build_report_from_dag(
                 ),
                 "variable": str(vertex.variable or ""),
                 "expression": str(vertex.expression or ""),
+                "lowered_expression": getattr(vertex, "lowered_expression", None),
                 "file": str(vertex.file or ""),
                 "line": vertex.line,
+                "end_line": getattr(vertex, "end_line", None),
+                "metadata": dict(vertex.metadata or {}),
                 "assumed": False,
             })
 

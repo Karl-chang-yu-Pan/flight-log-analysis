@@ -5738,3 +5738,39 @@ def test_assumed_pruned_nonterminal_writer_is_not_retained():
     assert "other_signal" not in [
         record.get("variable") for record
         in reduced.assumed_pruned_provenance]
+
+
+def test_mixed_control_proven_false_disqualifies_candidate():
+    """N7: an operation gated by ASSUMED_FALSE plus an independent
+    PROVEN_FALSE is pruned but NOT retained — assumption must be
+    the sole removal cause."""
+    bindings = [
+        _fake_binding(
+            binding_id="b1",
+            target="_rtl_alt",
+            expression="cone_result",
+            file="src/modules/navigator/rtl.cpp",
+            line=245,
+            control_predicates=[
+                "(hrt_absolute_time() - _destination_check_time) > 1",
+                "_param_rtl_cone_half_angle_deg.get() > 0",
+            ],
+        ),
+        _fake_binding(
+            binding_id="b2",
+            target="_rtl_alt",
+            expression="max(gpos.alt, 10)",
+            file="src/modules/navigator/rtl.cpp",
+            line=248,
+        ),
+    ]
+    dag = build_mechanism_dag(bindings, "_rtl_alt")
+    reduced = evaluate_feasibility(
+        dag,
+        parameter_values={"RTL_CONE_HALF_ANGLE_DEG": 0},
+        prune_dead=True,
+    )
+    remaining = [v for v in reduced.vertices
+                 if v.kind == "operation" and v.variable == "_rtl_alt"]
+    assert [v.line for v in remaining] == [248]
+    assert reduced.assumed_pruned_provenance == []
