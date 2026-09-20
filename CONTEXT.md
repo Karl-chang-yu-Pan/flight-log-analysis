@@ -72,6 +72,12 @@ justify stopping. Policy never upgrades invalid evidence.
 The justification for using a value: source link, transfer or publication site,
 timing, and policy, plus the identity and proof kind the evidence class requires.
 
+**Helper representative**:
+A single source reference standing for one helper callable at one caller
+source call site (plus output discriminator where one site yields multiple
+distinct returns), anchored at the helper's return-site source location.
+It never denotes an unrepresented helper-body interior operation.
+
 **Replay**:
 A deterministic comparison with one vocabulary: not attempted, unevaluable,
 partial, matched, mismatched. A matched result must carry its scope; a local
@@ -95,6 +101,11 @@ into the downstream request.
 
 **Scope**:
 Where a source use is evaluated: file, callable, line, and order.
+
+**Call site**:
+The source location issuing a call. It is distinct from a graph call
+instance; repeated call instances do not by themselves create distinct
+report identities.
 
 **Fallback identity**:
 An unproven candidate identity and lifecycle stage, not proof. It requires
