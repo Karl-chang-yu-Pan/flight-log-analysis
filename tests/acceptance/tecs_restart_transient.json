@@ -1,0 +1,66 @@
+{
+  "scenario_id": "tecs_restart_transient",
+  "question": "Why did the height-rate setpoint read about 1.012 m/s immediately after the mode transition, rather than holding a steady climb-rate limit?",
+  "inputs": {
+    "log": "uploads/tecs-switch-moded-hrate/switch-moded-hrate.ulg",
+    "source_snapshot": "1dacb4cdef2d7145754fc788fa8dc482eed74b40",
+    "backend": "tree_sitter",
+    "seeds": ["TECS", "altitude_rate_control", "tecs_status", "_reinitialize_tecs"],
+    "terminal": "_debug_output.altitude_rate_control",
+    "terminal_file": "src/lib/tecs/TECS.cpp",
+    "transition": {
+      "signal": "vehicle_status.nav_state",
+      "from": 15,
+      "to": 4,
+      "selection": "first"
+    },
+    "window": {
+      "relation": "after",
+      "first_sample_of": "tecs_status.height_rate_setpoint"
+    }
+  },
+  "expected": {
+    "mechanism_family": "restart_bumpless_transient",
+    "transition_time_s": 496.881397,
+    "first_sample_time_s": 496.899343,
+    "reference": 3.3737552165985107,
+    "first_setpoint": 1.0121265649795532,
+    "relation": "0.3 * reference ≈ first setpoint",
+    "tolerance": 0.001,
+    "later_setpoint": 5.0,
+    "candidate_writers": [
+      {"file": "src/lib/tecs/TECS.cpp", "line": 262},
+      {"file": "src/lib/tecs/TECS.cpp", "line": 296}
+    ],
+    "shared_mechanism": "_calcAltitudeControlOutput",
+    "rival_excluded": "persistent_1ms_limit"
+  },
+  "strength": "PROVEN",
+  "unavailable": [
+    "exact initialize-vs-update execution attribution (NON_DECISIVE: the restart-transient conclusion does not depend on which writer executed)",
+    "per-sample internal helper locals",
+    "reinitialize member-state history"
+  ],
+  "forbidden": [
+    "persistent_limit_diagnosis",
+    "fabricated_source_evidence",
+    "execution_attribution_claim",
+    "unsupported_complete_claim",
+    "confidence_upgrade_from_temporal_selection",
+    "silent_fixture_fallback",
+    "wrong_source_snapshot"
+  ],
+  "normalization": {
+    "unstable_fields": [
+      "ids",
+      "timings",
+      "paths",
+      "prose",
+      "vertex_counts",
+      "explaining_branches",
+      "unresolved_evidence_strings",
+      "replay_status",
+      "confidence_values"
+    ]
+  }
+}

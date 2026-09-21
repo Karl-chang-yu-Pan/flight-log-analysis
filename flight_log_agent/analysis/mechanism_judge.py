@@ -32,7 +32,7 @@ from typing import (
 )
 
 from agents import Agent
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from flight_log_agent.expression_math import is_safe_math_function_name
 
@@ -494,6 +494,38 @@ class TerminalCandidate(BaseModel):
     reason: str = ""
 
 
+class TransitionEventSpec(BaseModel):
+    """Generic transition-event intent for temporal window derivation.
+
+    Names a logged signal/state observation stream and, optionally,
+    the value change and disambiguation selecting one event, plus
+    how diagnostic window(s) relate to it. Pure intent: no mechanism
+    names, no thresholds with diagnostic meaning, no timestamps.
+    All case-specific mappings live in seeds/fixtures, never here.
+    """
+
+    transition_signal: str
+    from_value: Optional[float | int | str | bool] = None
+    to_value: Optional[float | int | str | bool] = None
+    event_selection: Optional[Literal["first", "last"]] = None
+    relation: Literal["after", "before", "around"]
+    duration_s: Optional[float] = None
+    first_sample_of: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _exactly_one_extent(self) -> "TransitionEventSpec":
+        has_duration = self.duration_s is not None
+        has_sample = self.first_sample_of is not None
+        if has_duration == has_sample:
+            raise ValueError(
+                "transition window needs exactly one of "
+                "duration_s or first_sample_of"
+            )
+        if has_duration and not self.duration_s > 0:
+            raise ValueError("duration_s must be positive")
+        return self
+
+
 class QuestionedCondition(BaseModel):
     """The comparison the question asserts, when it asserts one —
     evaluated deterministically over the log so the judge can compare
@@ -507,6 +539,7 @@ class QuestionedCondition(BaseModel):
     units: str
     frame: str
     assumptions: list[str] = Field(default_factory=list)
+    transition: Optional[TransitionEventSpec] = None
 
 
 class DiscoverySeeds(BaseModel):

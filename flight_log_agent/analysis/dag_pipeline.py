@@ -488,6 +488,69 @@ def evaluate_questioned_condition_windows(
     }
 
 
+def evaluate_transition_windows(
+    transition: Any,
+    *,
+    logged_set: set[str],
+    log_path: Path,
+    signal_policies: dict[str, Any],
+) -> dict[str, Any]:
+    """Derive diagnostic windows from a generic transition-event intent.
+
+    Loads the transition signal (plus the first-sample target signal
+    when requested) through the same evidence index as questioned
+    conditions, then applies the pure temporal-selection derivation:
+    match transition event(s), disambiguate explicitly, and build
+    event-relative windows. Returns ``{"windows": [...]}`` on
+    success or ``{"windows": None, "error": ...}`` with the exact
+    failure; callers fail closed on ``windows is None``. No
+    mechanism-specific signals, values, or timestamps appear here.
+    """
+    from flight_log_agent.analysis.temporal_selection import (
+        derive_diagnostic_windows,
+        derive_transition_events,
+        select_transition_event,
+    )
+
+    signal = str(getattr(transition, "transition_signal", None) or "")
+    target = str(getattr(transition, "first_sample_of", None) or "")
+    if not signal:
+        return {"error": "transition specification names no signal", "windows": None}
+    references = [signal] + ([target] if target and target != signal else [])
+    # Signal identity is resolved by the evidence index, which accepts
+    # both bare topic.field and instanced topic[i].field spellings;
+    # no separate logged-set spelling gate is applied here.
+    index = ULogEvidenceIndex.from_path(log_path, references)
+    samples: dict[str, list[tuple[float, Any]]] = {}
+    for name in references:
+        resolution = index.resolve_signal(name)
+        if resolution.status != "observed" or resolution.series is None:
+            return {"error": f"{name} not observed in log", "windows": None}
+        samples[name] = [
+            (sample.time_s, sample.value) for sample in resolution.series.samples
+        ]
+    events = derive_transition_events(transition, samples)
+    event = select_transition_event(
+        events, getattr(transition, "event_selection", None)
+    )
+    if event is None:
+        if not events:
+            return {"error": "no logged transition matches the specification", "windows": None}
+        return {
+            "error": "multiple logged transitions match without explicit selection",
+            "windows": None,
+        }
+    windows = derive_diagnostic_windows(transition, event, samples)
+    if not windows:
+        return {"error": "no diagnostic window follows the matched transition", "windows": None}
+    return {
+        "signal": target or signal,
+        "transition_signal": signal,
+        "event": event,
+        "windows": windows,
+    }
+
+
 def replay_terminal_expressions(
     annotated: MechanismDAG,
     log_path: Path,
@@ -497,6 +560,7 @@ def replay_terminal_expressions(
     signal_policies: Optional[dict[str, Any]] = None,
     signal_samples: Optional[dict[str, list[tuple[float, Any]]]] = None,
     prepared_signal_series: Optional[dict[str, PreparedSignalSeries]] = None,
+    scope: Optional[EvaluationScope] = None,
 ) -> dict[str, Any]:
     """Numerically compare terminal writes with their observed output.
 
@@ -505,7 +569,9 @@ def replay_terminal_expressions(
     operation; no recursively substituted expression participates in the
     result. Each writer is compared only inside its gating branch windows.
     A definitive match/mismatch requires exact, non-overlapping writer
-    domains that cover the observed output domain.
+    domains that cover the observed output domain. A supplied scope
+    restricts the comparison domain; absent scope keeps full-domain
+    behavior exactly.
     """
 
     def not_attempted(reason: str) -> dict[str, Any]:
@@ -566,6 +632,7 @@ def replay_terminal_expressions(
         signal_samples=samples,
         signal_policies=signal_policies,
         prepared_signal_series=prepared_series,
+        scope=scope,
     )
 
 
@@ -1017,6 +1084,7 @@ def _order_source_ref_entries(
     retained: Any,
     selected_terminal: str,
     dag: Any = None,
+    temporal_helper_keep: Optional[frozenset] = None,
 ) -> list[CodeRef]:
     """Order surviving terminal refs with retained assumed-pruned
     candidates per the causal-evidence contract: runtime
@@ -1024,7 +1092,10 @@ def _order_source_ref_entries(
     surviving derived/proven writers before assumed candidates;
     deterministic source order as tiebreak. Both surviving entries
     and retained records dedup by stable source-writer identity
-    (surviving wins cross-dedup ties).
+    (surviving wins cross-dedup ties). When ``temporal_helper_keep``
+    is not None, helper representatives outside the keep set (chosen
+    by report-adjacent temporal selection) are omitted; None keeps
+    existing behavior exactly.
     """
     unique: list[dict[str, Any]] = []
     seen: set[tuple] = set()
@@ -1096,6 +1167,8 @@ def _order_source_ref_entries(
         # Physical-statement overlap: one source line yields one ref
         # even when branch duplication gives the same call several
         # opaque per-instance site ids. Terminal wording wins ties.
+        if temporal_helper_keep is not None and _identity not in temporal_helper_keep:
+            continue
         location = (str(getattr(vertex, "file", None) or ""),
                     getattr(vertex, "line", None))
         if location in used_locations:
@@ -1123,11 +1196,154 @@ def _order_source_ref_entries(
     return [ref for _, ref in ranked]
 
 
+def _temporal_report_selection(
+    dag: Any,
+    scope: Optional[EvaluationScope],
+    replay: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Report-adjacent temporal selection over represented candidates.
+
+    Returns None when temporal selection is inactive (no scope), in
+    which case callers keep existing behavior exactly. Otherwise
+    returns ``eligible_terminal_ids`` / ``eligible_helper_identities``
+    keep-sets (helpers never participate in uniqueness: they explain
+    terminal values per WS2 tiers rather than rivaling writers),
+    ``unique_terminal_id`` (or None), and deterministic ``notes`` for
+    the existing unresolved-evidence path. A scope without diagnostic
+    windows fails closed to notes with no filtering, preserving
+    broader evidence.
+    """
+    from flight_log_agent.analysis.temporal_selection import (
+        control_gate_windows_for,
+        discriminate_candidates,
+        temporally_eligible,
+        writer_domain,
+    )
+
+    if scope is None:
+        return None
+    windows = [
+        (float(start), float(end))
+        for start, end in (getattr(scope, "windows", None) or ())
+    ]
+    if not windows:
+        reason = str(getattr(scope, "error", None) or "")
+        return {
+            "eligible_terminal_ids": frozenset(),
+            "eligible_helper_identities": frozenset(),
+            "unique_terminal_id": None,
+            "filter_active": False,
+            "notes": [
+                "temporal diagnostic window unavailable"
+                + (f": {reason}" if reason else "")
+                + "; no temporally-selected causal claim",
+            ],
+        }
+    replay_domains: dict[str, list] = {}
+    replay_supported: dict[str, bool] = {}
+    for result in ((replay or {}).get("results", None) or ()):
+        if not isinstance(result, dict):
+            continue
+        op_id = result.get("operation_id")
+        if not op_id:
+            continue
+        domain = [
+            (float(start), float(end))
+            for start, end in (result.get("active_windows") or ())
+        ]
+        replay_domains[str(op_id)] = domain
+        fraction = result.get("match_fraction")
+        replay_supported[str(op_id)] = bool(
+            result.get("evaluable")
+            and fraction is not None
+            and float(fraction) >= 0.95
+            and temporally_eligible(domain, windows)
+        )
+    # 0.95 mirrors the replay matched rule in dag_replay: a complete
+    # piecewise replay counts as matched at that fraction. Only
+    # already-linked per-writer results participate; nothing here
+    # invents numeric-check ↔ operation linkage.
+    vertices = list((getattr(dag, "vertices", None) if dag is not None else None) or ())
+
+    def domain_of(vertex_id: str) -> list:
+        gates = control_gate_windows_for(dag, vertex_id)
+        return writer_domain(
+            replay_domain=replay_domains.get(vertex_id),
+            branch_gates=gates,
+            scope_windows=windows,
+        )
+
+    runtime_ids: list[str] = []
+    anchor_ids: list[str] = []
+    for vertex in vertices:
+        if getattr(vertex, "kind", None) != "operation":
+            continue
+        if not getattr(vertex, "file", None):
+            continue
+        if not isinstance(getattr(vertex, "metadata", None), dict):
+            continue
+        if not vertex.metadata.get("is_terminal"):
+            continue
+        if not temporally_eligible(domain_of(vertex.id), windows):
+            continue
+        if _is_constant_writer_expression(
+            str(getattr(vertex, "expression", None) or "")
+        ):
+            # Declaration/storage anchors pass through eligibility;
+            # they support rather than rival runtime writers and
+            # never join the uniqueness universe.
+            anchor_ids.append(vertex.id)
+        else:
+            runtime_ids.append(vertex.id)
+    eligible_helper_identities: set = set()
+    for vertex, identity in _qualified_helper_entries(dag):
+        if temporally_eligible(domain_of(vertex.id), windows):
+            eligible_helper_identities.add(identity)
+    notes: list[str] = []
+    unique_terminal_id = None
+    eligible_terminal_ids = set(anchor_ids)
+    if runtime_ids:
+        outcome = discriminate_candidates(
+            [
+                {
+                    "key": vertex_id,
+                    "domain": domain_of(vertex_id),
+                    "replay_match": (
+                        replay_supported[vertex_id]
+                        if vertex_id in replay_supported
+                        else None
+                    ),
+                }
+                for vertex_id in runtime_ids
+            ],
+            windows,
+        )
+        eligible_terminal_ids = set(outcome["eligible"]) | set(anchor_ids)
+        unique_terminal_id = outcome["unique"]
+        if outcome["unresolved"] is not None:
+            if not outcome["eligible"] and eligible_helper_identities:
+                notes.append(
+                    "no terminal writer overlaps the diagnostic "
+                    "window; retained helper evidence is not a "
+                    "selected causal writer"
+                )
+            else:
+                notes.append(outcome["unresolved"])
+    return {
+        "eligible_terminal_ids": frozenset(eligible_terminal_ids),
+        "eligible_helper_identities": frozenset(eligible_helper_identities),
+        "unique_terminal_id": unique_terminal_id,
+        "filter_active": True,
+        "notes": notes,
+    }
+
+
 def build_report_from_dag(
     question: str,
     judged: JudgedDiscovery,
     annotated_dag: Optional[MechanismDAG],
     replay: Optional[dict[str, Any]] = None,
+    scope: Optional[EvaluationScope] = None,
 ) -> FlightLogReport:
     """Deterministic FlightLogReport from the verdict + annotated DAG.
 
@@ -1135,7 +1351,9 @@ def build_report_from_dag(
     partial numeric replay can establish at most ``medium``. Structural
     evidence alone remains low. Branch feasibility maps to applicability
     (``always_true`` -> supported, ``always_false`` -> excluded,
-    ``unknown`` -> unresolved).
+    ``unknown`` -> unresolved). A supplied temporal scope pre-filters
+    source candidates by diagnostic-window eligibility before the
+    existing normalization; absent scope keeps behavior exactly.
     """
     verdict = judged.verdict
     dag = annotated_dag or (judged.selected.dag if judged.selected else None)
@@ -1171,6 +1389,7 @@ def build_report_from_dag(
     # Workstream A selection below needs. CodeRefs alone cannot carry
     # variable identity or assumed status.
     terminal_write_entries: list[dict[str, Any]] = []
+    temporal = _temporal_report_selection(dag, scope, replay)
 
     for vertex in dag.vertices if dag else []:
         if vertex.kind == "branch":
@@ -1196,6 +1415,17 @@ def build_report_from_dag(
                     )
                 )
         elif vertex.kind == "operation" and vertex.file and vertex.metadata.get("is_terminal"):
+            if temporal is not None and temporal["filter_active"]:
+                if vertex.id not in temporal["eligible_terminal_ids"]:
+                    continue
+                if (
+                    temporal["unique_terminal_id"] is not None
+                    and vertex.id != temporal["unique_terminal_id"]
+                    and not _is_constant_writer_expression(
+                        str(vertex.expression or "")
+                    )
+                ):
+                    continue
             logged_output = str(
                 (vertex.metadata or {}).get("external_target_signal")
                 or (vertex.metadata or {}).get("logged_signal")
@@ -1243,6 +1473,11 @@ def build_report_from_dag(
              if dag is not None else ()),
             str((verdict.selected_terminal if verdict is not None else "") or ""),
             dag=dag,
+            temporal_helper_keep=(
+                temporal["eligible_helper_identities"]
+                if temporal is not None and temporal["filter_active"]
+                else None
+            ),
         )
     )
 
@@ -1266,6 +1501,8 @@ def build_report_from_dag(
     # dead. Otherwise the confirmation is downgraded — the mechanism may
     # be real code, but nothing shows it fired in THIS flight.
     unresolved_evidence = list(dag.unresolved_symbols) if dag else []
+    if temporal is not None:
+        unresolved_evidence.extend(temporal["notes"])
     branches_verified = False
     if verdict.sufficient and verdict.explaining_branches and dag is not None:
         dag_branches = {
@@ -1758,6 +1995,43 @@ async def run_dag_discovery_stage(
             annotated = annotate(selected)
 
     replay: Optional[dict[str, Any]] = None
+    temporal_scope: Optional[EvaluationScope] = None
+    transition = (
+        judged.seeds.questioned_condition.transition
+        if judged.seeds.questioned_condition is not None
+        else None
+    )
+    if transition is not None:
+        from flight_log_agent.analysis.temporal_selection import (
+            intersect_diagnostic_windows,
+        )
+
+        # Temporal seeds only: derive transition-relative diagnostic
+        # windows from logged observations. Absent spec leaves replay
+        # and report paths exactly as before.
+        evaluated = evaluate_transition_windows(
+            transition,
+            logged_set=logged_set,
+            log_path=log_path,
+            signal_policies=signal_policies or {},
+        )
+        if evaluated.get("windows"):
+            windows = evaluated["windows"]
+            if scope is not None and scope.windows:
+                windows = intersect_diagnostic_windows(
+                    scope.windows, windows
+                )
+            temporal_scope = EvaluationScope(
+                windows=tuple(windows),
+                signal=str(evaluated.get("signal") or ""),
+            )
+        else:
+            temporal_scope = EvaluationScope(
+                windows=None,
+                signal="",
+                error=evaluated.get("error")
+                or "transition window unresolved",
+            )
     if selected is not None and selected.checkpoint is not None:
         replay = selected.checkpoint.summary.get("selected_checkpoint") or {
             "status": "not_attempted", "complete": False, "reason": selected.checkpoint.summary["reason"],
@@ -1781,9 +2055,16 @@ async def run_dag_discovery_stage(
             prepared_signal_series=(
                 selected_signal_data[1] if selected_signal_data is not None else None
             ),
+            scope=(
+                temporal_scope
+                if temporal_scope is not None and temporal_scope.windows
+                else None
+            ),
         )
 
-    report = build_report_from_dag(question, judged, annotated, replay=replay)
+    report = build_report_from_dag(
+        question, judged, annotated, replay=replay, scope=temporal_scope
+    )
     return DagStageResult(
         judged=judged,
         annotated_dag=annotated,
