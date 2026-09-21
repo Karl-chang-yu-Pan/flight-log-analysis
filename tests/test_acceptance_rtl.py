@@ -331,17 +331,29 @@ def test_a5_report_validates_and_binds_evidence(_rtl_stage):
         "candidate terminal write excluded by assumed feasibility "
         "condition:") for ref in computation), \
         "causal refs must be candidate-marked while assumed"
-    # WS1 scope pin (not a permanent line-range ban): every ref must
-    # carry a known WS1 wording kind. A future WS2 helper ref with its
-    # own wording will fail here loudly, forcing an explicit
-    # allowlist update rather than slipping through.
+    helpers = [
+        ref for ref in top.source_refs
+        if ref.explanation.startswith("upstream helper contribution:")]
+    # STOP H topology limitation: the cone helper's only qualifying
+    # consumers (rtl.cpp:245 runtime terminal ops) are pruned, so the
+    # surviving DAG has no helper→terminal data path. The honest
+    # selector output is NO helper representative — never a
+    # synthesized one. Absence is a surviving-topology limitation,
+    # not evidence the helper did not contribute.
+    assert not helpers, \
+        f"fabricated helper ref without surviving helper→terminal path: {helpers}"
+    # Wording allowlist: every ref must carry a known semantic
+    # kind. The helper wording stays allowlisted for future cases
+    # with a surviving helper→terminal path; RTL itself must emit
+    # none (asserted above).
     assert all(
         ref.explanation.startswith((
             "terminal write:",
             "candidate terminal write excluded by assumed "
             "feasibility condition:",
+            "upstream helper contribution:",
         )) for ref in top.source_refs), \
-        "unexpected source-ref kind: helper refs belong to deferred Workstream B"
+        "unexpected source-ref kind"
     assert top.expected_logged_signature, "no expected log signature"
     inventory = parse_ulog_inventory(RTL_LOG, SOURCE_ROOT)
     observed = set(observed_signals_from_inventory(inventory))

@@ -572,6 +572,84 @@ def replay_terminal_expressions(
 _CANDIDATE_REF_PREFIX = (
     "candidate terminal write excluded by assumed feasibility condition: "
 )
+_HELPER_REF_PREFIX = "upstream helper contribution: "
+
+
+def _data_ancestors(vertices: Any, edges: Any, roots: Any) -> set:
+    """Backward data-edge ancestry of roots (edge-native, no new types)."""
+    by_id = {}
+    for vertex in vertices or ():
+        vid = getattr(vertex, "id", None)
+        if vid is not None:
+            by_id[vid] = vertex
+    incoming: dict[Any, list] = {}
+    for edge in edges or ():
+        if getattr(edge, "kind", None) != "data":
+            continue
+        incoming.setdefault(edge.target_id, []).append(edge.source_id)
+    seen = set(roots or ())
+    stack = list(seen)
+    while stack:
+        for source_id in incoming.get(stack.pop(), ()):
+            if source_id not in seen:
+                seen.add(source_id)
+                stack.append(source_id)
+    return seen
+
+
+def _qualified_helper_entries(dag: Any) -> list:
+    """Helper-return vertices supplying terminal value through a
+    call/data relationship, with stable identities.
+
+    A helper qualifies iff it is data-reachable from a terminal
+    operation AND at least one outgoing data edge carries a
+    ``call:`` / ``call-result:`` role into that reachable set.
+    Control-only reachability never qualifies. Returns
+    ``(vertex, identity)`` pairs deterministically ordered by
+    identity; dedupes repeated instances by identity here.
+    """
+    vertices = list((dag.vertices if dag is not None else None) or ())
+    edges = list((dag.edges if dag is not None else None) or ())
+    terminal_ids = [
+        vertex.id for vertex in vertices
+        if getattr(vertex, "kind", None) == "operation"
+        and isinstance(getattr(vertex, "metadata", None), dict)
+        and vertex.metadata.get("is_terminal")
+    ]
+    ancestors = _data_ancestors(vertices, edges, terminal_ids)
+    by_identity: dict[tuple, list] = {}
+    for vertex in vertices:
+        identity = _helper_representative_identity(vertex, dag)
+        if identity is None:
+            continue
+        if vertex.id not in ancestors:
+            continue
+        flows_to_terminal = False
+        for edge in edges:
+            if (getattr(edge, "source_id", None) != vertex.id
+                    or getattr(edge, "kind", None) != "data"):
+                continue
+            role = str(getattr(edge, "role", None) or "")
+            if not (role.startswith("call:")
+                    or role.startswith("call-result:")):
+                continue
+            if edge.target_id in ancestors:
+                flows_to_terminal = True
+                break
+        if not flows_to_terminal:
+            continue
+        by_identity.setdefault(identity, []).append(vertex)
+    chosen = []
+    for identity in sorted(by_identity):
+        vertex = min(
+            by_identity[identity],
+            key=lambda v: (str(getattr(v, "file", None) or ""),
+                           getattr(v, "line", None)
+                           if isinstance(getattr(v, "line", None), int)
+                           else -1),
+        )
+        chosen.append((vertex, identity))
+    return chosen
 
 
 def _is_constant_writer_expression(expression: Any) -> bool:
@@ -595,6 +673,177 @@ def _is_constant_writer_expression(expression: Any) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _helper_representative_identity(vertex: Any, dag: Any = None) -> Optional[tuple]:
+    """Stable helper identity for report dedup: (helper callable,
+    stable caller SOURCE call site, result-path discriminator).
+
+    Callable comes from the structured ``target_identity``
+    declaration (``{callable}:return`` suffix stripped), never
+    from diagnostic provenance strings. Call site is the §3 stable
+    caller SOURCE site (never an ``invocation_`` instance hash).
+    The discriminator distinguishes represented result paths
+    (``__return__`` vs ``__return__.{path}``); single-return
+    helpers yield ``""``. Returns None when no stable identity
+    exists — callers omit rather than invent. Never vertex IDs,
+    insertion order, or call-instance scopes.
+    """
+    metadata = getattr(vertex, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("synthetic_helper_return_binding") is not True:
+        return None
+    target_identity = metadata.get("target_identity")
+    declaration_id = (
+        target_identity.get("declaration_id")
+        if isinstance(target_identity, dict) else None)
+    if not declaration_id or not str(declaration_id).endswith(":return"):
+        return None
+    helper_callable = str(declaration_id)[:-len(":return")]
+    if not helper_callable:
+        return None
+    variable = str(getattr(vertex, "variable", None) or "")
+    if variable == "__return__":
+        discriminator = ""
+    elif variable.startswith("__return__."):
+        discriminator = variable[len("__return__."):]
+    elif variable.startswith("__return__"):
+        discriminator = variable[len("__return__"):]
+    else:
+        return None
+    call_site = _stable_caller_source_site(vertex, dag)
+    if not call_site:
+        return None
+    return (helper_callable, call_site, discriminator)
+
+
+_INVOCATION_SITE_PREFIX = "invocation_"
+
+
+def _is_stable_source_site(value: Any) -> bool:
+    """Whether a call-site value identifies a source statement.
+
+    ``invocation_<hash>`` values identify one runtime/graph call
+    instance (nested/contextualized callers); they must never
+    define report identity.
+    """
+    text = str(value or "").strip()
+    return bool(text) and not text.startswith(_INVOCATION_SITE_PREFIX)
+
+
+def _call_text_names(call_text: Any, name: str) -> bool:
+    """Whether source call text invokes helper ``name``."""
+    text = str(call_text or "")
+    if not text or not name:
+        return False
+    return re.search(r"\b" + re.escape(name) + r"\s*\(", text) is not None
+
+
+def _match_call_result_site(
+    results: Any, *, wanted_path: str, wanted_name: str
+) -> Optional[str]:
+    """Stable ``call_source_site_id`` for the entry matching a helper edge.
+
+    Match by result path first, then helper short name, then the
+    single unambiguous entry. Ambiguity (or no stable entry) yields
+    None — never a guess.
+    """
+    stable: list[dict[str, Any]] = []
+    for raw in results or ():
+        entry = raw if isinstance(raw, dict) else (
+            raw.model_dump(exclude_none=True)
+            if hasattr(raw, "model_dump") else None)
+        if not isinstance(entry, dict):
+            continue
+        if _is_stable_source_site(entry.get("call_source_site_id")):
+            stable.append(entry)
+    if not stable:
+        return None
+    pathed = [entry for entry in stable
+              if str(entry.get("result_path") or "") == wanted_path]
+    if len(pathed) == 1:
+        return str(pathed[0].get("call_source_site_id"))
+    pool = pathed if len(pathed) > 1 else stable
+    if wanted_name:
+        named = [entry for entry in pool
+                 if _call_text_names(entry.get("text"), wanted_name)]
+        if len(named) == 1:
+            return str(named[0].get("call_source_site_id"))
+        if named:
+            return None
+    if len(stable) == 1:
+        return str(stable[0].get("call_source_site_id"))
+    return None
+
+
+def _helper_call_edges(vertex: Any, dag: Any) -> list:
+    """Outgoing ``call:``/``call-result:`` data edges of one vertex."""
+    edges = list((getattr(dag, "edges", None) if dag is not None else None) or ())
+    vertex_id = getattr(vertex, "id", None)
+    matched = [
+        edge for edge in edges
+        if getattr(edge, "source_id", None) == vertex_id
+        and getattr(edge, "kind", None) == "data"
+        and (str(getattr(edge, "role", None) or "").startswith("call:")
+             or str(getattr(edge, "role", None) or "").startswith("call-result:"))
+    ]
+    matched.sort(key=lambda edge: str(getattr(edge, "id", None) or ""))
+    return matched
+
+
+def _stable_caller_source_site(vertex: Any, dag: Any = None) -> Optional[str]:
+    """Stable caller SOURCE call-site identity for one helper vertex.
+
+    Priority per the amended spec: consumer-side
+    ``call_results[].call_source_site_id`` matching the helper edge,
+    then raw ``call_site_id``, edge ``via``, and
+    ``source_call_roles`` keys — each only when source-stable.
+    Returns None when no stable site exists: callers omit rather
+    than invent (STOP I).
+    """
+    metadata = getattr(vertex, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    vertices = list((getattr(dag, "vertices", None) if dag is not None else None) or ())
+    by_id = {getattr(item, "id", None): item for item in vertices}
+    call_edges = _helper_call_edges(vertex, dag)
+    for edge in call_edges:
+        target = by_id.get(getattr(edge, "target_id", None))
+        target_metadata = getattr(target, "metadata", None)
+        if not isinstance(target_metadata, dict):
+            continue
+        expression_ref = target_metadata.get("source_expression_ref") or {}
+        if not isinstance(expression_ref, dict):
+            continue
+        role = str(getattr(edge, "role", None) or "")
+        if role.startswith("call-result:"):
+            wanted_path, wanted_name = role[len("call-result:"):], ""
+        else:
+            wanted_path, wanted_name = "", role[len("call:"):] if role.startswith("call:") else ""
+        site = _match_call_result_site(
+            expression_ref.get("call_results"),
+            wanted_path=wanted_path, wanted_name=wanted_name)
+        if site is not None:
+            return site
+    raw_site = metadata.get("call_site_id")
+    if _is_stable_source_site(raw_site):
+        return str(raw_site)
+    for edge in call_edges:
+        if _is_stable_source_site(getattr(edge, "via", None)):
+            return str(getattr(edge, "via"))
+    for edge in call_edges:
+        target = by_id.get(getattr(edge, "target_id", None))
+        target_metadata = getattr(target, "metadata", None)
+        if not isinstance(target_metadata, dict):
+            continue
+        roles = target_metadata.get("source_call_roles") or {}
+        if not isinstance(roles, dict):
+            continue
+        for key in sorted(str(item) for item in roles):
+            if _is_stable_source_site(key):
+                return key
+    return None
 
 
 def _normalize_writer_expression(source: Any) -> str:
@@ -739,10 +988,35 @@ def _retained_candidate_ref(record: dict[str, Any]) -> Optional[CodeRef]:
     )
 
 
+def _helper_candidate_ref(vertex: Any) -> Optional[CodeRef]:
+    """Honestly-marked CodeRef for one qualified helper
+    representative, or None when it has no reportable file.
+    Wording is its own semantic class, distinct from terminal
+    writes and assumed candidates alike."""
+    file = str(getattr(vertex, "file", None) or "")
+    if not file:
+        return None
+    variable = str(getattr(vertex, "variable", None) or "")
+    expression = str(getattr(vertex, "expression", None) or "")
+    line = getattr(vertex, "line", None)
+    location = f"{file}:{line}" if isinstance(line, int) else file
+    return CodeRef(
+        file=file,
+        start_line=line if isinstance(line, int) else None,
+        end_line=line if isinstance(line, int) else None,
+        snippet=getattr(vertex, "snippet", None),
+        explanation=(
+            f"{_HELPER_REF_PREFIX}{variable} <- "
+            f"{expression} [{location}]"
+        ),
+    )
+
+
 def _order_source_ref_entries(
     entries: list[dict[str, Any]],
     retained: Any,
     selected_terminal: str,
+    dag: Any = None,
 ) -> list[CodeRef]:
     """Order surviving terminal refs with retained assumed-pruned
     candidates per the causal-evidence contract: runtime
@@ -776,12 +1050,16 @@ def _order_source_ref_entries(
         for entry in unique
     }
     ranked: list[tuple[tuple, CodeRef]] = []
+    used_locations: set[tuple] = set()
     for entry in unique:
         source = _entry_source(entry)
         anchor = (
             _is_constant_writer_expression(entry.get("expression"))
             and str(entry.get("variable") or "") in runtime_vars
         )
+        if isinstance(entry.get("line"), int):
+            used_locations.add(
+                (str(entry.get("file") or ""), entry.get("line")))
         ranked.append((
             (1 if anchor else 0, 0,
              *_order_key(source, str(entry.get("file") or ""),
@@ -805,10 +1083,40 @@ def _order_source_ref_entries(
         ref = _retained_candidate_ref(record)
         if ref is None:
             continue
+        if isinstance(record.get("line"), int):
+            used_locations.add(
+                (str(record.get("file") or ""), record.get("line")))
         ranked.append((
             (0, 1,
              *_order_key(record, str(record.get("file") or ""),
                          record.get("line"))),
+            ref,
+        ))
+    for vertex, _identity in _qualified_helper_entries(dag):
+        # Physical-statement overlap: one source line yields one ref
+        # even when branch duplication gives the same call several
+        # opaque per-instance site ids. Terminal wording wins ties.
+        location = (str(getattr(vertex, "file", None) or ""),
+                    getattr(vertex, "line", None))
+        if location in used_locations:
+            continue
+        used_locations.add(location)
+        ref = _helper_candidate_ref(vertex)
+        if ref is None:
+            continue
+        ranked.append((
+            (0, 2,
+             *_order_key(
+                 {"file": getattr(vertex, "file", None),
+                  "line": getattr(vertex, "line", None),
+                  "variable": getattr(vertex, "variable", None),
+                  "expression": getattr(vertex, "expression", None),
+                  "metadata": (getattr(vertex, "metadata", None)
+                               if isinstance(
+                                   getattr(vertex, "metadata", None), dict)
+                               else {})},
+                 str(getattr(vertex, "file", None) or ""),
+                 getattr(vertex, "line", None))),
             ref,
         ))
     ranked.sort(key=lambda item: item[0])
@@ -934,6 +1242,7 @@ def build_report_from_dag(
             (getattr(dag, "assumed_pruned_provenance", None) or ()
              if dag is not None else ()),
             str((verdict.selected_terminal if verdict is not None else "") or ""),
+            dag=dag,
         )
     )
 

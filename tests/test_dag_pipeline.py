@@ -1551,12 +1551,12 @@ def _report_candidate_record(*, file, line, variable="stored",
     }
 
 
-def _report_for(vertices, retained=()):
+def _report_for(vertices, retained=(), edges=()):
     from flight_log_agent.analysis.mechanism_dag import MechanismDAG
     from flight_log_agent.analysis.mechanism_judge import JudgedDiscovery
     dag = MechanismDAG(
         dag_id="dag-acceptance", terminal="_final_out",
-        vertices=list(vertices), edges=[],
+        vertices=list(vertices), edges=list(edges),
         assumed_pruned_provenance=list(retained))
     judged = JudgedDiscovery(
         seeds=DiscoverySeeds(seeds=[], candidate_terminals=[]),
@@ -1739,6 +1739,448 @@ def test_report_dedups_retained_writer_instances():
     assert all(ref.explanation.startswith(
         "candidate terminal write excluded by assumed feasibility "
         "condition:") for ref in refs)
+
+
+def _helper_return_vertex(*, vid, variable="__return__",
+                           file="src/h.cpp", line=20,
+                           callable_id="src/h.cpp:20:scale:value",
+                           call_site_id="src/c.cpp:10:3:legacy_call"):
+    from flight_log_agent.analysis.mechanism_dag import DAGVertex
+    return DAGVertex(
+        id=vid, kind="operation", variable=variable,
+        expression="return_value", file=file, line=line,
+        metadata={
+            "synthetic_helper_return_binding": True,
+            "call_site_id": call_site_id,
+            "call_instance_scope": "scale::@call:aaa",
+            "target_identity": {
+                "declaration_id": f"{callable_id}:return",
+                "declaration_proven": True,
+            },
+        })
+
+
+def test_helper_identity_single_return():
+    """H1: represented single-return helper yields
+    (callable, call-site, empty-discriminator) identity."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _helper_representative_identity,
+    )
+    vertex = _helper_return_vertex(vid="h1")
+    assert (_helper_representative_identity(vertex)
+            == ("src/h.cpp:20:scale:value",
+                "src/c.cpp:10:3:legacy_call", ""))
+
+
+def test_helper_identity_missing_without_callable():
+    """H1: no stable callable identity means no helper
+    representative — never a synthesized identifier."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _helper_representative_identity,
+    )
+    from flight_log_agent.analysis.mechanism_dag import DAGVertex
+    vertex = DAGVertex(
+        id="h9", kind="operation", variable="__return__",
+        expression="return_value", file="src/h.cpp", line=20,
+        metadata={"synthetic_helper_return_binding": True})
+    assert _helper_representative_identity(vertex) is None
+
+
+def test_helper_identity_ignores_call_instance_scope():
+    """H2 (identity part): different call instances of one site
+    share one helper identity."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _helper_representative_identity,
+    )
+    first = _helper_return_vertex(vid="h1")
+    second = _helper_return_vertex(vid="h2")
+    second.metadata = dict(second.metadata,
+                           call_instance_scope="scale::@call:bbb")
+    assert (_helper_representative_identity(first)
+            == _helper_representative_identity(second))
+
+
+def test_helper_identity_separates_result_paths():
+    """H4: one callable+site with two represented result paths
+    yields two helper identities."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _helper_representative_identity,
+    )
+    plain = _helper_return_vertex(vid="h1", variable="__return__")
+    pathed = _helper_return_vertex(
+        vid="h2", variable="__return__.altitude")
+    assert (_helper_representative_identity(plain)
+            != _helper_representative_identity(pathed))
+    assert _helper_representative_identity(pathed)[2] == "altitude"
+
+
+def _wired_helper_vertex(*, vid, variable="__return__", **kwargs):
+    return _helper_return_vertex(vid=vid, variable=variable, **kwargs)
+
+
+def _data_edge(*, eid, source, target, role="call:calc", via=None):
+    from flight_log_agent.analysis.mechanism_dag import DAGEdge
+    return DAGEdge(id=eid, source_id=source, target_id=target,
+                   kind="data", role=role, via=via)
+
+
+_STABLE_CALL_SITE = "src/c.cpp:120:140:call_expression"
+
+
+def _consumer_with_call_site(*, vid="term", variable="_final_out",
+                             call_site=_STABLE_CALL_SITE,
+                             result_path="", call_text="scale(x)"):
+    """Terminal consumer whose expression provably contains one call.
+
+    The structured ``call_results`` entry carries the stable SOURCE
+    call-site identity, exactly as production
+    ``_source_expression_metadata`` records it."""
+    term = _terminal_consumer(vid=vid, variable=variable)
+    term.metadata = dict(term.metadata, source_expression_ref={
+        "text": term.expression,
+        "lowered_text": term.expression,
+        "input_symbols": [],
+        "input_identities": {},
+        "call_results": [{
+            "call_source_site_id": call_site,
+            "result_path": result_path,
+            "text": call_text,
+        }],
+        "exact": True,
+    })
+    return term
+
+
+def _terminal_consumer(*, vid="term", variable="_final_out"):
+    return _report_vertex(
+        vid=vid, variable=variable, expression="helper_value * 2.0",
+        file="src/main.cpp", line=30)
+
+
+def test_helper_qualifies_through_call_data_edge():
+    """H5: helper-return supplying terminal value through a
+    call/data edge yields one helper ref with helper wording."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    helper = _wired_helper_vertex(vid="h1")
+    term = _terminal_consumer()
+    report = _report_for(
+        [leaf, helper, term],
+        edges=[_data_edge(eid="e1", source="h1", target="term")])
+    refs = report.ranked_hypotheses[0].source_refs
+    helpers = [ref for ref in refs
+               if ref.explanation.startswith("upstream helper contribution:")]
+    assert len(helpers) == 1
+    assert (helpers[0].file, helpers[0].start_line) == ("src/h.cpp", 20)
+
+
+def test_helper_control_only_does_not_qualify():
+    """H5/H7: helper reachable only through a control edge
+    contributes no value and yields no helper ref."""
+    from flight_log_agent.analysis.mechanism_dag import DAGEdge
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    helper = _wired_helper_vertex(vid="h1")
+    term = _terminal_consumer()
+    report = _report_for(
+        [leaf, helper, term],
+        edges=[DAGEdge(id="e1", source_id="h1", target_id="term",
+                       kind="control")])
+    refs = report.ranked_hypotheses[0].source_refs
+    assert not any(ref.explanation.startswith("upstream helper contribution:")
+                   for ref in refs)
+
+
+def test_helper_instances_collapse_to_one_ref():
+    """H2/S1: same callable + same SOURCE site + same path across
+    graph instances yields one helper ref — even when the raw
+    per-instance sites are distinct invocation_<hash> values."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _qualified_helper_entries,
+    )
+    from flight_log_agent.analysis.mechanism_dag import MechanismDAG
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    first = _wired_helper_vertex(
+        vid="h1", call_site_id="invocation_000aaa111bbb")
+    first.metadata = dict(first.metadata,
+                          call_instance_scope="scale::@call:aaa")
+    second = _wired_helper_vertex(
+        vid="h2", call_site_id="invocation_000bbb222ccc")
+    second.metadata = dict(second.metadata,
+                           call_instance_scope="scale::@call:bbb")
+    term = _consumer_with_call_site()
+    vertices = [leaf, first, second, term]
+    edges = [_data_edge(eid="e1", source="h1", target="term",
+                        via="invocation_000aaa111bbb"),
+             _data_edge(eid="e2", source="h2", target="term",
+                        via="invocation_000bbb222ccc")]
+    # Selection-layer collapse: one stable identity, not two
+    # per-instance identities. Anchor-location overlap must not be
+    # what saves this test.
+    dag = MechanismDAG(
+        dag_id="dag-acceptance", terminal="_final_out",
+        vertices=vertices, edges=edges)
+    qualified = _qualified_helper_entries(dag)
+    assert len(qualified) == 1
+    assert qualified[0][1] == (
+        "src/h.cpp:20:scale:value", _STABLE_CALL_SITE, "")
+    report = _report_for(vertices, edges=edges)
+    refs = report.ranked_hypotheses[0].source_refs
+    helpers = [ref for ref in refs
+               if ref.explanation.startswith("upstream helper contribution:")]
+    assert len(helpers) == 1
+
+
+def test_helper_identity_resolves_stable_source_site():
+    """S1 (identity part): distinct invocation_<hash> raw sites from
+    one source call resolve to one stable SOURCE-site identity."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _helper_representative_identity,
+    )
+    from flight_log_agent.analysis.mechanism_dag import MechanismDAG
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    first = _wired_helper_vertex(
+        vid="h1", call_site_id="invocation_000aaa111bbb")
+    second = _wired_helper_vertex(
+        vid="h2", call_site_id="invocation_000bbb222ccc")
+    term = _consumer_with_call_site()
+    dag = MechanismDAG(
+        dag_id="dag-acceptance", terminal="_final_out",
+        vertices=[leaf, first, second, term],
+        edges=[_data_edge(eid="e1", source="h1", target="term",
+                          via="invocation_000aaa111bbb"),
+               _data_edge(eid="e2", source="h2", target="term",
+                          via="invocation_000bbb222ccc")])
+    assert (_helper_representative_identity(first, dag)
+            == ("src/h.cpp:20:scale:value", _STABLE_CALL_SITE, ""))
+    assert (_helper_representative_identity(first, dag)
+            == _helper_representative_identity(second, dag))
+
+
+def test_helper_identity_none_without_stable_source_site():
+    """S3: only per-instance invocation hashes available (no stable
+    consumer site, raw site, via, or roles key) → no helper
+    identity. Never fabricate one from the invocation hash."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _helper_representative_identity,
+        _qualified_helper_entries,
+    )
+    from flight_log_agent.analysis.mechanism_dag import MechanismDAG
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    helper = _wired_helper_vertex(
+        vid="h1", call_site_id="invocation_000aaa111bbb")
+    term = _terminal_consumer()
+    vertices = [leaf, helper, term]
+    edges = [_data_edge(eid="e1", source="h1", target="term",
+                        via="invocation_000aaa111bbb")]
+    dag = MechanismDAG(
+        dag_id="dag-acceptance", terminal="_final_out",
+        vertices=vertices, edges=edges)
+    assert _helper_representative_identity(helper, dag) is None
+    assert _qualified_helper_entries(dag) == []
+    report = _report_for(vertices, edges=edges)
+    refs = report.ranked_hypotheses[0].source_refs
+    assert not any(ref.explanation.startswith("upstream helper contribution:")
+                   for ref in refs)
+
+
+def test_helper_pruned_consumer_yields_no_helper_ref():
+    """H12: helper vertex exists but its qualifying data consumer is
+    absent from the surviving DAG — the selected terminal has no
+    data path from the helper → no helper representative."""
+    from flight_log_agent.analysis.mechanism_dag import DAGVertex
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    helper = _wired_helper_vertex(vid="h1")
+    dead = DAGVertex(
+        id="dead", kind="operation", variable="stale_val",
+        expression="helper_value + 1.0", file="src/main.cpp", line=25,
+        metadata={})
+    term = _terminal_consumer()
+    report = _report_for(
+        [leaf, helper, dead, term],
+        edges=[_data_edge(eid="e1", source="h1", target="dead")])
+    refs = report.ranked_hypotheses[0].source_refs
+    assert not any(ref.explanation.startswith("upstream helper contribution:")
+                   for ref in refs)
+    assert any(ref.explanation.startswith("terminal write:")
+               for ref in refs)
+
+
+def test_helper_distinct_sites_preserved_as_identities():
+    """H10: same callable at two caller sites yields two helper
+    identities (selection layer); both anchors coincide, so report
+    emission still collapses to one ref (see overlap test)."""
+    from flight_log_agent.analysis.dag_pipeline import (
+        _qualified_helper_entries,
+    )
+    from flight_log_agent.analysis.mechanism_dag import MechanismDAG
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    first = _wired_helper_vertex(vid="h1")
+    second = _helper_return_vertex(
+        vid="h2", call_site_id="src/other.cpp:5:1:legacy_call")
+    term = _terminal_consumer()
+    dag = MechanismDAG(
+        dag_id="dag-acceptance", terminal="_final_out",
+        vertices=[leaf, first, second, term],
+        edges=[_data_edge(eid="e1", source="h1", target="term"),
+               _data_edge(eid="e2", source="h2", target="term")])
+    qualified = _qualified_helper_entries(dag)
+    assert len(qualified) == 2
+    assert qualified[0][1] != qualified[1][1]
+    report = _report_for(
+        [leaf, first, second, term],
+        edges=[_data_edge(eid="e1", source="h1", target="term"),
+               _data_edge(eid="e2", source="h2", target="term")])
+    refs = report.ranked_hypotheses[0].source_refs
+    helpers = [ref for ref in refs
+               if ref.explanation.startswith(
+                   "upstream helper contribution:")]
+    assert len(helpers) == 1
+
+
+def test_helper_cross_path_dedup():
+    """H11/H6: one helper reachable directly and via an
+    intermediate op still yields one helper ref."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    helper = _wired_helper_vertex(vid="h1")
+    mid = _report_vertex(
+        vid="mid", variable="mid_val", expression="helper_value + 1.0",
+        file="src/main.cpp", line=25)
+    mid.metadata = {}
+    term = _terminal_consumer()
+    report = _report_for(
+        [leaf, helper, mid, term],
+        edges=[_data_edge(eid="e1", source="h1", target="term"),
+               _data_edge(eid="e2", source="h1", target="mid"),
+               _data_edge(eid="e3", source="mid", target="term",
+                          role="data")])
+    refs = report.ranked_hypotheses[0].source_refs
+    helpers = [ref for ref in refs
+               if ref.explanation.startswith("upstream helper contribution:")]
+    assert len(helpers) == 1
+
+
+def test_helper_terminal_overlap_single_terminal_ref():
+    """H12/H7: helper anchor coinciding with a terminal write
+    yields one ref with terminal wording."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    helper = _wired_helper_vertex(
+        vid="h1", file="src/main.cpp", line=30)
+    term = _terminal_consumer()
+    report = _report_for(
+        [leaf, helper, term],
+        edges=[_data_edge(eid="e1", source="h1", target="term")])
+    refs = [ref for ref in report.ranked_hypotheses[0].source_refs
+            if (ref.file, ref.start_line) == ("src/main.cpp", 30)]
+    assert len(refs) == 1
+    assert refs[0].explanation.startswith("terminal write:")
+
+
+def test_helper_tier_between_terminal_and_anchor():
+    """H8: ordering is terminal, then helper, then anchor."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    anchor = _report_vertex(
+        vid="decl", variable="_final_out", expression="0.0",
+        file="include/decl.h", line=3)
+    helper = _wired_helper_vertex(vid="h1")
+    term = _terminal_consumer()
+    report = _report_for(
+        [leaf, anchor, helper, term],
+        edges=[_data_edge(eid="e1", source="h1", target="term")])
+    refs = report.ranked_hypotheses[0].source_refs
+    kinds = [("helper" if ref.explanation.startswith(
+        "upstream helper contribution:")
+        else "anchor" if ref.file.endswith("decl.h")
+        else "terminal") for ref in refs]
+    assert kinds == ["terminal", "helper", "anchor"]
+
+
+def test_helper_confidence_isolation():
+    """H11: helper presence does not change confidence or
+    confirmation outcomes."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    term = _terminal_consumer()
+    vertices = [leaf, term]
+    plain = _report_for(vertices)
+    helper = _wired_helper_vertex(vid="h1")
+    with_helper = _report_for(
+        [leaf, helper, term],
+        edges=[_data_edge(eid="e1", source="h1", target="term")])
+    assert (with_helper.ranked_hypotheses[0].confidence
+            == plain.ranked_hypotheses[0].confidence)
+    assert with_helper.confirmed == plain.confirmed
+
+
+def _runtime_terminal(*, vid, variable, file="src/ops.cpp", line=10):
+    return _report_vertex(
+        vid=vid, variable=variable, expression=f"{variable}_in * 2.0",
+        file=file, line=line)
+
+
+def test_helper_omitted_when_terminals_saturate_budget():
+    """H15 saturated: 8 distinct causal terminal refs leave no
+    room; the qualified helper is omitted, terminals intact."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    terms = [_runtime_terminal(vid=f"t{i}", variable=f"out_{i}",
+                              line=10 + i) for i in range(8)]
+    helper = _wired_helper_vertex(vid="h1")
+    edges = [_data_edge(eid=f"e{i}", source="h1", target=f"t{i}")
+             for i in range(8)]
+    report = _report_for([leaf, helper, *terms], edges=edges)
+    refs = report.ranked_hypotheses[0].source_refs
+    assert len(refs) == 8
+    assert not any(ref.explanation.startswith("upstream helper contribution:")
+                   for ref in refs)
+
+
+def test_helper_precedes_anchors_with_remaining_capacity():
+    """H15 remaining capacity: 7 terminals + helper + anchors
+    keeps the helper before anchors."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    terms = [_runtime_terminal(vid=f"t{i}", variable=f"out_{i}",
+                              line=10 + i) for i in range(7)]
+    anchors = [
+        _report_vertex(
+            vid=f"d{i}", variable=f"out_{i}", expression="0.0",
+            file="include/decl.h", line=20 + i)
+        for i in range(7)]
+    helper = _wired_helper_vertex(vid="h1")
+    edges = [_data_edge(eid=f"e{i}", source="h1", target=f"t{i}")
+             for i in range(7)]
+    report = _report_for([leaf, helper, *terms, *anchors], edges=edges)
+    refs = report.ranked_hypotheses[0].source_refs
+    assert len(refs) == 8
+    kinds = [("helper" if ref.explanation.startswith(
+        "upstream helper contribution:")
+        else "terminal") for ref in refs]
+    assert kinds == ["terminal"] * 7 + ["helper"]
+
+
+def test_many_helpers_order_deterministically():
+    """H16: qualifying helpers order by source-derived keys,
+    independent of input order; no semantic ranking invented."""
+    leaf = _report_observed_leaf(vid="leaf", signal="x.y")
+    term = _terminal_consumer()
+    first = _helper_return_vertex(
+        vid="h1", file="src/h.cpp", line=20,
+        callable_id="src/h.cpp:20:aaa:value",
+        call_site_id="src/c.cpp:10:3:legacy_call")
+    second = _helper_return_vertex(
+        vid="h2", file="src/i.cpp", line=30,
+        callable_id="src/i.cpp:30:bbb:value",
+        call_site_id="src/c.cpp:11:3:legacy_call")
+    edges = [_data_edge(eid="e1", source="h1", target="term"),
+             _data_edge(eid="e2", source="h2", target="term")]
+    forward = _report_for([leaf, first, second, term], edges=edges)
+    backward = _report_for([leaf, term, second, first], edges=edges)
+    for report in (forward, backward):
+        helpers = [ref for ref in report.ranked_hypotheses[0].source_refs
+                   if ref.explanation.startswith(
+                       "upstream helper contribution:")]
+        assert [(ref.file, ref.start_line) for ref in helpers] == [
+            ("src/h.cpp", 20), ("src/i.cpp", 30)]
+    assert ([(ref.file, ref.start_line) for ref in forward
+             .ranked_hypotheses[0].source_refs]
+            == [(ref.file, ref.start_line) for ref in backward
+                .ranked_hypotheses[0].source_refs])
 
 
 def test_report_budget_keeps_causal_runtime_ref():
