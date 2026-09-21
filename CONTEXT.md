@@ -84,6 +84,20 @@ partial, matched, mismatched. A matched result must carry its scope; a local
 same-packet match and a terminal replay match have different authority.
 _Avoid_: bare matched
 
+## Temporal
+
+**Diagnostic window**:
+The time bounds within which the questioned behavior is evaluated, owned
+by the evaluation scope; stated directly or derived relative to a logged
+transition event, never from source order.
+_Avoid_: observation window, comparison domain, active window
+
+**Temporal qualification**:
+The decision that a represented writer or helper is the causally relevant
+one for a diagnostic window, made from scope windows plus replay and
+selection evidence. It filters candidates without changing source
+identity, feasibility, or proof claims.
+
 ## Identity
 
 **Source identity**:
