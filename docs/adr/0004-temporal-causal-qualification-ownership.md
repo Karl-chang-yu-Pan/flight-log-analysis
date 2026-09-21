@@ -126,6 +126,29 @@ that actually distinguishes one candidate.
   Takeoff: writers relevant in earlier versus later windows may
   separate uniquely, and indistinguishable candidates inside one
   window are retained, never ordered by source position.
+- Temporal non-uniqueness is evaluated at the level of the claim
+  being made. If multiple temporally eligible writers imply
+  materially different diagnostic mechanisms, lack of a
+  discriminator remains fail-closed: retain the candidates, make
+  no unique mechanism claim, and surface unresolved evidence.
+  If multiple eligible writers are execution-distinct but
+  mechanism-equivalent for the questioned diagnostic claim, the
+  system may retain all such writers without asserting which one
+  executed and may proceed with the shared mechanism-level
+  conclusion when that conclusion is independently supported.
+  Writer non-uniqueness must be recorded honestly and must never
+  be converted into an execution claim. Mechanism equivalence
+  exists only when, for the actual questioned claim, every
+  retained candidate supports the same material causal mechanism
+  and no accepted conclusion depends on distinguishing which
+  candidate executed; identical source text, destination symbol,
+  proximity, or lifecycle variant alone never establish it.
+- Unresolved writer non-uniqueness surfaces through existing
+  report paths when a report hypothesis exists. When no report
+  hypothesis is produced, acceptance/verification may record the
+  unavailable exact-writer attribution as NON_DECISIVE evidence
+  without fabricating a report claim. This is acceptance-side
+  metadata only; no new production severity enum is introduced.
 - Temporal qualification may FILTER an already-qualified
   helper/source candidate by window. It is orthogonal to
   identity: WS1/WS2/ADR-0003 identities are consumed unchanged.

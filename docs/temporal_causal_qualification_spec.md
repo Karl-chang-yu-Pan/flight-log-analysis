@@ -250,6 +250,39 @@ unresolved evidence through the existing
 wording. No arbitrary winner. Pin with T8 (including an
 input-permutation variant per T11).
 
+## 17a. Mechanism equivalence (narrow, claim-scoped)
+
+Temporal non-uniqueness is evaluated at the level of the
+claim being made, per ADR-0004. Candidates are
+mechanism-equivalent for a questioned claim ONLY if all of
+the following hold:
+
+1. every retained candidate is compatible with the same
+   claimed mechanism;
+2. no retained candidate supports a materially different
+   rival mechanism for that claim;
+3. the acceptance conclusion does not depend on identifying
+   which writer executed;
+4. independent observation/numeric/temporal evidence
+   establishes the shared mechanism.
+
+Same assignment text, same destination variable, same
+expression spelling, or same function family alone NEVER
+establish equivalence. TDD must verify the relevant shared
+downstream mechanism/source structure deterministically
+(for TECS per T16: that both retained writers feed the same
+relevant downstream altitude-rate-control
+mechanism/equation for the questioned claim); if that
+assertion fails, STOP G remains — do NOT force equivalence.
+
+Mechanism-equivalent ties: retain all writers, assert no
+execution winner, record writer non-uniqueness honestly
+(unresolved note where a hypothesis exists; NON_DECISIVE
+unavailable evidence otherwise), and allow mechanism-level
+acceptance to proceed on the independent evidence.
+Mechanism-different ties: STOP G (see refined rule in
+§25 and §46).
+
 ## 18. Missing diagnostic window
 
 Event/window derivation failure (zero events, ambiguous
@@ -335,16 +368,38 @@ whether replay evaluates it, and what evidence from §15 can
 distinguish it. Assumptions beyond this record are
 forbidden.
 
-## 25. STOP if TECS remains nondiscriminable
+Optional 2b probe (gated, never required): if an existing
+tecs_status observation binding naturally produces
+source/report grounding with ZERO new machinery (no new
+observation binding, no replay change, no numeric↔source
+linkage), it may be accepted as a strengthening. If the
+probe does not naturally work, stay with the 2a acceptance
+shape above and do not build binding machinery for W3B.
 
-If, after the transition-relative window, multiple TECS
-writer candidates remain eligible and writer domains plus
-existing replay plus observable ordering cannot distinguish
-them: STOP. Invent no winner. Report the exact missing
-discriminator and recommend a narrow `$wayfinder` for that
-relation. The accepted TECS benchmark stays PROVEN
-externally; current production selection simply cannot
-reproduce it yet.
+## 25. Refined STOP G (three cases)
+
+Case 1 — one mechanism: multiple writer identities remain,
+all retained candidates support the same mechanism for the
+questioned claim per §17a, and independent evidence supports
+that mechanism → proceed; retain writer non-uniqueness; make
+no execution claim.
+
+Case 2 — different mechanisms: multiple candidates imply
+materially different diagnostic mechanisms for the
+questioned claim and no available evidence distinguishes
+those mechanisms → STOP G. Invent no winner. Report the
+exact missing discriminator and recommend a narrow
+`$wayfinder` for that relation.
+
+Case 3 — equivalence itself unproven: the shared-mechanism
+assertion per §17a/T16 cannot be deterministically
+established → STOP G. This case is mandatory: do NOT force
+equivalence to escape case 2.
+
+The accepted TECS benchmark stays PROVEN externally in all
+cases; a STOP G firing means current production selection
+cannot reproduce the attribution, never that the benchmark
+is wrong.
 
 ## 26. TECS acceptance sidecar
 
@@ -366,7 +421,9 @@ expected early transient behavior,
 expected later steady-state behavior,
 required source/observation/temporal/numeric evidence,
 strength = PROVEN,
-unavailable/non-critical evidence,
+unavailable/non-critical evidence (including exact
+  initialize-vs-update execution attribution: unavailable,
+  NON_DECISIVE — the accepted conclusion does not require it),
 forbidden claims (persistent-limit diagnosis,
   fabricated helper/interior refs, numeric claims beyond
   tolerance, strength downgrade on tooling limits).
@@ -556,17 +613,27 @@ vertical slice per cycle (single test → minimal code).
   suites unchanged by temporal eligibility alone.
 - T14 TECS event/window derivation on the real log →
   correct transition-relative diagnostic window.
-- T15 TECS early transient: first post-transition relevant
-  sample ≈ accepted transient value (per sidecar).
-- T16 TECS later behavior: later setpoint approaches
-  accepted ~5 m/s behavior (per sidecar).
-- T17 TECS rival exclusion: early-vs-later temporal
-  evidence rejects the persistent-limit diagnosis.
-- T18 TECS source evidence: refs grounded in represented
-  computations available to the pipeline; no fabricated
-  refs (missing-fixture and snapshot pins per RTL A1
-  pattern).
-- T19 TECS benchmark strength: sidecar stays PROVEN.
+- T15 TECS represented candidate anchors: both accepted TECS
+  writer candidates exist in the pinned source/DAG (file +
+  symbol anchors). No execution assertion.
+- T16 TECS shared mechanism support: the retained candidates
+  are mechanism-equivalent for THIS claim through the
+  represented shared downstream mechanism/source structure
+  (§17a). If this assertion fails: STOP G.
+- T17 TECS first post-transition numeric transient: timing +
+  `0.3 × reference ≈ first setpoint ≈ 1.012127` (per sidecar).
+- T18 TECS later behavior and rival exclusion: later setpoint
+  approaches accepted ~5 m/s behavior, rejecting the
+  persistent-limit diagnosis; source grounding uses
+  deterministic DAG/source assertions outside report CodeRefs
+  where the live report emits none (no fabricated refs;
+  missing-fixture and snapshot pins per RTL A1 pattern).
+  There is no W3B requirement that the live report emit TECS
+  source refs; current empty-signature behavior may remain.
+- T19 TECS benchmark/availability contract: sidecar stays
+  PROVEN; exact writer attribution = unavailable /
+  NON_DECISIVE; no fabricated execution claim; no forced
+  confidence/confirmation upgrade.
 - T20 full isolation regression: replay/checkpoint/
   coverage/applicability/proof suites unchanged.
 
@@ -584,9 +651,10 @@ vertical slice per cycle (single test → minimal code).
   report-layer intent parsing.
 - STOP F: represented TECS writer candidates carry no
   temporal/domain information capable of narrowing them.
-- STOP G: after eligibility, multiple TECS candidates remain
-  and no existing writer-domain/replay/ordering evidence
-  distinguishes them (§25 governs the report).
+- STOP G: refined per §25 — fires only for mechanism-different
+  ties (case 2) or unproven equivalence (case 3, mandatory).
+  Mechanism-equivalent ties with independently supported shared
+  mechanism (case 1) proceed without writer uniqueness.
 - STOP H: unique selection would require source-order/
   insertion-order tiebreaking.
 - STOP I: a new persistent temporal evidence/phase graph is
