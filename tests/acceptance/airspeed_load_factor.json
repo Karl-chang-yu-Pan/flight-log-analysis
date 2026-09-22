@@ -1,0 +1,92 @@
+{
+  "scenario_id": "airspeed_load_factor",
+  "question": "Why did the equivalent airspeed setpoint rise to about 23.7 m/s, above the 21 m/s trim value, during the ~50-degree banked turn, rather than remaining at trim or following a mission, wind, or another persistent command?",
+  "inputs": {
+    "log": "uploads/8a8aa57fedf94caf833ab8b4ade11d25/airspeed-load-factor.ulg",
+    "log_md5": "2acb5b821e1dffed3edabb805f40dbaa",
+    "source_snapshot": "1dacb4cdef2d7145754fc788fa8dc482eed74b40",
+    "backend": "tree_sitter",
+    "excursion": {
+      "signal": "tecs_status.equivalent_airspeed_sp",
+      "op": ">",
+      "reference": "FW_AIRSPD_TRIM",
+      "units": "signal: m/s; reference: m/s"
+    }
+  },
+  "expected": {
+    "mechanism_family": "bank_load_factor_adapted_minimum",
+    "peak_time_s": 297.960673,
+    "peak_eas_m_s": 23.69844627380371,
+    "attitude_setpoint_roll_rad": 0.8726646304130554,
+    "measured_roll_rad": 0.7728081561909079,
+    "roll_signal": "vehicle_attitude_setpoint.roll_body",
+    "fw_airspd_trim": 21.0,
+    "fw_airspd_min": 19.0,
+    "fw_airspd_max": 35.0,
+    "fw_wind_arsp_sc": 0.0,
+    "fw_gnd_spd_min": 5.0,
+    "weight_base": -1.0,
+    "weight_gross": -1.0,
+    "weight_ratio": 1.0,
+    "cruising_speed": -1.0,
+    "reconstruction": "FW_AIRSPD_MIN * sqrt(1 / cos(setpoint_roll))",
+    "reconstructed_min_m_s": 23.698445190606932,
+    "tolerance": 1e-05,
+    "binding": "requested_fallback < adapted_minimum < maximum",
+    "requested_fallback_m_s": 21.0,
+    "peak_window_s": [297.361, 301.961],
+    "slew_rate_m_s_s": 1.0,
+    "fall_rate_m_s_s": -1.0,
+    "disclosed_transient": "single regime-crossing pair inside the slew envelope, input-path reconstruction unavailable",
+    "source_anchors": [
+      {"file": "src/modules/fw_pos_control/FixedwingPositionControl.cpp", "symbol": "adapt_airspeed_setpoint"},
+      {"file": "src/modules/fw_pos_control/FixedwingPositionControl.cpp", "symbol": "tecs_status_publish"},
+      {"file": "src/modules/fw_pos_control/FixedwingPositionControl.cpp", "symbol": "control_auto_position"},
+      {"file": "src/modules/fw_pos_control/FixedwingPositionControl.cpp", "symbol": "tecs_update_pitch_throttle"},
+      {"file": "src/modules/fw_pos_control/FixedwingPositionControl.hpp", "symbol": "ASPD_SP_SLEW_RATE"},
+      {"file": "src/lib/slew_rate/SlewRate.hpp", "symbol": "SlewRate"},
+      {"file": "src/lib/npfg/npfg.cpp", "symbol": "refAirVelocity"}
+    ],
+    "publication_owner": {"file": "src/modules/fw_pos_control/FixedwingPositionControl.cpp", "symbol": "tecs_status.equivalent_airspeed_sp"},
+    "rival_excluded": ["fixed_trim", "mission_requested_23_7", "wind_scaling", "weight_scaling", "measured_bank_input", "persistent_unrelated_command"],
+    "replay": "N/A / partial: minimum computation replay-evaluable in principle; full stateful trajectory incomplete without state anchors"
+  },
+  "strength": "BEST_SUPPORTED",
+  "unavailable": [
+    "slew-controller entry state at arbitrary window starts (DISCRIMINATING: limits full-trajectory proof, not the peak mechanism)",
+    "per-sample NPFG branch proof (DISCRIMINATING: peak identity strongly supported, whole-excursion branches unproven)",
+    "per-cycle dt and complete trajectory reconstruction (DISCRIMINATING: fingerprints support adaptation without full history)",
+    "TECS internal state (NON_DECISIVE: off the published-value path)",
+    "takeoff and landing state-machine internals beyond the observed inactive gate (NON_DECISIVE: wrong mode at peak)",
+    "exact _eas2tas value under source-confirmed set/get cancellation (NON_DECISIVE: factor cancels in the round-trip)",
+    "mission-file-style provenance (NON_DECISIVE: cruising fallback plus binding establish the rival exclusion)"
+  ],
+  "forbidden": [
+    "proven_strength_claim",
+    "measured_roll_as_formula_input",
+    "trim_multiplied_by_load_factor",
+    "fw_wgt_sca_as_active_parameter",
+    "tecs_writes_published_eas",
+    "full_trajectory_reconstructed",
+    "all_npfg_branches_proven",
+    "arbitrary_slew_entry_known",
+    "strength_equals_live_confidence",
+    "missing_state_as_contradiction",
+    "source_existence_proves_execution",
+    "silent_fixture_fallback",
+    "wrong_source_snapshot"
+  ],
+  "normalization": {
+    "unstable_fields": [
+      "ids",
+      "timings",
+      "paths",
+      "prose",
+      "vertex_counts",
+      "explaining_branches",
+      "unresolved_evidence_strings",
+      "replay_status",
+      "confidence_values"
+    ]
+  }
+}
