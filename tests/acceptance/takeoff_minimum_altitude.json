@@ -1,0 +1,94 @@
+{
+  "scenario_id": "takeoff_minimum_altitude",
+  "question": "Why did the vehicle initially command a climb to about 20 m above home rather than the ~7 m mission waypoint altitude?",
+  "inputs": {
+    "log": "uploads/takeoff-inconsistent-hgt/inconsistent-takeoff-hgt.ulg",
+    "log_md5": "864264eb3ceadc25c5e0b0703788be61",
+    "source_snapshot": "1dacb4cdef2d7145754fc788fa8dc482eed74b40",
+    "backend": "tree_sitter",
+    "window_a_transition": {
+      "signal": "vehicle_status.nav_state",
+      "from": 2,
+      "to": 3,
+      "selection": "first",
+      "relation": "after",
+      "first_sample_of": "position_setpoint_triplet.current.alt"
+    },
+    "window_b_transition": {
+      "signal": "navigator_mission_item.nav_cmd",
+      "from": 22,
+      "to": 16,
+      "selection": "first",
+      "relation": "after",
+      "first_sample_of": "position_setpoint_triplet.current.alt"
+    }
+  },
+  "expected": {
+    "mechanism_family": "minimum_takeoff_altitude_then_waypoint_resume",
+    "window_a_s": [791.408357, 791.476832],
+    "window_b_s": [805.313512, 805.313516],
+    "home_at_command_m": 12.183,
+    "home_sample_time_s": 682.506126,
+    "mis_takeoff_alt_m": 20.0,
+    "initial_commanded_target_m": 32.18299865722656,
+    "initial_relation": "home_at_command + MIS_TAKEOFF_ALT ~= initial commanded target",
+    "waypoint_relative_alt_m": 7.0,
+    "waypoint_nav_cmd": 16,
+    "waypoint_altitude_is_relative": true,
+    "later_commanded_target_m": 19.182998657226562,
+    "later_relation": "home_at_command + waypoint relative altitude ~= later commanded target",
+    "tolerance": 0.001,
+    "takeoff_item_nav_cmd": 22,
+    "takeoff_text": "Takeoff to 20.0 meters above home",
+    "takeoff_text_time_s": 791.475648,
+    "executing_mission_text_time_s": 791.475483,
+    "observed_peak_alt_m": 31.472423553466797,
+    "observed_peak_time_s": 805.815086,
+    "observed_peak_above_home_m": 19.289,
+    "source_anchors": [
+      {"file": "src/modules/navigator/mission_params.c", "symbol": "MIS_TAKEOFF_ALT"},
+      {"file": "src/modules/navigator/navigator.h", "symbol": "get_takeoff_min_alt"},
+      {"file": "src/modules/navigator/mission.cpp", "symbol": "calculate_takeoff_altitude"},
+      {"file": "src/modules/navigator/mission.cpp", "symbol": "do_need_vertical_takeoff"},
+      {"file": "src/modules/navigator/mission.cpp", "symbol": "mission_item_next_position"},
+      {"file": "src/modules/navigator/mission_block.cpp", "symbol": "get_absolute_altitude_for_item"},
+      {"file": "src/modules/navigator/mission.cpp", "symbol": "mission_item_to_position_setpoint"}
+    ],
+    "retention_identity": "MODERATE: source preservation plus logged item continuity plus later target continuity; pre-rewrite byte identity unlogged and not claimed",
+    "replay": "N/A: ordered windows plus source/log evidence suffice",
+    "rival_excluded": ["waypoint_requested_plus20", "waypoint_overwritten_lost", "uncontrolled_overshoot"]
+  },
+  "strength": "PROVEN",
+  "unavailable": [
+    "exact pre-rewrite mission-item byte identity (NON_DECISIVE: the retention/resume mechanism is carried by source preservation plus logged item continuity plus later target continuity)",
+    "exact internal branch fired per cycle (NON_DECISIVE: the mechanism-level conclusion does not depend on it)",
+    "full mission-file provenance (NON_DECISIVE: the later relative waypoint plus resume path establish the claim)",
+    "per-sample internal mission-state history (NON_DECISIVE: ordered logged windows distinguish the phases)"
+  ],
+  "forbidden": [
+    "overshoot_diagnosis",
+    "waypoint_overwrite_diagnosis",
+    "waypoint_requested_plus20",
+    "seq_current_as_retention_evidence",
+    "takeoff_state_for_window_derivation",
+    "achieved_for_commanded_substitution",
+    "fabricated_source_evidence",
+    "execution_attribution_claim",
+    "confidence_upgrade_from_temporal_selection",
+    "silent_fixture_fallback",
+    "wrong_source_snapshot"
+  ],
+  "normalization": {
+    "unstable_fields": [
+      "ids",
+      "timings",
+      "paths",
+      "prose",
+      "vertex_counts",
+      "explaining_branches",
+      "unresolved_evidence_strings",
+      "replay_status",
+      "confidence_values"
+    ]
+  }
+}
