@@ -212,3 +212,12 @@ _Avoid_: writer coverage
 The checkpoint verdict permitting discovery to stop: no unresolved
 requirements, satisfied coverage and applicability where required, and
 complete replay. Zero pending work alone is never authority.
+
+## Diagnostic routing
+
+**DAG-decisive**:
+A routing predicate (replay-complete, judge-verified,
+feasibility-passing, validation-passing) deciding whether the DAG
+result is user-facing. It never authorizes stop; stop authority is
+separate.
+_Avoid_: stop-authority verdict
