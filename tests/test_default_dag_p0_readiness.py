@@ -237,7 +237,9 @@ def test_p0_t3_authority_isolation():
 
     allowed = {
         "flight_log_agent.analysis.dag_pipeline": {
-            "run_dag_discovery_stage", "validate_report"},
+            "run_dag_discovery_stage"},
+        "flight_log_agent.analysis.report_validation": {
+            "validate_report"},
         "flight_log_agent.runner_core": {"analyze_flight_log"},
         "flight_log_agent.ulog.inventory": {
             "parse_ulog_inventory", "observed_signals_from_inventory"},
@@ -1540,6 +1542,36 @@ def _sum_usage(run_dir):
     return {"usage_files": counted, "total_tokens": total}
 
 
+def test_p0_bakeoff_imports_resolve():
+    """Gated-branch import preflight: every production import
+    inside the real bake-off branch must resolve WITHOUT
+    executing any model/API call. This catches unreachable
+    gated-branch imports that skip/dry runs never touch."""
+    import ast
+    import importlib
+
+    tree = _readiness_module_tree()
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == (
+                "test_p0_bakeoff_readiness_run"):
+            target = node
+            break
+    assert target is not None, "bake-off test missing"
+    checked = 0
+    for node in ast.walk(target):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module = importlib.import_module(node.module)
+        for alias in node.names:
+            assert hasattr(module, alias.name), \
+                f"unresolvable gated import: {node.module}.{alias.name}"
+            checked += 1
+    assert checked >= 5, \
+        f"expected real-branch imports to check, found {checked}"
+    print(f"\nBake-off gated imports resolve x{checked}, 0 model calls")
+
+
 def test_p0_bakeoff_readiness_run(tmp_path):
     """Gated real-readiness bake-off (manual, never default CI).
 
@@ -1574,6 +1606,8 @@ def test_p0_bakeoff_readiness_run(tmp_path):
 
     from flight_log_agent.analysis.dag_pipeline import (
         run_dag_discovery_stage,
+    )
+    from flight_log_agent.analysis.report_validation import (
         validate_report,
     )
     from flight_log_agent.px4.mechanism_source_profiler import (
