@@ -3,7 +3,7 @@ from flight_log_agent.analysis.verification_graph import (
     terminal_outputs,
 )
 from flight_log_agent.models import ExpectedSignatureItem, MechanismCandidate, RelationshipCheckSpec
-from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+from flight_log_agent.models import SourceOutputBindingRecord
 
 
 def test_terminal_rooted_graph_excludes_unrelated_cruising_speed_check():

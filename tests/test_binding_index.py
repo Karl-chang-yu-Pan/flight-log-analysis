@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from flight_log_agent.analysis.binding_index import BindingIndex
-from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+from flight_log_agent.models import SourceOutputBindingRecord
 
 
 def _binding(
@@ -479,3 +479,34 @@ class TestAssignmentResolutions:
         # The resolved branch still got substituted; the dead end stays
         # as a blocker.
         assert "vehicle_global_position.alt" in result.expression
+
+
+def test_source_output_binding_record_lives_in_shared_models():
+    """Stage-2 S3: the shared binding record is defined once in the
+    shared contract module, importable from its canonical home."""
+    from flight_log_agent.models import SourceOutputBindingRecord
+
+    assert SourceOutputBindingRecord.__module__ == "flight_log_agent.models"
+    record = SourceOutputBindingRecord(
+        binding_id="b1",
+        source_symbol="a",
+        target_symbol="b",
+    )
+    assert record.binding_id == "b1"
+
+
+def test_no_duplicate_binding_record_definition():
+    """Exactly one runtime class definition may exist: if the legacy
+    module path still resolves the name, it must be the same object."""
+    import importlib
+
+    models = importlib.import_module("flight_log_agent.models")
+    assert hasattr(models, "SourceOutputBindingRecord")
+    try:
+        legacy = importlib.import_module(
+            "flight_log_agent.px4.source_mechanism_models")
+    except ImportError:
+        return
+    if hasattr(legacy, "SourceOutputBindingRecord"):
+        assert (legacy.SourceOutputBindingRecord
+                is models.SourceOutputBindingRecord)

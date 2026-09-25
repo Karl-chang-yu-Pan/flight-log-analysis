@@ -5,6 +5,12 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 from flight_log_agent.models import CodeRef, RelationshipCheckSpec
+# Same-object compatibility import (Stage-2 S3): the canonical
+# SourceOutputBindingRecord now lives in flight_log_agent.models.
+# Remaining classes in this legacy file still reference the name,
+# so it is re-exported here as the SAME object (never a duplicate
+# definition) until S4 deletes this module with the subsystem.
+from flight_log_agent.models import SourceOutputBindingRecord  # noqa: F401
 
 
 class SourceDiscoveryLogContext(BaseModel):
@@ -72,14 +78,11 @@ class SourceBackedVerificationCheck(BaseModel):
     rationale: str = ""
 
 
-class SourceOutputBindingRecord(BaseModel):
-    binding_id: str
-    source_symbol: str
-    target_symbol: str
-    logged_signal: Optional[str] = None
-    assignment_path: list[dict[str, Any]] = Field(default_factory=list)
-    control_predicates: list[str] = Field(default_factory=list)
-    symbol_bindings: dict[str, str] = Field(default_factory=dict)
+# NOTE (Stage-2 S3): SourceOutputBindingRecord lived here until its
+# shared consumers moved to flight_log_agent.models. The canonical
+# definition is intentionally NOT duplicated here; import it from
+# flight_log_agent.models instead. This module itself is deleted
+# in S4 with the legacy subsystem.
 
 
 class SourceMechanismBranchGroup(BaseModel):

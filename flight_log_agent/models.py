@@ -340,3 +340,20 @@ class ValidationIssue(BaseModel):
 class ValidationResult(BaseModel):
     passed: bool
     issues: list[ValidationIssue] = Field(default_factory=list)
+
+
+class SourceOutputBindingRecord(BaseModel):
+    """One source-to-log output binding (target = expression proof).
+
+    Shared contract owned here (moved from the retired legacy
+    mechanism models in Stage-2 S3): binding/verification flows and
+    their tests consume it independently of any discovery path.
+    """
+
+    binding_id: str
+    source_symbol: str
+    target_symbol: str
+    logged_signal: Optional[str] = None
+    assignment_path: list[dict[str, Any]] = Field(default_factory=list)
+    control_predicates: list[str] = Field(default_factory=list)
+    symbol_bindings: dict[str, str] = Field(default_factory=dict)
