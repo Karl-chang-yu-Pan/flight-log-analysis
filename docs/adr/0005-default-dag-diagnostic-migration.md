@@ -12,6 +12,40 @@ authority. Legacy retirement is not decided here.
 
 Accepted. Staged migration; stop-authority decoupling explicitly out of scope.
 
+## Retirement record (Stage-2 physical removal)
+
+Runtime DAG-default landed in `4da67e5` (feat: make DAG
+mechanism analysis default). The legacy mechanism-discovery
+provider path was then physically removed (Stage-2 S1–S5;
+see `docs/legacy_mechanism_removal_spec.md`): the legacy
+agent, decide closure, discover/convert wrappers, resolver
+module, frontier module, and legacy schemas no longer exist
+in production, and no configuration restores them. Rollback
+is repository/deployment revert, not a runtime flag.
+
+- D1 default-flip: done (`4da67e5`).
+- D2 temporary fallback: retired. This record is the
+  separate later decision D2 required.
+- D20 retirement evidence: paid legacy bakeoff WAIVED
+  (legacy output is not a correctness oracle; DAG relies
+  on deterministic acceptance specs, accepted semantic
+  sidecars/oracles, and DAG authority checks);
+  compatibility SATISFIED on offline/deterministic
+  evidence (suites, composition boundary, oracles —
+  not longitudinal production observation); fallback
+  rate SUPERSEDED (no automatic fallback exists by
+  construction); contract parity SUPERSEDED (acceptance
+  specs + sidecars are the oracle); rollback SUPERSEDED
+  (operational revert is documented procedure, not
+  tested runtime capability); stable report behavior
+  SATISFIED (report pipeline unchanged; validation and
+  downgrades intact).
+- D7 parser parity: untouched by this removal.
+
+History above is preserved; superseded steps are marked,
+not rewritten. P1 remains NOT complete (budget policy
+open, separate cost/operations work).
+
 ## Decisions
 
 - **D1 target.** Staged DAG-primary migration. DAG becomes the default

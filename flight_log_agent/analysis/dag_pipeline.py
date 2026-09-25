@@ -1,8 +1,7 @@
-"""Flag-gated DAG discovery pipeline (#73 Stage 4).
+"""DAG discovery pipeline (default mechanism-analysis path).
 
-Replaces runner Stages 3–5 when enabled: fresh DAG discovery and judging
-instead of mechanism-cache retrieval and the SourceDiscoveryDecision loop,
-then DAG ``evaluate_feasibility`` over ULog parameters/samples instead of the
+Runs fresh DAG discovery and judging instead of the retired
+legacy mechanism path, then DAG ``evaluate_feasibility`` over ULog parameters/samples instead of the
 verification-plan checks. The final report is constructed deterministically
 from the verdict and annotated DAG. Persistent DAG caches are deliberately
 dormant until construction semantics are accepted.
