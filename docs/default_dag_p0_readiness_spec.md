@@ -230,6 +230,12 @@ migration and must be recorded in the artifact, not hidden.
 Environment is restored after each run; defaults never
 change globally.
 
+Stage-2 retirement note: the runnable legacy comparator
+no longer exists (legacy provider path physically
+removed). Legacy comparison runs cannot execute; the
+passages above describe historical methodology. DAG
+measurement runs are unaffected.
+
 ### 5.8 Snapshot-unavailable measurement
 
 Run the harness once per fixture with the snapshot
@@ -274,6 +280,12 @@ mismatch count (0 required pre-P2).
 
 The missing-snapshot case (§5.8) is a measured readiness
 case, classified as P1-fallback-required, not fixed.
+
+Stage-2 retirement note: the silent-fallthrough branch no
+longer exists — missing source now takes the explicit
+deterministic no-source result. The classification above
+is historical; do not require new P1 fallback work for
+a removed branch.
 
 ### 6.3 Four-fixture gate semantics
 
@@ -463,6 +475,13 @@ findings. P1 later implements explicit fallback,
 precedence routing, and markers. P2 later executes the
 shadow bake-off against ratified gates. No P1 behavior
 enters P0.
+
+Stage-2 retirement note: DAG-default precedence and the
+removal of runnable legacy fallback have since landed
+(runtime retirement + physical removal); the P0
+"later implements" posture above is historical for those
+items. Budget/threshold ratification remains open
+separate work; P1 is not marked complete by this note.
 
 ## 14. Explicit exclusions
 
