@@ -108,43 +108,70 @@ def test_dag_branch_returns_before_legacy_stages():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name == "decide_source_discovery"
     ]
-    assert len(legacy_defs) == 1
-    assert legacy_defs[0].lineno > dag_branches[0].lineno
-    for node in ast.walk(dag_branches[0]):
-        assert not (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "decide_source_discovery"
-        ), "legacy decide callback must not live inside the DAG branch"
+    assert legacy_defs == [], "legacy decide callback must not exist"
 
 
 def test_no_source_discovery_is_model_free_unresolved():
     """Missing source resolves deterministically without any
-    provider call: the decide callback raises if touched."""
-    import asyncio
-
-    from flight_log_agent.models import QuestionIntent
-    from flight_log_agent.px4.source_mechanism_models import (
-        SourceDiscoveryLogContext,
+    provider call: no resolver construction anywhere in the
+    runner, and the exact unresolved contract wording is
+    preserved."""
+    runner_text = (
+        _Path(__file__).resolve().parent.parent
+        / "flight_log_agent" / "runner_core.py"
+    ).read_text(encoding="utf-8")
+    assert "SourceMechanismResolver(" not in runner_text
+    assert (
+        "Exact PX4 source snapshot is unavailable for "
+        "source-mechanism discovery." in runner_text
     )
-    from flight_log_agent.runner_core import discover_source_mechanisms
 
-    async def forbidden_decide(packet):
-        raise AssertionError("legacy provider invoked without source")
 
-    result = asyncio.run(discover_source_mechanisms(
-        None,
-        QuestionIntent(
-            original_question="Why?",
-            problem_domain="",
-            concise_intent="Why?",
-            source_queries=["trigger_alpha"],
-        ),
-        SourceDiscoveryLogContext(),
-        5,
-        forbidden_decide,
-    ))
-    assert result.candidates == []
-    assert result.unresolved_questions == [
-        "Exact PX4 source snapshot is unavailable for source-mechanism discovery."
-    ]
-    assert result.expansion_queries == ["trigger_alpha"]
+# ----------------------------------------------------------------------
+# S2 — runner legacy provider path is gone
+# ----------------------------------------------------------------------
+
+import ast as _ast
+from pathlib import Path as _Path
+
+
+def _runner_tree():
+    return _ast.parse(
+        (_Path(__file__).resolve().parent.parent
+         / "flight_log_agent" / "runner_core.py").read_text(
+            encoding="utf-8")
+    )
+
+
+def test_no_legacy_provider_symbols_in_runner():
+    """The legacy mechanism-discovery provider path no longer
+    exists in production: no agent, no decide closure, no
+    discover/convert wrappers, no runner-local canonicalizer."""
+    tree = _runner_tree()
+    names = {
+        node.id for node in _ast.walk(tree)
+        if isinstance(node, _ast.Name)
+    }
+    for symbol in (
+        "source_discovery_agent",
+        "decide_source_discovery",
+        "discover_source_mechanisms",
+        "source_mechanisms_to_candidates",
+        "source_mechanism_to_candidate",
+        "canonicalize_mechanism_candidate_signals",
+    ):
+        assert symbol not in names, f"legacy provider symbol remains: {symbol}"
+    defined = {
+        node.name for node in _ast.walk(tree)
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                             _ast.ClassDef))
+    }
+    assert "SignalCanonicalizer" not in defined
+
+
+def test_legacy_branch_references_no_decide_call():
+    """No decide/model callback construction remains anywhere in
+    the runner module."""
+    for node in _ast.walk(_runner_tree()):
+        if isinstance(node, _ast.Name) and node.id == "decide_source_discovery":
+            raise AssertionError("legacy decide callback reference remains")

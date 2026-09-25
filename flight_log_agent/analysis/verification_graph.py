@@ -252,8 +252,7 @@ def source_signal_bindings(bindings: list[dict[str, Any]]) -> dict[str, str]:
     """Return the flat source-symbol -> logged-signal map for control-predicate lowering.
 
     Delegates to :class:`BindingIndex` so the lowering pipeline shares the
-    same alias-construction rules as :class:`SignalResolver` and
-    :class:`SignalCanonicalizer`.
+    same alias-construction rules as :class:`SignalResolver`.
     """
     return BindingIndex({}, bindings).symbol_bindings
 
