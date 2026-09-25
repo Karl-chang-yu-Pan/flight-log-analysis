@@ -1449,16 +1449,18 @@ class MechanismSourceProfiler:
                     first_line = line
                     for _, continuation in code_lines[index + 1 : index + 26]:
                         continuation_code = continuation.split("//", 1)[0].strip()
-                        if ("{" in continuation_code or "}" in continuation_code) and line.count(
-                            "("
-                        ) <= line.count(")"):
-                            # A brace at balanced parens is a signature/body
-                            # boundary, not a continued expression (braces
-                            # nested inside an open call stay imbalanced and
-                            # keep joining). Restore the first line so no
-                            # spurious assignment swallows later statements.
-                            line = first_line
-                            break
+                        if "{" in continuation_code or "}" in continuation_code:
+                            braces_open = line.count("{") > line.count("}")
+                            parens_open = line.count("(") > line.count(")")
+                            if not braces_open and not parens_open:
+                                # A brace at a balanced buffer is a
+                                # signature/body boundary, not a continued
+                                # expression (braces nested inside an open
+                                # call or brace initializer keep joining).
+                                # Restore the first line so no spurious
+                                # assignment swallows later statements.
+                                line = first_line
+                                break
                         line = line + " " + continuation_code
                         if (
                             line.count("(") <= line.count(")")

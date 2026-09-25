@@ -1017,6 +1017,36 @@ void Example::update()
     assert "combine(Wrapper{inner})" in by_target["output"].expression
 
 
+def test_braced_initializer_first_member_joins_across_lines(
+    tmp_path, source_backend
+):
+    """A braced struct initializer split across lines must bind the
+    first member's actual on the declaration line (the closing brace
+    in the continuation belongs to the still-open initializer)."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "brace.cpp").write_text(
+        """
+void TECS::update()
+{
+    const State setpoint{ .alt = hgt_setpoint,
+            .alt_rate = hgt_rate_sp};
+    out = setpoint.alt;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = _SourceExtractorContract(source_path, source_backend)
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/brace.cpp"]
+    )
+    first_line = [a for a in assignments if a.line == 4]
+    assert first_line, "braced initializer members missing from declaration line"
+    assert any("hgt_setpoint" in a.expression for a in first_line), \
+        "first member actual not bound on the declaration line"
+
+
 def test_multi_line_if_condition_attaches_predicate_to_body_assignment(
     tmp_path, source_backend
 ):
