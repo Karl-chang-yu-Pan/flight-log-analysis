@@ -338,6 +338,11 @@ def main() -> int:
     if args.dry_run:
         print("dry run: manifest and logs are valid; no LLM call made")
         return 0
+    provider_budget_json = build_provider_budget_json(args)
+    return run_suite(entries, Path(args.out), args.timeout, args.limit,
+                     provider_budget_json)
+
+
 def build_provider_budget_json(args) -> str:
     """Serialize calibration guard flags for the --run-one child
     transport. Empty string means no guard configured. Pure helper
@@ -369,11 +374,6 @@ def _abort_status_fragment(exc: BaseException) -> dict:
         return {"aborted_by_budget_guard": True,
                 "abort_dimension": exc.dimension}
     return {}
-
-
-    provider_budget_json = build_provider_budget_json(args)
-    return run_suite(entries, Path(args.out), args.timeout, args.limit,
-                     provider_budget_json)
 
 
 if __name__ == "__main__":
