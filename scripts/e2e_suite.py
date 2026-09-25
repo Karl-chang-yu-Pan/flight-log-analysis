@@ -56,8 +56,40 @@ def question_id(log: str, question: str) -> str:
 
 def run_one(log: str, question: str, output_dir: str) -> int:
     import asyncio
+    import json as _json
+    import os as _os
 
+    from flight_log_agent.provider_budget import (
+        BudgetExceeded,
+        ModelPrices,
+        ProviderBudget,
+    )
     from flight_log_agent.runner_core import analyze_flight_log
+
+    budget = None
+    raw_budget = _os.environ.get("FLIGHT_LOG_PROVIDER_BUDGET", "")
+    if raw_budget.strip():
+        payload = _json.loads(raw_budget)
+        prices = None
+        if isinstance(payload.get("model_prices"), dict):
+            prices = {
+                str(model): ModelPrices(
+                    input_usd_per_token=float(spec.get("input_usd_per_token", 0.0)),
+                    output_usd_per_token=float(spec.get("output_usd_per_token", 0.0)),
+                    cached_input_usd_per_token=float(
+                        spec.get("cached_input_usd_per_token", 0.0)),
+                )
+                for model, spec in payload["model_prices"].items()
+                if isinstance(spec, dict)
+            }
+        budget = ProviderBudget(
+            max_provider_calls=payload.get("max_provider_calls"),
+            max_total_input_tokens=payload.get("max_total_input_tokens"),
+            max_total_output_tokens=payload.get("max_total_output_tokens"),
+            max_total_cost_usd=payload.get("max_total_cost_usd"),
+            max_wall_seconds=payload.get("max_wall_seconds"),
+            model_prices=prices,
+        )
 
     started = time.monotonic()
     status: dict[str, object] = {"log": log, "question": question}
@@ -68,6 +100,7 @@ def run_one(log: str, question: str, output_dir: str) -> int:
                 user_question=question,
                 output_dir=output_dir,
                 dag_discovery=True,
+                provider_budget=budget,
             )
         )
         hypotheses = list(getattr(report, "ranked_hypotheses", []) or [])
@@ -98,6 +131,9 @@ def run_one(log: str, question: str, output_dir: str) -> int:
         status.update(
             {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:500]}
         )
+        # Explicit abort marking (machine-detectable): a budget
+        # abort is neither success nor an ordinary failure.
+        status.update(_abort_status_fragment(exc))
     status["seconds"] = round(time.monotonic() - started, 1)
     status["peak_rss_mb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
     print("SUITE_RESULT " + json.dumps(status, default=str), flush=True)
@@ -138,6 +174,7 @@ def run_suite(
     out_root: Path,
     timeout: int,
     limit: int | None,
+    provider_budget_json: str = "",
 ) -> int:
     out_root.mkdir(parents=True, exist_ok=True)
     results_dir = out_root / "results"
@@ -173,6 +210,10 @@ def run_suite(
         ]
         environment = dict(os.environ)
         environment.setdefault("PYTHONPATH", str(REPO_ROOT))
+        if provider_budget_json.strip():
+            # Transport-only carrier for the child calibration guard;
+            # parsed and validated by run_one, never trusted blindly.
+            environment["FLIGHT_LOG_PROVIDER_BUDGET"] = provider_budget_json
         try:
             proc = subprocess.run(
                 command,
@@ -265,6 +306,18 @@ def main() -> int:
         help="per-question wall-clock cap in seconds",
     )
     parser.add_argument("--limit", type=int, default=None, help="run at most N pending")
+    parser.add_argument("--max-provider-calls", type=int, default=None,
+                        help="calibration guard: stop before exceeding N provider calls")
+    parser.add_argument("--max-input-tokens", type=int, default=None,
+                        help="calibration guard: stop before exceeding N completed input tokens")
+    parser.add_argument("--max-output-tokens", type=int, default=None,
+                        help="calibration guard: stop before exceeding N completed output tokens")
+    parser.add_argument("--max-cost-usd", type=float, default=None,
+                        help="calibration guard: stop before exceeding USD (needs --model-prices)")
+    parser.add_argument("--max-wall-seconds", type=float, default=None,
+                        help="calibration guard: stop before exceeding wall seconds")
+    parser.add_argument("--model-prices", default="",
+                        help='calibration guard: JSON {model: {"input_usd_per_token": f, "output_usd_per_token": f}}')
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -285,7 +338,42 @@ def main() -> int:
     if args.dry_run:
         print("dry run: manifest and logs are valid; no LLM call made")
         return 0
-    return run_suite(entries, Path(args.out), args.timeout, args.limit)
+def build_provider_budget_json(args) -> str:
+    """Serialize calibration guard flags for the --run-one child
+    transport. Empty string means no guard configured. Pure helper
+    so offline tests can pin the CLI-to-guard contract."""
+    budget_payload = {
+        "max_provider_calls": args.max_provider_calls,
+        "max_total_input_tokens": args.max_input_tokens,
+        "max_total_output_tokens": args.max_output_tokens,
+        "max_total_cost_usd": args.max_cost_usd,
+        "max_wall_seconds": args.max_wall_seconds,
+    }
+    if args.model_prices.strip():
+        budget_payload["model_prices"] = json.loads(args.model_prices)
+    if any(value is not None
+           for key, value in budget_payload.items() if key != "model_prices") \
+            or budget_payload.get("model_prices"):
+        return json.dumps(budget_payload)
+    return ""
+
+
+def _abort_status_fragment(exc: BaseException) -> dict:
+    """Machine-detectable abort marking for suite results. Returns
+    {} for ordinary failures so only budget aborts gain the flag."""
+    try:
+        from flight_log_agent.provider_budget import BudgetExceeded
+    except ImportError:
+        return {}
+    if isinstance(exc, BudgetExceeded):
+        return {"aborted_by_budget_guard": True,
+                "abort_dimension": exc.dimension}
+    return {}
+
+
+    provider_budget_json = build_provider_budget_json(args)
+    return run_suite(entries, Path(args.out), args.timeout, args.limit,
+                     provider_budget_json)
 
 
 if __name__ == "__main__":

@@ -115,6 +115,11 @@ from flight_log_agent.audit import (
     DeveloperAuditLogger,
     log_run_items,
 )
+from flight_log_agent.provider_budget import (
+    BudgetExceeded,
+    ProviderBudget,
+    ProviderBudgetUsage,
+)
 
 from flight_log_agent.px4.mechanism_cache import (
     MechanismCacheConfig,
@@ -320,6 +325,7 @@ async def analyze_flight_log(
     force_mechanism_refresh: bool = False,
     dag_discovery: Optional[bool] = None,
     dag_cache_dir: str = ".flightlog_cache",
+    provider_budget: Optional[ProviderBudget] = None,
 ) -> FlightLogReport:
     log_path_obj = Path(log_path)
     mission_path_obj = Path(mission_path) if mission_path else None
@@ -330,6 +336,13 @@ async def analyze_flight_log(
     output_dir_obj.mkdir(parents=True, exist_ok=True)
 
     audit_logger = DeveloperAuditLogger(Path(dev_log_root), run_id=dev_run_id)
+    # Per-run provider budget state (calibration guard). Created only
+    # when a budget is configured; None preserves existing behavior
+    # exactly. Threaded explicitly (never global) through every
+    # provider call in this run, across all roles and stages.
+    budget_usage: Optional[ProviderBudgetUsage] = (
+        ProviderBudgetUsage() if provider_budget is not None else None
+    )
     report_path = output_dir_obj / "report.json"
 
     audit_logger.save_metadata(
@@ -444,6 +457,9 @@ async def analyze_flight_log(
             },
             ctx,
             max_turns=2,
+            budget=provider_budget,
+            budget_usage=budget_usage,
+            role="intent",
         )
 
         source_search_context = SourceSearchContext(
@@ -487,6 +503,8 @@ async def analyze_flight_log(
                     payload,
                     ctx,
                     max_turns=2,
+                    budget=provider_budget,
+                    budget_usage=budget_usage,
                 )
 
             dag_stage = await run_dag_discovery_stage(
@@ -834,6 +852,9 @@ async def analyze_flight_log(
             build_final_report_input(verified_results),
             ctx,
             max_turns=4,
+            budget=provider_budget,
+            budget_usage=budget_usage,
+            role="report",
         )
 
         apply_deterministic_report_summaries(report, airframe_context, question_intent)
@@ -1355,10 +1376,36 @@ async def _run_agent(
     payload: dict[str, Any],
     ctx: FlightLogContext,
     max_turns: int,
+    *,
+    budget: Optional["ProviderBudget"] = None,
+    budget_usage: Optional["ProviderBudgetUsage"] = None,
+    role: Optional[str] = None,
 ) -> Any:
     started_at = time.perf_counter()
     if audit_logger is not None:
         audit_logger.log_event(f"agent.{stage_name}.started", input=payload)
+
+    effective_role = role or getattr(agent, "name", "") or stage_name
+    guarded = budget is not None and budget_usage is not None
+    if guarded:
+        assert budget is not None and budget_usage is not None
+        try:
+            budget_usage.check_or_raise(budget, role=effective_role)
+        except BudgetExceeded:
+            if audit_logger is not None:
+                audit_logger.log_event(
+                    "run.budget_guard_aborted",
+                    role=effective_role,
+                    stage=stage_name,
+                    model=str(getattr(agent, "model", "") or ""),
+                    provider_calls_completed=budget_usage.provider_calls,
+                    input_tokens=budget_usage.total_input_tokens,
+                    output_tokens=budget_usage.total_output_tokens,
+                    cost_usd=budget_usage.total_cost_usd,
+                    elapsed_ms=round(
+                        (time.perf_counter() - started_at) * 1000, 3),
+                )
+            raise
 
     result = await Runner.run(
         agent,
@@ -1376,6 +1423,17 @@ async def _run_agent(
             output=_safe_model_dump(result.final_output),
             duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
             usage=usage,
+        )
+    if guarded:
+        assert budget is not None and budget_usage is not None
+        call_usage = getattr(
+            getattr(result, "context_wrapper", None), "usage", None)
+        budget_usage.record_call(
+            effective_role,
+            getattr(agent, "model", ""),
+            call_usage,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            prices=budget.model_prices,
         )
 
     return result.final_output
