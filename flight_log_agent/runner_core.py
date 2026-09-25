@@ -336,6 +336,35 @@ def generate_signal_plot(
 # 6. Main runner
 # ============================================================
 
+# Explicit opt-out values for FLIGHT_LOG_DAG_DISCOVERY selecting the
+# legacy mechanism path (manual rollback/debugging and explicitly
+# invoked comparison only). Any other value, including unset/empty,
+# selects the DAG default. Unknown values fail open to the supported
+# DAG path rather than silently pinning legacy.
+_DAG_EXPLICIT_OFF = frozenset({"0", "false", "no", "off", "legacy"})
+
+
+def resolve_mechanism_path(
+    *,
+    dag_discovery: Optional[bool],
+    env_value: str,
+) -> str:
+    """Select the mechanism-analysis path: ``"dag"`` or ``"legacy"``.
+
+    Pure flag-routing contract (no I/O, no provider calls). DAG is
+    the default; legacy runs only on explicit opt-in
+    (``dag_discovery is False`` or an opt-out env value). The caller
+    additionally requires a pinned source snapshot for the DAG
+    stage, so source absence keeps the pre-existing graceful legacy
+    fallthrough. Proof/stop authority is untouched by routing.
+    """
+    if dag_discovery is not None:
+        return "dag" if dag_discovery else "legacy"
+    if (env_value or "").strip().lower() in _DAG_EXPLICIT_OFF:
+        return "legacy"
+    return "dag"
+
+
 async def analyze_flight_log(
     log_path: str,
     user_question: str,
@@ -482,14 +511,17 @@ async def analyze_flight_log(
 
         # ------------------------------------------------------------
         # Stage 4-alt (#73): DAG discovery + judge + feasibility.
-        # Behind a flag; replaces Stages 3-5 and the report agent while
-        # the legacy path below stays untouched when the flag is off.
+        # DAG is the default mechanism-analysis path; the legacy
+        # Stages 3-5 below run only on explicit legacy opt-in
+        # (dag_discovery=False or opt-out env value) or when no
+        # pinned source snapshot exists for the DAG stage.
         # ------------------------------------------------------------
         dag_discovery_enabled = (
-            dag_discovery
-            if dag_discovery is not None
-            else os.environ.get("FLIGHT_LOG_DAG_DISCOVERY", "").lower()
-            in {"1", "true", "yes"}
+            resolve_mechanism_path(
+                dag_discovery=dag_discovery,
+                env_value=os.environ.get("FLIGHT_LOG_DAG_DISCOVERY", ""),
+            )
+            == "dag"
         )
         if dag_discovery_enabled and source_snapshot is not None:
             schema = load_px4_msg_schema(source_snapshot)
