@@ -1290,8 +1290,11 @@ def test_p0_t13_snapshot_unavailable_measurement():
     assert _snapshot_status(SOURCE_ROOT) == f"pinned:{PINNED_COMMIT}"
 
     runner = (REPO_ROOT / "flight_log_agent/runner_core.py").read_text()
-    assert ("if dag_discovery_enabled and source_snapshot is not None"
+    assert ("dag_discovery_enabled = source_snapshot is not None"
             in runner), "gated DAG branch must exist for P1 to mark"
+    assert ("if dag_discovery_enabled:"
+            in runner), "DAG branch gate must exist for P1 to mark"
+    assert "resolve_mechanism_path" not in runner
     classification = ("P1 explicit-fallback requirement"
                       if _snapshot_status(None) == "unavailable"
                       else "unexpected")
@@ -1318,6 +1321,27 @@ def test_p0_t14_wall_time_measurement():
     assert result == "semantic-ok"
     assert isinstance(seconds, float) and seconds >= 0.0
     print("\nP0-T14 wall-time seam records, never gates")
+
+
+def retired_legacy_bakeoff_leg(*args, **kwargs):
+    """Explicit unavailable marker for the retired legacy bakeoff
+    leg (Stage-2 S1). Invoking a legacy-vs-DAG comparison must fail
+    explicitly here instead of silently running DAG twice while one
+    side is labeled legacy. Historical P0 data/oracles untouched."""
+    raise RuntimeError(
+        "legacy bakeoff leg retired: legacy mechanism discovery "
+        "no longer exists in production; use DAG-only acceptance "
+        "specs, sidecars, and authority checks"
+    )
+
+
+def test_retired_legacy_bakeoff_leg_fails_explicitly():
+    try:
+        retired_legacy_bakeoff_leg()
+    except RuntimeError as exc:
+        assert "legacy bakeoff leg retired" in str(exc)
+    else:
+        raise AssertionError("retired legacy leg must fail explicitly")
 
 
 def test_p0_t15_llm_usage_measurement():
@@ -1629,12 +1653,9 @@ def test_p0_bakeoff_readiness_run(tmp_path):
         scen_dir = tmp_path / entry["scenario"]
         # Phase 1: run both paths (no oracle contact).
         def _run_legacy(entry=entry, scen_dir=scen_dir):
-            return asyncio.run(analyze_flight_log(
-                entry["log"], entry["question"],
-                source_path=str(SOURCE_ROOT),
-                output_dir=str(scen_dir / "legacy"),
-                dev_log_root=str(scen_dir / "devlogs" / "legacy"),
-                dag_discovery=False))
+            # Retired Stage-2 S1: explicit failure instead of a
+            # silent DAG-vs-DAG comparison labeled legacy.
+            return retired_legacy_bakeoff_leg()
         legacy_report, legacy_secs = _timed_call(_run_legacy)
 
         inventory = parse_ulog_inventory(Path(entry["log"]),

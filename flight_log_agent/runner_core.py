@@ -344,25 +344,33 @@ def generate_signal_plot(
 _DAG_EXPLICIT_OFF = frozenset({"0", "false", "no", "off", "legacy"})
 
 
-def resolve_mechanism_path(
+def deprecated_legacy_selector(
     *,
     dag_discovery: Optional[bool],
     env_value: str,
-) -> str:
-    """Select the mechanism-analysis path: ``"dag"`` or ``"legacy"``.
-
-    Pure flag-routing contract (no I/O, no provider calls). DAG is
-    the default; legacy runs only on explicit opt-in
-    (``dag_discovery is False`` or an opt-out env value). The caller
-    additionally requires a pinned source snapshot for the DAG
-    stage, so source absence keeps the pre-existing graceful legacy
-    fallthrough. Proof/stop authority is untouched by routing.
+) -> Optional[dict[str, str]]:
+    """Describe an explicit legacy-mechanism request for the
+    deprecation audit event, or None when no legacy selector was
+    given. Pure function (no I/O, no provider calls). The request
+    is always routed to DAG; this payload only records that the
+    operator asked for the removed legacy path.
     """
-    if dag_discovery is not None:
-        return "dag" if dag_discovery else "legacy"
-    if (env_value or "").strip().lower() in _DAG_EXPLICIT_OFF:
-        return "legacy"
-    return "dag"
+    if dag_discovery is False:
+        return {
+            "requested_source": "parameter",
+            "requested_value": "False",
+            "effective_route": "dag",
+            "reason": "legacy_removed",
+        }
+    normalized = (env_value or "").strip().lower()
+    if normalized in _DAG_EXPLICIT_OFF:
+        return {
+            "requested_source": "environment",
+            "requested_value": (env_value or "").strip(),
+            "effective_route": "dag",
+            "reason": "legacy_removed",
+        }
+    return None
 
 
 async def analyze_flight_log(
@@ -511,19 +519,23 @@ async def analyze_flight_log(
 
         # ------------------------------------------------------------
         # Stage 4-alt (#73): DAG discovery + judge + feasibility.
-        # DAG is the default mechanism-analysis path; the legacy
-        # Stages 3-5 below run only on explicit legacy opt-in
-        # (dag_discovery=False or opt-out env value) or when no
-        # pinned source snapshot exists for the DAG stage.
+        # DAG is the default mechanism-analysis path. Explicit
+        # legacy selectors are deprecated: they route to DAG and
+        # emit a deprecation audit event. The legacy Stages 3-5
+        # below run only when no pinned source snapshot exists
+        # for the DAG stage (model-free handling there).
         # ------------------------------------------------------------
-        dag_discovery_enabled = (
-            resolve_mechanism_path(
-                dag_discovery=dag_discovery,
-                env_value=os.environ.get("FLIGHT_LOG_DAG_DISCOVERY", ""),
-            )
-            == "dag"
+        deprecated_selector = deprecated_legacy_selector(
+            dag_discovery=dag_discovery,
+            env_value=os.environ.get("FLIGHT_LOG_DAG_DISCOVERY", ""),
         )
-        if dag_discovery_enabled and source_snapshot is not None:
+        if deprecated_selector is not None:
+            audit_logger.log_event(
+                "mechanism_selection.deprecated_legacy_requested",
+                **deprecated_selector,
+            )
+        dag_discovery_enabled = source_snapshot is not None
+        if dag_discovery_enabled:
             schema = load_px4_msg_schema(source_snapshot)
             dag_signal_policies = load_px4_signal_policies(source_snapshot)
             dag_schema_signals = {

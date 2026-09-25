@@ -1,73 +1,85 @@
-"""Mechanism-path mode selection tests (DAG-primary retirement).
+"""Stage-2 S1: DAG-only routing, no-source handling, deprecation, bakeoff.
 
-Pin the normal/default runtime routing for mechanism analysis:
-DAG by default, legacy only via explicit opt-in or when no pinned
-source snapshot exists for the DAG stage. No provider calls;
-pure orchestration contract.
+Normal runtime routes mechanism analysis through DAG only. Old
+legacy selectors route to DAG with a deprecation audit event.
+Missing/invalid source yields a deterministic model-free
+unresolved result. Explicit legacy bakeoff fails explicitly.
+No provider calls; pure orchestration + structural contracts.
 """
 
 from __future__ import annotations
 
 
-def _resolve(**kwargs):
-    from flight_log_agent.runner_core import resolve_mechanism_path
+def _selector(**kwargs):
+    from flight_log_agent.runner_core import deprecated_legacy_selector
 
-    return resolve_mechanism_path(**kwargs)
-
-
-def test_default_with_source_selects_dag():
-    """Normal/default execution with a pinned source snapshot runs
-    the DAG path, never legacy discovery."""
-    assert _resolve(dag_discovery=None, env_value="") == "dag"
+    return deprecated_legacy_selector(**kwargs)
 
 
-def test_explicit_true_selects_dag():
-    assert _resolve(dag_discovery=True, env_value="") == "dag"
+def test_no_legacy_selector_by_default():
+    assert _selector(dag_discovery=None, env_value="") is None
 
 
-def test_explicit_false_preserves_legacy_opt_in():
-    """Explicit False keeps the legacy path for manual
-    rollback/debugging and explicitly-invoked comparison."""
-    assert _resolve(dag_discovery=False, env_value="") == "legacy"
+def test_explicit_false_requests_deprecation():
+    result = _selector(dag_discovery=False, env_value="")
+    assert result is not None
+    assert result["requested_source"] == "parameter"
+    assert result["requested_value"] == "False"
+    assert result["effective_route"] == "dag"
+    assert result["reason"] == "legacy_removed"
 
 
-def test_explicit_off_env_values_select_legacy():
+def test_explicit_true_requests_no_deprecation():
+    assert _selector(dag_discovery=True, env_value="") is None
+
+
+def test_off_env_values_request_deprecation():
     for env_value in ("0", "false", "no", "off", "legacy",
                       "FALSE", " Off "):
-        assert _resolve(dag_discovery=None, env_value=env_value) == "legacy"
+        result = _selector(dag_discovery=None, env_value=env_value)
+        assert result is not None
+        assert result["requested_source"] == "environment"
+        assert result["effective_route"] == "dag"
+        assert result["reason"] == "legacy_removed"
 
 
-def test_explicit_on_env_values_select_dag():
-    for env_value in ("1", "true", "yes", "on", "dag"):
-        assert _resolve(dag_discovery=None, env_value=env_value) == "dag"
+def test_on_env_values_request_no_deprecation():
+    for env_value in ("1", "true", "yes", "on", "dag", "banana"):
+        assert _selector(dag_discovery=None, env_value=env_value) is None
 
 
-def test_param_overrides_env():
-    """Explicit param wins over env in both directions."""
-    assert _resolve(dag_discovery=True, env_value="0") == "dag"
-    assert _resolve(dag_discovery=False, env_value="1") == "legacy"
+def test_param_false_wins_over_env_on():
+    result = _selector(dag_discovery=False, env_value="1")
+    assert result is not None
+    assert result["requested_source"] == "parameter"
 
 
-def test_source_gating_lives_at_call_site():
-    """Source-snapshot gating stays in the analyze_flight_log gate
-    (`if dag_discovery_enabled and source_snapshot is not None`),
-    pinned by the P0 migration shape test — not in this pure
-    flag-routing contract. Without a snapshot the legacy branch
-    handles the run (model-free in practice)."""
+def test_gate_has_no_legacy_opt_in_branch():
+    """Structural pin: the DAG gate is snapshot-conditional only;
+    the old opt-in resolver and off-value set are gone."""
+    import ast
     from pathlib import Path
 
-    runner = (Path(__file__).resolve().parent.parent
-              / "flight_log_agent" / "runner_core.py").read_text(
-        encoding="utf-8")
-    assert ("if dag_discovery_enabled and source_snapshot is not None"
-            in runner)
+    tree = ast.parse(
+        (Path(__file__).resolve().parent.parent
+         / "flight_log_agent" / "runner_core.py").read_text(
+            encoding="utf-8")
+    )
+    analyze = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "analyze_flight_log"
+    )
+    dumped = ast.dump(analyze)
+    assert "resolve_mechanism_path" not in dumped
+    assert "_DAG_EXPLICIT_OFF" not in dumped
+    assert "mechanism_selection.deprecated_legacy_requested" in dumped
 
 
 def test_dag_branch_returns_before_legacy_stages():
-    """Structural pin: the DAG-enabled branch of analyze_flight_log
-    returns before any legacy stage code, so DAG failure cannot fall
-    through into legacy discovery (mirrors the repo's T3-style
-    AST-isolation test convention)."""
+    """Structural pin retained from retirement: the DAG-enabled
+    branch returns before any legacy stage code, so DAG failure
+    cannot fall through into legacy discovery."""
     import ast
     from pathlib import Path
 
@@ -98,9 +110,41 @@ def test_dag_branch_returns_before_legacy_stages():
     ]
     assert len(legacy_defs) == 1
     assert legacy_defs[0].lineno > dag_branches[0].lineno
-    assert dag_branches[0].lineno < legacy_defs[0].lineno
     for node in ast.walk(dag_branches[0]):
         assert not (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name == "decide_source_discovery"
         ), "legacy decide callback must not live inside the DAG branch"
+
+
+def test_no_source_discovery_is_model_free_unresolved():
+    """Missing source resolves deterministically without any
+    provider call: the decide callback raises if touched."""
+    import asyncio
+
+    from flight_log_agent.models import QuestionIntent
+    from flight_log_agent.px4.source_mechanism_models import (
+        SourceDiscoveryLogContext,
+    )
+    from flight_log_agent.runner_core import discover_source_mechanisms
+
+    async def forbidden_decide(packet):
+        raise AssertionError("legacy provider invoked without source")
+
+    result = asyncio.run(discover_source_mechanisms(
+        None,
+        QuestionIntent(
+            original_question="Why?",
+            problem_domain="",
+            concise_intent="Why?",
+            source_queries=["trigger_alpha"],
+        ),
+        SourceDiscoveryLogContext(),
+        5,
+        forbidden_decide,
+    ))
+    assert result.candidates == []
+    assert result.unresolved_questions == [
+        "Exact PX4 source snapshot is unavailable for source-mechanism discovery."
+    ]
+    assert result.expansion_queries == ["trigger_alpha"]
