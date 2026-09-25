@@ -281,7 +281,7 @@ class BindingIndex:
         """Return the canonical logged signal for ``reference``.
 
         Returns the input unchanged when no unique resolution is available;
-        this matches the previous ``SignalCanonicalizer.canonicalize``
+        this matches the previous shared ``SignalCanonicalizer.canonicalize``
         contract used by ``runner_core``.
         """
         if not reference:
