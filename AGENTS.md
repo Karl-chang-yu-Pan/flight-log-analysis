@@ -169,3 +169,13 @@ Do not expose credentials in logs, commits, generated files, or command output.
 
 Runtime flight-log-agent behavior belongs in runtime prompts, application code, configuration, or other runtime-specific instructions rather than in `AGENTS.md`.
 
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (uses the `gh` CLI). See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
