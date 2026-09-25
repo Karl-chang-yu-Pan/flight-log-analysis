@@ -23,6 +23,7 @@ from flight_log_agent.px4.mechanism_source_profiler import (
     substitute_expression_symbols,
 )
 from flight_log_agent.px4.msg_schema import is_valid_topic_field, load_px4_msg_schema, normalize_px4_enum_value
+from flight_log_agent.px4 import discovery_frontier as df_mod
 from flight_log_agent.px4.source_mechanism_models import (
     ParameterRequirement,
     SourceBackedParameterPredicate,
@@ -117,6 +118,24 @@ class SourceMechanismResolver:
         decision_notes: list[str] = []
         candidate_drafts: list[SourceDiscoveryCandidateDraft] = []
         relevant_files: list[str] = []
+        # Bounded-frontier run bookkeeping (spec §8-§10, §16, §17).
+        # Canonical store + novelty baseline + fallback/mass
+        # accounting. Traversal state stays in the loop locals below.
+        frontier_state = df_mod.DiscoveryRoundState()
+        frontier_accounting: dict[str, Any] = {
+            "rounds": 0,
+            "bounded_rounds": 0,
+            "fallback_count": 0,
+            "fallback_bytes": 0,
+            "lookup_complete": 0,
+            "lookup_dropped_unknown": 0,
+            "lookup_unavailable": 0,
+            "lookup_exhausted": 0,
+            "iteration_dropped_files": 0,
+            "search_dropped_files": 0,
+            "total_avoided_bytes": 0,
+            "unavailable_rounds": 0,
+        }
 
         for depth in range(max(max_depth, 1)):
             if not active_queries or len(visited_files) >= max_total_files:
@@ -165,10 +184,13 @@ class SourceMechanismResolver:
                             log_context,
                         )
                     )
-                requested_files = [
-                    path for path in search_decision.relevant_files
-                    if path in candidate_files
-                ]
+                requested_files, search_dropped = df_mod.validate_decision_files(
+                    search_decision.relevant_files,
+                    eligible_files=candidate_files,
+                )
+                frontier_accounting["search_dropped_files"] = (
+                    frontier_accounting.get("search_dropped_files", 0) + search_dropped
+                )
                 if requested_files:
                     selected_files = requested_files[:max_profile_files_per_iteration]
                 if search_decision.expansion_queries:
@@ -235,10 +257,54 @@ class SourceMechanismResolver:
                 max_queries=max_expansion_queries,
             )
             if decide is not None:
-                decision = await decide(
-                    self._build_iteration_packet(
-                        user_question=user_question,
+                frontier_accounting["rounds"] = (
+                    frontier_accounting.get("rounds", 0) + 1
+                )
+                observed = df_mod.observe_discovery_round(
+                    frontier_state,
+                    round_no=depth,
+                    assignments=source_assignments,
+                    calls=function_calls,
+                    helpers=helper_expressions,
+                    branches=branch_conditions,
+                    predicates=parameter_predicates,
+                    topics=published_topics + subscribed_topics,
+                    fields=assigned_fields + read_fields,
+                    parameter_refs=parameter_refs,
+                    requirements=parameter_requirements,
+                    files=new_files,
+                )
+                full_packet = self._build_iteration_packet(
+                    user_question=user_question,
+                    depth=depth,
+                    active_queries=active_queries,
+                    visited_files=visited_files,
+                    new_files=new_files,
+                    hits=list(hits_by_file.values()),
+                    parameter_refs=parameter_refs,
+                    published_topics=published_topics,
+                    subscribed_topics=subscribed_topics,
+                    assigned_fields=assigned_fields,
+                    read_fields=read_fields,
+                    source_assignments=source_assignments,
+                    function_calls=function_calls,
+                    helper_expressions=helper_expressions,
+                    branch_conditions=branch_conditions,
+                    parameter_predicates=parameter_predicates,
+                    parameter_requirements=parameter_requirements,
+                    eliminated_parameter_paths=eliminated_parameter_paths,
+                    log_context=log_context,
+                    prior_decision_notes=decision_notes,
+                    cached_mechanism_seeds=compact_seed_candidates,
+                )
+                try:
+                    bounded_packet, round_acct = self._build_bounded_round_packet(
+                        full_packet,
+                        state=frontier_state,
+                        observed=observed,
                         depth=depth,
+                        max_depth=max_depth,
+                        max_total_files=max_total_files,
                         active_queries=active_queries,
                         visited_files=visited_files,
                         new_files=new_files,
@@ -254,33 +320,50 @@ class SourceMechanismResolver:
                         branch_conditions=branch_conditions,
                         parameter_predicates=parameter_predicates,
                         parameter_requirements=parameter_requirements,
-                        eliminated_parameter_paths=eliminated_parameter_paths,
                         log_context=log_context,
                         prior_decision_notes=decision_notes,
                         cached_mechanism_seeds=compact_seed_candidates,
                     )
-                )
-                relevant_files.extend([
-                    path for path in decision.relevant_files
-                    if path in visited_files
-                ])
-                candidate_drafts.extend(
-                    self._filter_candidate_drafts_by_parameter_gate(
-                        decision.candidate_drafts,
-                        parameter_requirements,
-                        log_context,
+                    packet_to_send = bounded_packet
+                    if round_acct.get("unavailable"):
+                        frontier_accounting["unavailable_rounds"] = (
+                            frontier_accounting.get("unavailable_rounds", 0) + 1
+                        )
+                    else:
+                        frontier_accounting["bounded_rounds"] = (
+                            frontier_accounting.get("bounded_rounds", 0) + 1
+                        )
+                    frontier_accounting["total_avoided_bytes"] = (
+                        frontier_accounting.get("total_avoided_bytes", 0)
+                        + round_acct["mass"]["retransmission_avoided_bytes"]
                     )
+                except df_mod.BoundedPacketError as exc:
+                    fell_back = self._apply_round_fallback(
+                        full_packet,
+                        state=frontier_state,
+                        accounting=frontier_accounting,
+                        reason=exc.reason,
+                    )
+                    packet_to_send = fell_back
+                decision = await decide(packet_to_send)
+                expansions, break_loop = await self._consume_decision_with_lookup(
+                    decision,
+                    packet_to_send=packet_to_send,
+                    state=frontier_state,
+                    accounting=frontier_accounting,
+                    decide=decide,
+                    visited_files=visited_files,
+                    parameter_requirements=parameter_requirements,
+                    log_context=log_context,
+                    decision_notes=decision_notes,
+                    candidate_drafts=candidate_drafts,
+                    relevant_files=relevant_files,
+                    expansions=expansions,
+                    max_expansion_queries=max_expansion_queries,
+                    all_queries=all_queries,
+                    depth=depth,
                 )
-                decision_notes.extend(decision.notes)
-                expansions = dedupe_keep_order([
-                    *decision.expansion_queries,
-                    *expansions,
-                ])[:max_expansion_queries]
-                if decision.stop:
-                    all_queries.extend([
-                        query for query in expansions
-                        if query not in all_queries
-                    ])
+                if break_loop:
                     break
 
             active_queries = [
@@ -294,6 +377,7 @@ class SourceMechanismResolver:
                 candidates=[],
                 expansion_queries=all_queries,
                 unresolved_questions=["No PX4 source files matched the discovery seed queries."],
+                frontier_accounting=dict(frontier_accounting),
             )
 
         parameter_requirements = self.parameter_gate.evaluate(
@@ -339,6 +423,13 @@ class SourceMechanismResolver:
                 ref.model_dump(exclude_none=True)
                 for ref in dedupe_source_assignment_refs(source_assignments)
             ],
+            frontier_accounting={
+                **frontier_accounting,
+                "p0_mass": df_mod.p0_mass_fragment(
+                    frontier_state.mass_log[-1]
+                    if frontier_state.mass_log else {}
+                ),
+            },
         )
 
     def _build_iteration_packet(
@@ -612,6 +703,648 @@ class SourceMechanismResolver:
             },
             prior_decision_notes=prior_decision_notes,
         )
+
+    def _consume_iteration_decision(
+        self,
+        decision: SourceDiscoveryDecision,
+        *,
+        visited_files: list[str],
+        parameter_requirements: list[ParameterRequirement],
+        log_context: SourceDiscoveryLogContext,
+        decision_notes: list[str],
+        candidate_drafts: list[SourceDiscoveryCandidateDraft],
+        relevant_files: list[str],
+        expansions: list[str],
+        max_expansion_queries: int,
+        all_queries: list[str],
+        accounting: Optional[dict[str, Any]] = None,
+    ) -> tuple[list[str], bool, list[str]]:
+        """Validate and consume one iteration-phase decision (spec §15).
+
+        Semantics identical to the previously inline block: relevant
+        files survive only when deterministically eligible (visited),
+        drafts pass the parameter gate, notes accumulate,
+        deterministic expansions merge with advisory queries under the
+        cap, and the stop hint breaks only with remaining-work
+        accounting. Returns (expansions, break_loop, all_queries_add).
+        """
+        kept_files, dropped_files = df_mod.validate_decision_files(
+            decision.relevant_files, eligible_files=visited_files,
+        )
+        if accounting is not None:
+            accounting["iteration_dropped_files"] = (
+                accounting.get("iteration_dropped_files", 0) + dropped_files
+            )
+        relevant_files.extend(kept_files)
+        candidate_drafts.extend(
+            self._filter_candidate_drafts_by_parameter_gate(
+                decision.candidate_drafts,
+                parameter_requirements,
+                log_context,
+            )
+        )
+        decision_notes.extend(decision.notes)
+        expansions = dedupe_keep_order([
+            *decision.expansion_queries,
+            *expansions,
+        ])[:max_expansion_queries]
+        if decision.stop:
+            return expansions, True, [
+                query for query in expansions if query not in all_queries
+            ]
+        return expansions, False, []
+
+    def _apply_round_fallback(
+        self,
+        full_packet: SourceDiscoveryIterationPacket,
+        *,
+        state: df_mod.DiscoveryRoundState,
+        accounting: dict[str, Any],
+        reason: str,
+    ) -> SourceDiscoveryIterationPacket:
+        """Fail closed to the current full packet for one round (spec §16).
+
+        Marks fallback use with the committed reason, measures mass
+        with fallback fields set, counts monotonically, and treats
+        the full send as delivering every observed identity. Never
+        counts as bounded-frontier success.
+        """
+        full_bytes = len(df_mod.serialize_packet(
+            full_packet.model_dump()).encode("utf-8"))
+        state.fallback_count += 1
+        state.fallback_bytes_total += full_bytes
+        full_packet.fallback = {"used": True, "reason": reason}
+        full_packet.packet_mass = df_mod.measure_packet_mass(
+            sections={
+                "source_profile": df_mod.serialize_packet(full_packet.source_profile),
+                "parameter_requirements": df_mod.serialize_packet([
+                    _safe_model_dump(requirement)
+                    for requirement in full_packet.parameter_requirements
+                ]),
+                "static_log_context": df_mod.serialize_packet(full_packet.static_log_context),
+            },
+            section_item_counts={
+                "parameter_requirements": len(full_packet.parameter_requirements),
+            },
+            new_item_count=0,
+            summary_bytes=0,
+            frontier_bytes=0,
+            full_equivalent_bytes=full_bytes,
+            fallback_used=True,
+            fallback_reason=reason,
+            fallback_count=state.fallback_count,
+            fallback_bytes=full_bytes,
+        )
+        state.prior_sent_identities |= set(state.all_observed_identities)
+        state.mass_log.append(dict(full_packet.packet_mass))
+        accounting["fallback_count"] = state.fallback_count
+        accounting["fallback_bytes"] = state.fallback_bytes_total
+        return full_packet
+
+    async def _consume_decision_with_lookup(
+        self,
+        decision: SourceDiscoveryDecision,
+        *,
+        packet_to_send: SourceDiscoveryIterationPacket,
+        state: df_mod.DiscoveryRoundState,
+        accounting: dict[str, Any],
+        decide: Any,
+        visited_files: list[str],
+        parameter_requirements: list[ParameterRequirement],
+        log_context: SourceDiscoveryLogContext,
+        decision_notes: list[str],
+        candidate_drafts: list[SourceDiscoveryCandidateDraft],
+        relevant_files: list[str],
+        expansions: list[str],
+        max_expansion_queries: int,
+        all_queries: list[str],
+        depth: int,
+    ) -> tuple[list[str], bool]:
+        """Consume one decision plus at most one bounded lookup round.
+
+        Processes advisory Mode-B lookup requests deterministically:
+        validated identities retrieve canonical content for exactly
+        one reconstructed follow-up decision call; unknown identities
+        count as unavailable without extra calls, and budget
+        exhaustion fails closed. Every consumed decision (first and
+        follow-up) passes through the same validated traversal
+        consumption, so model output can never directly mutate
+        visited/exhaustion state (spec §15, §27).
+        """
+        current = decision
+        current_packet = packet_to_send
+        extra_allowed = (
+            current_packet.bounded
+            and not current_packet.fallback.get("used", False)
+        )
+        # One shared lookup budget per discovery round (spec §27
+        # default: maximum 1 lookup round). The initial and follow-up
+        # decisions validate against the SAME usage object, so a
+        # second request deterministically exhausts, counts, and
+        # retrieves nothing. Never per-decision, never global.
+        usage = df_mod.LookupUsage()
+        while True:
+            for draft in current.candidate_drafts or ():
+                title = str(getattr(draft, "title", "") or "")
+                if title and all(
+                    seen != title for seen, _ in state.prior_draft_titles
+                ):
+                    state.prior_draft_titles.append((title, depth))
+            if not current.lookup_requests:
+                break
+            result = df_mod.process_lookup_requests(
+                current.lookup_requests,
+                store=state.store,
+                budget=df_mod.LookupBudget(),
+                usage=usage,
+            )
+            if result.status == df_mod.LOOKUP_COMPLETE:
+                accounting["lookup_complete"] = accounting.get("lookup_complete", 0) + 1
+            elif result.status == df_mod.LOOKUP_UNAVAILABLE:
+                accounting["lookup_unavailable"] = accounting.get("lookup_unavailable", 0) + 1
+            else:
+                accounting["lookup_exhausted"] = accounting.get("lookup_exhausted", 0) + 1
+            accounting["lookup_dropped_unknown"] = (
+                accounting.get("lookup_dropped_unknown", 0)
+                + result.dropped_unknown_count
+            )
+            if (
+                result.status != df_mod.LOOKUP_COMPLETE
+                or not result.retrieved
+                or not extra_allowed
+            ):
+                break
+            extra_allowed = False
+            follow = current_packet.model_copy(deep=True)
+            frontier = dict(follow.decision_frontier)
+            frontier["lookup_retrieved"] = {
+                repr(identity): content
+                for identity, content in result.retrieved.items()
+            }
+            follow.decision_frontier = frontier
+            mass = dict(follow.packet_mass)
+            mass.update(usage.mass_fragment(
+                prefetched_item_count=0, prefetched_bytes=0,
+            ))
+            follow.packet_mass = mass
+            current = await decide(follow)
+            current_packet = follow
+        expansions, break_loop, all_add = self._consume_iteration_decision(
+            current,
+            visited_files=visited_files,
+            parameter_requirements=parameter_requirements,
+            log_context=log_context,
+            decision_notes=decision_notes,
+            candidate_drafts=candidate_drafts,
+            relevant_files=relevant_files,
+            expansions=expansions,
+            max_expansion_queries=max_expansion_queries,
+            all_queries=all_queries,
+            accounting=accounting,
+        )
+        all_queries.extend(all_add)
+        return expansions, break_loop
+
+    def _build_bounded_round_packet(
+        self,
+        full_packet: SourceDiscoveryIterationPacket,
+        *,
+        state: df_mod.DiscoveryRoundState,
+        observed: dict[str, Any],
+        depth: int,
+        max_depth: int,
+        max_total_files: int,
+        active_queries: list[str],
+        visited_files: list[str],
+        new_files: list[str],
+        hits: list[SourceFileHit],
+        parameter_refs: list[ParameterRef],
+        published_topics: list[TopicRef],
+        subscribed_topics: list[TopicRef],
+        assigned_fields: list[FieldRef],
+        read_fields: list[FieldRef],
+        source_assignments: list[SourceAssignmentRef],
+        function_calls: list[FunctionCallRef],
+        helper_expressions: list[HelperExpressionRef],
+        branch_conditions: list[BranchConditionRef],
+        parameter_predicates: list[ParameterPredicateRef],
+        parameter_requirements: list[ParameterRequirement],
+        log_context: SourceDiscoveryLogContext,
+        prior_decision_notes: list[str],
+        cached_mechanism_seeds: list[dict[str, Any]],
+        max_frontier_bytes: Optional[int] = None,
+    ) -> tuple[SourceDiscoveryIterationPacket, dict[str, Any]]:
+        """Derive the bounded decision packet for one round (spec §14).
+
+        Narrows the accumulated corpus to new/changed/prefetched
+        material plus the carry-forward projection, reusing the
+        existing packet builder so round-1 bounded packets carry
+        identical content to full packets. Raises
+        BoundedPacketError (summary-failure | invariant-violation)
+        when narrowing cannot preserve the decision; the caller
+        fails closed to the full packet.
+        """
+        try:
+            return self._narrow_to_bounded(
+                full_packet,
+                state=state,
+                observed=observed,
+                depth=depth,
+                max_depth=max_depth,
+                max_total_files=max_total_files,
+                active_queries=active_queries,
+                visited_files=visited_files,
+                new_files=new_files,
+                hits=hits,
+                parameter_refs=parameter_refs,
+                published_topics=published_topics,
+                subscribed_topics=subscribed_topics,
+                assigned_fields=assigned_fields,
+                read_fields=read_fields,
+                source_assignments=source_assignments,
+                function_calls=function_calls,
+                helper_expressions=helper_expressions,
+                branch_conditions=branch_conditions,
+                parameter_predicates=parameter_predicates,
+                parameter_requirements=parameter_requirements,
+                log_context=log_context,
+                prior_decision_notes=prior_decision_notes,
+                cached_mechanism_seeds=cached_mechanism_seeds,
+                max_frontier_bytes=max_frontier_bytes,
+            )
+        except df_mod.BoundedPacketError:
+            raise
+        except Exception as exc:
+            raise df_mod.BoundedPacketError("summary-failure") from exc
+
+    def _narrow_to_bounded(
+        self,
+        full_packet: SourceDiscoveryIterationPacket,
+        *,
+        state: df_mod.DiscoveryRoundState,
+        observed: dict[str, Any],
+        depth: int,
+        max_depth: int,
+        max_total_files: int,
+        active_queries: list[str],
+        visited_files: list[str],
+        new_files: list[str],
+        hits: list[SourceFileHit],
+        parameter_refs: list[ParameterRef],
+        published_topics: list[TopicRef],
+        subscribed_topics: list[TopicRef],
+        assigned_fields: list[FieldRef],
+        read_fields: list[FieldRef],
+        source_assignments: list[SourceAssignmentRef],
+        function_calls: list[FunctionCallRef],
+        helper_expressions: list[HelperExpressionRef],
+        branch_conditions: list[BranchConditionRef],
+        parameter_predicates: list[ParameterPredicateRef],
+        parameter_requirements: list[ParameterRequirement],
+        log_context: SourceDiscoveryLogContext,
+        prior_decision_notes: list[str],
+        cached_mechanism_seeds: list[dict[str, Any]],
+        max_frontier_bytes: Optional[int] = None,
+    ) -> tuple[SourceDiscoveryIterationPacket, dict[str, Any]]:
+        store = state.store
+        by_category = observed["by_category"]
+        # Reactivation BEFORE frontier construction (spec §10A, §27).
+        # Discovery-round trigger modeling covers changed same-identity
+        # requirements and new contradictions touching retained
+        # predecessors by variant base key. Hypothesis/candidate/window
+        # relation triggers are not modeled at discovery granularity;
+        # evaluation runs regardless so future trigger wiring composes.
+        contradicted = list(observed["contradicted"])
+        base_keys = {
+            df_mod.requirement_base_key(identity) for identity in contradicted
+        }
+        support = set(contradicted)
+        for record in store.all_current():
+            if (
+                record.kind == "requirement"
+                and df_mod.requirement_base_key(record.identity) in base_keys
+            ):
+                support.add(record.identity)
+        fired = df_mod.evaluate_reactivation(
+            store,
+            round_no=depth,
+            new_contradictions=[support] if support else [],
+            changed_requirements=observed["changed_requirements"],
+        )
+        reactivated_ids = {record.identity for record in fired}
+        send = set(observed["new_all"]) | set(observed["changed_all"]) | reactivated_ids
+
+        def keep(category: str, refs: list, idfn: Any) -> list:
+            return [ref for ref in refs if idfn(ref) in send]
+
+        narrowed_assignments = keep("assignment", source_assignments, df_mod.identity_for_assignment)
+        narrowed_calls = keep("call", function_calls, df_mod.identity_for_call)
+        narrowed_helpers = keep("helper", helper_expressions, df_mod.identity_for_helper)
+        narrowed_branches = keep("branch", branch_conditions, df_mod.identity_for_branch)
+        narrowed_predicates = keep("predicate", parameter_predicates, df_mod.identity_for_predicate)
+        narrowed_published = keep("topic", published_topics, df_mod.identity_for_topic)
+        narrowed_subscribed = keep("topic", subscribed_topics, df_mod.identity_for_topic)
+        narrowed_assigned = keep("field", assigned_fields, df_mod.identity_for_field)
+        narrowed_read = keep("field", read_fields, df_mod.identity_for_field)
+        narrowed_param_refs = keep("paramref", parameter_refs, df_mod.identity_for_parameter_ref)
+        narrowed_requirements = keep("requirement", parameter_requirements, df_mod.identity_for_requirement)
+        narrowed_hits = [hit for hit in hits if hit.file in new_files]
+        narrowed_eliminated = eliminated_branch_selector_requirements(narrowed_requirements)
+
+        new_branch_ids = [identity for identity in by_category["branch"] if identity in send]
+        open_reqs = list(observed["open_requirements"])
+        # Fail closed on unexpected prefetch gaps: every closure
+        # member is store-observed by construction, so a missing
+        # record means the bounded representation cannot preserve
+        # the decision (spec §13).
+        found = df_mod.closed_prefetch(
+            store,
+            active_candidates=sorted(observed["new_all"], key=repr),
+            open_claims=open_reqs,
+            new_contradictions=contradicted,
+            new_branches=new_branch_ids,
+            reactivated=sorted(reactivated_ids, key=repr),
+            unresolved_requirements=open_reqs,
+        )
+
+        file_counts: dict[str, dict[str, int]] = {}
+        for path in visited_files:
+            file_counts[path] = {
+                "assignments": 0, "calls": 0, "helpers": 0, "branches": 0,
+            }
+        for ref in source_assignments:
+            if ref.file in file_counts:
+                file_counts[ref.file]["assignments"] += 1
+        for ref in function_calls:
+            if ref.file in file_counts:
+                file_counts[ref.file]["calls"] += 1
+        for ref in helper_expressions:
+            if ref.file in file_counts:
+                file_counts[ref.file]["helpers"] += 1
+        for ref in branch_conditions:
+            if ref.file in file_counts:
+                file_counts[ref.file]["branches"] += 1
+        coverage_map = {
+            "files_seen": len(visited_files),
+            "files": file_counts,
+            "rounds": depth,
+        }
+        standings = [
+            {
+                "candidate": title,
+                "rounds_in_contention": max(0, depth - first_round),
+            }
+            for title, first_round in state.prior_draft_titles
+        ]
+        summary = df_mod.build_summary(
+            store,
+            coverage_map=coverage_map,
+            gate_tally=observed["gate_tally"],
+            candidate_standings=standings,
+            round_no=depth,
+        )
+
+        def compact_map(category: str) -> dict[str, Any]:
+            # New/changed items render from current refs; reactivated
+            # items that were not re-extracted render from the
+            # canonical record with full prior verdict history (§10A).
+            # Category gating via the record kind keeps reactivated
+            # identities in their own section only.
+            wanted = {
+                identity for identity in send
+                if identity in by_category.get(category, {})
+            }
+            for identity in reactivated_ids:
+                record = store.get(identity)
+                if record is not None and record.kind == category:
+                    wanted.add(identity)
+            return {
+                identity: _frontier_item_payload(
+                    store, by_category[category].get(identity), identity,
+                )
+                for identity in sorted(wanted, key=repr)
+            }
+
+        unresolved_entries: dict[Any, Any] = {}
+        for identity in sorted(open_reqs, key=repr):
+            record = found.get(identity)
+            if record is None:
+                continue
+            unresolved_entries[identity] = {
+                "lifecycle": record.lifecycle,
+                "rounds_waiting": max(0, depth - record.first_seen_round),
+                "value_revision": record.value_revision,
+                "changed_this_round": record.last_changed_round == depth,
+                "full_content": dict(record.content),
+            }
+        contradiction_entries: dict[Any, Any] = {}
+        for identity in sorted(set(contradicted), key=repr):
+            record = store.get(identity)
+            if record is None:
+                continue
+            if identity in state.prior_sent_identities and record.last_changed_round != depth:
+                continue
+            contradiction_entries[identity] = {
+                "refutations": [list(verdict) for verdict in record.prior_verdicts],
+                "window_identity": record.window_identity,
+            }
+        grouped = df_mod.group_requirements(parameter_requirements)
+        frontier = df_mod.DiscoveryFrontier(
+            new_candidates={
+                df_mod.identity_for_file(path): {
+                    "hits": sum(1 for hit in narrowed_hits if hit.file == path),
+                }
+                for path in new_files
+            },
+            changed_assignments=compact_map("assignment"),
+            changed_calls=compact_map("call"),
+            changed_branches=compact_map("branch"),
+            new_helper_relationships=compact_map("helper"),
+            new_requirements={
+                identity: _requirement_variant_descriptor(
+                    store, by_category["requirement"].get(identity), identity,
+                )
+                for identity in sorted(by_category["requirement"].keys(), key=repr)
+                if identity in send
+            } | {
+                identity: _frontier_item_payload(store, None, identity)
+                for identity in sorted(reactivated_ids, key=repr)
+                if (store.get(identity) is not None
+                    and store.get(identity).kind == "requirement"
+                    and identity not in by_category["requirement"])
+            },
+            new_verification_candidates={},
+            unresolved_questions=unresolved_entries,
+            contradictions=contradiction_entries,
+            work_state={
+                "queries_remaining": len(active_queries),
+                "files_remaining_under_cap": max(0, max_total_files - len(visited_files)),
+                "depth_remaining": max(0, max_depth - depth),
+            },
+        )
+        frontier_dict = frontier.to_packet_dict()
+        frontier_dict["requirement_groups"] = {
+            name: [repr(df_mod.identity_for_requirement(variant)) for variant in variants]
+            for name, variants in grouped["groups"].items()
+        }
+        summary_dict = summary.to_packet_dict()
+
+        narrowed_packet = self._build_iteration_packet(
+            user_question=full_packet.user_question,
+            depth=depth,
+            active_queries=active_queries,
+            visited_files=visited_files,
+            new_files=new_files,
+            hits=narrowed_hits,
+            parameter_refs=narrowed_param_refs,
+            published_topics=narrowed_published,
+            subscribed_topics=narrowed_subscribed,
+            assigned_fields=narrowed_assigned,
+            read_fields=narrowed_read,
+            source_assignments=narrowed_assignments,
+            function_calls=narrowed_calls,
+            helper_expressions=narrowed_helpers,
+            branch_conditions=narrowed_branches,
+            parameter_predicates=narrowed_predicates,
+            parameter_requirements=narrowed_requirements,
+            eliminated_parameter_paths=narrowed_eliminated,
+            log_context=log_context,
+            prior_decision_notes=prior_decision_notes,
+            cached_mechanism_seeds=cached_mechanism_seeds,
+        )
+        verification = narrowed_packet.source_profile.get(
+            "expression_verification_candidates", [],
+        ) or []
+        verification_ids: dict[Any, Any] = {}
+        for candidate in verification:
+            identity = df_mod.identity_for_verification(
+                candidate.get("name"), candidate.get("source_file"),
+                candidate.get("source_line"),
+            )
+            verification_ids[identity] = candidate
+            if identity not in state.prior_sent_identities:
+                state.store.observe(
+                    identity, kind="verification",
+                    content={"semantic_effect": candidate.get("name")},
+                    round_no=depth,
+                )
+                state.all_observed_identities.add(identity)
+        prior_sent_reprs = {
+            repr(identity) for identity in state.prior_sent_identities
+        }
+        frontier_dict["new_verification_candidates"] = {
+            identity: candidate
+            for identity, candidate in verification_ids.items()
+            if repr(identity) not in prior_sent_reprs
+        }
+
+        frontier_ids: set = set()
+        for section in (
+            "new_candidates", "changed_assignments", "changed_calls",
+            "changed_branches", "new_helper_relationships",
+            "new_requirements", "unresolved_questions", "contradictions",
+        ):
+            frontier_ids.update(frontier_dict.get(section, {}).keys())
+        frontier_ids.update(repr(identity) for identity in verification_ids.keys())
+        summary_ids: set = set()
+        for entry in summary.resolved_claims + summary.open_claims + summary.contradiction_ledger:
+            identity = entry.get("identity")
+            # Summary entries serialize identities as lists; normalize
+            # back to tuples so reprs match the frontier side exactly.
+            if isinstance(identity, list):
+                identity = tuple(identity)
+            summary_ids.add(identity if isinstance(identity, str) else repr(identity))
+        summary_ids.update(repr(df_mod.identity_for_file(path)) for path in coverage_map["files"])
+        verdict_ids = {
+            repr(record.identity)
+            for record in store.all_current()
+            if record.lifecycle in {df_mod.RESOLVED, df_mod.CONTRADICTED}
+        }
+        full_check = {
+            identity
+            for identity in state.all_observed_identities
+            if (store.get(identity) is None
+                or store.get(identity).lifecycle != df_mod.IRRELEVANT)
+        }
+        ok, report = df_mod.check_round_trip(
+            full_identities={repr(identity) for identity in full_check},
+            frontier_identities=set(frontier_ids),
+            summary_identities=set(summary_ids),
+            verdict_identities=set(verdict_ids),
+        )
+        if not ok:
+            raise df_mod.BoundedPacketError("invariant-violation")
+
+        narrowed_packet.bounded = True
+        narrowed_packet.decision_frontier = frontier_dict
+        narrowed_packet.carry_forward_summary = summary_dict
+        narrowed_packet.fallback = {"used": False, "reason": ""}
+        sections = {
+            "decision_frontier": df_mod.serialize_packet(frontier_dict),
+            "carry_forward_summary": df_mod.serialize_packet(summary_dict),
+            "source_profile": df_mod.serialize_packet(narrowed_packet.source_profile),
+            "parameter_requirements": df_mod.serialize_packet([
+                _safe_model_dump(requirement) for requirement in narrowed_requirements
+            ]),
+            "static_log_context": df_mod.serialize_packet(narrowed_packet.static_log_context),
+        }
+        full_sections = {
+            "source_profile": df_mod.serialize_packet(full_packet.source_profile),
+            "parameter_requirements": df_mod.serialize_packet([
+                _safe_model_dump(requirement) for requirement in full_packet.parameter_requirements
+            ]),
+            "static_log_context": df_mod.serialize_packet(full_packet.static_log_context),
+        }
+        full_bytes = sum(len(text.encode("utf-8")) for text in full_sections.values())
+        frontier_bytes = len(sections["decision_frontier"].encode("utf-8"))
+        summary_bytes = len(sections["carry_forward_summary"].encode("utf-8"))
+        mass = df_mod.measure_packet_mass(
+            sections=sections,
+            section_item_counts={
+                "decision_frontier": len(frontier_ids),
+                "carry_forward_summary": len(summary_ids),
+                "parameter_requirements": len(narrowed_requirements),
+            },
+            new_item_count=len(observed["new_all"]),
+            summary_bytes=summary_bytes,
+            frontier_bytes=frontier_bytes,
+            full_equivalent_bytes=full_bytes,
+        )
+        narrowed_packet.packet_mass = mass
+        if max_frontier_bytes is not None:
+            over = df_mod.check_frontier_budget(
+                sections["decision_frontier"], max_bytes=max_frontier_bytes,
+            )
+            if over is not None:
+                unavailable = full_packet.model_copy(deep=True)
+                unavailable.bounded = True
+                unavailable.source_profile = {
+                    "stage": "bounded-unavailable",
+                    "unavailable": df_mod.FRONTIER_TOO_LARGE,
+                }
+                unavailable.decision_frontier = {
+                    "unavailable": df_mod.FRONTIER_TOO_LARGE,
+                    "work_state": frontier_dict["work_state"],
+                }
+                unavailable.carry_forward_summary = summary_dict
+                unavailable.packet_mass = mass
+                unavailable.fallback = {"used": False, "reason": ""}
+                return unavailable, {
+                    "bounded_ok": False, "unavailable": True,
+                    "frontier_ids": set(), "summary_ids": set(summary_ids),
+                    "mass": mass, "new_count": 0,
+                }
+        sent_ids = {
+            identity for identity in state.all_observed_identities
+            if repr(identity) in frontier_ids or repr(identity) in summary_ids
+        }
+        state.prior_sent_identities |= sent_ids
+        state.mass_log.append(mass)
+        return narrowed_packet, {
+            "bounded_ok": True, "unavailable": False,
+            "frontier_ids": set(frontier_ids), "summary_ids": set(summary_ids),
+            "mass": mass, "new_count": len(observed["new_all"]),
+        }
 
     def _source_snippets_for_files(
         self,
@@ -2466,6 +3199,40 @@ def compact_mode_state_constraints(value: Any) -> dict[str, Any]:
         "observed_values": value.get("observed_values", {}),
         "omitted_event_count": value.get("omitted_event_count", 0),
     }
+
+
+def _frontier_item_payload(store: Any, ref: Any, identity: Any) -> dict[str, Any]:
+    """Render one frontier item from its current ref, or from the
+    canonical record when the item reactivated without
+    re-extraction. Reactivated payloads carry the full prior verdict
+    history, never a blank item (spec §10A)."""
+    if ref is not None:
+        return compact_ref(ref)
+    record = store.get(identity) if store is not None else None
+    if record is None:
+        return {"identity": repr(identity), "reactivated": True}
+    return {
+        "identity": repr(identity),
+        "reactivated": True,
+        "lifecycle": record.lifecycle,
+        "value_revision": record.value_revision,
+        "prior_verdicts": [list(verdict) for verdict in record.prior_verdicts],
+    }
+
+
+def _requirement_variant_descriptor(store: Any, req: Any, identity: Any) -> dict[str, Any]:
+    """Lightweight decision-relevant descriptor for one requirement
+    variant in the frontier (spec §8, §12)."""
+    if req is not None:
+        record = store.get(identity) if store is not None else None
+        return {
+            "name": getattr(req, "name", None),
+            "gate_result": getattr(req, "gate_result", None),
+            "role": getattr(req, "role", None),
+            "site": f"{getattr(req, 'source_file', '')}:{getattr(req, 'source_line', '')}",
+            "value_revision": record.value_revision if record is not None else 0,
+        }
+    return _frontier_item_payload(store, None, identity)
 
 
 def truncate_text(text: str, max_chars: int) -> str:

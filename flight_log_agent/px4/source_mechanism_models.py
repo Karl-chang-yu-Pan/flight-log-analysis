@@ -132,6 +132,10 @@ class SourceMechanismCandidateSet(BaseModel):
     # unbound dotted symbols in derived_expression checks; also kept as
     # opaque dicts to avoid coupling with SourceAssignmentRef.
     source_assignments: list[dict[str, Any]] = Field(default_factory=list)
+    # Bounded-frontier run accounting (fallback counts/bytes, mass
+    # totals). Empty unless the discovery loop ran with bounded-input
+    # narrowing; never affects candidate semantics.
+    frontier_accounting: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourceDiscoveryCandidateDraft(BaseModel):
@@ -163,6 +167,17 @@ class SourceDiscoveryIterationPacket(BaseModel):
     parameter_requirements: list[ParameterRequirement] = Field(default_factory=list)
     static_log_context: dict[str, Any] = Field(default_factory=dict)
     prior_decision_notes: list[str] = Field(default_factory=list)
+    # Bounded-input narrowing sections. Empty/off unless the resolver
+    # built this packet through the bounded-frontier path: `bounded`
+    # marks narrowed source_profile content, `decision_frontier` and
+    # `carry_forward_summary` carry the §8/§9 structures,
+    # `packet_mass` carries §17 measurements, and `fallback` records
+    # §16 fallback use for the round. Full packets validate unchanged.
+    bounded: bool = False
+    decision_frontier: dict[str, Any] = Field(default_factory=dict)
+    carry_forward_summary: dict[str, Any] = Field(default_factory=dict)
+    packet_mass: dict[str, Any] = Field(default_factory=dict)
+    fallback: dict[str, Any] = Field(default_factory=dict)
 
 
 class SourceDiscoveryDecision(BaseModel):
@@ -171,3 +186,8 @@ class SourceDiscoveryDecision(BaseModel):
     stop: bool = False
     candidate_drafts: list[SourceDiscoveryCandidateDraft] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    # Mode-B bounded lookup requests: canonical evidence identity
+    # strings the model asks to retrieve. Advisory only; deterministic
+    # code validates every identity and drops unknown ones with a
+    # count. Empty preserves existing behavior exactly.
+    lookup_requests: list[str] = Field(default_factory=list)
