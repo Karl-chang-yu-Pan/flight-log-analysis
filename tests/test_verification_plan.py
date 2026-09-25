@@ -12,7 +12,7 @@ from flight_log_agent.models import (
     PlotRef,
     RelationshipCheckSpec,
 )
-from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+from flight_log_agent.models import SourceOutputBindingRecord
 import flight_log_agent.analysis.log_evidence as log_evidence
 import flight_log_agent.ulog.signature_evaluator as signature_evaluator
 
@@ -318,7 +318,7 @@ def test_signal_resolver_prefers_primary_output_slice_to_break_suffix_collision(
     as tecs_status.equivalent_airspeed_sp and a binding chain shows that
     terminal is reached from current.cruising_speed (not previous), the
     SignalResolver should resolve uniquely to the current side."""
-    from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+    from flight_log_agent.models import SourceOutputBindingRecord
 
     bindings = [
         SourceOutputBindingRecord(

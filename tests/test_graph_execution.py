@@ -5,7 +5,7 @@ from flight_log_agent.analysis.log_evidence import ULogEvidenceIndex
 from flight_log_agent.analysis.signature_verification import merge_graph_results
 from flight_log_agent.analysis.verification_graph import compile_verification_graphs
 from flight_log_agent.models import MechanismBranchGroup, MechanismCandidate, RelationshipCheckSpec, SignatureEvaluation
-from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+from flight_log_agent.models import SourceOutputBindingRecord
 
 
 def build_graph():

@@ -1201,7 +1201,7 @@ def test_deterministic_checks_belong_to_branch_groups_when_groups_exist(tmp_path
 
 def test_primary_output_signals_require_cited_exact_binding_path():
     from flight_log_agent.models import CodeRef
-    from flight_log_agent.px4.source_mechanism_models import SourceOutputBindingRecord
+    from flight_log_agent.models import SourceOutputBindingRecord
     from flight_log_agent.px4.source_mechanism_resolver import source_backed_primary_output_signals
 
     bindings = [

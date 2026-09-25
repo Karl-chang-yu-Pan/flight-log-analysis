@@ -73,6 +73,7 @@ from flight_log_agent.models import (
     RelationshipCheckSpec,
     SignatureEvaluation,
     SourceEvidenceBundle,
+    SourceOutputBindingRecord,
     SourceSearchContext,
     ValidationResult,
     VerifiedMechanismResult,
@@ -97,9 +98,6 @@ from flight_log_agent.ulog.timeline import (
     build_basic_timeline as build_basic_timeline_impl,
     build_signal_timeline,
     merge_timeline_events,
-)
-from flight_log_agent.px4.source_mechanism_models import (
-    SourceOutputBindingRecord,
 )
 from flight_log_agent.px4.msg_schema import (
     load_px4_msg_schema,

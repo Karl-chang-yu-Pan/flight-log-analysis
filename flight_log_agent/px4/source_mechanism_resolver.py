@@ -6,7 +6,12 @@ import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from flight_log_agent.models import AirframeContext, CodeRef, RelationshipCheckSpec
+from flight_log_agent.models import (
+    AirframeContext,
+    CodeRef,
+    RelationshipCheckSpec,
+    SourceOutputBindingRecord,
+)
 from flight_log_agent.utils import compare
 from flight_log_agent.px4.mechanism_source_profiler import (
     BranchConditionRef,
@@ -36,7 +41,6 @@ from flight_log_agent.px4.source_mechanism_models import (
     SourceMechanismBranchGroup,
     SourceMechanismCandidate,
     SourceMechanismCandidateSet,
-    SourceOutputBindingRecord,
     SourceSnippet,
     TopicFieldRef,
 )
