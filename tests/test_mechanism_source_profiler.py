@@ -932,6 +932,91 @@ void Example::run()
     assert scale.declaration_kind == "constexpr"
 
 
+def test_operator_continued_assignment_joins_across_lines(
+    tmp_path, source_backend
+):
+    """An assignment whose RHS continues on the next line after a binary
+    operator (balanced parens on the first line) must still extract with
+    the full expression."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "blended.cpp").write_text(
+        """
+void Example::update()
+{
+    float blended = shape(first) *
+        limit(second, third);
+    output = blended;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = _SourceExtractorContract(source_path, source_backend)
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/blended.cpp"]
+    )
+    by_target = {assignment.target: assignment for assignment in assignments}
+    assert "shape(first)" in by_target["blended"].expression
+    assert "limit(second, third)" in by_target["blended"].expression
+
+
+def test_split_signature_does_not_merge_body_assignment(
+    tmp_path, source_backend
+):
+    """A signature split across lines must not merge with the body: the
+    join stops at the opening brace instead of producing a spurious
+    assignment that swallows the body's first statement."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "split.cpp").write_text(
+        """
+Foo &Foo::operator=(
+    const Foo &other)
+{
+    _x = other._x;
+    return *this;
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = _SourceExtractorContract(source_path, source_backend)
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/split.cpp"]
+    )
+    by_target = {assignment.target: assignment for assignment in assignments}
+    assert "operator" not in by_target
+    assert by_target["_x"].expression == "other._x"
+    assert by_target["_x"].line == 5
+
+
+def test_brace_argument_inside_open_call_still_joins(
+    tmp_path, source_backend
+):
+    """Braces nested inside an still-open call are argument braces, not
+    a body boundary: the join must proceed through them."""
+    source_path = tmp_path / "PX4-Autopilot"
+    module_dir = source_path / "src" / "modules" / "example"
+    module_dir.mkdir(parents=True)
+    (module_dir / "bracearg.cpp").write_text(
+        """
+void Example::update()
+{
+    output = combine(
+        Wrapper{inner});
+}
+""",
+        encoding="utf-8",
+    )
+    profiler = _SourceExtractorContract(source_path, source_backend)
+    assignments = profiler.extract_source_assignments_from_source(
+        ["src/modules/example/bracearg.cpp"]
+    )
+    by_target = {assignment.target: assignment for assignment in assignments}
+    assert "combine(Wrapper{inner})" in by_target["output"].expression
+
+
 def test_multi_line_if_condition_attaches_predicate_to_body_assignment(
     tmp_path, source_backend
 ):

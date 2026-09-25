@@ -1410,18 +1410,60 @@ class MechanismSourceProfiler:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("//"):
                     continue
+                code_head = stripped.split("//", 1)[0].rstrip()
                 if (
                     "=" in stripped
-                    and not stripped.endswith((";", "{", "}"))
-                    and stripped.count("(") > stripped.count(")")
+                    and not code_head.endswith((";", "{", "}"))
+                    and (
+                        stripped.count("(") > stripped.count(")")
+                        or code_head.endswith(
+                            (
+                                "+",
+                                "-",
+                                "*",
+                                "/",
+                                "%",
+                                "=",
+                                "&",
+                                "|",
+                                "^",
+                                "?",
+                                ":",
+                                ",",
+                                ".",
+                                "(",
+                                "[",
+                                "<",
+                                ">",
+                                "!",
+                                "->",
+                            )
+                        )
+                    )
                 ):
-                    # RHS continues on later lines (a multi-line call
-                    # initializer) — join until parens balance so the
+                    # RHS continues on later lines — either inside an
+                    # open call (paren imbalance) or after a trailing
+                    # binary operator/comma/accessor with balanced
+                    # parens. Join until the statement terminates so the
                     # assignment pattern can match the full statement.
+                    first_line = line
                     for _, continuation in code_lines[index + 1 : index + 26]:
                         continuation_code = continuation.split("//", 1)[0].strip()
+                        if ("{" in continuation_code or "}" in continuation_code) and line.count(
+                            "("
+                        ) <= line.count(")"):
+                            # A brace at balanced parens is a signature/body
+                            # boundary, not a continued expression (braces
+                            # nested inside an open call stay imbalanced and
+                            # keep joining). Restore the first line so no
+                            # spurious assignment swallows later statements.
+                            line = first_line
+                            break
                         line = line + " " + continuation_code
-                        if line.count("(") <= line.count(")"):
+                        if (
+                            line.count("(") <= line.count(")")
+                            and ";" in line
+                        ):
                             break
                     stripped = line.strip()
                 function_name = self._function_name_for_line(definitions, line_no)
