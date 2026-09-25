@@ -194,3 +194,77 @@ def test_legacy_subsystem_modules_absent():
         "flight_log_agent.px4.source_mechanism_models",
     ):
         assert importlib.util.find_spec(module) is None, module
+
+
+# ----------------------------------------------------------------------
+# S5 — legacy orphan scan (structural budget guard)
+# ----------------------------------------------------------------------
+
+import ast as _ast_scan
+from pathlib import Path as _Path_scan
+
+_LEGACY_PROVIDER_SYMBOLS = frozenset({
+    "source_discovery_agent",
+    "decide_source_discovery",
+    "discover_source_mechanisms",
+    "SourceMechanismResolver",
+    "SourceDiscoveryDecision",
+    "SourceDiscoveryIterationPacket",
+    "SourceDiscoveryCandidateDraft",
+    "SourceMechanismCandidate",
+    "SourceMechanismCandidateSet",
+})
+
+_LEGACY_MODULE_FRAGMENTS = (
+    "source_mechanism_resolver",
+    "discovery_frontier",
+    "source_mechanism_models",
+)
+
+
+def _legacy_live_references(source: str) -> set[str]:
+    """Name/attribute/import references in live code (comments and
+    docstrings never produce Name nodes, so historical mentions
+    do not count)."""
+    tree = _ast_scan.parse(source)
+    found = set()
+    for node in _ast_scan.walk(tree):
+        if isinstance(node, _ast_scan.Name) and node.id in _LEGACY_PROVIDER_SYMBOLS:
+            found.add(node.id)
+        elif (isinstance(node, _ast_scan.Attribute)
+                and node.attr in _LEGACY_PROVIDER_SYMBOLS):
+            found.add(node.attr)
+        elif isinstance(node, _ast_scan.ImportFrom) and node.module:
+            for fragment in _LEGACY_MODULE_FRAGMENTS:
+                if fragment in node.module:
+                    found.add(node.module)
+        elif isinstance(node, _ast_scan.Import):
+            for alias in node.names:
+                for fragment in _LEGACY_MODULE_FRAGMENTS:
+                    if fragment in alias.name:
+                        found.add(alias.name)
+    return found
+
+
+def test_legacy_reference_detector_catches_live_use():
+    assert _legacy_live_references(
+        "x = source_discovery_agent\n") == {"source_discovery_agent"}
+    assert _legacy_live_references(
+        "# source_discovery_agent mentioned historically\n"
+        '"""SourceDiscoveryDecision loop replaced."""\n'
+        "x = 1\n") == set()
+
+
+def test_no_live_legacy_provider_references_in_production():
+    """Orphan sweep: no live production code references the erased
+    legacy provider path. Historical docstring/docs mentions are
+    not live references and do not count."""
+    root = (_Path_scan(__file__).resolve().parent.parent
+            / "flight_log_agent")
+    violations = {}
+    for path in sorted(root.rglob("*.py")):
+        found = _legacy_live_references(
+            path.read_text(encoding="utf-8"))
+        if found:
+            violations[str(path.relative_to(root.parent))] = sorted(found)
+    assert violations == {}, f"live legacy references remain: {violations}"
