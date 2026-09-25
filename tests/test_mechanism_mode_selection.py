@@ -175,3 +175,22 @@ def test_legacy_branch_references_no_decide_call():
     for node in _ast.walk(_runner_tree()):
         if isinstance(node, _ast.Name) and node.id == "decide_source_discovery":
             raise AssertionError("legacy decide callback reference remains")
+
+
+# ----------------------------------------------------------------------
+# S4 — legacy subsystem physically absent
+# ----------------------------------------------------------------------
+
+
+def test_legacy_subsystem_modules_absent():
+    """Stage-2 S4: the legacy mechanism-discovery implementation
+    does not exist in production — no resolver, no frontier
+    machinery, no legacy schema module."""
+    import importlib.util
+
+    for module in (
+        "flight_log_agent.px4.source_mechanism_resolver",
+        "flight_log_agent.px4.discovery_frontier",
+        "flight_log_agent.px4.source_mechanism_models",
+    ):
+        assert importlib.util.find_spec(module) is None, module

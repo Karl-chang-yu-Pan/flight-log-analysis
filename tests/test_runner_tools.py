@@ -22,7 +22,6 @@ import flight_log_agent.mission.parser as mission_parser
 import flight_log_agent.ulog.plots as ulog_plots
 from flight_log_agent.px4 import msg_schema as px4_msg_schema
 from flight_log_agent.analysis import control_predicate
-from flight_log_agent.px4 import source_mechanism_resolver
 from flight_log_agent.px4.source_snapshot import DirectorySource, SourceRepository
 from flight_log_agent.source_path import SOURCE_UNAVAILABLE
 
@@ -812,7 +811,6 @@ uint8 TEST_CONSTANT = 7
     assert ulog_control_surface.control_surface_type_labels(None)[5] == "left_elevon"
     assert ulog_control_surface.output_function_definitions(None)["ranges"][0]["function"] == "motor"
     assert control_predicate.global_constant_value("TEST_CONSTANT", None) == 7
-    assert source_mechanism_resolver.numeric_source_constants(None)["TEST_SOURCE_CONSTANT"] == 12.5
 
 
 def test_parse_mission_file_extracts_qgroundcontrol_plan_items(tmp_path):

@@ -20,10 +20,6 @@ from flight_log_agent.px4.source_facts_cache import (
     SourceFileFacts,
     extract_facts_for_file,
 )
-from flight_log_agent.px4.source_mechanism_resolver import (
-    ParameterFeasibilityGate,
-    build_source_discovery_log_context,
-)
 
 
 @pytest.fixture(params=("legacy", "tree_sitter"), ids=("legacy", "tree-sitter"))
@@ -1925,53 +1921,6 @@ void noop(int x)
     reason = helpers[0].unresolved_reason or ""
     assert "no return value" in reason
     assert "no pointer-output writes" in reason
-
-
-def test_parameter_feasibility_gate_uses_only_discovered_parameters():
-    context = build_source_discovery_log_context(
-        {
-            "parameters": {
-                "VT_TYPE": 2,
-                "NAV_ACC_RAD": 10,
-                "UNRELATED": 1,
-            },
-            "topic_fields": {"vehicle_status": ["timestamp", "nav_state"]},
-            "available_topics": ["vehicle_status"],
-        }
-    )
-    gate = ParameterFeasibilityGate()
-    requirements = gate.evaluate(
-        [
-            ParameterPredicateRef(
-                name="VT_TYPE",
-                member="_param_vt_type",
-                predicate="_param_vt_type.get() == 2",
-                operator="==",
-                compared_value="2",
-                file="src/modules/navigator/rtl.cpp",
-                line=12,
-                evidence="if (_param_vt_type.get() == 2) {",
-            ),
-            ParameterPredicateRef(
-                name="NAV_ACC_RAD",
-                member="_param_nav_acc_rad",
-                predicate="_param_nav_acc_rad.get() < distance_to_wp",
-                operator="<",
-                compared_value="distance_to_wp",
-                file="src/modules/navigator/mission.cpp",
-                line=30,
-                evidence="if (_param_nav_acc_rad.get() < distance_to_wp) {",
-            ),
-        ],
-        context,
-    )
-
-    assert requirements[0].name == "VT_TYPE"
-    assert requirements[0].actual_value == 2
-    assert requirements[0].gate_result == "satisfied"
-    assert requirements[1].name == "NAV_ACC_RAD"
-    assert requirements[1].role == "threshold"
-    assert requirements[1].gate_result == "verification_required"
 
 
 def test_enum_entries_extracted_as_source_assignments(tmp_path, source_backend):
