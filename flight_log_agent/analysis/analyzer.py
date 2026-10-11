@@ -50,12 +50,14 @@ from agents import (
 from agents.tool_context import ToolContext
 from openai.types.shared.reasoning import Reasoning
 
+from flight_log_agent.analysis.jev_consult import build_jev_consult_tool
 from flight_log_agent.analysis.model_provider import (
     UNAVAILABLE,
     resolve_model_runtime,
     router_plugins_body,
     served_model_from_result,
 )
+
 from flight_log_agent.analysis.report_validation import (
     enforce_validation_downgrades,
     validate_report,
@@ -183,6 +185,18 @@ workspace rules apply as with direct shell access: one command per call, no
 pipes, redirection, or chaining, and read-only workspace inspection for rg,
 sed, and find. Save useful plots under /plots/ and reuse results already
 obtained.
+"""
+
+
+JEV_CONSULT_INSTRUCTIONS = """
+When choosing among next investigation steps, you may call the
+consult_investigation_direction function tool with your current
+hypotheses (your claims), model-reported evidence (facts as you observed
+them, with tool or artifact references; they are your claims until
+checks verify them), uncertainties, and 2-5 candidate next checks. The
+returned direction is advisory only: consider it, but only evidence and
+validation decide the report. It never raises confidence and never
+replaces a numeric check or source read.
 """
 
 
@@ -1271,6 +1285,8 @@ async def analyze_flight_log(
     openrouter_api_key: str | None = None,
     router_cost_tier: str | None = None,
     shell_output_limit: int | None = None,
+    jev_consult: bool | None = None,
+    jev_api_key: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_total_requests: int | None = None,
     project_instructions: str = "",
@@ -1306,6 +1322,11 @@ async def analyze_flight_log(
         )
     if shell_output_limit < 1000:
         raise ValueError("shell_output_limit must be at least 1000 characters")
+    if jev_consult is None:
+        jev_consult = (
+            os.environ.get("FLIGHT_LOG_JEV_CONSULT", "").strip().lower()
+            in ("1", "true", "yes")
+        )
 
     model_name = model or os.environ.get("OPENAI_MODEL", "gpt-5.6")
     work_dir = prepare_workspace(
@@ -1374,7 +1395,9 @@ async def analyze_flight_log(
             "enable_web_fallback": enable_web_fallback,
             "web_search_context": web_search_context,
             "max_turns": turn_limit,
-            "shell_output_limit": shell_output_limit,            "max_total_requests": max_total_requests,
+            "shell_output_limit": shell_output_limit,
+            "requested_jev_consult": bool(jev_consult),
+            "max_total_requests": max_total_requests,
         }
     )
     audit_logger.log_event("run.started")
@@ -1488,6 +1511,16 @@ async def analyze_flight_log(
                 WebSearchTool(
                     search_context_size=web_search_context,
                     external_web_access=True,
+                )
+            )
+        if jev_consult:
+            instructions += JEV_CONSULT_INSTRUCTIONS
+            tools.append(
+                build_jev_consult_tool(
+                    api_key=jev_api_key or os.environ.get("OPENROUTER_API_KEY"),
+                    audit_sink=lambda fields: audit_logger.log_event(
+                        "decision.consult", **fields
+                    ),
                 )
             )
 
@@ -1781,6 +1814,7 @@ async def run_analysis(args: argparse.Namespace) -> None:
         reasoning_effort=args.reasoning_effort,
         router_cost_tier=args.router_cost_tier,
         shell_output_limit=args.shell_output_limit,
+        jev_consult=args.jev_consult,
         max_turns=args.max_turns,
         max_total_requests=args.max_total_requests,
         project_instructions=project_instructions,
@@ -1875,6 +1909,15 @@ def parse_args() -> argparse.Namespace:
             "Per-command tool-output cap in characters sent to the model; "
             "full output is saved under work/shell_outputs/. Defaults to "
             "FLIGHT_LOG_SHELL_OUTPUT_LIMIT or 600000"
+        ),
+    )
+    parser.add_argument(
+        "--jev-consult",
+        action="store_true",
+        default=None,
+        help=(
+            "Attach the advisory JEV direction-consultation tool; defaults "
+            "to FLIGHT_LOG_JEV_CONSULT or off"
         ),
     )
     parser.add_argument(

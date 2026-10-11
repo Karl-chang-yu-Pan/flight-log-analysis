@@ -2047,3 +2047,71 @@ def test_configured_output_limit_reaches_executor_and_metadata(
     )
     assert captured["shell_tool"]["executor"].output_limit == 2000
     assert metadata["shell_output_limit"] == 2000
+
+
+def test_jev_consult_defaults_off_with_no_tool_or_metadata(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("FLIGHT_LOG_JEV_CONSULT", raising=False)
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6"
+    )
+    tool_names = [getattr(tool, "name", None) for tool in captured["agent_kwargs"]["tools"]]
+    assert "consult_investigation_direction" not in tool_names
+    assert metadata["requested_jev_consult"] is False
+    assert "consult_investigation_direction" not in captured["agent_kwargs"]["instructions"]
+
+
+def test_jev_consult_enabled_attaches_tool_instructions_and_metadata(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, metadata, _, dev_log_root = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6", jev_consult=True
+    )
+    tools = captured["agent_kwargs"]["tools"]
+    consult = next(
+        tool
+        for tool in tools
+        if getattr(tool, "name", None) == "consult_investigation_direction"
+    )
+    assert "consult_investigation_direction" in captured["agent_kwargs"]["instructions"]
+    assert "advisory" in captured["agent_kwargs"]["instructions"].lower()
+    assert metadata["requested_jev_consult"] is True
+
+
+def test_jev_consult_audit_sink_writes_decision_events(tmp_path, monkeypatch):
+    import json
+
+    from flight_log_agent.analysis import jev_consult as jc
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    seen = {}
+    real_builder = jc.build_jev_consult_tool
+
+    def spy_builder(**kwargs):
+        seen.update(kwargs)
+        return real_builder(**kwargs)
+
+    monkeypatch.setattr(analyzer, "build_jev_consult_tool", spy_builder)
+    _, _, _, _, _, dev_log_root = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6", jev_consult=True
+    )
+    seen["audit_sink"](
+        {
+            "selected_action": "compute_derivation",
+            "effective_recommendation": "compute_derivation",
+            "tool_call_id": "call-9",
+        }
+    )
+    events = [
+        json.loads(line)
+        for line in (
+            dev_log_root / "provider_run" / "run_events.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    consults = [e for e in events if e.get("event") == "decision.consult"]
+    assert len(consults) == 1
+    assert consults[0]["selected_action"] == "compute_derivation"
+    assert consults[0]["tool_call_id"] == "call-9"
