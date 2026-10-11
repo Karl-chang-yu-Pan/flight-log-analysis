@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import urlopen
 
 from pyulog import ULog
+from flight_log_agent.analysis.jev_consult import resolve_jev_mode
 from flight_log_agent.ulog.preparse_view import build_preparse_payload
 from flight_log_agent.audit import DEFAULT_DEV_LOG_ROOT, make_json_safe
 from flight_log_agent.ulog.interactive_plots import build_interactive_plot_payload
@@ -637,6 +638,13 @@ def start_analysis_run(payload: dict[str, Any]) -> dict[str, Any]:
     if not user_question:
         raise ValueError("user_question is required")
 
+    try:
+        jev_mode = resolve_jev_mode(payload.get("jev_mode"), None)
+    except ValueError as exc:
+        raise ValueError(f"invalid jev_mode: {exc}")
+    model = str(payload.get("model") or "").strip() or None
+    model_provider = str(payload.get("model_provider") or "").strip() or None
+
     stored_inputs = (browse_row or {}).get("review_inputs") or {}
     run_id = uuid.uuid4().hex
     output_dir = OUTPUT_ROOT / f"web_{run_id}"
@@ -666,6 +674,9 @@ def start_analysis_run(payload: dict[str, Any]) -> dict[str, Any]:
             or stored_inputs.get("source_path")
         ),
         "user_question": user_question,
+        "jev_mode": jev_mode,
+        "model": model,
+        "model_provider": model_provider,
         "output_dir": str(output_dir),
         "report_path": str(output_dir / "report.json"),
         "dev_log_dir": str(WEB_DEV_LOG_ROOT / run_id),
@@ -1064,6 +1075,9 @@ def _run_analysis_job(run_id: str, user_question: str | None = None) -> None:
                 output_dir=run["output_dir"],
                 dev_log_root=str(WEB_DEV_LOG_ROOT),
                 dev_run_id=run_id,
+                jev_consult=run.get("jev_mode", "off"),
+                model=run.get("model"),
+                model_provider=run.get("model_provider"),
             )
         )
         _update_analysis_run(
@@ -1110,6 +1124,9 @@ def _persist_analysis_run_history(run: dict[str, Any]) -> None:
             "browse_log_id": run.get("browse_log_id"),
             "status": run["status"],
             "question": run["user_question"],
+            "jev_mode": run.get("jev_mode", "off"),
+            "model": run.get("model"),
+            "model_provider": run.get("model_provider"),
             "created_at": run.get("created_at"),
             "started_at": run.get("started_at"),
             "finished_at": run.get("finished_at"),

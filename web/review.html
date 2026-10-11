@@ -175,6 +175,14 @@
           <div id="analysisProgress" class="progress-list"></div>
           <div class="analysis-controls">
             <label>
+              Direction selection
+              <select id="analysisDirectionMode">
+                <option value="off" selected>Off — standard analysis</option>
+                <option value="voluntary">Advisory — JEV suggests next steps</option>
+                <option value="sole">JEV selects and executes — each check runs through JEV selection</option>
+              </select>
+            </label>
+            <label>
               Ask about this log
               <textarea id="analysisQuestion" rows="3" placeholder="Why did the aircraft drop altitude right after transition?"></textarea>
             </label>

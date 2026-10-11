@@ -358,6 +358,9 @@ def test_analysis_job_uses_shell_analyzer_and_preserves_run_contract(
             "report_path": str(output_dir / "report.json"),
             "dev_log_dir": str(web_app.WEB_DEV_LOG_ROOT / run_id),
             "report": None,
+            "jev_mode": "off",
+            "model": None,
+            "model_provider": None,
         }
 
     try:
@@ -377,7 +380,13 @@ def test_analysis_job_uses_shell_analyzer_and_preserves_run_contract(
         "output_dir": str(output_dir),
         "dev_log_root": str(web_app.WEB_DEV_LOG_ROOT),
         "dev_run_id": run_id,
+        "jev_consult": "off",
+        "model": None,
+        "model_provider": None,
     }
+    assert snapshot["jev_mode"] == "off"
+    assert snapshot["model"] is None
+    assert snapshot["model_provider"] is None
 
 
 def test_analysis_runs_keep_distinct_work_and_report_directories(
@@ -675,3 +684,167 @@ def test_review_tags_are_searchable_and_load_progress_covers_plot_generation():
     assert "await waitForPlotPaint()" in app_js
     assert 'setUploadProcessing("Processing log")' in upload_js
     assert 'setUploadProcessing("Processing local log")' in upload_js
+
+
+def _start_run_with_fake_thread(tmp_path, monkeypatch, payload):
+    started = {}
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            started["started"] = True
+            return None
+
+    monkeypatch.setattr(web_app, "OUTPUT_ROOT", tmp_path / "outputs")
+    monkeypatch.setattr(web_app, "UPLOAD_ROOT", tmp_path / "uploads")
+    monkeypatch.setattr(web_app.threading, "Thread", FakeThread)
+    run = web_app.start_analysis_run(payload)
+    return run, started
+
+
+def test_analysis_run_defaults_to_off_and_unset_model(tmp_path, monkeypatch):
+    run, started = _start_run_with_fake_thread(
+        tmp_path, monkeypatch, {
+            "log_path": str(tmp_path / "uploads" / "flight.ulg"),
+            "user_question": "What happened?",
+        })
+    try:
+        assert started.get("started") is True
+        assert run["jev_mode"] == "off"
+        assert run["model"] is None
+        assert run["model_provider"] is None
+    finally:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS.pop(run["run_id"], None)
+
+
+def test_analysis_run_rejects_invalid_jev_mode_before_launch(
+    tmp_path, monkeypatch
+):
+    started = {}
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            started["started"] = True
+            return None
+
+    monkeypatch.setattr(web_app, "OUTPUT_ROOT", tmp_path / "outputs")
+    monkeypatch.setattr(web_app, "UPLOAD_ROOT", tmp_path / "uploads")
+    monkeypatch.setattr(web_app.threading, "Thread", FakeThread)
+    with pytest.raises(ValueError, match="invalid jev_mode"):
+        web_app.start_analysis_run({
+            "log_path": str(tmp_path / "uploads" / "flight.ulg"),
+            "user_question": "What happened?",
+            "jev_mode": "turbo",
+        })
+    assert started.get("started") is None
+
+
+@pytest.mark.parametrize("mode", ["off", "voluntary", "sole"])
+def test_analysis_run_modes_reach_analyzer(tmp_path, monkeypatch, mode):
+    import flight_log_agent.analysis.analyzer as shell_analyzer
+
+    captured = {}
+
+    async def fake_analyze_flight_log(**kwargs):
+        captured.update(kwargs)
+        return {"final_summary": "done"}
+
+    run, _ = _start_run_with_fake_thread(
+        tmp_path, monkeypatch, {
+            "log_path": str(tmp_path / "uploads" / "flight.ulg"),
+            "user_question": "What happened?",
+            "jev_mode": mode,
+        })
+    monkeypatch.setattr(
+        shell_analyzer, "analyze_flight_log", fake_analyze_flight_log)
+    try:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS[run["run_id"]] = run
+        web_app._run_analysis_job(run["run_id"])
+        assert captured["jev_consult"] == mode
+        snapshot = web_app.analysis_run_snapshot(run["run_id"])
+        assert snapshot["jev_mode"] == mode
+    finally:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS.pop(run["run_id"], None)
+
+
+def test_analysis_run_passes_openrouter_luna_configuration(tmp_path, monkeypatch):
+    import flight_log_agent.analysis.analyzer as shell_analyzer
+
+    captured = {}
+
+    async def fake_analyze_flight_log(**kwargs):
+        captured.update(kwargs)
+        return {"final_summary": "done"}
+
+    run, _ = _start_run_with_fake_thread(
+        tmp_path, monkeypatch, {
+            "log_path": str(tmp_path / "uploads" / "flight.ulg"),
+            "user_question": "What happened?",
+            "jev_mode": "sole",
+            "model": "openai/gpt-6-luna",
+            "model_provider": "openrouter",
+        })
+    monkeypatch.setattr(
+        shell_analyzer, "analyze_flight_log", fake_analyze_flight_log)
+    try:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS[run["run_id"]] = run
+        web_app._run_analysis_job(run["run_id"])
+        assert captured["model"] == "openai/gpt-6-luna"
+        assert captured["model_provider"] == "openrouter"
+        assert captured["jev_consult"] == "sole"
+        snapshot = web_app.analysis_run_snapshot(run["run_id"])
+        assert snapshot["model"] == "openai/gpt-6-luna"
+        assert snapshot["model_provider"] == "openrouter"
+    finally:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS.pop(run["run_id"], None)
+
+
+def test_analysis_history_persists_mode_and_model(tmp_path, monkeypatch):
+    upload_root = tmp_path / "uploads"
+    log_path = upload_root / "upload-1" / "flight.ulg"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_bytes(b"ulog")
+    browse_row = {
+        "id": "browse-1",
+        "log_path": str(log_path),
+        "review_inputs": {},
+    }
+    monkeypatch.setattr(web_app, "UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(web_app, "OUTPUT_ROOT", tmp_path / "outputs")
+    monkeypatch.setattr(web_app, "get_log", lambda _db_path, _log_id: browse_row)
+    monkeypatch.setattr(web_app.threading, "Thread", type(
+        "FakeThread",
+        (),
+        {"__init__": lambda self, **kwargs: None,
+         "start": lambda self: None},
+    ))
+    run = web_app.start_analysis_run({
+        "browse_log_id": "browse-1",
+        "user_question": "What happened?",
+        "jev_mode": "sole",
+        "model": "openai/gpt-6-luna",
+        "model_provider": "openrouter",
+    })
+    try:
+        history_path = (
+            log_path.parent
+            / "analysis_history"
+            / f"{run['run_id']}.json"
+        )
+        record = json.loads(history_path.read_text(encoding="utf-8"))
+        assert record["jev_mode"] == "sole"
+        assert record["model"] == "openai/gpt-6-luna"
+        assert record["model_provider"] == "openrouter"
+    finally:
+        with web_app.ANALYSIS_RUNS_LOCK:
+            web_app.ANALYSIS_RUNS.pop(run["run_id"], None)

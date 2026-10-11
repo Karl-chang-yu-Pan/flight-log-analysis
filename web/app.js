@@ -59,6 +59,7 @@ const els = {
   mainSummary: document.getElementById("mainSummary"),
   analysisSourcePath: document.getElementById("analysisSourcePath"),
   analysisQuestion: document.getElementById("analysisQuestion"),
+  analysisDirectionMode: document.getElementById("analysisDirectionMode"),
   analysisButton: document.getElementById("analysisButton"),
   analysisStatus: document.getElementById("analysisStatus"),
   analysisProgress: document.getElementById("analysisProgress"),
@@ -222,6 +223,7 @@ async function startAnalysis() {
     mission_path: inputs.mission_path,
     source_path: currentSourcePath || inputs.source_path,
     user_question: question,
+    jev_mode: els.analysisDirectionMode ? els.analysisDirectionMode.value : "off",
   };
 
   if (!payload.log_path) {
@@ -388,6 +390,20 @@ function compareAnalysisHistoryEntries(left, right) {
   return timeDifference || String(left.run_id || "").localeCompare(String(right.run_id || ""));
 }
 
+function analysisRunConfigText(entry) {
+  const modes = {
+    off: "Direction: off",
+    voluntary: "Direction: advisory (JEV suggests)",
+    sole: "Direction: JEV selects and executes",
+  };
+  const parts = [modes[entry.jev_mode] || "Direction: off"];
+  const model = entry.model || entry.model_provider
+    ? [entry.model_provider, entry.model].filter(Boolean).join(" / ")
+    : "";
+  if (model) parts.push(`Model: ${model}`);
+  return parts.join(" · ");
+}
+
 function renderAnalysisTurn(entry, isLatest) {
   const timestamp = formatAnalysisTimestamp(entry.created_at);
   return `
@@ -398,6 +414,7 @@ function renderAnalysisTurn(entry, isLatest) {
           ${timestamp ? `<time>${escapeHtml(timestamp)}</time>` : ""}
         </div>
         <p>${escapeHtml(entry.question || "Analyze this flight log.")}</p>
+        <p class="analysis-run-config">${escapeHtml(analysisRunConfigText(entry))}</p>
       </div>
       <div class="analysis-message analysis-message-assistant">
         <div class="analysis-message-header">
