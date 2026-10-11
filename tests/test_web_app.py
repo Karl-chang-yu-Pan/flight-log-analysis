@@ -2,6 +2,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -848,3 +849,293 @@ def test_analysis_history_persists_mode_and_model(tmp_path, monkeypatch):
     finally:
         with web_app.ANALYSIS_RUNS_LOCK:
             web_app.ANALYSIS_RUNS.pop(run["run_id"], None)
+
+
+def _make_git_repo(tmp_path, name="PX4-Autopilot"):
+    import subprocess
+
+    repo = tmp_path / name
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    (repo / "src").mkdir()
+    (repo / "src" / "module.cpp").write_text(
+        "int value = 1;\nint other = 2;\nint third = 3;\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "commit", "-m", "one"],
+        check=True, capture_output=True,
+    )
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return repo, sha
+
+
+def test_resolve_source_excerpt_reads_pinned_lines(tmp_path):
+    repo, sha = _make_git_repo(tmp_path)
+    result = web_app.resolve_source_excerpt({
+        "commit": [sha],
+        "file": ["src/module.cpp"],
+        "start": ["2"],
+        "end": ["3"],
+        "source_path": [str(repo)],
+    })
+    assert result["commit"] == sha
+    assert result["file"] == "src/module.cpp"
+    assert result["start_line"] == 2
+    assert result["end_line"] == 3
+    assert result["lines"] == ["int other = 2;", "int third = 3;"]
+    assert result["total_lines"] == 3
+
+
+def test_resolve_source_excerpt_uses_explicit_source_path(tmp_path):
+    repo, sha = _make_git_repo(tmp_path, name="custom-checkout")
+    result = web_app.resolve_source_excerpt({
+        "commit": [sha],
+        "file": ["src/module.cpp"],
+        "start": ["1"],
+        "end": ["1"],
+        "source_path": [str(repo)],
+    })
+    assert result["lines"] == ["int value = 1;"]
+
+
+@pytest.mark.parametrize("query", [
+    {"commit": ["nope"], "file": ["src/module.cpp"], "start": ["1"], "end": ["1"]},
+    {"commit": ["abc"], "file": ["src/module.cpp"], "start": ["1"], "end": ["1"]},
+    {"file": ["src/module.cpp"], "start": ["1"], "end": ["1"]},
+    {"commit": ["a" * 40], "start": ["1"], "end": ["1"]},
+    {"commit": ["a" * 40], "file": ["src/module.cpp"], "start": ["0"], "end": ["1"]},
+    {"commit": ["a" * 40], "file": ["src/module.cpp"], "start": ["2"], "end": ["1"]},
+    {"commit": ["a" * 40], "file": ["src/module.cpp"], "start": ["x"], "end": ["1"]},
+    {"commit": ["a" * 40], "file": ["src/module.cpp"], "start": ["1"], "end": ["500"]},
+    {"commit": ["a" * 40], "file": ["src/module.cpp"], "start": ["1"], "end": ["1"],
+     "source_path": ["/nonexistent-checkout"]},
+])
+def test_resolve_source_excerpt_rejects_bad_input(query):
+    with pytest.raises(ValueError):
+        web_app.resolve_source_excerpt(query)
+
+
+def test_resolve_source_excerpt_rejects_escaping_paths(tmp_path):
+    from flight_log_agent.px4.source_snapshot import SourceResolutionError
+
+    repo, _ = _make_git_repo(tmp_path)
+    with pytest.raises(SourceResolutionError):
+        web_app.resolve_source_excerpt({
+            "commit": ["a" * 40],
+            "file": ["../escape.cpp"],
+            "start": ["1"],
+            "end": ["1"],
+            "source_path": [str(repo)],
+        })
+
+
+def test_resolve_source_excerpt_unknown_commit_is_unavailable(tmp_path):
+    from flight_log_agent.px4.source_snapshot import SourceResolutionError
+
+    repo, _ = _make_git_repo(tmp_path)
+    with pytest.raises(SourceResolutionError):
+        web_app.resolve_source_excerpt({
+            "commit": ["b" * 40],
+            "file": ["src/module.cpp"],
+            "start": ["1"],
+            "end": ["1"],
+            "source_path": [str(repo)],
+        })
+
+
+def test_resolve_source_excerpt_without_repository_is_unavailable(tmp_path, monkeypatch):
+    from flight_log_agent.px4.source_snapshot import SourceResolutionError
+
+    monkeypatch.setattr(web_app, "DEFAULT_PX4_SOURCE_PATH", tmp_path / "missing")
+    with pytest.raises(SourceResolutionError) as excinfo:
+        web_app.resolve_source_excerpt({
+            "commit": ["a" * 40],
+            "file": ["src/module.cpp"],
+            "start": ["1"],
+            "end": ["1"],
+        })
+    assert excinfo.value.status == "repository_unavailable"
+
+
+def test_source_excerpt_handler_reports_unavailable(tmp_path, monkeypatch):
+    responses = []
+    handler = object.__new__(web_app.FlightLogWebHandler)
+    handler._send_json = lambda value, status=200: responses.append((status, value))
+    monkeypatch.setattr(web_app, "DEFAULT_PX4_SOURCE_PATH", tmp_path / "missing")
+    handler._handle_source_excerpt(
+        "commit=" + "a" * 40 + "&file=src%2Fmodule.cpp&start=1&end=2"
+    )
+    assert responses[0][0] == 200
+    assert responses[0][1]["available"] is False
+    assert "reason" in responses[0][1]
+
+
+def test_source_excerpt_handler_serves_pinned_lines(tmp_path):
+    repo, sha = _make_git_repo(tmp_path)
+    responses = []
+    handler = object.__new__(web_app.FlightLogWebHandler)
+    handler._send_json = lambda value, status=200: responses.append((status, value))
+    handler._handle_source_excerpt(
+        f"commit={sha}&file=src%2Fmodule.cpp&start=1&end=1"
+        f"&source_path={quote(str(repo))}"
+    )
+    assert responses[0][0] == 200
+    assert responses[0][1]["available"] is True
+    assert responses[0][1]["lines"] == ["int value = 1;"]
+
+
+def test_history_preserves_source_commit_snippets_and_plots(tmp_path):
+    from flight_log_agent.models import FlightLogReport
+    from flight_log_agent.web.analysis_history import (
+        load_history_records,
+        write_history_record,
+    )
+
+    report = FlightLogReport(
+        airframe_summary="quad",
+        question_intent_summary="why climb",
+        ranked_hypotheses=[{
+            "title": "Cone floor",
+            "known_px4_mechanism": "RTL cone",
+            "mechanism": "Floor applies.",
+            "source_refs": [{
+                "file": "src/modules/navigator/rtl.cpp",
+                "function": "RTL::find_RTL_destination",
+                "start_line": 242,
+                "end_line": 250,
+                "snippet": "_rtl_alt = calculate_return_alt_from_cone_half_angle(...);",
+                "explanation": "Selects cone altitude.",
+            }],
+            "expected_logged_signature": [],
+            "applicability": {"applicable": True},
+            "evidence": ["103.94 m setpoint"],
+            "contradicting_evidence": [],
+            "exclusion_checks": [],
+            "numeric_checks": [{
+                "type": "derived_expression",
+                "expression": "max(83.94 + 10.0, 83.94 + 2*10.0)",
+                "expected_expression": "103.94",
+                "variables": [{"name": "destination_alt", "source": "setpoint"}],
+            }],
+            "confidence": "high",
+            "plots": [{
+                "title": "Altitude",
+                "path": "/plots/alt.png",
+                "purpose": "Shows climb.",
+            }],
+        }],
+        excluded_mechanisms=[],
+        confirmed=[],
+        unconfirmed=[],
+        final_summary="Cone floor.",
+        source_commit="a" * 40,
+    )
+    record = {
+        "schema_version": 1,
+        "run_id": "history-roundtrip",
+        "status": "completed",
+        "question": "Why climb?",
+        "report": json.loads(report.model_dump_json()),
+    }
+    write_history_record(tmp_path, record)
+    [loaded] = load_history_records(tmp_path)
+    assert loaded["report"]["source_commit"] == "a" * 40
+    [hypothesis] = loaded["report"]["ranked_hypotheses"]
+    assert hypothesis["source_refs"][0]["snippet"].startswith("_rtl_alt")
+    assert hypothesis["numeric_checks"][0]["expression"].startswith("max(")
+    assert hypothesis["plots"][0]["path"] == "/plots/alt.png"
+
+
+def test_legacy_report_without_source_commit_loads_gracefully(tmp_path):
+    from flight_log_agent.models import FlightLogReport
+    from flight_log_agent.web.analysis_history import (
+        load_history_records,
+        write_history_record,
+    )
+
+    report = {
+        "airframe_summary": "quad",
+        "question_intent_summary": "why climb",
+        "ranked_hypotheses": [],
+        "excluded_mechanisms": [],
+        "confirmed": [],
+        "unconfirmed": [],
+        "final_summary": "done",
+    }
+    write_history_record(tmp_path, {
+        "schema_version": 1, "run_id": "legacy", "status": "completed",
+        "question": "Why?", "report": report,
+    })
+    [loaded] = load_history_records(tmp_path)
+    assert FlightLogReport.model_validate(loaded["report"]).source_commit is None
+
+
+def test_report_rendering_shows_evidence_refs_and_plots(tmp_path):
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is unavailable for rendering verification")
+
+    report_path = tmp_path / "report.json"
+    report_path.write_text(json.dumps({
+        "airframe_summary": "quad",
+        "question_intent_summary": "why climb",
+        "ranked_hypotheses": [{
+            "title": "Cone floor",
+            "known_px4_mechanism": "RTL cone",
+            "mechanism": "The cone safety floor applies.",
+            "source_refs": [{
+                "file": "src/modules/navigator/rtl.cpp",
+                "function": "RTL::find_RTL_destination",
+                "start_line": 242,
+                "end_line": 250,
+                "snippet": "_rtl_alt = calculate_return_alt_from_cone(...);",
+                "explanation": "Selects cone altitude.",
+            }],
+            "expected_logged_signature": [],
+            "applicability": {"applicable": True},
+            "evidence": ["103.94 m setpoint"],
+            "contradicting_evidence": [],
+            "unresolved_evidence": ["Mission file absent"],
+            "exclusion_checks": [],
+            "numeric_checks": [{
+                "type": "derived_expression",
+                "window": "RTL activation",
+                "expression": "max(83.94 + 10.0, 83.94 + 2*10.0)",
+                "expected_expression": "103.94",
+                "variables": [
+                    {"name": "destination_alt", "source": "setpoint triplet"}
+                ],
+                "supports": "Matches logged target.",
+            }],
+            "confidence": "high",
+            "plots": [{
+                "title": "Altitude",
+                "path": "/plots/alt.png",
+                "purpose": "Shows climb.",
+                "warnings": ["EAS vs TAS differs."],
+            }],
+        }],
+        "excluded_mechanisms": [],
+        "confirmed": [],
+        "unconfirmed": [],
+        "final_summary": "Cone floor.",
+        "source_commit": "a" * 40,
+    }), encoding="utf-8")
+    repo_root = Path(__file__).resolve().parent.parent
+    completed = subprocess.run(
+        [node, str(repo_root / "tests" / "report_render_check.mjs"),
+         str(report_path), str(repo_root)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert completed.returncode == 0, (
+        "rendering checks failed: " + completed.stdout + completed.stderr
+    )
+    verdict = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert verdict["failures"] == []

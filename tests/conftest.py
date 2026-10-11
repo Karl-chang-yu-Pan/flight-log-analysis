@@ -11,6 +11,7 @@ REPORT_KEYS = {
     "confirmed",
     "unconfirmed",
     "final_summary",
+    "source_commit",
 }
 
 

@@ -2190,3 +2190,89 @@ def test_other_modes_keep_direct_execution_tools(tmp_path, monkeypatch):
     ]
     assert ssm.SOLE_SELECTOR_TOOL_NAME not in names
     assert len(names) >= 1
+
+
+def test_analyzer_records_source_commit_in_report(tmp_path, monkeypatch):
+    import subprocess
+
+    log_path = tmp_path / "uploads" / "flight.ulg"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_bytes(b"ULog")
+    source_path = tmp_path / "PX4-Autopilot"
+    source_path.mkdir()
+    subprocess.run(["git", "-C", str(source_path), "init"], check=True, capture_output=True)
+    (source_path / "file.txt").write_text("source\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source_path), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(source_path), "-c", "user.name=Test",
+         "-c", "user.email=test@example.com", "commit", "-m", "source"],
+        check=True, capture_output=True,
+    )
+    logged_commit = subprocess.run(
+        ["git", "-C", str(source_path), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    output_dir = tmp_path / "outputs" / "run"
+    dev_log_root = tmp_path / "dev_logs"
+    report = _empty_report()
+    parse_inventory = Mock(
+        return_value={
+            "firmware_version": "v1.0.0",
+            "git_hash": logged_commit,
+            "parameters": {},
+            "topic_fields": {},
+            "topic_instances": {},
+            "logged_messages": [],
+            "available_topics": [],
+            "missing_topics": [],
+            "warnings": [],
+        }
+    )
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeShellTool:
+        def __init__(self, **kwargs):
+            pass
+
+    async def fake_run(agent, prompt, max_turns, hooks, run_config=None):
+        return SimpleNamespace(
+            final_output=report,
+            new_items=[],
+            context_wrapper=SimpleNamespace(usage=Usage()),
+        )
+
+    async def fake_preflight(executor):
+        return None
+
+    monkeypatch.setattr(analyzer, "parse_ulog_inventory", parse_inventory)
+    monkeypatch.setattr(analyzer, "Agent", FakeAgent)
+    monkeypatch.setattr(analyzer, "ShellTool", FakeShellTool)
+    monkeypatch.setattr(analyzer.Runner, "run", fake_run)
+    monkeypatch.setattr(
+        analyzer.RestrictedShellExecutor, "preflight", fake_preflight
+    )
+    asyncio.run(
+        analyzer.analyze_flight_log(
+            log_path=str(log_path),
+            source_path=str(source_path),
+            output_dir=str(output_dir),
+            dev_log_root=str(dev_log_root),
+            dev_run_id="commit_run",
+            user_question="What happened?",
+            model="gpt-5.6",
+        )
+    )
+    saved = json.loads(
+        (output_dir / "report.json").read_text(encoding="utf-8")
+    )
+    assert saved["source_commit"] == logged_commit
+
+
+def test_instructions_request_code_support_and_evidence_plots():
+    normalized = " ".join(analyzer.BASE_INSTRUCTIONS.split())
+    assert "quote the decisive lines in the reference snippet" in normalized
+    assert "Generate one evidence plot per ranked hypothesis" in normalized
+    assert "state the reason plainly in the hypothesis evidence" in normalized

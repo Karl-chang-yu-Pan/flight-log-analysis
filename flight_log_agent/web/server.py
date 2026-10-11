@@ -6,6 +6,7 @@ import cgi
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import threading
 import time
@@ -20,6 +21,11 @@ from urllib.request import urlopen
 
 from pyulog import ULog
 from flight_log_agent.analysis.jev_consult import resolve_jev_mode
+from flight_log_agent.px4.source_snapshot import (
+    SourceRepository,
+    SourceResolutionError,
+)
+from flight_log_agent.source_path import DEFAULT_PX4_SOURCE_PATH
 from flight_log_agent.ulog.preparse_view import build_preparse_payload
 from flight_log_agent.audit import DEFAULT_DEV_LOG_ROOT, make_json_safe
 from flight_log_agent.ulog.interactive_plots import build_interactive_plot_payload
@@ -131,6 +137,10 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/analysis-history":
             self._handle_analysis_history(parsed.query)
+            return
+
+        if path == "/api/source-excerpt":
+            self._handle_source_excerpt(parsed.query)
             return
 
         if path == "/artifacts":
@@ -521,6 +531,20 @@ class FlightLogWebHandler(BaseHTTPRequestHandler):
             return
 
         self._serve_file(artifact_path)
+
+    def _handle_source_excerpt(self, query: str) -> None:
+        try:
+            result = resolve_source_excerpt(parse_qs(query))
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        except SourceResolutionError as exc:
+            self._send_json(
+                {"available": False, "reason": f"{exc.status}: {exc}"},
+            )
+            return
+
+        self._send_json({"available": True, **result})
 
     def _read_multipart_form(self) -> cgi.FieldStorage:
         try:
@@ -965,6 +989,66 @@ def resolve_artifact_path(path_value: str) -> Path:
         raise ValueError("artifact does not exist")
 
     return requested
+
+
+MAX_EXCERPT_LINES = 200
+
+
+def resolve_source_excerpt(query: dict[str, list[str]]) -> dict[str, Any]:
+    """Read exact lines from a pinned PX4 source snapshot.
+
+    Query fields (all single-valued): commit (40-hex SHA), file
+    (repository-relative path), start/end (1-based inclusive line
+    numbers), optional source_path (server-local PX4 checkout,
+    defaulting to the reference checkout). Raises ValueError for
+    malformed input and SourceResolutionError when the source cannot
+    provide the lines.
+    """
+    commit = "".join(query.get("commit") or []).strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+        raise ValueError("commit must be a 40-character hex SHA")
+
+    file_values = query.get("file") or []
+    if not file_values or not file_values[0].strip():
+        raise ValueError("file is required")
+
+    try:
+        start = int((query.get("start") or [""])[0])
+        end = int((query.get("end") or [""])[0])
+    except ValueError:
+        raise ValueError("start and end must be integers")
+    if start < 1 or end < start:
+        raise ValueError("line range must satisfy 1 <= start <= end")
+    if end - start + 1 > MAX_EXCERPT_LINES:
+        raise ValueError(f"line range exceeds {MAX_EXCERPT_LINES} lines")
+
+    source_values = [v.strip() for v in query.get("source_path") or [] if v.strip()]
+    repository: Path | None = None
+    if source_values:
+        candidate = Path(source_values[0]).expanduser()
+        if not candidate.is_dir():
+            raise ValueError("source_path is not a directory")
+        repository = candidate
+    elif DEFAULT_PX4_SOURCE_PATH.exists():
+        repository = DEFAULT_PX4_SOURCE_PATH
+    if repository is None:
+        raise SourceResolutionError(
+            "repository_unavailable",
+            "no PX4 source repository available on the server",
+        )
+
+    snapshot = SourceRepository(repository).resolve_snapshot(commit)
+    text = snapshot.read_text(file_values[0].strip())
+    lines = text.splitlines()
+    selected = lines[start - 1 : end]
+    return {
+        "commit": commit.lower(),
+        "file": file_values[0].strip(),
+        "start_line": start,
+        "end_line": start + len(selected) - 1 if selected else start,
+        "lines": selected,
+        "total_lines": len(lines),
+    }
 
 
 def browse_config_payload() -> dict[str, Any]:

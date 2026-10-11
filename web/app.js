@@ -321,7 +321,7 @@ function analysisReportHtml(report) {
     ${renderStringList("Unconfirmed", report.unconfirmed || [])}
     ${renderStringList("Excluded Mechanisms", report.excluded_mechanisms || [])}
     <div class="hypothesis-list">
-      ${hypotheses.map(renderHypothesis).join("")}
+      ${hypotheses.map((hypothesis, index) => renderHypothesis(hypothesis, index, report.source_commit || "")).join("")}
     </div>
   `;
 }
@@ -457,7 +457,7 @@ function renderReportBlock(title, text) {
   `;
 }
 
-function renderHypothesis(hypothesis, index) {
+function renderHypothesis(hypothesis, index, sourceCommit) {
   const applicability = hypothesis.applicability || {};
   return `
     <article class="hypothesis-card">
@@ -469,12 +469,13 @@ function renderHypothesis(hypothesis, index) {
       <p>${escapeHtml(hypothesis.mechanism || "")}</p>
       ${renderStringList("Evidence", hypothesis.evidence || [])}
       ${renderStringList("Contradicting Evidence", hypothesis.contradicting_evidence || [])}
+      ${renderStringList("Unresolved Evidence", hypothesis.unresolved_evidence || [])}
       ${renderStringList("Supported Conditions", applicability.supported_conditions || [])}
       ${renderStringList("Unresolved Conditions", applicability.unresolved_conditions || [])}
       ${renderStringList("Excluded By", applicability.excluded_by || [])}
       ${renderStringList("Relevant Parameters", formatParameterValues(applicability.relevant_parameters || []))}
       ${renderStringList("Missing Signals", applicability.missing_required_signals || [])}
-      ${renderSourceRefs(hypothesis.source_refs || hypothesis.code_references || [])}
+      ${renderSourceRefs(hypothesis.source_refs || hypothesis.code_references || [], sourceCommit)}
       ${renderSignatureItems(hypothesis.expected_logged_signature || [])}
       ${renderCheckList("Numeric Checks", hypothesis.numeric_checks || [])}
       ${renderCheckList("Exclusion Checks", hypothesis.exclusion_checks || [])}
@@ -495,22 +496,62 @@ function renderStringList(title, rows) {
   `;
 }
 
-function renderSourceRefs(refs) {
+function renderSourceRefs(refs, sourceCommit) {
   if (!refs.length) return "";
+  const commitNote = sourceCommit
+    ? ` <span>pinned to <code>${escapeHtml(String(sourceCommit).slice(0, 12))}</code></span>`
+    : ` <span class="plot-warning">source snapshot unavailable</span>`;
   return `
     <div class="report-list">
-      <h4>Source References</h4>
+      <h4>Source References${commitNote}</h4>
       <ul>
         ${refs.map((ref) => `
           <li>
             <code>${escapeHtml(sourceRefLabel(ref))}</code>
             ${ref.explanation ? ` - ${escapeHtml(ref.explanation)}` : ""}
+            ${ref.snippet ? `<pre class="source-snippet">${escapeHtml(ref.snippet)}</pre>` : ""}
+            ${renderSourceExcerpt(ref, sourceCommit)}
           </li>
         `).join("")}
       </ul>
     </div>
   `;
 }
+
+function renderSourceExcerpt(ref, sourceCommit) {
+  if (!ref.start_line || !sourceCommit) return "";
+  const params = new URLSearchParams({
+    commit: sourceCommit,
+    file: ref.file || "",
+    start: String(ref.start_line),
+    end: String(ref.end_line || ref.start_line),
+  });
+  return `
+    <details class="source-excerpt">
+      <summary>View exact lines</summary>
+      <div class="source-excerpt-body" data-excerpt-url="${escapeAttr(`/api/source-excerpt?${params}`)}">Loading…</div>
+    </details>
+  `;
+}
+
+document.addEventListener("click", async (event) => {
+  const target = event.target && event.target.closest
+    ? event.target.closest("[data-excerpt-url]")
+    : null;
+  if (!target || target.dataset.excerptLoaded) return;
+  target.dataset.excerptLoaded = "1";
+  try {
+    const response = await fetch(target.dataset.excerptUrl);
+    const data = await response.json();
+    if (data && data.available && Array.isArray(data.lines)) {
+      target.textContent = data.lines.join("\n") || "(empty range)";
+    } else {
+      target.textContent = (data && data.reason) || "Source excerpt unavailable.";
+    }
+  } catch (error) {
+    target.textContent = "Source excerpt unavailable.";
+  }
+});
 
 function renderSignatureItems(items) {
   if (!items.length) return "";
@@ -542,7 +583,12 @@ function renderCheckList(title, checks) {
             <code>${escapeHtml(check.type || "check")}</code>
             ${check.window ? ` in ${escapeHtml(check.window)}` : ""}
             ${check.signal ? ` on <code>${escapeHtml(check.signal)}</code>` : ""}
+            ${check.parameter ? ` param <code>${escapeHtml(check.parameter)}</code>` : ""}
             ${check.actual || check.setpoint ? ` ${escapeHtml([check.actual, check.setpoint].filter(Boolean).join(" vs "))}` : ""}
+            ${check.expression ? ` <code>${escapeHtml(check.expression)}</code>` : ""}
+            ${check.expected_expression ? ` expected <code>${escapeHtml(check.expected_expression)}</code>` : ""}
+            ${check.metric || check.op || check.value != null ? ` <code>${escapeHtml([check.metric, check.op, check.value].filter((v) => v != null && v !== "").join(" "))}</code>` : ""}
+            ${renderCheckVariables(check.variables || [])}
             ${check.supports ? ` - ${escapeHtml(check.supports)}` : ""}
             ${check.contradicts ? ` - ${escapeHtml(check.contradicts)}` : ""}
             ${check.description && !check.supports && !check.contradicts ? ` - ${escapeHtml(check.description)}` : ""}
@@ -551,6 +597,16 @@ function renderCheckList(title, checks) {
       </ul>
     </div>
   `;
+}
+
+function renderCheckVariables(variables) {
+  if (!variables.length) return "";
+  return ` where ${variables.map((variable) => {
+    if (variable && typeof variable === "object") {
+      return `<code>${escapeHtml(variable.name || "?")}</code>${variable.source ? ` (${escapeHtml(variable.source)})` : ""}`;
+    }
+    return `<code>${escapeHtml(formatReportValue(variable))}</code>`;
+  }).join(", ")}`;
 }
 
 function sourceRefLabel(ref) {
@@ -576,7 +632,9 @@ function formatParameterValues(parameters) {
 }
 
 function renderPlots(plots) {
-  if (!plots.length) return "";
+  if (!plots.length) {
+    return `<p class="plot-empty">No plots were generated for this finding.</p>`;
+  }
   return `
     <div class="plot-grid">
       ${plots.map((plot) => `

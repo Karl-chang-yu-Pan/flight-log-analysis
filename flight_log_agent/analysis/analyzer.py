@@ -1240,6 +1240,17 @@ from, and reuse results already obtained. The executor accepts one command at
 a time and rejects pipes, redirection, and command chaining.
 - To create a temporary script, use Python, for example:
   python -c "from pathlib import Path; Path('analysis.py').write_text('...')"
+
+For every hypothesis grounded in source behavior, cite the exact file,
+function, and line range in its source references, quote the decisive
+lines in the reference snippet, and explain what the code does in the
+reference explanation. Generate one evidence plot per ranked hypothesis
+whenever the log contains the needed signals: time-series windows
+around the key event work well. Reference each produced plot from the
+hypothesis it supports, describing its purpose. When a plot cannot be
+produced (missing signals, empty windows, or a rendering failure),
+leave its reference out and state the reason plainly in the hypothesis
+evidence instead of inventing a plot.
 """
 
 
@@ -1542,7 +1553,10 @@ async def analyze_flight_log(
                 "the selected check executes. When several next checks are "
                 "possible, call it once with the candidate shell commands. "
                 "Pass luna_selection with a candidate id only after a "
-                "fallback to run your own pick."
+                "fallback to run your own pick. Evidence plots, including "
+                "matplotlib figures saved under /plots/, are also produced "
+                "through candidate checks: propose a plot-generating command "
+                "whenever a hypothesis needs visual evidence."
             )
             tools.append(
                 build_sole_selector_tool(
@@ -1640,6 +1654,8 @@ async def analyze_flight_log(
                 output=validation.model_dump(),
             )
 
+        if source_snapshot is not None:
+            report.source_commit = source_snapshot.commit_sha
         _save_report(report, report_path)
         audit_logger.log_event(
             "run.finished",

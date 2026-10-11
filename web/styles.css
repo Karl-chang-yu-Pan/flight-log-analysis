@@ -1085,6 +1085,37 @@ h2 {
   background: #ffffff;
 }
 
+.source-snippet {
+  margin: 6px 0;
+  padding: 8px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.source-excerpt {
+  margin-top: 4px;
+}
+
+.source-excerpt summary {
+  cursor: pointer;
+  color: var(--accent, #4f9cf7);
+}
+
+.source-excerpt-body {
+  margin: 6px 0;
+  padding: 8px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
 .plot-card figcaption {
   display: grid;
   gap: 4px;

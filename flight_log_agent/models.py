@@ -329,6 +329,7 @@ class FlightLogReport(BaseModel):
     confirmed: list[str]
     unconfirmed: list[str]
     final_summary: str
+    source_commit: Optional[str] = None
 
 
 class ValidationIssue(BaseModel):
