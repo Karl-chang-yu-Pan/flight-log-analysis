@@ -21,6 +21,39 @@ JEV_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 JEV_DECISIONS_MODEL = "typesafe/jev-1.13"
 UNAVAILABLE = "unavailable"
 
+JEV_MODES = ("off", "voluntary", "sole")
+_ENABLED_ENV_VALUES = ("1", "true", "yes")
+
+
+def resolve_jev_mode(
+    jev_consult: Any, env_value: Optional[str]
+) -> str:
+    """Resolve off/voluntary/sole preserving legacy configuration.
+
+    Booleans keep their established meaning (True is voluntary); an
+    explicit mode string always wins, so explicit off overrides an
+    enabled environment setting; otherwise the environment enables
+    voluntary, defaulting to off.
+    """
+    if isinstance(jev_consult, bool):
+        return "voluntary" if jev_consult else "off"
+    if isinstance(jev_consult, str):
+        mode = jev_consult.strip().lower()
+        if mode not in JEV_MODES:
+            raise ValueError(
+                f"unknown jev_consult mode {jev_consult!r}; "
+                f"expected one of {JEV_MODES}"
+            )
+        return mode
+    if jev_consult is not None:
+        raise ValueError(
+            f"unknown jev_consult mode {jev_consult!r}; "
+            f"expected one of {JEV_MODES}"
+        )
+    if (env_value or "").strip().lower() in _ENABLED_ENV_VALUES:
+        return "voluntary"
+    return "off"
+
 # Experimental thresholds for treating a JEV answer as decisive rather
 # than ambiguous. Tuned against three evaluation snapshots, not production
 # traffic; revisit with measured ambiguity/fallback rates.
@@ -62,6 +95,65 @@ def build_decision_state(
             candidate_checks if isinstance(candidate_checks, list) else []
         ),
     }
+
+
+async def _post_decision_vote(
+    *,
+    api_key: str,
+    model: str,
+    payload: dict[str, Any],
+    http_transport: Any,
+) -> tuple[str, dict[str, Any]]:
+    """POST one Decisions request; never raises, never touches budget.
+
+    Returns ("ok", {"status", "body", "latency_ms"}) or
+    ("error", {"reason", "latency_ms"}).
+    """
+    import time as _time
+
+    import httpx
+
+    started_at = _time.perf_counter()
+    try:
+        client_kwargs: dict[str, Any] = {"timeout": _REQUEST_TIMEOUT_S}
+        if http_transport is not None:
+            client_kwargs["transport"] = http_transport
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.post(
+                JEV_DECISIONS_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+            )
+    except Exception as exc:
+        return (
+            "error",
+            {
+                "reason": f"Decisions request failed: {type(exc).__name__}",
+                "latency_ms": round(
+                    (_time.perf_counter() - started_at) * 1000, 1
+                ),
+            },
+        )
+    latency_ms = round((_time.perf_counter() - started_at) * 1000, 1)
+    if response.status_code != 200:
+        return (
+            "error",
+            {
+                "reason": f"Decisions returned HTTP {response.status_code}",
+                "latency_ms": latency_ms,
+            },
+        )
+    try:
+        body = response.json()
+    except ValueError:
+        return (
+            "error",
+            {"reason": "unparseable Decisions response", "latency_ms": latency_ms},
+        )
+    return (
+        "ok",
+        {"status": response.status_code, "body": body, "latency_ms": latency_ms},
+    )
 
 
 def build_jev_consult_tool(

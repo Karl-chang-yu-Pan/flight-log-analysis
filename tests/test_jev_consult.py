@@ -374,3 +374,29 @@ def test_null_optional_fields_survive_invocation():
     assert out["selected_action"] == "compute_derivation"
     sent_checks = seen[0]
     assert sent_checks, "expected the request to be transmitted"
+
+
+def test_mode_resolution_preserves_legacy_configuration():
+    from flight_log_agent.analysis import jev_consult as jc
+
+    assert jc.resolve_jev_mode(None, None) == "off"
+    assert jc.resolve_jev_mode(False, None) == "off"
+    assert jc.resolve_jev_mode(True, None) == "voluntary"
+    assert jc.resolve_jev_mode(None, "1") == "voluntary"
+    assert jc.resolve_jev_mode(None, "yes") == "voluntary"
+
+
+def test_unknown_mode_is_rejected():
+    import pytest
+
+    from flight_log_agent.analysis import jev_consult as jc
+
+    with pytest.raises(ValueError, match="jev_consult"):
+        jc.resolve_jev_mode("always", None)
+
+
+def test_sole_mode_value_resolves():
+    from flight_log_agent.analysis import jev_consult as jc
+
+    assert jc.resolve_jev_mode("sole", None) == "sole"
+    assert jc.resolve_jev_mode(None, None) == "off"

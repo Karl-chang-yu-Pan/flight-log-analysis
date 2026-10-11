@@ -50,13 +50,17 @@ from agents import (
 from agents.tool_context import ToolContext
 from openai.types.shared.reasoning import Reasoning
 
-from flight_log_agent.analysis.jev_consult import build_jev_consult_tool
+from flight_log_agent.analysis.jev_consult import (
+    build_jev_consult_tool,
+    resolve_jev_mode,
+)
 from flight_log_agent.analysis.model_provider import (
     UNAVAILABLE,
     resolve_model_runtime,
     router_plugins_body,
     served_model_from_result,
 )
+from flight_log_agent.analysis.sole_selector import build_sole_selector_tool
 
 from flight_log_agent.analysis.report_validation import (
     enforce_validation_downgrades,
@@ -1285,7 +1289,7 @@ async def analyze_flight_log(
     openrouter_api_key: str | None = None,
     router_cost_tier: str | None = None,
     shell_output_limit: int | None = None,
-    jev_consult: bool | None = None,
+    jev_consult: bool | str | None = None,
     jev_api_key: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_total_requests: int | None = None,
@@ -1322,11 +1326,9 @@ async def analyze_flight_log(
         )
     if shell_output_limit < 1000:
         raise ValueError("shell_output_limit must be at least 1000 characters")
-    if jev_consult is None:
-        jev_consult = (
-            os.environ.get("FLIGHT_LOG_JEV_CONSULT", "").strip().lower()
-            in ("1", "true", "yes")
-        )
+    jev_mode = resolve_jev_mode(
+        jev_consult, os.environ.get("FLIGHT_LOG_JEV_CONSULT")
+    )
 
     model_name = model or os.environ.get("OPENAI_MODEL", "gpt-5.6")
     work_dir = prepare_workspace(
@@ -1396,7 +1398,8 @@ async def analyze_flight_log(
             "web_search_context": web_search_context,
             "max_turns": turn_limit,
             "shell_output_limit": shell_output_limit,
-            "requested_jev_consult": bool(jev_consult),
+            "requested_jev_consult": jev_mode != "off",
+            "requested_jev_mode": jev_mode,
             "max_total_requests": max_total_requests,
         }
     )
@@ -1490,22 +1493,29 @@ async def analyze_flight_log(
         if not use_responses_shell:
             instructions += SHELL_FUNCTION_TOOL_INSTRUCTIONS
 
-        tools: list[Any] = (
-            [
-                ShellTool(
-                    executor=shell_executor,
-                    needs_approval=False,
-                )
-            ]
-            if use_responses_shell
-            else [make_local_shell_function_tool(shell_executor)]
-        )
-        if source_snapshot is not None:
-            tools.append(
-                make_read_px4_source_file_tool(
-                    shell_executor.resolve_source_alias,
-                )
+        # Sole mode removes direct shell/source execution: every command
+        # Luna runs must pass through one select_and_run_check decision
+        # (JEV-selected or audited Luna fallback pick). Ordinary tools
+        # remain for exploration, plotting, and unsubmitted checks in all
+        # other modes.
+        tools: list[Any] = []
+        if jev_mode != "sole":
+            tools.extend(
+                [
+                    ShellTool(
+                        executor=shell_executor,
+                        needs_approval=False,
+                    )
+                ]
+                if use_responses_shell
+                else [make_local_shell_function_tool(shell_executor)]
             )
+            if source_snapshot is not None:
+                tools.append(
+                    make_read_px4_source_file_tool(
+                        shell_executor.resolve_source_alias,
+                    )
+                )
         if enable_web_fallback and model_runtime.web_search_supported:
             tools.append(
                 WebSearchTool(
@@ -1513,7 +1523,7 @@ async def analyze_flight_log(
                     external_web_access=True,
                 )
             )
-        if jev_consult:
+        if jev_mode == "voluntary":
             instructions += JEV_CONSULT_INSTRUCTIONS
             tools.append(
                 build_jev_consult_tool(
@@ -1521,6 +1531,29 @@ async def analyze_flight_log(
                     audit_sink=lambda fields: audit_logger.log_event(
                         "decision.consult", **fields
                     ),
+                )
+            )
+
+        if jev_mode == "sole":
+            instructions += (
+                "\n\nYou have no direct shell or source-reading tools: every "
+                "shell command you run must go through one "
+                "select_and_run_check call as a candidate check, and only "
+                "the selected check executes. When several next checks are "
+                "possible, call it once with the candidate shell commands. "
+                "Pass luna_selection with a candidate id only after a "
+                "fallback to run your own pick."
+            )
+            tools.append(
+                build_sole_selector_tool(
+                    executor=shell_executor,
+                    api_key=jev_api_key or os.environ.get("OPENROUTER_API_KEY"),
+                    audit_sink=lambda fields: audit_logger.log_event(
+                        "decision.select", **fields
+                    ),
+                    # Sole mode bounds total work through model turns, not
+                    # through a consultation count: votes stay unbounded.
+                    max_consults=None,
                 )
             )
 
@@ -1913,11 +1946,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--jev-consult",
-        action="store_true",
+        nargs="?",
+        const="voluntary",
         default=None,
+        choices=("off", "voluntary", "sole"),
         help=(
-            "Attach the advisory JEV direction-consultation tool; defaults "
-            "to FLIGHT_LOG_JEV_CONSULT or off"
+            "Attach JEV direction consultation; 'sole' routes all command "
+            "execution through select_and_run_check. Defaults to "
+            "FLIGHT_LOG_JEV_CONSULT or off"
         ),
     )
     parser.add_argument(

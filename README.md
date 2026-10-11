@@ -181,6 +181,7 @@ available. Useful optional arguments include:
 | `--model-provider auto\|openai\|openrouter` | Select the model provider. |
 | `--model-transport auto\|responses\|chat` | Select the provider transport. |
 | `--reasoning-effort low\|medium\|high` | Set reasoning effort; default is high. |
+| `--jev-consult [off\|voluntary\|sole]` | Attach JEV direction consultation. |
 | `--shell-output-limit N` | Per-command tool-output cap in characters sent to the model. |
 | `--max-turns N` | Set the analysis turn limit; default is 30. |
 | `--max-total-requests N` | Apply an additional request cap. |
@@ -270,6 +271,24 @@ Limitations:
   current behavior.
 - The web UI does not expose provider/model selection; it uses the
   analyzer defaults.
+
+## JEV Direction Consultation
+
+`--jev-consult` (`FLIGHT_LOG_JEV_CONSULT`, default `off`) attaches JEV
+direction consultation without changing the analysis loop, report
+schema, or validation:
+
+- `off`: no consultation tool; the default path is unchanged.
+- `voluntary`: Luna may call the advisory tool when choosing among
+  next steps.
+- `sole`: Luna proposes candidate checks as runnable shell commands
+  and the `select_and_run_check` tool runs only JEV's selection
+  locally; on fallback Luna may run its own pick from the same set
+  without re-calling JEV. Sole mode attaches no direct shell or
+  source-reading tools, so every executed command passed through
+  exactly one selector decision (JEV-selected or audited Luna fallback
+  pick). Sole-mode consultations are uncapped; voluntary consultation
+  keeps the three-attempt limit. Web-search policy is unchanged.
 
 The turn, request, and web-search flags above apply to the direct CLI and Python
 API. The current web UI uses the analyzer defaults: 30 turns and web search

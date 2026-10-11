@@ -2115,3 +2115,78 @@ def test_jev_consult_audit_sink_writes_decision_events(tmp_path, monkeypatch):
     assert len(consults) == 1
     assert consults[0]["selected_action"] == "compute_derivation"
     assert consults[0]["tool_call_id"] == "call-9"
+
+
+def test_sole_mode_attaches_only_the_sole_selector(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6", jev_consult="sole"
+    )
+    names = [
+        getattr(tool, "name", None) for tool in captured["agent_kwargs"]["tools"]
+    ]
+    assert "select_and_run_check" in names
+    assert "consult_investigation_direction" not in names
+    assert captured["agent_kwargs"]["model_settings"].tool_choice is None
+    assert metadata["requested_jev_mode"] == "sole"
+    assert metadata["requested_jev_consult"] is True
+
+
+def test_default_path_has_no_sole_selector(tmp_path, monkeypatch):
+    monkeypatch.delenv("FLIGHT_LOG_JEV_CONSULT", raising=False)
+    _, captured, _, _, _, _ = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6"
+    )
+    names = [
+        getattr(tool, "name", None) for tool in captured["agent_kwargs"]["tools"]
+    ]
+    assert "select_and_run_check" not in names
+
+
+def test_sole_mode_exposes_no_direct_shell_or_source_tools(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="gpt-5.6",
+        model_provider="openrouter",
+        jev_consult="sole",
+    )
+    names = [
+        getattr(tool, "name", None) for tool in captured["agent_kwargs"]["tools"]
+    ]
+    assert names == ["select_and_run_check"]
+    assert metadata["requested_jev_mode"] == "sole"
+
+
+def test_sole_mode_keeps_web_search_policy_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, _, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="gpt-5.6",
+        model_provider="openrouter",
+        model_transport="responses",
+        enable_web_fallback=True,
+        jev_consult="sole",
+    )
+    names = [
+        getattr(tool, "name", None) for tool in captured["agent_kwargs"]["tools"]
+    ]
+    assert "select_and_run_check" in names
+    assert len(captured.get("web_tools", [])) == 1
+
+
+def test_other_modes_keep_direct_execution_tools(tmp_path, monkeypatch):
+    from flight_log_agent.analysis import sole_selector as ssm
+
+    _, captured, _, _, _, _ = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6"
+    )
+    names = [
+        getattr(tool, "name", None) for tool in captured["agent_kwargs"]["tools"]
+    ]
+    assert ssm.SOLE_SELECTOR_TOOL_NAME not in names
+    assert len(names) >= 1
