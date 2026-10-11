@@ -13,6 +13,48 @@ from agents import RunHooks
 
 DEFAULT_DEV_LOG_ROOT = Path(".dev_logs") / "flight_agent_runs"
 
+RESPONSE_UNAVAILABLE = "unavailable"
+
+
+def _observed_text(value: Any) -> Any:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return RESPONSE_UNAVAILABLE
+
+
+def extract_response_metadata(response: Any, raw: Any = None) -> dict[str, Any]:
+    """Observed per-request model metadata; never inferred.
+
+    ``response`` is the normalized SDK model response (usage, response and
+    request IDs where the transport provides them). ``raw`` is the
+    provider's raw response object when one is available; the installed SDK
+    discards raw responses before hooks run, so production calls pass none
+    and provider-returned fields stay unavailable. Requested settings are
+    deliberately absent here; they live in run metadata. Reasoning effort
+    is never derived from token counts.
+    """
+    provider_data = getattr(raw, "provider_data", None)
+    provider_name = getattr(raw, "provider", None)
+    if provider_name is None and isinstance(provider_data, dict):
+        provider_name = provider_data.get("provider")
+    cost = getattr(raw, "cost", None)
+    if cost is None:
+        cost = getattr(raw, "charged_cost", None)
+    if cost is None:
+        cost = getattr(raw, "usage_cost", None)
+    routing = getattr(raw, "routing", None)
+    if not isinstance(routing, (dict, list)):
+        routing = RESPONSE_UNAVAILABLE
+    return {
+        "response_id": _observed_text(getattr(response, "response_id", None)),
+        "request_id": _observed_text(getattr(response, "request_id", None)),
+        "served_model": _observed_text(getattr(raw, "model", None)),
+        "served_provider": _observed_text(provider_name),
+        "charged_cost": cost if isinstance(cost, (int, float)) else RESPONSE_UNAVAILABLE,
+        "routing": routing,
+        "served_reasoning_effort": RESPONSE_UNAVAILABLE,
+    }
+
 
 class DeveloperAuditLogger:
     def __init__(
@@ -46,6 +88,25 @@ class DeveloperAuditLogger:
             "created_at": _utc_now_iso(),
             **metadata,
         }
+        self._write_json(self.metadata_path, payload)
+
+    def update_metadata(self, updates: dict[str, Any]) -> None:
+        """Merge fields into the saved metadata without touching identity.
+
+        ``run_id`` and ``created_at`` are never overwritten, so late-arriving
+        facts (e.g. served-model identity known only after the run) cannot
+        rewrite run provenance.
+        """
+        try:
+            payload = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {"run_id": self.run_id, "created_at": _utc_now_iso()}
+        if not isinstance(payload, dict):
+            payload = {"run_id": self.run_id, "created_at": _utc_now_iso()}
+        for key, value in updates.items():
+            if key in ("run_id", "created_at"):
+                continue
+            payload[key] = value
         self._write_json(self.metadata_path, payload)
 
     def save_usage(self, usage: Any) -> None:
@@ -91,6 +152,13 @@ class AgentRunAuditHooks(RunHooks):
             response_id=getattr(response, "response_id", None),
             request_id=getattr(response, "request_id", None),
             usage=serialize_usage(getattr(response, "usage", None)),
+        )
+        # Observed per-request identity, appended incrementally so records
+        # survive a later request or finalization failure.
+        self.audit_logger.log_event(
+            "model.request",
+            agent_name=_agent_name(agent),
+            **extract_response_metadata(response),
         )
 
     async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:

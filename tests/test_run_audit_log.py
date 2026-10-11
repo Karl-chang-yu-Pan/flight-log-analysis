@@ -94,6 +94,26 @@ def test_developer_audit_logger_writes_usage_summary(tmp_path):
     }
 
 
+def test_developer_audit_logger_update_metadata_preserves_identity(tmp_path):
+    audit_logger = DeveloperAuditLogger(tmp_path / "dev_logs", run_id="run_001")
+    audit_logger.save_metadata({"model": "gpt-5.6", "served_model": "unavailable"})
+    before = json.loads(audit_logger.metadata_path.read_text())
+
+    audit_logger.update_metadata(
+        {
+            "served_model": "served-choice",
+            "run_id": "rewritten",
+            "created_at": "rewritten",
+        }
+    )
+
+    after = json.loads(audit_logger.metadata_path.read_text())
+    assert after["run_id"] == before["run_id"]
+    assert after["created_at"] == before["created_at"]
+    assert after["model"] == "gpt-5.6"
+    assert after["served_model"] == "served-choice"
+
+
 def test_log_run_items_captures_hosted_tool_search_items(tmp_path):
     audit_logger = DeveloperAuditLogger(tmp_path / "dev_logs", run_id="run_001")
     items = [
@@ -136,3 +156,89 @@ def test_log_run_items_captures_hosted_tool_search_items(tmp_path):
     assert events[2]["raw_item"]["results"] == [{"title": "PX4"}]
     assert events[3]["raw_item"]["type"] == "shell_call"
     assert events[4]["raw_item"]["type"] == "shell_call_output"
+
+
+def _model_response(response_id=None, request_id=None):
+    from agents import Usage
+    from agents.items import ModelResponse
+
+    return ModelResponse(
+        output=[], usage=Usage(), response_id=response_id,
+        request_id=request_id,
+    )
+
+
+def test_model_request_event_records_observed_ids_without_requested_settings(
+    tmp_path,
+):
+    import asyncio
+
+    audit_logger = DeveloperAuditLogger(tmp_path / "dev_logs", run_id="run_001")
+    hooks = AgentRunAuditHooks(audit_logger)
+    asyncio.run(
+        hooks.on_llm_end(
+            None, None, _model_response(response_id="gen-123", request_id="req-456")
+        )
+    )
+    events = read_events(audit_logger.run_dir)
+    recorded = [e for e in events if e.get("event") == "model.request"]
+    assert len(recorded) == 1
+    assert recorded[0]["response_id"] == "gen-123"
+    assert recorded[0]["request_id"] == "req-456"
+    assert recorded[0]["served_model"] == "unavailable"
+    assert recorded[0]["served_provider"] == "unavailable"
+    assert recorded[0]["charged_cost"] == "unavailable"
+    assert recorded[0]["routing"] == "unavailable"
+    assert recorded[0]["served_reasoning_effort"] == "unavailable"
+    assert not any(key.startswith("requested_") for key in recorded[0])
+
+
+def test_model_request_event_marks_missing_ids_unavailable(tmp_path):
+    import asyncio
+
+    audit_logger = DeveloperAuditLogger(tmp_path / "dev_logs", run_id="run_001")
+    hooks = AgentRunAuditHooks(audit_logger)
+    asyncio.run(hooks.on_llm_end(None, None, _model_response()))
+    events = read_events(audit_logger.run_dir)
+    recorded = [e for e in events if e.get("event") == "model.request"]
+    assert len(recorded) == 1
+    assert recorded[0]["response_id"] == "unavailable"
+    assert recorded[0]["request_id"] == "unavailable"
+
+
+def test_model_request_events_accumulate_across_requests(tmp_path):
+    import asyncio
+
+    from flight_log_agent.audit import extract_response_metadata
+
+    first = extract_response_metadata(
+        _model_response(response_id="gen-1"),
+        raw=SimpleNamespace(id="gen-1", model="served-a"),
+    )
+    second = extract_response_metadata(
+        _model_response(response_id="gen-2"),
+        raw=SimpleNamespace(
+            id="gen-2",
+            model="served-b",
+            provider="prov-b",
+            cost=0.001,
+            routing={"selected_model": "served-b", "effort": "low"},
+        ),
+    )
+    assert first["served_model"] == "served-a"
+    assert first["served_provider"] == "unavailable"
+    assert first["charged_cost"] == "unavailable"
+    assert second["served_model"] == "served-b"
+    assert second["served_provider"] == "prov-b"
+    assert second["charged_cost"] == 0.001
+    assert second["routing"] == {"selected_model": "served-b", "effort": "low"}
+    # Effort is never inferred from token counts or settings.
+    assert second["served_reasoning_effort"] == "unavailable"
+
+    audit_logger = DeveloperAuditLogger(tmp_path / "dev_logs", run_id="run_001")
+    audit_logger.log_event("model.request", **first)
+    audit_logger.log_event("model.request", **second)
+    audit_logger.log_event("run.failed", error="boom")
+    events = read_events(audit_logger.run_dir)
+    recorded = [e for e in events if e.get("event") == "model.request"]
+    assert [e["served_model"] for e in recorded] == ["served-a", "served-b"]

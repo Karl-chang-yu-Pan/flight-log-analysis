@@ -34,8 +34,12 @@ from typing import Any
 
 from agents import (
     Agent,
+    FunctionTool,
     ModelSettings,
+    RunContextWrapper,
     Runner,
+    ShellActionRequest,
+    ShellCallData,
     ShellCallOutcome,
     ShellCommandOutput,
     ShellCommandRequest,
@@ -43,8 +47,15 @@ from agents import (
     ShellTool,
     WebSearchTool,
 )
+from agents.tool_context import ToolContext
 from openai.types.shared.reasoning import Reasoning
 
+from flight_log_agent.analysis.model_provider import (
+    UNAVAILABLE,
+    resolve_model_runtime,
+    router_plugins_body,
+    served_model_from_result,
+)
 from flight_log_agent.analysis.report_validation import (
     enforce_validation_downgrades,
     validate_report,
@@ -81,6 +92,7 @@ DEFAULT_TIMEOUT_S = 1200
 DEFAULT_MAX_TURNS = 30
 SOURCE_ALIAS = "PX4-Autopilot"
 SNAPSHOT_TOKEN = "SNAPSHOT"
+SHELL_FUNCTION_TOOL_NAME = "run_shell_command"
 READ_ONLY_GIT_SUBCOMMANDS = {"grep", "show", "ls-tree"}
 FORBIDDEN_GIT_OPTIONS = {
     "--ext-diff",
@@ -155,6 +167,114 @@ DUPLICATE_SNAPSHOT_GIT_READ_MESSAGE = (
 )
 
 
+SHELL_FUNCTION_TOOL_DESCRIPTION = (
+    "Run one allowlisted shell command in the analysis workspace and "
+    "return its output. Use it to inspect the read-only ULog with pyulog, "
+    "run Python checks, and read the commit-pinned PX4 source with "
+    "'git -C PX4-Autopilot <command> ...' (SNAPSHOT is a virtual revision "
+    "the runner resolves; never use HEAD, a branch, a tag, or a literal "
+    "hash). Programs allowed: python, python3, rg, git, sed, find."
+)
+
+SHELL_FUNCTION_TOOL_INSTRUCTIONS = """
+Run shell work with the run_shell_command function tool. Pass one command
+at a time as {"command": "..."} with an optional timeout_ms. The same
+workspace rules apply as with direct shell access: one command per call, no
+pipes, redirection, or chaining, and read-only workspace inspection for rg,
+sed, and find. Save useful plots under /plots/ and reuse results already
+obtained.
+"""
+
+
+def _render_shell_result_text(result: ShellResult) -> str:
+    lines: list[str] = []
+    for output in result.output:
+        lines.append(f"$ {output.command}")
+        if output.stdout:
+            lines.append(output.stdout)
+        if output.stderr:
+            lines.append(output.stderr)
+        if output.outcome.type == "timeout":
+            lines.append(f"timed out (exit code: {output.outcome.exit_code})")
+        else:
+            lines.append(f"exit code: {output.outcome.exit_code}")
+    return "\n".join(lines)
+
+
+def make_local_shell_function_tool(
+    executor: RestrictedShellExecutor,
+) -> FunctionTool:
+    """Adapt the sandboxed shell executor to chat-completions transports.
+
+    The Responses ShellTool has no Chat Completions serialization, so chat
+    transports call this plain function tool instead. Execution stays local:
+    every call runs through the existing executor, keeping command
+    restrictions, snapshot pinning, timeouts, output limits, and the
+    sandboxed working directory. Rejections and timeouts return as result
+    text so the model can adjust; nothing is raised to the run loop.
+    """
+
+    async def _invoke(ctx: Any, args_json: str) -> str:
+        try:
+            args = json.loads(args_json)
+        except ValueError:
+            return "error: arguments must be a JSON object with a 'command' string"
+        if (
+            not isinstance(args, dict)
+            or not isinstance(args.get("command"), str)
+            or not args["command"].strip()
+        ):
+            return "error: arguments must be a JSON object with a 'command' string"
+        timeout_ms = args.get("timeout_ms")
+        if timeout_ms is not None and (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or timeout_ms <= 0
+        ):
+            return "error: 'timeout_ms' must be a positive integer of milliseconds"
+        request = ShellCommandRequest(
+            ctx_wrapper=RunContextWrapper(context=None),
+            data=ShellCallData(
+                call_id=getattr(ctx, "tool_call_id", None) or "local",
+                action=ShellActionRequest(
+                    commands=[args["command"]],
+                    timeout_ms=timeout_ms,
+                ),
+            ),
+        )
+        result = await executor(request)
+        return _render_shell_result_text(result)
+
+    return FunctionTool(
+        name=SHELL_FUNCTION_TOOL_NAME,
+        description=SHELL_FUNCTION_TOOL_DESCRIPTION,
+        params_json_schema={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "One shell command, e.g. "
+                        "\"python -c '...'\" or "
+                        "\"git -C PX4-Autopilot grep -n -F 'term' SNAPSHOT -- src/\""
+                    ),
+                },
+                "timeout_ms": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Optional per-command timeout in milliseconds; "
+                        "null uses the runner default"
+                    ),
+                },
+            },
+            "required": ["command", "timeout_ms"],
+            "additionalProperties": False,
+        },
+        on_invoke_tool=_invoke,
+        needs_approval=False,
+    )
+
+
 class RestrictedShellExecutor:
     """Run an allowlist of commands and pin PX4 Git reads to one snapshot."""
 
@@ -163,8 +283,11 @@ class RestrictedShellExecutor:
         cwd: Path,
         source_snapshot: SourceSnapshot | None = None,
         input_paths: dict[str, Path] | None = None,
+        output_limit: int = MAX_OUTPUT_CHARS,
     ):
         self.cwd = cwd.resolve()
+        self.output_limit = output_limit
+        self._overflow_count = 0
         self.source_snapshot = source_snapshot
         self.input_paths = {
             name: path.expanduser().resolve()
@@ -990,14 +1113,20 @@ else:
             await asyncio.shield(communication)
             raise
 
-    @staticmethod
-    def _truncate(text: str) -> str:
-        if len(text) <= MAX_OUTPUT_CHARS:
+    def _truncate(self, text: str) -> str:
+        if len(text) <= self.output_limit:
             return text
-        omitted = len(text) - MAX_OUTPUT_CHARS
+        omitted = len(text) - self.output_limit
+        self._overflow_count += 1
+        overflow_dir = self.cwd / "shell_outputs"
+        overflow_dir.mkdir(parents=True, exist_ok=True)
+        overflow_path = overflow_dir / f"cmd_{self._overflow_count:03d}.txt"
+        overflow_path.write_text(text, encoding="utf-8")
         return (
-            text[:MAX_OUTPUT_CHARS]
-            + f"\n\n[output truncated; {omitted} characters omitted]"
+            text[: self.output_limit]
+            + f"\n\n[output truncated; {omitted} characters omitted; "
+            f"full output saved to shell_outputs/{overflow_path.name} - "
+            "read bounded slices with Python]"
         )
 
     def _restricted_env(self) -> dict[str, str]:
@@ -1136,6 +1265,12 @@ async def analyze_flight_log(
     dag_cache_dir: str = ".flightlog_cache",
     *,
     model: str | None = None,
+    model_provider: str | None = None,
+    model_transport: str | None = None,
+    reasoning_effort: str | None = None,
+    openrouter_api_key: str | None = None,
+    router_cost_tier: str | None = None,
+    shell_output_limit: int | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_total_requests: int | None = None,
     project_instructions: str = "",
@@ -1164,23 +1299,48 @@ async def analyze_flight_log(
         raise ValueError("max_turns must be at least 1")
     if max_total_requests is not None and max_total_requests < 1:
         raise ValueError("max_total_requests must be at least 1")
+    if shell_output_limit is None:
+        shell_output_env = os.environ.get("FLIGHT_LOG_SHELL_OUTPUT_LIMIT")
+        shell_output_limit = (
+            int(shell_output_env) if shell_output_env else MAX_OUTPUT_CHARS
+        )
+    if shell_output_limit < 1000:
+        raise ValueError("shell_output_limit must be at least 1000 characters")
 
     model_name = model or os.environ.get("OPENAI_MODEL", "gpt-5.6")
-    turn_limit = (
-        min(max_turns, max_total_requests)
-        if max_total_requests is not None
-        else max_turns
-    )
     work_dir = prepare_workspace(
         log_path_obj,
         output_dir_obj,
         mission_path_obj,
     )
+    audit_logger = DeveloperAuditLogger(Path(dev_log_root), run_id=dev_run_id)
+    # Local configuration errors (unknown provider/transport/effort,
+    # empty model, missing key) raise here, before any model request.
+    # Remote errors (authentication, unknown model, unreachable endpoint)
+    # surface from the provider at run time through run.failed.
+    model_runtime = resolve_model_runtime(
+        model=model_name,
+        model_provider=model_provider,
+        model_transport=model_transport,
+        reasoning_effort=reasoning_effort,
+        openrouter_api_key=openrouter_api_key,
+        router_cost_tier=router_cost_tier,
+        response_sink=lambda fields: audit_logger.log_event(
+            "model.provider_response", **fields
+        ),
+    )
+    web_search_effective = (
+        enable_web_fallback and model_runtime.web_search_supported
+    )
+    turn_limit = (
+        min(max_turns, max_total_requests)
+        if max_total_requests is not None
+        else max_turns
+    )
     analysis_inputs = {"flight.ulg": log_path_obj}
     if mission_path_obj is not None:
         analysis_inputs["mission.plan"] = mission_path_obj
     report_path = output_dir_obj / "report.json"
-    audit_logger = DeveloperAuditLogger(Path(dev_log_root), run_id=dev_run_id)
     audit_logger.save_metadata(
         {
             "runner_version": "shell_snapshot_v1",
@@ -1199,11 +1359,22 @@ async def analyze_flight_log(
             "dag_cache_dir": dag_cache_dir,
             "analysis_architecture": "single_agent_v1",
             "model": model_name,
-            "reasoning_effort": "high",
+            "reasoning_effort": model_runtime.reasoning_effort,
+            "requested_model_provider": model_runtime.provider,
+            "requested_model": model_runtime.model,
+            "requested_reasoning_effort": model_runtime.reasoning_effort,
+            "model_transport": model_runtime.transport,
+            "requested_router_cost_tier": model_runtime.router_cost_tier,
+            "web_search_requested": enable_web_fallback,
+            "web_search_effective": web_search_effective,
+            # Served identity is known only after the run; "unavailable"
+            # until the post-run update below records what was exposed.
+            "served_model": UNAVAILABLE,
+            "served_reasoning_effort": UNAVAILABLE,
             "enable_web_fallback": enable_web_fallback,
             "web_search_context": web_search_context,
             "max_turns": turn_limit,
-            "max_total_requests": max_total_requests,
+            "shell_output_limit": shell_output_limit,            "max_total_requests": max_total_requests,
         }
     )
     audit_logger.log_event("run.started")
@@ -1262,6 +1433,7 @@ async def analyze_flight_log(
             work_dir,
             source_snapshot,
             input_paths=analysis_inputs,
+            output_limit=shell_output_limit,
         )
         await shell_executor.preflight()
 
@@ -1284,19 +1456,34 @@ async def analyze_flight_log(
                 + project_instructions
             )
 
-        tools: list[Any] = [
-            ShellTool(
-                executor=shell_executor,
-                needs_approval=False,
-            )
-        ]
+        # Native ShellTool lives only on the established default OpenAI
+        # Responses path. Every OpenRouter configuration and every chat
+        # transport runs the same sandboxed executor behind a plain
+        # function tool with matching call instructions.
+        use_responses_shell = (
+            model_runtime.provider == "openai"
+            and model_runtime.transport == "responses"
+        )
+        if not use_responses_shell:
+            instructions += SHELL_FUNCTION_TOOL_INSTRUCTIONS
+
+        tools: list[Any] = (
+            [
+                ShellTool(
+                    executor=shell_executor,
+                    needs_approval=False,
+                )
+            ]
+            if use_responses_shell
+            else [make_local_shell_function_tool(shell_executor)]
+        )
         if source_snapshot is not None:
             tools.append(
                 make_read_px4_source_file_tool(
                     shell_executor.resolve_source_alias,
                 )
             )
-        if enable_web_fallback:
+        if enable_web_fallback and model_runtime.web_search_supported:
             tools.append(
                 WebSearchTool(
                     search_context_size=web_search_context,
@@ -1304,13 +1491,21 @@ async def analyze_flight_log(
                 )
             )
 
+        # Router plugin fragments travel only to OpenRouter; other
+        # providers never receive unknown body fields.
+        router_body = (
+            router_plugins_body(model_runtime.router_cost_tier)
+            if model_runtime.provider == "openrouter"
+            else None
+        )
         agent = Agent(
             name="PX4 ULog Analyst",
             model=model_name,
             instructions=instructions,
             tools=tools,
             model_settings=ModelSettings(
-                reasoning=Reasoning(effort="high"),
+                reasoning=Reasoning(effort=model_runtime.reasoning_effort),
+                extra_body=router_body,
             ),
             output_type=FlightLogReport,
         )
@@ -1320,15 +1515,34 @@ async def analyze_flight_log(
             source_snapshot=source_snapshot,
             mission_path=mission_path_obj,
             plots_dir=output_dir_obj / "plots",
-            web_search_available=enable_web_fallback,
+            web_search_available=web_search_effective,
         )
         result = await Runner.run(
             agent,
             prompt,
             max_turns=turn_limit,
             hooks=AgentRunAuditHooks(audit_logger),
+            run_config=model_runtime.run_config,
         )
         log_run_items(audit_logger, getattr(result, "new_items", []) or [])
+        served_model = served_model_from_result(result)
+        audit_logger.log_event(
+            "model.served",
+            requested_provider=model_runtime.provider,
+            requested_model=model_runtime.model,
+            requested_reasoning_effort=model_runtime.reasoning_effort,
+            # Result-level identity where the SDK exposes it; per-request
+            # served values are not exposed, so record them as unavailable
+            # rather than inferring them.
+            served_model=served_model,
+            served_reasoning_effort=UNAVAILABLE,
+        )
+        audit_logger.update_metadata(
+            {
+                "served_model": served_model,
+                "served_reasoning_effort": UNAVAILABLE,
+            }
+        )
         report = (
             result.final_output
             if isinstance(result.final_output, FlightLogReport)
@@ -1373,6 +1587,9 @@ async def analyze_flight_log(
     except Exception as exc:
         audit_logger.log_event("run.failed", error=repr(exc))
         raise
+    finally:
+        if model_runtime.aclose is not None:
+            await model_runtime.aclose()
 
 
 def _model_inventory(
@@ -1559,6 +1776,11 @@ async def run_analysis(args: argparse.Namespace) -> None:
         dev_log_root=args.dev_log_root,
         user_question=args.question,
         model=args.model,
+        model_provider=args.model_provider,
+        model_transport=args.model_transport,
+        reasoning_effort=args.reasoning_effort,
+        router_cost_tier=args.router_cost_tier,
+        shell_output_limit=args.shell_output_limit,
         max_turns=args.max_turns,
         max_total_requests=args.max_total_requests,
         project_instructions=project_instructions,
@@ -1608,6 +1830,52 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=os.environ.get("OPENAI_MODEL", "gpt-5.6"),
         help="API model ID; defaults to OPENAI_MODEL or gpt-5.6",
+    )
+    parser.add_argument(
+        "--model-provider",
+        choices=("auto", "openai", "openrouter"),
+        default=None,
+        help=(
+            "Model provider; defaults to FLIGHT_LOG_MODEL_PROVIDER or "
+            "'auto' (current OpenAI behavior)"
+        ),
+    )
+    parser.add_argument(
+        "--model-transport",
+        choices=("auto", "responses", "chat"),
+        default=None,
+        help=(
+            "Provider transport; 'auto' keeps the SDK default for OpenAI "
+            "and uses chat completions for OpenRouter"
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=None,
+        help=(
+            "Reasoning effort; defaults to FLIGHT_LOG_REASONING_EFFORT "
+            "or 'high'"
+        ),
+    )
+    parser.add_argument(
+        "--router-cost-tier",
+        choices=("low", "medium", "high"),
+        default=None,
+        help=(
+            "Router cost-tier policy; defaults to "
+            "FLIGHT_LOG_ROUTER_COST_TIER or unset"
+        ),
+    )
+    parser.add_argument(
+        "--shell-output-limit",
+        type=int,
+        default=None,
+        help=(
+            "Per-command tool-output cap in characters sent to the model; "
+            "full output is saved under work/shell_outputs/. Defaults to "
+            "FLIGHT_LOG_SHELL_OUTPUT_LIMIT or 600000"
+        ),
     )
     parser.add_argument(
         "--max-turns",

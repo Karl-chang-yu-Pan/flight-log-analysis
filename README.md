@@ -178,6 +178,10 @@ available. Useful optional arguments include:
 | `--mission PATH` | Supply an optional mission file. |
 | `--instructions PATH` | Append project-specific runtime instructions. |
 | `--model MODEL` | Override `OPENAI_MODEL`. |
+| `--model-provider auto\|openai\|openrouter` | Select the model provider. |
+| `--model-transport auto\|responses\|chat` | Select the provider transport. |
+| `--reasoning-effort low\|medium\|high` | Set reasoning effort; default is high. |
+| `--shell-output-limit N` | Per-command tool-output cap in characters sent to the model. |
 | `--max-turns N` | Set the analysis turn limit; default is 30. |
 | `--max-total-requests N` | Apply an additional request cap. |
 | `--no-web-fallback` | Remove hosted web search from the run. |
@@ -186,6 +190,86 @@ available. Useful optional arguments include:
 Web search is available to the agent from the beginning of a default run. The
 runtime prompt tells the agent to use it only when the local ULog and exact PX4
 source leave a material external-context gap.
+
+## Model Provider Configuration
+
+The analyzer defaults to the current OpenAI setup: explicit `--model` (or
+`model=` in the Python API) wins, then `OPENAI_MODEL`, then `gpt-5.6`, with
+high reasoning effort and hosted web search available. Nothing about that path
+changes when no provider is configured.
+
+To run against OpenRouter instead, set an API key and pick a provider and
+model. Model IDs pass through verbatim, including routed IDs:
+
+```bash
+export OPENROUTER_API_KEY=your_openrouter_key
+
+.venv/bin/python -m flight_log_agent.analysis.analyzer \
+  --ulog /path/to/flight.ulg \
+  --question "Why did the aircraft behave this way?" \
+  --source ref/PX4-Autopilot \
+  --output-dir outputs/openrouter_run \
+  --model-provider openrouter \
+  --model openai/gpt-5-nano
+```
+
+Precedence: explicit flags/arguments beat environment, which beats defaults.
+`--model-provider` (`FLIGHT_LOG_MODEL_PROVIDER`, default `auto`) selects
+`openai` or `openrouter`. `--model-transport`
+(`auto`/`responses`/`chat`) selects the API transport: `auto` keeps the SDK
+default for OpenAI and uses chat completions for OpenRouter (the OpenRouter
+Responses surface is beta). `--reasoning-effort`
+(`FLIGHT_LOG_REASONING_EFFORT`, default `high`) sets the effort passed to the
+provider. No new Python package is needed for OpenRouter access.
+
+Limitations:
+
+- The Responses ShellTool lives only on the established default OpenAI
+  Responses path. Every OpenRouter configuration and every chat transport
+  runs the same sandboxed executor behind a plain `run_shell_command`
+  function tool instead. Execution stays local: the same command
+  allowlist, snapshot pinning, timeouts, output limits, and Bubblewrap
+  sandbox apply, and no log or source data leaves the machine.
+- Hosted web search is a Responses-only tool. On the chat-completions
+  transport it is forced off and recorded as such; pass an explicit
+  `responses` transport to keep it. This task adds no new search
+  integration and no hosted execution containers.
+- Run metadata records the requested provider, model, effort, transport,
+  and requested/effective web policy. Served-model identity is recorded
+  where the run result exposes it; per-request served values are not
+  exposed by the SDK, so they are recorded as unavailable rather than
+  inferred. Usage stays in tokens; the repository performs no currency
+  conversion.
+- Every completed model request also appends a `model.request` audit
+  event carrying observed response identity (`response_id`, when the
+  transport provides one) alongside served model, provider, charged
+  cost, and routing metadata. Fields the provider does not return are
+  recorded as unavailable: on the installed SDK the raw provider
+  response (which is where generation IDs, served-model echoes, and
+  usage costs live) is discarded before hooks run, so those slots stay
+  unavailable until a transport surfaces them. Requested settings are
+  never mixed into these observed records, effort is never inferred
+  from token counts, and the append-only events survive later request
+  or finalization failures.
+- On OpenRouter configurations the analyzer additionally sends
+  `X-OpenRouter-Metadata: enabled` and records a `model.provider_response`
+  event per successful response with the returned generation ID, served
+  model, charged cost, and router metadata. Only these metadata fields
+  are stored — never prompts, response content, or credentials — and
+  missing fields stay unavailable without failing the run. The client is
+  run-scoped (default retry/timeout behavior, closed when the run ends);
+  the default OpenAI path builds no custom client.
+- Local configuration problems (unknown provider/transport/effort, empty
+  model ID, missing OpenRouter key) fail before any model request.
+  Provider-side failures (authentication, unknown model, unreachable
+  endpoint) abort through the existing run-failure path.
+- Tool outputs past `--shell-output-limit` (`FLIGHT_LOG_SHELL_OUTPUT_LIMIT`,
+  default 600000, minimum 1000) are cut to a head excerpt with a visible
+  banner; the full text is saved under `work/shell_outputs/` and remains
+  readable with bounded Python slice reads. The default cap preserves
+  current behavior.
+- The web UI does not expose provider/model selection; it uses the
+  analyzer defaults.
 
 The turn, request, and web-search flags above apply to the direct CLI and Python
 API. The current web UI uses the analyzer defaults: 30 turns and web search

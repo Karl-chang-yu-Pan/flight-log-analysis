@@ -1089,7 +1089,7 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
         def __init__(self, **kwargs):
             captured.setdefault("web_tools", []).append(kwargs)
 
-    async def fake_run(agent, prompt, max_turns, hooks):
+    async def fake_run(agent, prompt, max_turns, hooks, run_config=None):
         artifact = json.loads((output_dir / "work" / "ulog_inventory.json").read_text())
         assert artifact["parameters"] == {"EXAMPLE_PARAM": 42, "SYS_AUTOSTART": 777}
         if source_available:
@@ -1111,6 +1111,7 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
         captured["prompt"] = prompt
         captured["max_turns"] = max_turns
         captured["hooks"] = hooks
+        captured["run_config"] = run_config
         return SimpleNamespace(
             final_output=report,
             new_items=[],
@@ -1167,6 +1168,9 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
     assert source_executor.input_paths == {"flight.ulg": log_path.resolve()}
     assert captured["agent_kwargs"]["output_type"] is FlightLogReport
     assert captured["agent_kwargs"]["model"] == "gpt-5.6"
+    # Default path resolves no explicit provider: Runner.run receives no
+    # RunConfig, preserving today's provider behavior.
+    assert captured["run_config"] is None
     assert (
         captured["agent_kwargs"]["model_settings"].reasoning.effort
         == "high"
@@ -1210,3 +1214,836 @@ def test_single_agent_analyzer_preserves_shared_report_and_run_contract(
         dev_log_root,
         "web_run_1",
     )
+
+
+def _provider_harness(tmp_path, monkeypatch, extra_result_kwargs=None, **run_kwargs):
+    """Minimal fakes driving analyze_flight_log for provider-wiring tests."""
+    from agents import RunConfig
+
+    log_path = tmp_path / "uploads" / "flight.ulg"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_bytes(b"ULog")
+    output_dir = tmp_path / "outputs" / "run"
+    dev_log_root = tmp_path / "dev_logs"
+    report = _empty_report()
+    captured = {}
+    parse_inventory = Mock(
+        return_value={
+            "firmware_version": "v1.0.0",
+            "git_hash": None,
+            "parameters": {},
+            "topic_fields": {},
+            "topic_instances": {},
+            "logged_messages": [],
+            "available_topics": [],
+            "missing_topics": [],
+            "warnings": [],
+        }
+    )
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["agent_kwargs"] = kwargs
+
+    class FakeShellTool:
+        def __init__(self, **kwargs):
+            captured["shell_tool"] = kwargs
+
+    class FakeWebSearchTool:
+        def __init__(self, **kwargs):
+            captured.setdefault("web_tools", []).append(kwargs)
+
+    async def fake_run(agent, prompt, max_turns, hooks, run_config=None):
+        captured["prompt"] = prompt
+        captured["run_config"] = run_config
+        return SimpleNamespace(
+            final_output=report,
+            new_items=[],
+            context_wrapper=SimpleNamespace(usage=Usage()),
+            **(extra_result_kwargs or {}),
+        )
+
+    async def fake_preflight(executor):
+        return None
+
+    monkeypatch.setattr(analyzer, "parse_ulog_inventory", parse_inventory)
+    monkeypatch.setattr(analyzer, "Agent", FakeAgent)
+    monkeypatch.setattr(analyzer, "ShellTool", FakeShellTool)
+    monkeypatch.setattr(analyzer, "WebSearchTool", FakeWebSearchTool)
+    monkeypatch.setattr(analyzer.Runner, "run", fake_run)
+    monkeypatch.setattr(
+        analyzer.RestrictedShellExecutor, "preflight", fake_preflight
+    )
+    kwargs = {
+        "log_path": str(log_path),
+        "source_path": None,
+        "output_dir": str(output_dir),
+        "dev_log_root": str(dev_log_root),
+        "dev_run_id": "provider_run",
+        "user_question": "What happened?",
+        **run_kwargs,
+    }
+    result = asyncio.run(analyzer.analyze_flight_log(**kwargs))
+    events = [
+        json.loads(line)
+        for line in (
+            dev_log_root / "provider_run" / "run_events.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    metadata = json.loads(
+        (dev_log_root / "provider_run" / "metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return result, captured, events, metadata, output_dir, dev_log_root
+
+
+def _served_events(events):
+    return [e for e in events if e.get("event") == "model.served"]
+
+
+def test_default_path_passes_no_run_config_and_records_requested_values(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("FLIGHT_LOG_MODEL_PROVIDER", raising=False)
+    monkeypatch.delenv("FLIGHT_LOG_REASONING_EFFORT", raising=False)
+    _, captured, events, metadata, _, _ = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6"
+    )
+    assert captured["run_config"] is None
+    assert captured["agent_kwargs"]["model"] == "gpt-5.6"
+    assert (
+        captured["agent_kwargs"]["model_settings"].reasoning.effort == "high"
+    )
+    assert captured["agent_kwargs"]["output_type"] is FlightLogReport
+    assert len(captured.get("web_tools", [])) == 1
+    assert metadata["model"] == "gpt-5.6"
+    assert metadata["requested_model_provider"] == "openai"
+    assert metadata["requested_model"] == "gpt-5.6"
+    assert metadata["requested_reasoning_effort"] == "high"
+    assert metadata["model_transport"] == "responses"
+    assert metadata["web_search_requested"] is True
+    assert metadata["web_search_effective"] is True
+    served = _served_events(events)
+    assert len(served) == 1
+    assert served[0]["requested_model"] == "gpt-5.6"
+    assert served[0]["served_model"] == "unavailable"
+    assert served[0]["served_reasoning_effort"] == "unavailable"
+    assert metadata["served_model"] == "unavailable"
+    assert metadata["served_reasoning_effort"] == "unavailable"
+
+
+def test_openrouter_chat_forces_web_search_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="openai/gpt-5-nano",
+        model_provider="openrouter",
+        enable_web_fallback=True,
+    )
+    from agents import RunConfig
+
+    assert isinstance(captured["run_config"], RunConfig)
+    assert captured.get("web_tools", []) == []
+    assert "Web search is disabled" in captured["prompt"]
+    assert metadata["requested_model_provider"] == "openrouter"
+    assert metadata["model_transport"] == "chat"
+    assert metadata["web_search_requested"] is True
+    assert metadata["web_search_effective"] is False
+
+
+def test_openrouter_responses_uses_function_adapter(tmp_path, monkeypatch):
+    from agents import FunctionTool
+    from agents.models.chatcmpl_converter import Converter
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="openai/gpt-5-nano",
+        model_provider="openrouter",
+        model_transport="responses",
+        enable_web_fallback=True,
+    )
+    tools = captured["agent_kwargs"]["tools"]
+    function_tools = [tool for tool in tools if isinstance(tool, FunctionTool)]
+    assert any(
+        tool.name == analyzer.SHELL_FUNCTION_TOOL_NAME
+        for tool in function_tools
+    )
+    assert not any(type(tool).__name__ == "ShellTool" for tool in tools)
+    # Every function tool on the OpenRouter Responses list must serialize
+    # on the real Chat Completions converter: no hosted ShellTool may
+    # remain. (The hosted web-search tool travels the Responses
+    # transport, not this converter.)
+    converted = [Converter.tool_to_openai(tool) for tool in function_tools]
+    assert converted
+    assert {entry["type"] for entry in converted} == {"function"}
+    assert len(captured.get("web_tools", [])) == 1
+    assert metadata["web_search_effective"] is True
+
+
+def test_openrouter_responses_keeps_web_search(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="openai/gpt-5-nano",
+        model_provider="openrouter",
+        model_transport="responses",
+        enable_web_fallback=True,
+    )
+    assert len(captured.get("web_tools", [])) == 1
+    assert metadata["web_search_effective"] is True
+
+
+def test_routed_fixture_records_served_model(tmp_path, monkeypatch):
+    class Raw:
+        model = "served-router-choice"
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    # served identity differs from the requested router ID
+    _, _, events, metadata, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        {"raw_responses": [Raw()]},
+        model="typesafe/jev-router",
+        model_provider="openrouter",
+        enable_web_fallback=False,
+    )
+    served = [e for e in events if e.get("event") == "model.served"]
+    assert len(served) == 1
+    assert served[0]["requested_model"] == "typesafe/jev-router"
+    assert served[0]["served_model"] == "served-router-choice"
+    assert metadata["served_model"] == "served-router-choice"
+    assert metadata["served_reasoning_effort"] == "unavailable"
+
+
+def test_openrouter_without_key_fails_before_model_request(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    called = {}
+
+    async def fake_run(*args, **kwargs):
+        called["ran"] = True
+        raise AssertionError("must not reach the model")
+
+    monkeypatch.setattr(analyzer.Runner, "run", fake_run)
+    log_path = tmp_path / "uploads" / "flight.ulg"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_bytes(b"ULog")
+    with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+        asyncio.run(
+            analyzer.analyze_flight_log(
+                log_path=str(log_path),
+                output_dir=str(tmp_path / "outputs" / "run"),
+                dev_log_root=str(tmp_path / "dev_logs"),
+                user_question="What happened?",
+                model="openai/gpt-5-nano",
+                model_provider="openrouter",
+            )
+        )
+    assert "ran" not in called
+
+
+def test_usage_record_written_for_configured_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, _, _, metadata, _, dev_log_root = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="openai/gpt-5-nano",
+        model_provider="openrouter",
+    )
+    usage_path = dev_log_root / "provider_run" / "usage.json"
+    assert usage_path.is_file()
+    assert json.loads(usage_path.read_text(encoding="utf-8")) is not None
+    assert metadata["served_model"] == "unavailable"
+
+
+def test_openai_chat_transport_forces_web_search_off(tmp_path, monkeypatch):
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="gpt-5.6",
+        model_provider="openai",
+        model_transport="chat",
+        enable_web_fallback=True,
+    )
+    assert captured.get("web_tools", []) == []
+    assert "Web search is disabled" in captured["prompt"]
+    assert metadata["model_transport"] == "chat"
+    assert metadata["web_search_requested"] is True
+    assert metadata["web_search_effective"] is False
+
+
+def test_provider_side_error_flows_through_existing_failure_path(
+    tmp_path, monkeypatch
+):
+    """Remote errors propagate; resolution must not swallow or reclassify."""
+    log_path = tmp_path / "uploads" / "flight.ulg"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_bytes(b"ULog")
+    dev_log_root = tmp_path / "dev_logs"
+    parse_inventory = Mock(
+        return_value={
+            "firmware_version": "v1.0.0",
+            "git_hash": None,
+            "parameters": {},
+            "topic_fields": {},
+            "topic_instances": {},
+            "logged_messages": [],
+            "available_topics": [],
+            "missing_topics": [],
+            "warnings": [],
+        }
+    )
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeShellTool:
+        def __init__(self, **kwargs):
+            pass
+
+    async def fake_run(agent, prompt, max_turns, hooks, run_config=None):
+        raise RuntimeError("provider: model not found")
+
+    async def fake_preflight(executor):
+        return None
+
+    monkeypatch.setattr(analyzer, "parse_ulog_inventory", parse_inventory)
+    monkeypatch.setattr(analyzer, "Agent", FakeAgent)
+    monkeypatch.setattr(analyzer, "ShellTool", FakeShellTool)
+    monkeypatch.setattr(analyzer.Runner, "run", fake_run)
+    monkeypatch.setattr(
+        analyzer.RestrictedShellExecutor, "preflight", fake_preflight
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    with pytest.raises(RuntimeError, match="model not found"):
+        asyncio.run(
+            analyzer.analyze_flight_log(
+                log_path=str(log_path),
+                source_path=None,
+                output_dir=str(tmp_path / "outputs" / "run"),
+                dev_log_root=str(dev_log_root),
+                dev_run_id="provider_run",
+                user_question="What happened?",
+                model="openai/does-not-exist",
+                model_provider="openrouter",
+            )
+        )
+    events = [
+        json.loads(line)
+        for line in (
+            dev_log_root / "provider_run" / "run_events.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert events[-1]["event"] == "run.failed"
+    assert "model not found" in events[-1]["error"]
+
+
+def test_cli_exposes_provider_transport_effort_flags(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "analyzer",
+            "--ulog",
+            "flight.ulg",
+            "--question",
+            "q",
+            "--model-provider",
+            "openrouter",
+            "--model-transport",
+            "chat",
+            "--reasoning-effort",
+            "low",
+        ],
+    )
+    args = analyzer.parse_args()
+    assert args.model_provider == "openrouter"
+    assert args.model_transport == "chat"
+    assert args.reasoning_effort == "low"
+    monkeypatch.setattr("sys.argv", ["analyzer"])
+    with pytest.raises(SystemExit):
+        analyzer.parse_args()
+
+
+def _chat_tools_via_harness(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, _, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="openai/gpt-5-nano",
+        model_provider="openrouter",
+        enable_web_fallback=True,
+    )
+    return captured["agent_kwargs"]["tools"]
+
+
+def test_chat_tool_list_serializes_with_real_sdk_converter(
+    tmp_path, monkeypatch
+):
+    from agents.models.chatcmpl_converter import Converter
+
+    tools = _chat_tools_via_harness(tmp_path, monkeypatch)
+    converted = [Converter.tool_to_openai(tool) for tool in tools]
+    assert converted, "expected a non-empty chat tool list"
+    for entry in converted:
+        assert entry["type"] == "function"
+        assert entry["function"]["name"]
+        assert entry["function"]["parameters"]
+    names = {entry["function"]["name"] for entry in converted}
+    assert analyzer.SHELL_FUNCTION_TOOL_NAME in names
+
+
+def test_source_excerpt_tool_serializes_with_real_sdk_converter(tmp_path):
+    from agents.models.chatcmpl_converter import Converter
+
+    from flight_log_agent.analysis.source_tools import (
+        make_read_px4_source_file_tool,
+    )
+
+    tool = make_read_px4_source_file_tool(lambda alias: None)
+    entry = Converter.tool_to_openai(tool)
+    assert entry["type"] == "function"
+    assert entry["function"]["name"] == "read_px4_source_file"
+
+
+def test_shell_function_adapter_executes_snapshot_pinned_git_read(
+    tmp_path,
+):
+    from agents.tool_context import ToolContext
+
+    from flight_log_agent.px4.source_snapshot import SourceRepository
+
+    source_path = tmp_path / "PX4-Autopilot"
+    source_path.mkdir()
+    _git(source_path, "init")
+    (source_path / "note.txt").write_text("pinned-content\n", encoding="utf-8")
+    commit = _commit(source_path, "snapshot")
+    snapshot = SourceRepository(source_path).resolve_snapshot(commit)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    executor = analyzer.RestrictedShellExecutor(
+        work_dir, snapshot, input_paths={}
+    )
+    tool = analyzer.make_local_shell_function_tool(executor)
+    ctx = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call_1",
+        tool_arguments='{"command": "x"}',
+    )
+    output = asyncio.run(
+        tool.on_invoke_tool(
+            ctx,
+            '{"command": "git -C PX4-Autopilot show SNAPSHOT:note.txt"}',
+        )
+    )
+    assert "pinned-content" in output
+    assert "exit code: 0" in output
+
+
+def test_shell_function_adapter_rejects_disallowed_program(tmp_path):
+    from agents.tool_context import ToolContext
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    executor = analyzer.RestrictedShellExecutor(
+        work_dir, None, input_paths={}
+    )
+    tool = analyzer.make_local_shell_function_tool(executor)
+    ctx = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call_2",
+        tool_arguments='{"command": "x"}',
+    )
+    output = asyncio.run(
+        tool.on_invoke_tool(ctx, '{"command": "ls /"}')
+    )
+    assert "exit code: 126" in output
+
+
+def test_chat_transport_offline_loop_with_mocked_http(tmp_path, monkeypatch):
+    from agents import Usage
+    from agents.agent_output import AgentOutputSchema
+    from agents.model_settings import ModelSettings
+    from agents.models.chatcmpl_converter import Converter
+    from agents.models.interface import ModelTracing
+    from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+    from agents.tool_context import ToolContext
+    from openai.types.chat.chat_completion import ChatCompletion, Choice
+    from openai.types.chat.chat_completion_message import (
+        ChatCompletionMessage,
+    )
+    from openai.types.chat.chat_completion_message_tool_call import (
+        ChatCompletionMessageToolCall,
+        Function as ToolFunction,
+    )
+    from openai.types.completion_usage import CompletionUsage
+
+    from flight_log_agent.analysis.report_validation import validate_report
+    from flight_log_agent.px4.source_snapshot import SourceRepository
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    source_path = tmp_path / "PX4-Autopilot"
+    source_path.mkdir()
+    _git(source_path, "init")
+    (source_path / "note.txt").write_text("pinned-content\n", encoding="utf-8")
+    commit = _commit(source_path, "snapshot")
+    snapshot = SourceRepository(source_path).resolve_snapshot(commit)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    executor = analyzer.RestrictedShellExecutor(
+        work_dir, snapshot, input_paths={}
+    )
+    shell_tool = analyzer.make_local_shell_function_tool(executor)
+    tools = [shell_tool]
+
+    # 1. Serialize the complete tool list with the real SDK transport.
+    converted = [Converter.tool_to_openai(tool) for tool in tools]
+    assert [entry["function"]["name"] for entry in converted] == [
+        shell_tool.name
+    ]
+
+    report_json = _empty_report().model_dump_json()
+
+    def make_completion(content, tool_calls):
+        message = ChatCompletionMessage(
+            role="assistant", content=content, tool_calls=tool_calls
+        )
+        choice = Choice(
+            finish_reason="tool_calls" if tool_calls else "stop",
+            index=0,
+            message=message,
+        )
+        return ChatCompletion(
+            id="chatcmpl-test",
+            choices=[choice],
+            created=0,
+            model="openai/gpt-5-nano",
+            object="chat.completion",
+            usage=CompletionUsage(
+                prompt_tokens=100, completion_tokens=20, total_tokens=120
+            ),
+        )
+
+    call_args = (
+        '{"command": "git -C PX4-Autopilot show SNAPSHOT:note.txt"}'
+    )
+    responses = [
+        make_completion(
+            None,
+            [
+                ChatCompletionMessageToolCall(
+                    id="call_1",
+                    function=ToolFunction(
+                        name=shell_tool.name, arguments=call_args
+                    ),
+                    type="function",
+                )
+            ],
+        ),
+        make_completion(report_json, None),
+    ]
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return responses[len(self.calls) - 1]
+
+    class FakeClient:
+        base_url = "https://openrouter.ai/api/v1"
+
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    model = OpenAIChatCompletionsModel(
+        model="openai/gpt-5-nano", openai_client=(client := FakeClient())
+    )
+    settings = ModelSettings()
+    schema = AgentOutputSchema(output_type=FlightLogReport)
+    first = asyncio.run(
+        model.get_response(
+            "system",
+            "investigate",
+            settings,
+            tools,
+            schema,
+            [],
+            ModelTracing.DISABLED,
+        )
+    )
+    # 2-3. Receive the function call, execute locally, replay the result.
+    function_calls = [
+        item
+        for item in first.output
+        if getattr(item, "type", None) == "function_call"
+    ]
+    assert len(function_calls) == 1
+    assert function_calls[0].name == shell_tool.name
+    ctx = ToolContext(
+        context=None,
+        tool_name=shell_tool.name,
+        tool_call_id=function_calls[0].call_id,
+        tool_arguments=call_args,
+    )
+    tool_output = asyncio.run(
+        shell_tool.on_invoke_tool(ctx, call_args)
+    )
+    assert "pinned-content" in tool_output
+    replay_input = [
+        function_calls[0].model_dump(exclude_none=True),
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": tool_output,
+        },
+    ]
+    converted_replay = Converter.items_to_messages(replay_input)
+    assert converted_replay, "expected replayable tool output messages"
+    assert converted_replay[-1]["role"] == "tool"
+
+    # 4. Structured report parses and validates; usage captured per request.
+    # The follow-up input replays history as response items (as the real
+    # run loop does), not as already-converted chat messages.
+    history_input = [
+        {"role": "user", "content": "investigate"},
+        function_calls[0].model_dump(exclude_none=True),
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": tool_output,
+        },
+    ]
+    second = asyncio.run(
+        model.get_response(
+            "system",
+            history_input,
+            settings,
+            tools,
+            schema,
+            [],
+            ModelTracing.DISABLED,
+        )
+    )
+    first_kwargs, second_kwargs = client.chat.completions.calls
+    for kwargs in (first_kwargs, second_kwargs):
+        assert kwargs["model"] == "openai/gpt-5-nano"
+        assert kwargs["tools"][0]["type"] == "function"
+        assert "response_format" in kwargs
+    texts = [
+        item
+        for item in second.output
+        if getattr(item, "type", None) == "message"
+    ]
+    assert texts, "expected a final assistant message"
+    def _message_text(item):
+        content = item.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, dict):
+            return content.get("text", "")
+        parts = []
+        for part in content or []:
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "".join(parts)
+
+    report = FlightLogReport.model_validate_json(_message_text(texts[0]))
+    assert validate_report(report).passed
+    total = Usage()
+    total.add(first.usage)
+    total.add(second.usage)
+    assert total.requests == 2
+    assert total.input_tokens == 200
+    assert total.output_tokens == 40
+
+
+def test_default_path_sends_no_router_plugins(tmp_path, monkeypatch):
+    monkeypatch.delenv("FLIGHT_LOG_ROUTER_COST_TIER", raising=False)
+    _, captured, _, _, _, _ = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6"
+    )
+    assert captured["agent_kwargs"]["model_settings"].extra_body is None
+
+
+def test_router_tier_attaches_plugins_only_for_openrouter(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="typesafe/jev-router",
+        model_provider="openrouter",
+        router_cost_tier="low",
+    )
+    assert captured["agent_kwargs"]["model_settings"].extra_body == {
+        "plugins": [{"id": "jev-router", "cost_tier": "low"}]
+    }
+    assert metadata["requested_router_cost_tier"] == "low"
+
+
+def test_router_tier_never_reaches_other_providers(tmp_path, monkeypatch):
+    _, captured_openai, _, _, _, _ = _provider_harness(
+        tmp_path,
+        monkeypatch,
+        model="gpt-5.6",
+        model_provider="openai",
+        router_cost_tier="low",
+    )
+    assert captured_openai["agent_kwargs"]["model_settings"].extra_body is None
+
+
+def test_router_plugins_reach_transmitted_request_body(tmp_path):
+    import asyncio
+    import json
+
+    import httpx
+    from agents.agent_output import AgentOutputSchema
+    from agents.model_settings import ModelSettings
+    from agents.models.interface import ModelTracing
+    from openai.types.shared.reasoning import Reasoning
+
+    from flight_log_agent.analysis import model_provider as mpm
+    from flight_log_agent.models import FlightLogReport
+
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "gen-x",
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                        "index": 0,
+                    }
+                ],
+                "created": 0,
+                "model": "served-x",
+                "object": "chat.completion",
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            },
+            request=request,
+        )
+
+    runtime = mpm.resolve_model_runtime(
+        model="typesafe/jev-router",
+        model_provider="openrouter",
+        router_cost_tier="low",
+        openrouter_api_key="repro-key",
+        http_transport=httpx.MockTransport(handler),
+    )
+    model = runtime.run_config.model_provider.get_model("typesafe/jev-router")
+    asyncio.run(
+        model.get_response(
+            "system",
+            "investigate",
+            ModelSettings(
+                reasoning=Reasoning(effort="high"),
+                extra_body=mpm.router_plugins_body(runtime.router_cost_tier),
+            ),
+            [],
+            AgentOutputSchema(output_type=FlightLogReport),
+            [],
+            ModelTracing.DISABLED,
+        )
+    )
+    assert seen[0]["plugins"] == [{"id": "jev-router", "cost_tier": "low"}]
+    assert seen[0]["model"] == "typesafe/jev-router"
+
+
+def test_executor_overflow_limit_saves_full_output_and_cites_path(
+    tmp_path, monkeypatch
+):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    executor = analyzer.RestrictedShellExecutor(
+        work_dir, None, input_paths={}, output_limit=200
+    )
+    full = "0123456789" * 100
+
+    async def fake_sandboxed_process(argv, **_kwargs):
+        return full.encode(), b"", 0, False
+
+    monkeypatch.setattr(
+        executor, "_run_sandboxed_process", fake_sandboxed_process
+    )
+    result = asyncio.run(executor(_shell_request('python -c "print(1)"')))
+
+    shown = result.output[0].stdout
+    assert len(shown) < len(full)
+    assert "shell_outputs/" in shown
+    saved = sorted((work_dir / "shell_outputs").glob("*.txt"))
+    assert len(saved) == 1
+    assert saved[0].read_text(encoding="utf-8") == full
+
+
+def test_executor_default_limit_delivers_output_without_overflow_file(
+    tmp_path, monkeypatch
+):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    executor = analyzer.RestrictedShellExecutor(
+        work_dir, None, input_paths={}
+    )
+    full = "0123456789" * 500
+
+    async def fake_sandboxed_process(argv, **_kwargs):
+        return full.encode(), b"", 0, False
+
+    monkeypatch.setattr(
+        executor, "_run_sandboxed_process", fake_sandboxed_process
+    )
+    result = asyncio.run(executor(_shell_request('python -c "print(1)"')))
+
+    assert result.output[0].stdout == full
+    assert not (work_dir / "shell_outputs").exists()
+
+
+def test_shell_output_limit_rejects_nonpositive_value(tmp_path, monkeypatch):
+    log_path = tmp_path / "uploads" / "flight.ulg"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_bytes(b"ULog")
+    with pytest.raises(ValueError, match="shell_output_limit"):
+        asyncio.run(
+            analyzer.analyze_flight_log(
+                log_path=str(log_path),
+                output_dir=str(tmp_path / "outputs" / "run"),
+                dev_log_root=str(tmp_path / "dev_logs"),
+                user_question="What happened?",
+                shell_output_limit=0,
+            )
+        )
+
+
+def test_configured_output_limit_reaches_executor_and_metadata(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("FLIGHT_LOG_SHELL_OUTPUT_LIMIT", raising=False)
+    _, captured, _, metadata, _, _ = _provider_harness(
+        tmp_path, monkeypatch, model="gpt-5.6", shell_output_limit=2000
+    )
+    assert captured["shell_tool"]["executor"].output_limit == 2000
+    assert metadata["shell_output_limit"] == 2000
